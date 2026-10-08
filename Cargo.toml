@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+gpui = "=0.2.2"
+ignore = "0.4"
+ropey = "1.6"
+text = { path = "crates/text" }
+unicode-segmentation = "1"
