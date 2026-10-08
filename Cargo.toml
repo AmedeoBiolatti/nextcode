@@ -8,13 +8,17 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+alacritty_terminal = "0.26"
 anyhow = "1"
+dirs = "7"
 futures = "0.3"
 gpui = "=0.2.2"
 ignore = "0.4"
+language = { path = "crates/language" }
 lsp = { path = "crates/lsp" }
 lsp-types = "0.97"
 nucleo-matcher = "0.3"
+notify = "8"
 parking_lot = "0.12"
 percent-encoding = "2"
 # LF-only line indexing; CR before LF is handled by `text::Buffer`.
@@ -23,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 syntax = { path = "crates/syntax" }
 text = { path = "crates/text" }
+terminal = { path = "crates/terminal" }
 tree-sitter = "0.27"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
@@ -31,3 +36,4 @@ tree-sitter-rust = "0.24"
 tree-sitter-sequel = "0.3"
 unicode-segmentation = "1"
 url = "2"
+watcher = { path = "crates/watcher" }

@@ -1,19 +1,30 @@
 //! Multi-line code editor view: buffer state, keyboard/mouse handling, IME, and painting.
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use gpui::{
-    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
+    AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString, Style,
-    TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px,
-    relative, rgb,
+    GlobalElementId, InspectorElementId, KeyBinding, KeyContext, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, ShapedLine,
+    SharedString, StrikethroughStyle, Style, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
+    actions, div, fill, point, prelude::*, px, relative, rgb, size,
+};
+use lsp::types::{
+    DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncKind, Uri,
+    VersionedTextDocumentIdentifier, notification,
 };
 use syntax::{HighlightSpan, Language, Syntax};
-use text::Buffer;
+use text::{Bias, Buffer, Change, Encoding};
 
-use crate::theme;
+use crate::{lsp_store::RunningServer, theme};
+
+mod completion;
+mod navigation;
+
+pub use navigation::{FindReferences, GoToDefinition};
 
 actions!(
     editor,
@@ -53,6 +64,13 @@ actions!(
         Undo,
         Redo,
         Save,
+        NextDiagnostic,
+        PrevDiagnostic,
+        ShowCompletions,
+        SelectPrevCompletion,
+        SelectNextCompletion,
+        ConfirmCompletion,
+        CloseCompletions,
     ]
 );
 
@@ -106,6 +124,22 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-z", Redo, ctx),
         KeyBinding::new("secondary-y", Redo, ctx),
         KeyBinding::new("secondary-s", Save, ctx),
+        KeyBinding::new("f8", NextDiagnostic, ctx),
+        KeyBinding::new("shift-f8", PrevDiagnostic, ctx),
+        KeyBinding::new("f12", GoToDefinition, ctx),
+        KeyBinding::new("secondary-b", GoToDefinition, ctx),
+        KeyBinding::new("shift-f12", FindReferences, ctx),
+        KeyBinding::new("alt-f7", FindReferences, ctx),
+        KeyBinding::new("ctrl-space", ShowCompletions, ctx),
+    ]);
+    // Bound after the plain editor keys so they win while the menu is open.
+    let menu = Some("Editor && showing_completions");
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPrevCompletion, menu),
+        KeyBinding::new("down", SelectNextCompletion, menu),
+        KeyBinding::new("enter", ConfirmCompletion, menu),
+        KeyBinding::new("tab", ConfirmCompletion, menu),
+        KeyBinding::new("escape", CloseCompletions, menu),
     ]);
 }
 
@@ -114,6 +148,11 @@ pub enum EditorEvent {
     DirtyChanged,
     /// The text changed.
     Edited,
+    /// Open one of these locations (a picker when there are several).
+    Navigate {
+        locations: Vec<language::Location>,
+        title: SharedString,
+    },
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -139,10 +178,87 @@ pub struct Editor {
     /// Input-field mode: no gutter or status bar; Enter, Tab and vertical
     /// motion bubble up to the parent view.
     single_line: bool,
+    lsp: Option<LspDocument>,
+    /// Language-server status shown in the status bar, with its color.
+    lsp_status: Option<(SharedString, u32)>,
+    /// Scratch space for changes drained from the buffer.
+    changes: Vec<Change>,
+    /// Sorted by start; kept in sync with edits until the server republishes.
+    diagnostics: Vec<EditorDiagnostic>,
+    hover: Option<HoverPopover>,
+    _hover_delay: Option<Task<()>>,
+    /// Word the hover popover shows, or is waiting to show, information for.
+    hover_word: Option<Range<usize>>,
+    completion: Option<completion::CompletionMenu>,
+    /// Bumped per completion request; stale responses are dropped.
+    completion_generation: usize,
+    _completion_task: Option<Task<()>>,
+    _resolve_task: Option<Task<()>>,
+    _navigation_task: Option<Task<()>>,
+    /// Informational status-bar text, cleared by the next edit.
+    notice: Option<SharedString>,
+    /// Scroll the cursor to the middle of the view on the next layout.
+    center_cursor: bool,
+}
+
+/// Most severe first, so `min` picks what to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+impl Severity {
+    fn color(self) -> u32 {
+        match self {
+            Self::Error => theme::ERROR,
+            Self::Warning => theme::WARNING,
+            Self::Information => theme::ACCENT_TEXT,
+            Self::Hint => theme::MUTED,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Information => "info",
+            Self::Hint => "hint",
+        }
+    }
+}
+
+struct EditorDiagnostic {
+    range: Range<usize>,
+    severity: Severity,
+    message: SharedString,
+    source: Option<SharedString>,
+    /// Rendered faded (e.g. unused imports).
+    unnecessary: bool,
+    /// Rendered struck through.
+    deprecated: bool,
+}
+
+/// Popover shown when the mouse rests on text: diagnostics and hover docs.
+struct HoverPopover {
+    line: usize,
+    x: Pixels,
+    messages: Vec<(Severity, SharedString)>,
+    docs: Vec<language::markdown::Block>,
+}
+
+/// This editor's document as open on a language server.
+struct LspDocument {
+    server: Arc<RunningServer>,
+    uri: Uri,
+    version: i32,
 }
 
 /// Geometry from the last prepaint, used for painting and hit-testing.
 struct EditorLayout {
+    bounds: Bounds<Pixels>,
     text_bounds: Bounds<Pixels>,
     gutter_width: Pixels,
     line_height: Pixels,
@@ -150,6 +266,8 @@ struct EditorLayout {
     first_line: usize,
     lines: Vec<ShapedLine>,
     line_numbers: Vec<ShapedLine>,
+    /// Most severe diagnostic per visible line.
+    gutter_marks: Vec<Option<Severity>>,
 }
 
 impl Editor {
@@ -173,7 +291,116 @@ impl Editor {
             error: None,
             syntax,
             single_line: false,
+            lsp: None,
+            lsp_status: None,
+            changes: Vec::new(),
+            diagnostics: Vec::new(),
+            hover: None,
+            _hover_delay: None,
+            hover_word: None,
+            completion: None,
+            completion_generation: 0,
+            _completion_task: None,
+            _resolve_task: None,
+            _navigation_task: None,
+            notice: None,
+            center_cursor: false,
         }
+    }
+
+    pub fn language(&self) -> Option<Language> {
+        self.syntax.as_ref().map(Syntax::language)
+    }
+
+    pub fn set_lsp_status(&mut self, status: Option<(SharedString, u32)>, cx: &mut Context<Self>) {
+        self.lsp_status = status;
+        cx.notify();
+    }
+
+    /// Opens this document on `server` (no-op if already open there).
+    pub fn attach_server(&mut self, server: Arc<RunningServer>) {
+        if self
+            .lsp
+            .as_ref()
+            .is_some_and(|doc| Arc::ptr_eq(&doc.server, &server))
+        {
+            return;
+        }
+        let (Some(language), Some(uri)) = (
+            self.language(),
+            self.buffer.path().and_then(lsp::path_to_uri),
+        ) else {
+            return;
+        };
+        server
+            .connection
+            .notify::<notification::DidOpenTextDocument>(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem::new(
+                    uri.clone(),
+                    language.id().into(),
+                    1,
+                    self.text(),
+                ),
+            });
+        self.lsp = Some(LspDocument {
+            server,
+            uri,
+            version: 1,
+        });
+    }
+
+    /// Forgets the server; `close` also tells it the document closed.
+    pub fn detach_server(&mut self, close: bool) {
+        if let Some(doc) = self.lsp.take()
+            && close
+            && !doc.server.connection.has_exited()
+        {
+            doc.server
+                .connection
+                .notify::<notification::DidCloseTextDocument>(DidCloseTextDocumentParams {
+                    text_document: TextDocumentIdentifier::new(doc.uri),
+                });
+        }
+    }
+
+    /// Sends the drained `changes` to the server: one incremental edit when
+    /// possible, otherwise the full text.
+    fn sync_changes(&mut self) {
+        let Some(doc) = &mut self.lsp else {
+            return;
+        };
+        let server = &doc.server;
+        let content_changes =
+            if server.sync == TextDocumentSyncKind::INCREMENTAL && self.changes.len() == 1 {
+                let change = self.changes[0];
+                let (start, end) = match server.encoding {
+                    Encoding::Utf8 => (change.start_point, change.old_end_point),
+                    Encoding::Utf16 => (change.start_utf16, change.old_end_utf16),
+                };
+                vec![TextDocumentContentChangeEvent {
+                    range: Some(lsp::types::Range::new(
+                        lsp_position(start),
+                        lsp_position(end),
+                    )),
+                    range_length: None,
+                    text: self.buffer.slice(change.start..change.new_end),
+                }]
+            } else if server.sync != TextDocumentSyncKind::NONE {
+                vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: self.buffer.slice(0..self.buffer.len()),
+                }]
+            } else {
+                return;
+            };
+        doc.version += 1;
+        server
+            .connection
+            .notify::<notification::DidChangeTextDocument>(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(doc.uri.clone(), doc.version),
+                content_changes,
+            });
     }
 
     pub fn single_line(cx: &mut Context<Self>) -> Self {
@@ -195,6 +422,14 @@ impl Editor {
         let saved = match self.buffer.save() {
             Ok(()) => {
                 self.error = None;
+                if let Some(doc) = &self.lsp {
+                    doc.server
+                        .connection
+                        .notify::<notification::DidSaveTextDocument>(DidSaveTextDocumentParams {
+                            text_document: TextDocumentIdentifier::new(doc.uri.clone()),
+                            text: doc.server.save_includes_text.then(|| self.text()),
+                        });
+                }
                 true
             }
             Err(err) => {
@@ -216,6 +451,7 @@ impl Editor {
             self.anchor = offset;
         }
         self.autoscroll = true;
+        self.update_completion_menu(cx);
         cx.notify();
     }
 
@@ -315,18 +551,40 @@ impl Editor {
     }
 
     fn finish_change(&mut self, was_dirty: bool, cx: &mut Context<Self>) {
-        let mut edited = false;
-        for change in self.buffer.drain_changes() {
-            edited = true;
-            if let Some(syntax) = &mut self.syntax {
-                syntax.edit(&change);
+        self.changes.clear();
+        self.changes.extend(self.buffer.drain_changes());
+        let edited = !self.changes.is_empty();
+        for change in &self.changes {
+            for diagnostic in &mut self.diagnostics {
+                let end = change.map_offset(diagnostic.range.end, Bias::Left);
+                let start = change
+                    .map_offset(diagnostic.range.start, Bias::Right)
+                    .min(end);
+                diagnostic.range = start..end;
             }
         }
-        if edited && let Some(syntax) = &mut self.syntax {
+        if edited {
+            self.hover = None;
+            self.hover_word = None;
+            self._hover_delay = None;
+            self.notice = None;
+        }
+        if let Some(syntax) = &mut self.syntax
+            && edited
+        {
+            for change in &self.changes {
+                syntax.edit(change);
+            }
             syntax.reparse(&self.buffer);
         }
         if edited {
+            self.sync_changes();
+        }
+        if edited {
             cx.emit(EditorEvent::Edited);
+        }
+        if edited {
+            self.update_completion_menu(cx);
         }
         if was_dirty != self.buffer.is_dirty() {
             cx.emit(EditorEvent::DirtyChanged);
@@ -549,6 +807,10 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        self.hover = None;
+        self.hover_word = None;
+        self._hover_delay = None;
+        self.completion = None;
         let offset = self.offset_for_position(event.position);
         self.goal_column = None;
         if event.click_count >= 2 {
@@ -556,6 +818,9 @@ impl Editor {
             self.anchor = self.buffer.prev_word_start(end);
             self.head = end;
             cx.notify();
+        } else if event.modifiers.secondary() {
+            self.move_head(offset, false, cx);
+            self.request_definition(offset, cx);
         } else {
             self.move_head(offset, event.modifiers.shift, cx);
             self.selecting = true;
@@ -570,7 +835,123 @@ impl Editor {
         if self.selecting {
             let offset = self.offset_for_position(event.position);
             self.move_head(offset, true, cx);
+        } else {
+            self.update_hover(event.position, cx);
         }
+    }
+
+    /// Line and offset of the character under `position`, if it is over text.
+    fn character_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
+        let layout = self.layout.as_ref()?;
+        if !layout.text_bounds.contains(&position) {
+            return None;
+        }
+        let row = (position.y - layout.text_bounds.top() + self.scroll.y) / layout.line_height;
+        let line = row.max(0.) as usize;
+        let shaped = layout.lines.get(line.checked_sub(layout.first_line)?)?;
+        let x = position.x - layout.text_bounds.left() + self.scroll.x;
+        let index = shaped.index_for_x(x)?;
+        Some((line, self.buffer.line_start(line) + index))
+    }
+
+    fn clear_hover(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if !hovered && (self.hover.is_some() || self._hover_delay.is_some()) {
+            self.hover = None;
+            self.hover_word = None;
+            self._hover_delay = None;
+            cx.notify();
+        }
+    }
+
+    /// Replaces diagnostics with a server's, given in its position encoding.
+    pub fn set_diagnostics(
+        &mut self,
+        diagnostics: &[lsp::types::Diagnostic],
+        cx: &mut Context<Self>,
+    ) {
+        let encoding = self
+            .lsp
+            .as_ref()
+            .map_or(Encoding::Utf16, |doc| doc.server.encoding);
+        let offset = |position: lsp::types::Position| {
+            let point = text::Point {
+                row: position.line as usize,
+                column: position.character as usize,
+            };
+            self.buffer.offset_of(point, encoding)
+        };
+        self.diagnostics = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let tags = diagnostic.tags.as_deref().unwrap_or_default();
+                EditorDiagnostic {
+                    range: self.visible_range(
+                        offset(diagnostic.range.start),
+                        offset(diagnostic.range.end),
+                    ),
+                    severity: match diagnostic.severity {
+                        Some(DiagnosticSeverity::WARNING) => Severity::Warning,
+                        Some(DiagnosticSeverity::INFORMATION) => Severity::Information,
+                        Some(DiagnosticSeverity::HINT) => Severity::Hint,
+                        _ => Severity::Error,
+                    },
+                    message: diagnostic.message.clone().into(),
+                    source: diagnostic.source.clone().map(Into::into),
+                    unnecessary: tags.contains(&DiagnosticTag::UNNECESSARY),
+                    deprecated: tags.contains(&DiagnosticTag::DEPRECATED),
+                }
+            })
+            .collect();
+        self.diagnostics
+            .sort_by_key(|d| (d.range.start, d.severity));
+        self.hover = None;
+        cx.notify();
+    }
+
+    /// Widens an empty range to one character so it can be underlined.
+    fn visible_range(&self, start: usize, end: usize) -> Range<usize> {
+        if start < end {
+            return start..end;
+        }
+        let line = self.buffer.line_of(start);
+        if start < self.buffer.line_end(line) {
+            start..self.buffer.next_grapheme(start)
+        } else if start > self.buffer.line_start(line) {
+            self.buffer.prev_grapheme(start)..start
+        } else {
+            start..start
+        }
+    }
+
+    fn jump_to_diagnostic(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let starts = self
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity < Severity::Hint)
+            .map(|d| d.range.start);
+        let target = if forward {
+            starts
+                .clone()
+                .find(|&start| start > self.head)
+                .or_else(|| starts.clone().next())
+        } else {
+            starts
+                .clone()
+                .rfind(|&start| start < self.head)
+                .or_else(|| starts.clone().next_back())
+        };
+        if let Some(target) = target {
+            self.goal_column = None;
+            self.move_head(target, false, cx);
+        }
+    }
+
+    fn next_diagnostic(&mut self, _: &NextDiagnostic, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_diagnostic(true, cx);
+    }
+
+    fn prev_diagnostic(&mut self, _: &PrevDiagnostic, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_diagnostic(false, cx);
     }
 
     fn on_scroll_wheel(
@@ -590,6 +971,8 @@ impl Editor {
         // Upper bounds are clamped in `layout`, which knows the viewport.
         self.scroll.x = (self.scroll.x - delta.x).max(px(0.));
         self.scroll.y = (self.scroll.y - delta.y).max(px(0.));
+        self.hover = None;
+        self._hover_delay = None;
         cx.notify();
     }
 
@@ -627,6 +1010,11 @@ impl Editor {
         let viewport = text_bounds.size;
 
         let cursor_line = self.buffer.line_of(self.head);
+        if self.center_cursor {
+            self.center_cursor = false;
+            self.autoscroll = false;
+            self.scroll.y = line_height * cursor_line as f32 - viewport.height / 2.;
+        }
         if self.autoscroll {
             let top = line_height * cursor_line as f32;
             if top < self.scroll.y {
@@ -657,6 +1045,8 @@ impl Editor {
         let mut lines = Vec::with_capacity(last_line - first_line);
         let mut line_numbers = Vec::with_capacity(last_line - first_line);
         let mut cuts = Vec::new();
+        let mut gutter_marks = Vec::with_capacity(last_line - first_line);
+        let mut line_diagnostics: Vec<&EditorDiagnostic> = Vec::new();
         for line in first_line..last_line {
             let start = self.buffer.line_start(line);
             // Tabs render as one space for now; byte offsets stay aligned.
@@ -666,10 +1056,27 @@ impl Editor {
             let line_spans = &spans[first_span..];
             let line_spans =
                 &line_spans[..line_spans.partition_point(|span| span.range.start < range.end)];
+            line_diagnostics.clear();
+            let candidates = self
+                .diagnostics
+                .partition_point(|d| d.range.start < range.end.max(range.start + 1));
+            line_diagnostics.extend(
+                self.diagnostics[..candidates]
+                    .iter()
+                    .filter(|d| d.range.end > range.start || d.range.start == range.start),
+            );
+            gutter_marks.push(
+                line_diagnostics
+                    .iter()
+                    .map(|d| d.severity)
+                    .filter(|&severity| severity < Severity::Hint)
+                    .min(),
+            );
             let runs = line_runs(
                 range,
                 line_spans,
                 self.marked.as_ref(),
+                &line_diagnostics,
                 &base_run,
                 &mut cuts,
             );
@@ -702,6 +1109,7 @@ impl Editor {
         self.autoscroll = false;
 
         self.layout = Some(EditorLayout {
+            bounds,
             text_bounds,
             gutter_width,
             line_height,
@@ -709,6 +1117,7 @@ impl Editor {
             first_line,
             lines,
             line_numbers,
+            gutter_marks,
         });
     }
 
@@ -733,6 +1142,18 @@ impl Editor {
                     cx,
                 )
                 .ok();
+        }
+        for (i, mark) in layout.gutter_marks.iter().enumerate() {
+            if let Some(severity) = mark {
+                let top = line_top(layout.first_line + i);
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left() + px(3.), top + px(3.)),
+                        size(px(3.), line_height - px(6.)),
+                    ),
+                    rgb(severity.color()),
+                ));
+            }
         }
 
         window.with_content_mask(
@@ -782,12 +1203,18 @@ impl Editor {
     }
 }
 
-/// Text runs for one line: syntax colors from `spans`, IME composition underlined.
-/// `cuts` is scratch space reused across lines.
+fn lsp_position(point: text::Point) -> lsp::types::Position {
+    lsp::types::Position::new(point.row as u32, point.column as u32)
+}
+
+/// Text runs for one line: syntax colors from `spans`, wavy underlines from
+/// `diagnostics`, IME composition underlined. `cuts` is scratch space reused
+/// across lines.
 fn line_runs(
     line: Range<usize>,
     spans: &[HighlightSpan],
     marked: Option<&Range<usize>>,
+    diagnostics: &[&EditorDiagnostic],
     base: &TextRun,
     cuts: &mut Vec<usize>,
 ) -> Vec<TextRun> {
@@ -796,6 +1223,9 @@ fn line_runs(
     cuts.extend([line.start, line.end]);
     for span in spans {
         cuts.extend([clamp(span.range.start), clamp(span.range.end)]);
+    }
+    for diagnostic in diagnostics {
+        cuts.extend([clamp(diagnostic.range.start), clamp(diagnostic.range.end)]);
     }
     if let Some(marked) = marked {
         cuts.extend([clamp(marked.start), clamp(marked.end)]);
@@ -806,24 +1236,44 @@ fn line_runs(
     cuts.windows(2)
         .map(|cut| {
             let start = cut[0];
-            let color = spans
-                .iter()
-                .find(|span| span.range.contains(&start))
-                .map_or(base.color, |span| {
-                    rgb(theme::highlight_color(span.highlight)).into()
-                });
-            let underline =
-                marked
-                    .filter(|marked| marked.contains(&start))
-                    .map(|_| UnderlineStyle {
-                        color: Some(color),
+            let covering = || diagnostics.iter().filter(move |d| d.range.contains(&start));
+            let color = if covering().any(|d| d.unnecessary) {
+                rgb(theme::MUTED).into()
+            } else {
+                spans
+                    .iter()
+                    .find(|span| span.range.contains(&start))
+                    .map_or(base.color, |span| {
+                        rgb(theme::highlight_color(span.highlight)).into()
+                    })
+            };
+            let underline = match marked.filter(|marked| marked.contains(&start)) {
+                Some(_) => Some(UnderlineStyle {
+                    color: Some(color),
+                    thickness: px(1.),
+                    wavy: false,
+                }),
+                None => covering()
+                    .map(|d| d.severity)
+                    .filter(|&severity| severity < Severity::Hint)
+                    .min()
+                    .map(|severity| UnderlineStyle {
+                        color: Some(rgb(severity.color()).into()),
                         thickness: px(1.),
-                        wavy: false,
-                    });
+                        wavy: true,
+                    }),
+            };
+            let strikethrough = covering()
+                .any(|d| d.deprecated)
+                .then(|| StrikethroughStyle {
+                    color: Some(color),
+                    thickness: px(1.),
+                });
             TextRun {
                 len: cut[1] - start,
                 color,
                 underline,
+                strikethrough,
                 ..base.clone()
             }
         })
@@ -882,6 +1332,7 @@ impl EntityInputHandler for Editor {
             .or(self.marked.clone())
             .unwrap_or_else(|| self.selection());
         self.replace(range, text, cx);
+        self.on_typed(text, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -1017,9 +1468,10 @@ impl Focusable for Editor {
         self.focus_handle.clone()
     }
 }
-
 impl Render for Editor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A modal (finder, picker) took focus: don't leave a popover over it.
+        let focused = self.focus_handle.contains_focused(window, cx);
         let line = self.buffer.line_of(self.head) + 1;
         let column = self.buffer.column(self.head) + 1;
         let language = self
@@ -1031,9 +1483,10 @@ impl Render for Editor {
         } else {
             "LF"
         };
-        let (message, message_color) = match &self.error {
-            Some(error) => (error.clone(), theme::ERROR),
-            None => (
+        let (message, message_color) = match (&self.error, &self.notice) {
+            (Some(error), _) => (error.clone(), theme::ERROR),
+            (None, Some(notice)) => (notice.clone(), theme::TEXT),
+            (None, None) => (
                 self.buffer
                     .path()
                     .map(|path| path.display().to_string().into())
@@ -1041,9 +1494,23 @@ impl Render for Editor {
                 theme::MUTED,
             ),
         };
+        let count = |severity| {
+            self.diagnostics
+                .iter()
+                .filter(|d| d.severity == severity)
+                .count()
+        };
+        let (errors, warnings) = (count(Severity::Error), count(Severity::Warning));
 
         div()
-            .key_context(CONTEXT)
+            .key_context({
+                let mut context = KeyContext::default();
+                context.add(CONTEXT);
+                if self.completion.is_some() {
+                    context.add("showing_completions");
+                }
+                context
+            })
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()
@@ -1087,8 +1554,18 @@ impl Render for Editor {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::save_action))
+            .on_action(cx.listener(Self::next_diagnostic))
+            .on_action(cx.listener(Self::prev_diagnostic))
+            .on_action(cx.listener(Self::go_to_definition))
+            .on_action(cx.listener(Self::find_references))
+            .on_action(cx.listener(Self::show_completions))
+            .on_action(cx.listener(Self::select_prev_completion))
+            .on_action(cx.listener(Self::select_next_completion))
+            .on_action(cx.listener(Self::confirm_completion))
+            .on_action(cx.listener(Self::close_completions))
             .child(
                 div()
+                    .id("editor-text")
                     .flex_1()
                     .relative()
                     .overflow_hidden()
@@ -1102,9 +1579,12 @@ impl Render for Editor {
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                    .on_hover(cx.listener(Self::clear_hover))
                     .child(EditorElement {
                         editor: cx.entity(),
-                    }),
+                    })
+                    .when(focused, |text| text.children(self.render_hover()))
+                    .children(self.render_completions(cx)),
             )
             .when(!self.single_line, |editor| {
                 editor.child(
@@ -1119,9 +1599,34 @@ impl Render for Editor {
                         .text_xs()
                         .text_color(rgb(theme::MUTED))
                         .child(div().text_color(rgb(message_color)).child(message))
-                        .child(format!(
-                            "Ln {line}, Col {column}   {line_ending}   UTF-8   {language}"
-                        )),
+                        .child(
+                            div()
+                                .flex()
+                                .gap_4()
+                                .children(self.lsp_status.clone().map(|(status, color)| {
+                                    div().text_color(rgb(color)).child(status)
+                                }))
+                                .child(format!(
+                                    "Ln {line}, Col {column}   {line_ending}   UTF-8   {language}"
+                                ))
+                                .when(errors + warnings > 0, |row| {
+                                    row.child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(theme::ERROR))
+                                                    .child(format!("✕ {errors}")),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(theme::WARNING))
+                                                    .child(format!("⚠ {warnings}")),
+                                            ),
+                                    )
+                                }),
+                        ),
                 )
             })
     }

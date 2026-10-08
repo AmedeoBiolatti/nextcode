@@ -9,6 +9,7 @@ pub const TEXT: u32 = 0xbcbec4;
 pub const MUTED: u32 = 0x6f737a;
 pub const ACCENT: u32 = 0x3574f0;
 pub const ACCENT_TEXT: u32 = 0x6ca2ff;
+pub const WARNING: u32 = 0xf2c55c;
 pub const ACTIVE_ROW: u32 = 0x2e436e;
 pub const HOVER_ROW: u32 = 0x35373b;
 pub const SELECTION: u32 = 0x214283;
@@ -41,3 +42,6 @@ pub const MONO_FONT: &str = "Consolas";
 pub const MONO_FONT: &str = "Menlo";
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub const MONO_FONT: &str = "DejaVu Sans Mono";
+
+/// gpui alias for the platform UI font.
+pub const UI_FONT: &str = ".SystemUIFont";

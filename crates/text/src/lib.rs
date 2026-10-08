@@ -22,14 +22,24 @@ struct Edit {
     new: String,
 }
 
-/// Row and byte column of an offset.
+/// Row and column of an offset; the column unit depends on the [`Encoding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Point {
     pub row: usize,
     pub column: usize,
 }
 
+/// Unit of [`Point::column`]: UTF-8 bytes (tree-sitter, most LSP servers)
+/// or UTF-16 code units (the LSP default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    Utf8,
+    Utf16,
+}
+
 /// One text replacement, in the coordinates incremental parsers expect.
+/// `*_point` columns are UTF-8 bytes; `*_utf16` are the same positions in
+/// UTF-16 units, all measured before the edit except `new_end*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Change {
     pub start: usize,
@@ -38,13 +48,56 @@ pub struct Change {
     pub start_point: Point,
     pub old_end_point: Point,
     pub new_end_point: Point,
+    pub start_utf16: Point,
+    pub old_end_utf16: Point,
+}
+
+/// [`Buffer::edit_batch`] was given overlapping ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlappingEdits;
+
+impl std::fmt::Display for OverlappingEdits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("edits overlap")
+    }
+}
+
+impl std::error::Error for OverlappingEdits {}
+
+/// Which side of an edit a mapped position sticks to when the edit touches it.
+/// Map range starts with `Right` and ends with `Left` so text typed at either
+/// edge stays outside the range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bias {
+    /// Stay before text inserted at the position.
+    Left,
+    /// Move after text inserted at the position.
+    Right,
+}
+
+impl Change {
+    /// Where a pre-edit `offset` ends up after this change. Offsets inside the
+    /// replaced text move to its start (`Left`) or end (`Right`).
+    pub fn map_offset(&self, offset: usize, bias: Bias) -> usize {
+        if offset < self.start || (offset == self.start && bias == Bias::Left) {
+            offset
+        } else if offset >= self.old_end && !(offset == self.start && bias == Bias::Left) {
+            offset + self.new_end - self.old_end
+        } else {
+            match bias {
+                Bias::Left => self.start,
+                Bias::Right => self.new_end,
+            }
+        }
+    }
 }
 
 pub struct Buffer {
     rope: Rope,
     path: Option<PathBuf>,
-    undo: Vec<Edit>,
-    redo: Vec<Edit>,
+    /// Undo steps; each is one or more edits in the order they were applied.
+    undo: Vec<Vec<Edit>>,
+    redo: Vec<Vec<Edit>>,
     /// Undo-stack depth matching the file on disk; `None` if that state is unreachable.
     saved_at: Option<usize>,
     line_ending: &'static str,
@@ -141,11 +194,53 @@ impl Buffer {
         end
     }
 
+    /// Point of `offset` with UTF-8 byte columns.
     pub fn point(&self, offset: usize) -> Point {
         let row = self.rope.byte_to_line(offset);
         Point {
             row,
             column: offset - self.rope.line_to_byte(row),
+        }
+    }
+
+    pub fn point_in(&self, offset: usize, encoding: Encoding) -> Point {
+        match encoding {
+            Encoding::Utf8 => self.point(offset),
+            Encoding::Utf16 => {
+                let row = self.rope.byte_to_line(offset);
+                let char = self.rope.byte_to_char(offset);
+                let line_char = self.rope.line_to_char(row);
+                Point {
+                    row,
+                    column: self.rope.char_to_utf16_cu(char)
+                        - self.rope.char_to_utf16_cu(line_char),
+                }
+            }
+        }
+    }
+
+    /// Offset of `point`, clamped to the buffer and to the end of its line
+    /// (servers may send positions past either). A column inside a
+    /// multi-unit character snaps to that character's start.
+    pub fn offset_of(&self, point: Point, encoding: Encoding) -> usize {
+        if point.row >= self.line_count() {
+            return self.len();
+        }
+        let line_start = self.line_start(point.row);
+        let line_end = self.line_end(point.row);
+        match encoding {
+            Encoding::Utf8 => {
+                let offset = (line_start + point.column).min(line_end);
+                self.rope.char_to_byte(self.rope.byte_to_char(offset))
+            }
+            Encoding::Utf16 => {
+                let start_char = self.rope.byte_to_char(line_start);
+                let end_char = self.rope.byte_to_char(line_end);
+                let start_unit = self.rope.char_to_utf16_cu(start_char);
+                let end_unit = self.rope.char_to_utf16_cu(end_char);
+                let unit = (start_unit + point.column).min(end_unit);
+                self.rope.char_to_byte(self.rope.utf16_cu_to_char(unit))
+            }
         }
     }
 
@@ -296,7 +391,7 @@ impl Buffer {
         if old.is_empty()
             && !text.contains('\n')
             && Some(self.undo.len()) != self.saved_at
-            && let Some(last) = self.undo.last_mut()
+            && let Some([last]) = self.undo.last_mut().map(Vec::as_mut_slice)
             && last.old.is_empty()
             && !last.new.contains('\n')
             && last.offset + last.new.len() == range.start
@@ -304,34 +399,85 @@ impl Buffer {
             last.new.push_str(text);
             return;
         }
-        self.undo.push(Edit {
+        self.undo.push(vec![Edit {
             offset: range.start,
             old,
             new: text.to_owned(),
-        });
+        }]);
     }
 
-    /// Reverts the last edit; returns the range of restored text.
+    /// Applies several edits as one undo step. Ranges refer to the current
+    /// text and must not overlap; inserts at the same offset keep their order.
+    pub fn edit_batch(
+        &mut self,
+        mut edits: Vec<(Range<usize>, String)>,
+    ) -> Result<(), OverlappingEdits> {
+        edits.sort_by_key(|(range, _)| range.start);
+        if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+            return Err(OverlappingEdits);
+        }
+        edits.retain(|(range, text)| !(range.is_empty() && text.is_empty()));
+        if edits.is_empty() {
+            return Ok(());
+        }
+        // Back to front, so earlier ranges stay valid.
+        let mut transaction = Vec::with_capacity(edits.len());
+        for (range, text) in edits.into_iter().rev() {
+            let old = self.slice(range.clone());
+            self.replace(range.clone(), &text);
+            transaction.push(Edit {
+                offset: range.start,
+                old,
+                new: text,
+            });
+        }
+        self.redo.clear();
+        if self.saved_at.is_some_and(|saved| saved > self.undo.len()) {
+            self.saved_at = None;
+        }
+        self.undo.push(transaction);
+        Ok(())
+    }
+
+    /// Reverts the last undo step; returns the restored range of its
+    /// last-in-text edit (where the cursor belongs).
     pub fn undo(&mut self) -> Option<Range<usize>> {
-        let edit = self.undo.pop()?;
-        self.replace(edit.offset..edit.offset + edit.new.len(), &edit.old);
-        let restored = edit.offset..edit.offset + edit.old.len();
-        self.redo.push(edit);
+        let transaction = self.undo.pop()?;
+        for edit in transaction.iter().rev() {
+            self.replace(edit.offset..edit.offset + edit.new.len(), &edit.old);
+        }
+        // Edits apply back to front, so the first one is last in the text and,
+        // being reverted last, its offset is already final.
+        let first = &transaction[0];
+        let restored = first.offset..first.offset + first.old.len();
+        self.redo.push(transaction);
         Some(restored)
     }
 
-    /// Reapplies the last undone edit; returns the range of reinserted text.
+    /// Reapplies the last undone step; returns the reinserted range of its
+    /// last-in-text edit.
     pub fn redo(&mut self) -> Option<Range<usize>> {
-        let edit = self.redo.pop()?;
-        self.replace(edit.offset..edit.offset + edit.old.len(), &edit.new);
-        let inserted = edit.offset..edit.offset + edit.new.len();
-        self.undo.push(edit);
+        let transaction = self.redo.pop()?;
+        for edit in &transaction {
+            self.replace(edit.offset..edit.offset + edit.old.len(), &edit.new);
+        }
+        let first = &transaction[0];
+        // Later edits sit earlier in the text and shift the first one.
+        let shift: isize = transaction[1..]
+            .iter()
+            .map(|edit| edit.new.len() as isize - edit.old.len() as isize)
+            .sum();
+        let inserted = first.offset.saturating_add_signed(shift)
+            ..first.offset.saturating_add_signed(shift) + first.new.len();
+        self.undo.push(transaction);
         Some(inserted)
     }
 
     fn replace(&mut self, range: Range<usize>, text: &str) {
         let start_point = self.point(range.start);
         let old_end_point = self.point(range.end);
+        let start_utf16 = self.point_in(range.start, Encoding::Utf16);
+        let old_end_utf16 = self.point_in(range.end, Encoding::Utf16);
         let start = self.rope.byte_to_char(range.start);
         let end = self.rope.byte_to_char(range.end);
         self.rope.remove(start..end);
@@ -344,6 +490,8 @@ impl Buffer {
             start_point,
             old_end_point,
             new_end_point: self.point(new_end),
+            start_utf16,
+            old_end_utf16,
         });
     }
 }
@@ -379,6 +527,32 @@ mod tests {
     }
 
     #[test]
+    fn ranges_mapped_through_edits_do_not_absorb_text_typed_at_their_edges() {
+        let mut buffer = Buffer::new("aa BAD bb");
+        let range = 3..6; // "BAD"
+        let map = |change: Change, range: Range<usize>| {
+            change.map_offset(range.start, Bias::Right)..change.map_offset(range.end, Bias::Left)
+        };
+        let mut edit = |at: Range<usize>, text: &str| {
+            buffer.edit(at, text);
+            buffer.drain_changes().next().unwrap()
+        };
+        // Typing just before and just after leaves the range on "BAD".
+        let range = map(edit(3..3, "xx"), range);
+        assert_eq!(range, 5..8);
+        let range = map(edit(8..8, "yy"), range);
+        assert_eq!(range, 5..8);
+        // Edits earlier in the text shift it; edits inside resize it.
+        let range = map(edit(0..2, ""), range);
+        assert_eq!(range, 3..6);
+        let range = map(edit(4..5, "ZZZ"), range);
+        assert_eq!(range, 3..8);
+        // Deleting the whole range collapses it.
+        let range = map(edit(2..9, ""), range);
+        assert!(range.is_empty());
+    }
+
+    #[test]
     fn only_lf_starts_a_line() {
         let buffer = Buffer::new("a\rb\u{2028}c\nd");
         assert_eq!(buffer.line_count(), 2);
@@ -400,6 +574,8 @@ mod tests {
                 start_point: Point { row: 0, column: 1 },
                 old_end_point: Point { row: 1, column: 1 },
                 new_end_point: Point { row: 1, column: 1 },
+                start_utf16: Point { row: 0, column: 1 },
+                old_end_utf16: Point { row: 1, column: 1 },
             }]
         );
         buffer.undo();
@@ -411,6 +587,47 @@ mod tests {
         assert_eq!(Buffer::new("a\r\nb\n").line_ending(), "\r\n");
         assert_eq!(Buffer::new("a\nb\r\n").line_ending(), "\n");
         assert_eq!(Buffer::new("no breaks").line_ending(), "\n");
+    }
+
+    #[test]
+    fn points_convert_in_both_encodings_and_clamp_out_of_range() {
+        // '😀' is 4 UTF-8 bytes and 2 UTF-16 units.
+        let buffer = Buffer::new("x\r\na😀b\n");
+        let b = 3 + 1 + 4; // offset of 'b'
+        assert_eq!(
+            buffer.point_in(b, Encoding::Utf8),
+            Point { row: 1, column: 5 }
+        );
+        assert_eq!(
+            buffer.point_in(b, Encoding::Utf16),
+            Point { row: 1, column: 3 }
+        );
+        assert_eq!(
+            buffer.offset_of(Point { row: 1, column: 3 }, Encoding::Utf16),
+            b
+        );
+        assert_eq!(
+            buffer.offset_of(Point { row: 1, column: 5 }, Encoding::Utf8),
+            b
+        );
+        // Inside the emoji snaps to its start.
+        assert_eq!(
+            buffer.offset_of(Point { row: 1, column: 2 }, Encoding::Utf8),
+            4
+        );
+        assert_eq!(
+            buffer.offset_of(Point { row: 1, column: 2 }, Encoding::Utf16),
+            4
+        );
+        // Past the line end stops before the line break, not inside it.
+        assert_eq!(
+            buffer.offset_of(Point { row: 0, column: 99 }, Encoding::Utf16),
+            1
+        );
+        assert_eq!(
+            buffer.offset_of(Point { row: 9, column: 0 }, Encoding::Utf8),
+            buffer.len()
+        );
     }
 
     #[test]
@@ -466,6 +683,39 @@ mod tests {
         assert!(!buffer.is_dirty());
         assert_eq!(buffer.redo(), Some(1..3));
         assert!(buffer.is_dirty());
+    }
+
+    #[test]
+    fn batch_edits_apply_and_undo_as_one_step() {
+        let text = "def f():\n    os.pa\n";
+        let mut buffer = Buffer::new(text);
+        // Complete `os.pa` → `os.path` and add an import at the top.
+        buffer
+            .edit_batch(vec![(16..18, "path".into()), (0..0, "import os\n".into())])
+            .unwrap();
+        let edited = "import os\ndef f():\n    os.path\n";
+        assert_eq!(buffer.slice(0..buffer.len()), edited);
+
+        // The cursor goes back to the completion, not the import.
+        assert_eq!(buffer.undo(), Some(16..18));
+        assert_eq!(buffer.slice(0..buffer.len()), text);
+        assert_eq!(buffer.redo(), Some(26..30));
+        assert_eq!(buffer.slice(0..buffer.len()), edited);
+        assert_eq!(buffer.slice(26..30), "path");
+    }
+
+    #[test]
+    fn batch_inserts_at_one_offset_keep_order_and_overlaps_are_rejected() {
+        let mut buffer = Buffer::new("x");
+        buffer
+            .edit_batch(vec![(0..0, "a".into()), (0..0, "b".into())])
+            .unwrap();
+        assert_eq!(buffer.slice(0..buffer.len()), "abx");
+        assert_eq!(
+            buffer.edit_batch(vec![(0..2, "".into()), (1..3, "".into())]),
+            Err(OverlappingEdits)
+        );
+        assert_eq!(buffer.slice(0..buffer.len()), "abx");
     }
 
     #[test]

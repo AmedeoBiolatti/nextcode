@@ -7,7 +7,7 @@ use tree_sitter::{
     InputEdit, Language as Grammar, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     C,
     Cpp,
@@ -32,6 +32,17 @@ impl Language {
             "sql" => Self::Sql,
             _ => return None,
         })
+    }
+
+    /// Identifier used as the LSP `languageId` and as the settings key.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Python => "python",
+            Self::Rust => "rust",
+            Self::Sql => "sql",
+        }
     }
 
     pub fn name(self) -> &'static str {

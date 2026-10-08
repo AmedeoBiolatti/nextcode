@@ -6,8 +6,15 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+dirs.workspace = true
+futures.workspace = true
 gpui.workspace = true
 ignore.workspace = true
+language.workspace = true
+lsp.workspace = true
 nucleo-matcher.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 syntax.workspace = true
 text.workspace = true
