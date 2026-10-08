@@ -6,8 +6,9 @@ Native, AI-first IDE written in Rust on [gpui](https://crates.io/crates/gpui).
 
 | Crate | Purpose |
 |---|---|
-| `crates/text` | UI-agnostic rope buffer: edits, undo/redo, grapheme/word motion, UTF-16 mapping, line endings |
-| `crates/ui` | `next_code` binary: window, file tree, tabs, editor view |
+| `crates/text` | UI-agnostic rope buffer: edits, undo/redo, grapheme/word motion, UTF-16 mapping, line endings, change log |
+| `crates/syntax` | Incremental tree-sitter parsing and highlight spans for C, C++, Python, Rust, SQL |
+| `crates/ui` | `next_code` binary: window, file tree, tabs, editor view, fuzzy file finder (`Ctrl+P`) |
 
 ## Build and run
 
@@ -23,7 +24,7 @@ Linux additionally needs the gpui system libraries (Wayland/X11, xkbcommon, font
 
 ## Roadmap
 
-- **M0** editor core: window, file tree, tabs, editing, save — *in progress*; next: tree-sitter highlighting, fuzzy file finder
+- **M0** editor core: window, file tree, tabs, editing, save, syntax highlighting, fuzzy file finder — *done*
 - **M1** LSP (completion, go-to-definition, diagnostics), terminal, project search
 - **M2** host agent protocol, WSL
 - **M3** git panel and diff view, multiple workspaces

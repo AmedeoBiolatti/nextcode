@@ -10,6 +10,7 @@ use gpui::{
     TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px,
     relative, rgb,
 };
+use syntax::{HighlightSpan, Language, Syntax};
 use text::Buffer;
 
 use crate::theme;
@@ -111,6 +112,8 @@ pub fn bind_keys(cx: &mut App) {
 pub enum EditorEvent {
     /// The buffer gained or lost unsaved changes.
     DirtyChanged,
+    /// The text changed.
+    Edited,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -132,6 +135,10 @@ pub struct Editor {
     selecting: bool,
     layout: Option<EditorLayout>,
     error: Option<SharedString>,
+    syntax: Option<Syntax>,
+    /// Input-field mode: no gutter or status bar; Enter, Tab and vertical
+    /// motion bubble up to the parent view.
+    single_line: bool,
 }
 
 /// Geometry from the last prepaint, used for painting and hit-testing.
@@ -146,7 +153,12 @@ struct EditorLayout {
 }
 
 impl Editor {
-    pub fn new(buffer: Buffer, cx: &mut Context<Self>) -> Self {
+    pub fn new(mut buffer: Buffer, cx: &mut Context<Self>) -> Self {
+        let syntax = buffer
+            .path()
+            .and_then(Language::from_path)
+            .map(|language| Syntax::new(language, &buffer));
+        buffer.drain_changes();
         Self {
             focus_handle: cx.focus_handle(),
             buffer,
@@ -159,9 +171,21 @@ impl Editor {
             selecting: false,
             layout: None,
             error: None,
+            syntax,
+            single_line: false,
         }
     }
 
+    pub fn single_line(cx: &mut Context<Self>) -> Self {
+        Self {
+            single_line: true,
+            ..Self::new(Buffer::new(""), cx)
+        }
+    }
+
+    pub fn text(&self) -> String {
+        self.buffer.slice(0..self.buffer.len())
+    }
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
     }
@@ -291,6 +315,19 @@ impl Editor {
     }
 
     fn finish_change(&mut self, was_dirty: bool, cx: &mut Context<Self>) {
+        let mut edited = false;
+        for change in self.buffer.drain_changes() {
+            edited = true;
+            if let Some(syntax) = &mut self.syntax {
+                syntax.edit(&change);
+            }
+        }
+        if edited && let Some(syntax) = &mut self.syntax {
+            syntax.reparse(&self.buffer);
+        }
+        if edited {
+            cx.emit(EditorEvent::Edited);
+        }
         if was_dirty != self.buffer.is_dirty() {
             cx.emit(EditorEvent::DirtyChanged);
         }
@@ -453,7 +490,11 @@ impl Editor {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            let text = self.normalize_line_endings(&text);
+            let text = if self.single_line {
+                text.replace(['\r', '\n'], " ")
+            } else {
+                self.normalize_line_endings(&text)
+            };
             self.replace(self.selection(), &text, cx);
         }
     }
@@ -574,7 +615,11 @@ impl Editor {
         let em_width = shape("m".into(), &[run(1, style.color)]).width;
         let line_count = self.buffer.line_count();
         let digits = line_count.to_string().len().max(3);
-        let gutter_width = em_width * digits as f32 + GUTTER_PADDING * 2.;
+        let gutter_width = if self.single_line {
+            px(0.)
+        } else {
+            em_width * digits as f32 + GUTTER_PADDING * 2.
+        };
         let text_bounds = Bounds::from_corners(
             point(bounds.left() + gutter_width, bounds.top()),
             bounds.bottom_right(),
@@ -598,48 +643,47 @@ impl Editor {
             (first_line + (viewport.height / line_height).ceil() as usize + 1).min(line_count);
         let text_color = rgb(theme::TEXT).into();
         let muted = rgb(theme::MUTED).into();
+        let base_run = run(0, text_color);
+        let visible = self.buffer.line_start(first_line)
+            ..self
+                .buffer
+                .line_end(last_line.saturating_sub(1).max(first_line));
+        let spans = self
+            .syntax
+            .as_ref()
+            .map(|syntax| syntax.highlights(&self.buffer, visible))
+            .unwrap_or_default();
 
         let mut lines = Vec::with_capacity(last_line - first_line);
         let mut line_numbers = Vec::with_capacity(last_line - first_line);
+        let mut cuts = Vec::new();
         for line in first_line..last_line {
             let start = self.buffer.line_start(line);
             // Tabs render as one space for now; byte offsets stay aligned.
             let text = self.buffer.line_text(line).replace('\t', " ");
-            let mut runs = vec![run(text.len(), text_color)];
-            if let Some(marked) = &self.marked {
-                let lo = marked.start.clamp(start, start + text.len()) - start;
-                let hi = marked.end.clamp(start, start + text.len()) - start;
-                if lo < hi {
-                    let underline = Some(UnderlineStyle {
-                        color: Some(text_color),
-                        thickness: px(1.),
-                        wavy: false,
-                    });
-                    runs = [
-                        run(lo, text_color),
-                        TextRun {
-                            underline,
-                            ..run(hi - lo, text_color)
-                        },
-                        run(text.len() - hi, text_color),
-                    ]
-                    .into_iter()
-                    .filter(|run| run.len > 0)
-                    .collect();
-                }
-            }
-            if text.is_empty() {
-                runs.clear();
-            }
+            let range = start..start + text.len();
+            let first_span = spans.partition_point(|span| span.range.end <= range.start);
+            let line_spans = &spans[first_span..];
+            let line_spans =
+                &line_spans[..line_spans.partition_point(|span| span.range.start < range.end)];
+            let runs = line_runs(
+                range,
+                line_spans,
+                self.marked.as_ref(),
+                &base_run,
+                &mut cuts,
+            );
             lines.push(shape(text, &runs));
 
-            let number = (line + 1).to_string();
-            let color = if line == cursor_line {
-                text_color
-            } else {
-                muted
-            };
-            line_numbers.push(shape(number.clone(), &[run(number.len(), color)]));
+            if !self.single_line {
+                let number = (line + 1).to_string();
+                let color = if line == cursor_line {
+                    text_color
+                } else {
+                    muted
+                };
+                line_numbers.push(shape(number.clone(), &[run(number.len(), color)]));
+            }
         }
 
         if self.autoscroll
@@ -736,6 +780,54 @@ impl Editor {
             },
         );
     }
+}
+
+/// Text runs for one line: syntax colors from `spans`, IME composition underlined.
+/// `cuts` is scratch space reused across lines.
+fn line_runs(
+    line: Range<usize>,
+    spans: &[HighlightSpan],
+    marked: Option<&Range<usize>>,
+    base: &TextRun,
+    cuts: &mut Vec<usize>,
+) -> Vec<TextRun> {
+    let clamp = |offset: usize| offset.clamp(line.start, line.end);
+    cuts.clear();
+    cuts.extend([line.start, line.end]);
+    for span in spans {
+        cuts.extend([clamp(span.range.start), clamp(span.range.end)]);
+    }
+    if let Some(marked) = marked {
+        cuts.extend([clamp(marked.start), clamp(marked.end)]);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    cuts.windows(2)
+        .map(|cut| {
+            let start = cut[0];
+            let color = spans
+                .iter()
+                .find(|span| span.range.contains(&start))
+                .map_or(base.color, |span| {
+                    rgb(theme::highlight_color(span.highlight)).into()
+                });
+            let underline =
+                marked
+                    .filter(|marked| marked.contains(&start))
+                    .map(|_| UnderlineStyle {
+                        color: Some(color),
+                        thickness: px(1.),
+                        wavy: false,
+                    });
+            TextRun {
+                len: cut[1] - start,
+                color,
+                underline,
+                ..base.clone()
+            }
+        })
+        .collect()
 }
 
 impl EntityInputHandler for Editor {
@@ -930,6 +1022,10 @@ impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let line = self.buffer.line_of(self.head) + 1;
         let column = self.buffer.column(self.head) + 1;
+        let language = self
+            .syntax
+            .as_ref()
+            .map_or("Plain Text", |syntax| syntax.language().name());
         let line_ending = if self.buffer.line_ending() == "\r\n" {
             "CRLF"
         } else {
@@ -959,12 +1055,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::delete_word_right))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
-            .on_action(cx.listener(Self::up))
-            .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
-            .on_action(cx.listener(Self::select_up))
-            .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::word_left))
             .on_action(cx.listener(Self::word_right))
             .on_action(cx.listener(Self::select_word_left))
@@ -977,10 +1069,17 @@ impl Render for Editor {
             .on_action(cx.listener(Self::doc_end))
             .on_action(cx.listener(Self::select_doc_start))
             .on_action(cx.listener(Self::select_doc_end))
-            .on_action(cx.listener(Self::page_up))
-            .on_action(cx.listener(Self::page_down))
-            .on_action(cx.listener(Self::newline))
-            .on_action(cx.listener(Self::tab))
+            .when(!self.single_line, |editor| {
+                editor
+                    .on_action(cx.listener(Self::up))
+                    .on_action(cx.listener(Self::down))
+                    .on_action(cx.listener(Self::select_up))
+                    .on_action(cx.listener(Self::select_down))
+                    .on_action(cx.listener(Self::page_up))
+                    .on_action(cx.listener(Self::page_down))
+                    .on_action(cx.listener(Self::newline))
+                    .on_action(cx.listener(Self::tab))
+            })
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
@@ -1007,19 +1106,23 @@ impl Render for Editor {
                         editor: cx.entity(),
                     }),
             )
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .px_3()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(rgb(theme::BORDER))
-                    .bg(rgb(theme::PANEL))
-                    .text_xs()
-                    .text_color(rgb(theme::MUTED))
-                    .child(div().text_color(rgb(message_color)).child(message))
-                    .child(format!("Ln {line}, Col {column}   {line_ending}   UTF-8")),
-            )
+            .when(!self.single_line, |editor| {
+                editor.child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .px_3()
+                        .py_1()
+                        .border_t_1()
+                        .border_color(rgb(theme::BORDER))
+                        .bg(rgb(theme::PANEL))
+                        .text_xs()
+                        .text_color(rgb(theme::MUTED))
+                        .child(div().text_color(rgb(message_color)).child(message))
+                        .child(format!(
+                            "Ln {line}, Col {column}   {line_ending}   UTF-8   {language}"
+                        )),
+                )
+            })
     }
 }

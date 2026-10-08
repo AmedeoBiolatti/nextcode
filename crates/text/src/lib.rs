@@ -2,7 +2,8 @@
 //!
 //! All public offsets are UTF-8 byte offsets into the whole buffer. Callers must
 //! pass offsets on char boundaries; grapheme helpers and UTF-16 conversions
-//! always return valid boundaries.
+//! always return valid boundaries. Lines are separated by `\n` (a preceding `\r`
+//! belongs to the line break), matching tree-sitter and LSP row numbering.
 
 use std::{
     fs,
@@ -14,16 +15,29 @@ use std::{
 use ropey::Rope;
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
-/// Characters ropey treats as line breaks (CRLF is handled as a pair).
-const LINE_BREAKS: [char; 7] = [
-    '\n', '\r', '\u{0B}', '\u{0C}', '\u{85}', '\u{2028}', '\u{2029}',
-];
-
 #[derive(Debug, Clone)]
 struct Edit {
     offset: usize,
     old: String,
     new: String,
+}
+
+/// Row and byte column of an offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Point {
+    pub row: usize,
+    pub column: usize,
+}
+
+/// One text replacement, in the coordinates incremental parsers expect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Change {
+    pub start: usize,
+    pub old_end: usize,
+    pub new_end: usize,
+    pub start_point: Point,
+    pub old_end_point: Point,
+    pub new_end_point: Point,
 }
 
 pub struct Buffer {
@@ -34,6 +48,8 @@ pub struct Buffer {
     /// Undo-stack depth matching the file on disk; `None` if that state is unreachable.
     saved_at: Option<usize>,
     line_ending: &'static str,
+    /// Changes not yet consumed by `drain_changes`.
+    changes: Vec<Change>,
 }
 
 impl Buffer {
@@ -49,6 +65,7 @@ impl Buffer {
             redo: Vec::new(),
             saved_at: Some(0),
             line_ending,
+            changes: Vec::new(),
         }
     }
 
@@ -115,13 +132,40 @@ impl Buffer {
         let slice = self.rope.line(line);
         let mut end = self.rope.line_to_byte(line) + slice.len_bytes();
         let mut chars = slice.chars_at(slice.len_chars());
-        if let Some(last) = chars.prev().filter(|c| LINE_BREAKS.contains(c)) {
-            end -= last.len_utf8();
-            if last == '\n' && chars.prev() == Some('\r') {
+        if chars.prev() == Some('\n') {
+            end -= 1;
+            if chars.prev() == Some('\r') {
                 end -= 1;
             }
         }
         end
+    }
+
+    pub fn point(&self, offset: usize) -> Point {
+        let row = self.rope.byte_to_line(offset);
+        Point {
+            row,
+            column: offset - self.rope.line_to_byte(row),
+        }
+    }
+
+    /// Text from `offset` to the end of its rope chunk; empty at the end.
+    pub fn chunk_at(&self, offset: usize) -> &str {
+        if offset >= self.len() {
+            return "";
+        }
+        let (chunk, start, _, _) = self.rope.chunk_at_byte(offset);
+        &chunk[offset - start..]
+    }
+
+    /// Chunks covering `range`, in order.
+    pub fn chunks(&self, range: Range<usize>) -> impl Iterator<Item = &str> {
+        self.rope.byte_slice(range).chunks()
+    }
+
+    /// Changes since the last call, oldest first.
+    pub fn drain_changes(&mut self) -> std::vec::Drain<'_, Change> {
+        self.changes.drain(..)
     }
 
     /// Text of `line` without its line break.
@@ -250,11 +294,11 @@ impl Buffer {
         }
 
         if old.is_empty()
-            && !text.contains(LINE_BREAKS)
+            && !text.contains('\n')
             && Some(self.undo.len()) != self.saved_at
             && let Some(last) = self.undo.last_mut()
             && last.old.is_empty()
-            && !last.new.contains(LINE_BREAKS)
+            && !last.new.contains('\n')
             && last.offset + last.new.len() == range.start
         {
             last.new.push_str(text);
@@ -286,10 +330,21 @@ impl Buffer {
     }
 
     fn replace(&mut self, range: Range<usize>, text: &str) {
+        let start_point = self.point(range.start);
+        let old_end_point = self.point(range.end);
         let start = self.rope.byte_to_char(range.start);
         let end = self.rope.byte_to_char(range.end);
         self.rope.remove(start..end);
         self.rope.insert(start, text);
+        let new_end = range.start + text.len();
+        self.changes.push(Change {
+            start: range.start,
+            old_end: range.end,
+            new_end,
+            start_point,
+            old_end_point,
+            new_end_point: self.point(new_end),
+        });
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -321,6 +376,34 @@ mod tests {
         assert_eq!(buffer.line_text(0), "ab");
         assert_eq!(buffer.line_end(1), 6);
         assert_eq!(buffer.line_text(2), "ef");
+    }
+
+    #[test]
+    fn only_lf_starts_a_line() {
+        let buffer = Buffer::new("a\rb\u{2028}c\nd");
+        assert_eq!(buffer.line_count(), 2);
+        assert_eq!(buffer.point(buffer.len()), Point { row: 1, column: 1 });
+    }
+
+    #[test]
+    fn edits_record_old_and_new_points() {
+        let mut buffer = Buffer::new("ab\r\ncd");
+        buffer.edit(1..5, "X\nY");
+        assert_eq!(buffer.slice(0..buffer.len()), "aX\nYd");
+        let changes: Vec<Change> = buffer.drain_changes().collect();
+        assert_eq!(
+            changes,
+            [Change {
+                start: 1,
+                old_end: 5,
+                new_end: 4,
+                start_point: Point { row: 0, column: 1 },
+                old_end_point: Point { row: 1, column: 1 },
+                new_end_point: Point { row: 1, column: 1 },
+            }]
+        );
+        buffer.undo();
+        assert_eq!(buffer.drain_changes().count(), 1);
     }
 
     #[test]

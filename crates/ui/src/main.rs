@@ -1,4 +1,5 @@
 mod editor;
+mod file_finder;
 mod file_tree;
 mod theme;
 mod workspace;
@@ -24,6 +25,7 @@ fn main() -> anyhow::Result<()> {
     Application::new().run(move |cx: &mut App| {
         editor::bind_keys(cx);
         workspace::bind_keys(cx);
+        file_finder::bind_keys(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();

@@ -8,4 +8,6 @@ publish.workspace = true
 anyhow.workspace = true
 gpui.workspace = true
 ignore.workspace = true
+nucleo-matcher.workspace = true
+syntax.workspace = true
 text.workspace = true

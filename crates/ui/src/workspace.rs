@@ -10,14 +10,19 @@ use text::Buffer;
 
 use crate::{
     editor::{Editor, EditorEvent},
+    file_finder::{FileFinder, FileFinderEvent},
     file_tree::{FileTree, OpenFile},
     theme,
 };
 
-actions!(workspace, [CloseTab]);
+actions!(workspace, [CloseTab, ToggleFileFinder]);
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("secondary-w", CloseTab, Some("Workspace"))]);
+    let ctx = Some("Workspace");
+    cx.bind_keys([
+        KeyBinding::new("secondary-w", CloseTab, ctx),
+        KeyBinding::new("secondary-p", ToggleFileFinder, ctx),
+    ]);
 }
 
 struct Tab {
@@ -29,7 +34,9 @@ struct Tab {
 
 pub struct Workspace {
     focus_handle: FocusHandle,
+    root: PathBuf,
     file_tree: Entity<FileTree>,
+    file_finder: Option<(Entity<FileFinder>, Subscription)>,
     tabs: Vec<Tab>,
     active: usize,
     notice: Option<SharedString>,
@@ -40,7 +47,7 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let file_tree = cx.new(|_| FileTree::new(root));
+        let file_tree = cx.new(|_| FileTree::new(root.clone()));
         let subscription = cx.subscribe_in(
             &file_tree,
             window,
@@ -56,9 +63,14 @@ impl Workspace {
                 .unwrap_or(true)
         });
 
+        // Workspace key bindings (e.g. Ctrl+P) need focus inside the workspace.
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle);
         Self {
-            focus_handle: cx.focus_handle(),
+            focus_handle,
+            root,
             file_tree,
+            file_finder: None,
             tabs: Vec::new(),
             active: 0,
             notice: None,
@@ -103,6 +115,39 @@ impl Workspace {
         window.focus(&tab.editor.focus_handle(cx));
         self.file_tree
             .update(cx, |tree, cx| tree.select(&tab.path, cx));
+        cx.notify();
+    }
+
+    fn toggle_file_finder(
+        &mut self,
+        _: &ToggleFileFinder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.file_finder.is_some() {
+            self.dismiss_file_finder(window, cx);
+            return;
+        }
+        let finder = cx.new(|cx| FileFinder::new(self.root.clone(), cx));
+        let subscription =
+            cx.subscribe_in(&finder, window, |this, _, event, window, cx| match event {
+                FileFinderEvent::Open(path) => {
+                    this.file_finder = None;
+                    this.open(path, window, cx);
+                }
+                FileFinderEvent::Dismissed => this.dismiss_file_finder(window, cx),
+            });
+        window.focus(&finder.focus_handle(cx));
+        self.file_finder = Some((finder, subscription));
+        cx.notify();
+    }
+
+    fn dismiss_file_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.file_finder = None;
+        match self.tabs.get(self.active) {
+            Some(tab) => window.focus(&tab.editor.focus_handle(cx)),
+            None => window.focus(&self.focus_handle),
+        }
         cx.notify();
     }
 
@@ -257,13 +302,15 @@ impl Render for Workspace {
                 .items_center()
                 .justify_center()
                 .text_color(rgb(theme::MUTED))
-                .child("Open a file from the project tree"),
+                .child("Open a file from the project tree, or press Ctrl+P"),
         };
 
         div()
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close_active))
+            .on_action(cx.listener(Self::toggle_file_finder))
+            .relative()
             .size_full()
             .flex()
             .bg(rgb(theme::BACKGROUND))
@@ -296,5 +343,15 @@ impl Render for Workspace {
                     }))
                     .child(main),
             )
+            .children(self.file_finder.as_ref().map(|(finder, _)| {
+                div()
+                    .absolute()
+                    .top(px(72.))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(finder.clone())
+            }))
     }
 }
