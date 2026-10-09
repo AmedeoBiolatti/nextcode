@@ -53,6 +53,14 @@ impl Editor {
         cx.notify();
     }
 
+    /// Moves to `line` and UTF-8 byte `column` (e.g. a search match).
+    pub fn go_to_line(&mut self, line: usize, column: usize, cx: &mut Context<Self>) {
+        let offset = self
+            .buffer
+            .offset_of(text::Point { row: line, column }, Encoding::Utf8);
+        self.set_cursor(offset, cx);
+    }
+
     /// Moves to a server position (in this document's server encoding).
     pub fn go_to(&mut self, position: lsp::types::Position, cx: &mut Context<Self>) {
         let encoding = self

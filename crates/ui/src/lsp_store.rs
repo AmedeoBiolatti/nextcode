@@ -116,6 +116,41 @@ impl LspStore {
         self.diagnostics.get(path).map_or(&[], Vec::as_slice)
     }
 
+    /// Tells every running server about files changed outside the editor.
+    /// Servers may register narrower globs; all project changes are sent,
+    /// which servers accept and filter themselves.
+    pub fn notify_file_changes(&self, events: &[watcher::FileEvent]) {
+        use lsp::types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+        let changes: Vec<FileEvent> = events
+            .iter()
+            .filter_map(|event| {
+                let typ = match event.kind {
+                    watcher::ChangeKind::Created => FileChangeType::CREATED,
+                    watcher::ChangeKind::Modified => FileChangeType::CHANGED,
+                    watcher::ChangeKind::Removed => FileChangeType::DELETED,
+                };
+                Some(FileEvent::new(path_to_uri(&event.path)?, typ))
+            })
+            .collect();
+        if changes.is_empty() {
+            return;
+        }
+        for server in self.slots.values().filter_map(|slot| slot.running.as_ref()) {
+            server
+                .connection
+                .notify::<notification::DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
+                    changes: changes.clone(),
+                });
+        }
+    }
+
+    /// Every file's diagnostics, in no particular order.
+    pub fn all_diagnostics(&self) -> impl Iterator<Item = (&Path, &[lsp::types::Diagnostic])> {
+        self.diagnostics
+            .iter()
+            .map(|(path, diagnostics)| (path.as_path(), diagnostics.as_slice()))
+    }
+
     fn start(&mut self, language: Language, cx: &mut Context<Self>) {
         let restarts = self.slots.get(&language).map_or(0, |slot| slot.restarts);
         let Some(mut config) = self.settings.server_config(language) else {
@@ -434,7 +469,11 @@ fn client_capabilities() -> ClientCapabilities {
                 },
             },
         },
-        "workspace": { "configuration": true, "workspaceFolders": true },
+        "workspace": {
+            "configuration": true,
+            "workspaceFolders": true,
+            "didChangeWatchedFiles": { "dynamicRegistration": true },
+        },
         "window": { "workDoneProgress": true },
     }))
     .expect("valid client capabilities")

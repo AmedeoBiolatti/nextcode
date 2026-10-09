@@ -292,6 +292,24 @@ mod tests {
     }
 
     #[test]
+    fn successive_modifications_of_an_existing_file_are_reported() {
+        let dir = TempDir::new("successive");
+        let file = dir.0.join("edited.py");
+        fs::write(&file, "value = 0\n").unwrap();
+        let (_watcher, mut rx) = watch(&dir.0, DEBOUNCE).unwrap();
+
+        for value in [1, 2] {
+            fs::write(&file, format!("value = {value}\n")).unwrap();
+            let events = collect(&mut rx, |events| events.iter().any(|event| event.path == file));
+            assert_eq!(
+                kinds_for(&events, &file).last(),
+                Some(ChangeKind::Modified),
+                "modification {value} was not reported"
+            );
+        }
+    }
+
+    #[test]
     fn removals_and_modifications_of_existing_files_are_reported() {
         let dir = TempDir::new("existing");
         let kept = dir.0.join("kept.txt");

@@ -143,6 +143,15 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
+pub enum ReloadOutcome {
+    Unchanged,
+    Reloaded,
+    /// The buffer has unsaved edits that differ from the file on disk.
+    Conflict,
+    /// The file could not be read (e.g. deleted).
+    Failed,
+}
+
 pub enum EditorEvent {
     /// The buffer gained or lost unsaved changes.
     DirtyChanged,
@@ -415,6 +424,37 @@ impl Editor {
     }
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
+    }
+
+    /// Brings in the file's current contents after an external change.
+    /// Unsaved edits are only overwritten when `force` is set.
+    pub fn reload_from_disk(&mut self, force: bool, cx: &mut Context<Self>) -> ReloadOutcome {
+        let Some(text) = self
+            .buffer
+            .path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+        else {
+            return ReloadOutcome::Failed;
+        };
+        let was_dirty = self.buffer.is_dirty();
+        if was_dirty && !force && self.buffer.slice(0..self.buffer.len()) != text {
+            return ReloadOutcome::Conflict;
+        }
+        if !self.buffer.reload(&text) {
+            // Same text as on disk (e.g. our own save): nothing to redraw
+            // except a cleared dirty marker.
+            self.finish_change(was_dirty, cx);
+            return ReloadOutcome::Unchanged;
+        }
+        let keep = |offset: usize| {
+            let offset = offset.min(self.buffer.len());
+            self.buffer
+                .offset_of(self.buffer.point(offset), Encoding::Utf8)
+        };
+        self.head = keep(self.head);
+        self.anchor = keep(self.anchor);
+        self.finish_change(was_dirty, cx);
+        ReloadOutcome::Reloaded
     }
 
     pub fn save(&mut self, cx: &mut Context<Self>) -> bool {

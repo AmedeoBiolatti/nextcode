@@ -64,6 +64,28 @@ impl FileTree {
         cx.notify();
     }
 
+    /// Re-reads the directories containing created or removed `paths`
+    /// (everything when `rescan`), keeping expansion state.
+    pub fn refresh<'a>(
+        &mut self,
+        paths: impl IntoIterator<Item = &'a Path>,
+        rescan: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if rescan {
+            self.children.clear();
+        } else {
+            for path in paths {
+                if let Some(parent) = path.parent() {
+                    self.children.remove(parent);
+                }
+            }
+        }
+        self.expanded.retain(|dir| dir.is_dir());
+        self.rebuild_rows();
+        cx.notify();
+    }
+
     fn rebuild_rows(&mut self) {
         self.rows.clear();
         push_rows(

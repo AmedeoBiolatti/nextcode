@@ -1,27 +1,38 @@
-//! Main window: file tree, editor tabs, and close/save confirmation.
+//! Main window: docks with panels, editor tabs, and close/save confirmation.
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
+
+use futures::StreamExt;
 
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, KeyBinding, PromptLevel, SharedString,
-    Subscription, Window, actions, div, prelude::*, px, rgb,
+    Subscription, Task, Window, actions, div, prelude::*, px, rgb,
 };
 use language::Location;
 use syntax::Language;
 use text::Buffer;
+use watcher::{Batch, ChangeKind, ProjectWatcher};
 
 use crate::{
-    editor::{Editor, EditorEvent},
+    editor::{Editor, EditorEvent, ReloadOutcome},
     file_finder::{FileFinder, FileFinderEvent},
     file_tree::{FileTree, OpenFile},
+    layout::{DockPosition, Layout},
     location_picker::{LocationPicker, LocationPickerEvent},
     lsp_store::{LspStore, LspStoreEvent, ServerStatus},
+    problems::{ProblemsEvent, ProblemsPanel},
+    search_panel::{SearchPanel, SearchPanelEvent},
     settings::Settings,
+    terminal_panel::TerminalPanel,
     theme,
 };
+
+mod docks;
 
 actions!(workspace, [CloseTab, ToggleFileFinder, GoBack, GoForward]);
 
@@ -39,7 +50,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-left", GoBack, ctx),
         KeyBinding::new("secondary-alt-right", GoForward, ctx),
     ]);
+    docks::bind_keys(cx);
 }
+
+
 
 /// A remembered cursor position for Back/Forward.
 struct NavEntry {
@@ -58,6 +72,13 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     root: PathBuf,
     file_tree: Entity<FileTree>,
+    problems: Entity<ProblemsPanel>,
+    terminal: Entity<TerminalPanel>,
+    search: Entity<SearchPanel>,
+    layout: Layout,
+    /// Dock being resized by dragging its handle.
+    resizing: Option<DockPosition>,
+    panel_menu: Option<docks::PanelMenu>,
     file_finder: Option<(Entity<FileFinder>, Subscription)>,
     location_picker: Option<(Entity<LocationPicker>, Subscription)>,
     back: Vec<NavEntry>,
@@ -68,6 +89,9 @@ pub struct Workspace {
     notice: Option<SharedString>,
     /// Set once the user confirmed discarding unsaved changes on window close.
     close_confirmed: bool,
+    /// Files with an open "changed on disk" prompt, so it is asked once.
+    reload_prompts: HashSet<PathBuf>,
+    _watcher: Option<(ProjectWatcher, Task<()>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -87,6 +111,26 @@ impl Workspace {
         let lsp_subscription = cx.subscribe(&lsp_store, |this, _, event, cx| {
             this.on_lsp_event(event, cx);
         });
+        let problems = cx.new(|cx| ProblemsPanel::new(root.clone(), lsp_store.clone(), cx));
+        let terminal = cx.new(|cx| TerminalPanel::new(root.clone(), cx));
+        let search = cx.new(|cx| SearchPanel::new(root.clone(), cx));
+        let search_subscription =
+            cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
+                SearchPanelEvent::Open { path, line, column } => {
+                    this.record_position(cx);
+                    this.forward.clear();
+                    if let Some(editor) = this.open_editor(path, window, cx) {
+                        editor.update(cx, |editor, cx| editor.go_to_line(*line, *column, cx));
+                    }
+                }
+            });
+        let problems_subscription = cx.subscribe_in(
+            &problems,
+            window,
+            |this, _, event, window, cx| match event {
+                ProblemsEvent::Open(location) => this.jump_to(location, window, cx),
+            },
+        );
 
         let workspace = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -98,10 +142,39 @@ impl Workspace {
         // Workspace key bindings (e.g. Ctrl+P) need focus inside the workspace.
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
+        let layout = Layout::load(&root);
+        let mut notice = settings_error.map(|error| format!("Settings ignored: {error}").into());
+        let watcher = match watcher::watch(&root, Duration::from_millis(150)) {
+            Ok((watcher, mut batches)) => {
+                let task = cx.spawn_in(window, async move |this, cx| {
+                    while let Some(batch) = batches.next().await {
+                        if this
+                            .update_in(cx, |this, window, cx| {
+                                this.on_files_changed(batch, window, cx)
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                Some((watcher, task))
+            }
+            Err(err) => {
+                notice = Some(format!("File watching unavailable: {err}").into());
+                None
+            }
+        };
         Self {
             focus_handle,
             root,
             file_tree,
+            problems,
+            terminal,
+            search,
+            layout,
+            resizing: None,
+            panel_menu: None,
             file_finder: None,
             location_picker: None,
             back: Vec::new(),
@@ -109,10 +182,94 @@ impl Workspace {
             lsp_store,
             tabs: Vec::new(),
             active: 0,
-            notice: settings_error.map(|error| format!("Settings ignored: {error}").into()),
+            notice,
             close_confirmed: false,
-            _subscriptions: vec![tree_subscription, lsp_subscription],
+            reload_prompts: HashSet::new(),
+            _watcher: watcher,
+            _subscriptions: vec![
+                tree_subscription,
+                lsp_subscription,
+                problems_subscription,
+                search_subscription,
+            ],
         }
+    }
+
+    /// Applies external file changes: refreshes the tree, informs language
+    /// servers, and reloads open files (asking first if they have edits).
+    fn on_files_changed(&mut self, batch: Batch, window: &mut Window, cx: &mut Context<Self>) {
+        let structural = batch
+            .events
+            .iter()
+            .filter(|event| event.kind != ChangeKind::Modified)
+            .map(|event| event.path.as_path());
+        self.file_tree
+            .update(cx, |tree, cx| tree.refresh(structural, batch.rescan, cx));
+        self.lsp_store.read(cx).notify_file_changes(&batch.events);
+
+        let affected: Vec<(Entity<Editor>, PathBuf, bool)> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let event = batch.events.iter().find(|event| event.path == tab.path);
+                match event {
+                    Some(event) => Some((
+                        tab.editor.clone(),
+                        tab.path.clone(),
+                        event.kind == ChangeKind::Removed,
+                    )),
+                    None if batch.rescan => {
+                        Some((tab.editor.clone(), tab.path.clone(), !tab.path.exists()))
+                    }
+                    None => None,
+                }
+            })
+            .collect();
+        for (editor, path, removed) in affected {
+            if removed {
+                self.notice = Some(format!("{} was deleted on disk", path.display()).into());
+                cx.notify();
+                continue;
+            }
+            let outcome = editor.update(cx, |editor, cx| editor.reload_from_disk(false, cx));
+            if let ReloadOutcome::Conflict = outcome
+                && self.reload_prompts.insert(path.clone())
+            {
+                self.prompt_reload(editor, path, window, cx);
+            }
+        }
+    }
+
+    fn prompt_reload(
+        &mut self,
+        editor: Entity<Editor>,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("{name} changed on disk"),
+            Some("You have unsaved changes. Reload the file from disk and lose them?"),
+            &["Keep My Changes", "Reload"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let reload = answer.await == Ok(1);
+            this.update_in(cx, |this, _, cx| {
+                this.reload_prompts.remove(&path);
+                if reload {
+                    editor.update(cx, |editor, cx| editor.reload_from_disk(true, cx));
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn on_lsp_event(&mut self, event: &LspStoreEvent, cx: &mut Context<Self>) {
@@ -522,7 +679,7 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.tabs.get(self.active) {
             Some(tab) => div().flex_1().min_h_0().child(tab.editor.clone()),
             None => div()
@@ -541,19 +698,21 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_file_finder))
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
+            .on_action(cx.listener(Self::toggle_files))
+            .on_action(cx.listener(Self::toggle_search))
+            .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::toggle_problems))
+            .on_action(cx.listener(Self::toggle_bottom_dock))
+            .on_action(cx.listener(Self::save_layout_as_default))
+            .on_action(cx.listener(Self::reset_layout))
+            .on_mouse_move(cx.listener(Self::on_resize_move))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(Self::on_resize_end))
             .relative()
             .size_full()
             .flex()
             .bg(rgb(theme::BACKGROUND))
             .text_color(rgb(theme::TEXT))
-            .child(
-                div()
-                    .w(px(280.))
-                    .h_full()
-                    .border_r_1()
-                    .border_color(rgb(theme::BORDER))
-                    .child(self.file_tree.clone()),
-            )
+            .children(self.render_dock(DockPosition::Left, window, cx))
             .child(
                 div()
                     .flex_1()
@@ -572,8 +731,11 @@ impl Render for Workspace {
                             .text_color(rgb(theme::ERROR))
                             .child(notice)
                     }))
-                    .child(main),
+                    .child(main)
+                    .children(self.render_dock(DockPosition::Bottom, window, cx)),
             )
+            .children(self.render_dock(DockPosition::Right, window, cx))
+            .children(self.render_panel_menu(cx))
             .children(self.file_finder.as_ref().map(|(finder, _)| {
                 div()
                     .absolute()

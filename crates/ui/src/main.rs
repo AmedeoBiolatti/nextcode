@@ -1,9 +1,13 @@
 mod editor;
 mod file_finder;
 mod file_tree;
+mod layout;
 mod location_picker;
 mod lsp_store;
+mod problems;
+mod search_panel;
 mod settings;
+mod terminal_panel;
 mod theme;
 mod workspace;
 
@@ -30,6 +34,7 @@ fn main() -> anyhow::Result<()> {
         workspace::bind_keys(cx);
         file_finder::bind_keys(cx);
         location_picker::bind_keys(cx);
+        terminal_panel::bind_keys(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();

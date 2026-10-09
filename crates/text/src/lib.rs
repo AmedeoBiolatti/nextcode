@@ -406,6 +406,19 @@ impl Buffer {
         }]);
     }
 
+    /// Replaces the whole text with what is now on disk, as one undo step,
+    /// and marks the buffer saved. Returns `false` if nothing differed.
+    pub fn reload(&mut self, text: &str) -> bool {
+        if self.rope == text {
+            self.saved_at = Some(self.undo.len());
+            return false;
+        }
+        self.edit(0..self.len(), text);
+        self.saved_at = Some(self.undo.len());
+        self.line_ending = Self::new(text).line_ending;
+        true
+    }
+
     /// Applies several edits as one undo step. Ranges refer to the current
     /// text and must not overlap; inserts at the same offset keep their order.
     pub fn edit_batch(
@@ -702,6 +715,19 @@ mod tests {
         assert_eq!(buffer.redo(), Some(26..30));
         assert_eq!(buffer.slice(0..buffer.len()), edited);
         assert_eq!(buffer.slice(26..30), "path");
+    }
+
+    #[test]
+    fn reload_is_undoable_and_leaves_the_buffer_clean() {
+        let mut buffer = Buffer::new("old\n");
+        assert!(!buffer.reload("old\n"), "identical text is not an edit");
+        assert!(buffer.reload("new\r\n"));
+        assert_eq!(buffer.slice(0..buffer.len()), "new\r\n");
+        assert_eq!(buffer.line_ending(), "\r\n");
+        assert!(!buffer.is_dirty());
+        buffer.undo();
+        assert_eq!(buffer.slice(0..buffer.len()), "old\n");
+        assert!(buffer.is_dirty(), "undoing a reload diverges from disk");
     }
 
     #[test]
