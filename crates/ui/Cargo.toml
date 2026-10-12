@@ -26,6 +26,13 @@ worktree.workspace = true
 git.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# The version gpui uses (no second copy): startup warm-up (`startup::prewarm`).
+windows = { version = "0.61", features = [
+    "Win32_Graphics_DirectWrite",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Console",

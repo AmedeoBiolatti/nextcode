@@ -92,7 +92,9 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Connect to WSL or read git status while gpui sets up the platform.
+    // Warm up graphics, and connect to WSL or read git status, while gpui
+    // sets up the platform.
+    let prewarm = startup::prewarm();
     let preload = workspace::Preload::start(&location);
     let application = Application::new();
     startup::mark("gpui platform");
@@ -111,6 +113,8 @@ fn run() -> anyhow::Result<()> {
         })
         .detach();
         workspace::open_preloaded(location, Some(preload), cx);
+        // The window's renderer exists now.
+        prewarm.finish();
         startup::mark("window opened");
         cx.activate(true);
     });

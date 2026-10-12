@@ -45,7 +45,9 @@ Set `NEXT_CODE_TRACE_STARTUP=1` to print startup milestones (time since the
 process was created) to stderr, e.g. from PowerShell:
 `$env:NEXT_CODE_TRACE_STARTUP=1; .\next_code.exe C:\dev\p 2> trace.txt`.
 The WSL connection (or, for local projects, git status) starts on a thread
-before the window, alongside gpui's platform setup.
+before the window, alongside gpui's platform setup; DirectWrite's font list
+and the shell's drag-and-drop helper are loaded on threads of their own
+while gpui creates its Direct3D devices.
 
 ## WSL projects
 
