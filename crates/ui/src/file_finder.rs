@@ -2,7 +2,7 @@
 
 use std::{
     ops::Range,
-    path::{MAIN_SEPARATOR, Path, PathBuf},
+    path::{MAIN_SEPARATOR, PathBuf},
     sync::Arc,
 };
 
@@ -11,7 +11,6 @@ use gpui::{
     KeyBinding, MouseButton, ScrollStrategy, SharedString, StyledText, Subscription, Task,
     UniformListScrollHandle, Window, actions, div, prelude::*, px, rgb, uniform_list,
 };
-use ignore::WalkBuilder;
 use nucleo_matcher::{
     Config, Matcher, Utf32Str,
     pattern::{CaseMatching, Normalization, Pattern},
@@ -19,6 +18,7 @@ use nucleo_matcher::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    project::Project,
     theme,
 };
 
@@ -46,11 +46,13 @@ struct PathMatch {
 }
 
 pub struct FileFinder {
-    root: PathBuf,
+    project: Project,
     query: Entity<Editor>,
     /// Project-relative paths, sorted.
     files: Arc<Vec<String>>,
     indexing: bool,
+    /// Why the project could not be listed.
+    error: Option<String>,
     matches: Vec<PathMatch>,
     selected: usize,
     scroll: UniformListScrollHandle,
@@ -60,30 +62,34 @@ pub struct FileFinder {
 }
 
 impl FileFinder {
-    pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(project: Project, cx: &mut Context<Self>) -> Self {
         let query = cx.new(Editor::single_line);
         let subscription = cx.subscribe(&query, |this, _, event, cx| {
             if let EditorEvent::Edited = event {
                 this.search(cx);
             }
         });
-        let walk_root = root.clone();
+        let walk_project = project.clone();
         let index = cx.spawn(async move |this, cx| {
             let files = cx
-                .background_spawn(async move { index_files(&walk_root) })
+                .background_spawn(async move { walk_project.list_files() })
                 .await;
             this.update(cx, |this, cx| {
-                this.files = Arc::new(files);
+                match files {
+                    Ok(files) => this.files = Arc::new(files),
+                    Err(err) => this.error = Some(format!("Cannot list files: {err}")),
+                }
                 this.indexing = false;
                 this.search(cx);
             })
             .ok();
         });
         Self {
-            root,
+            project,
             query,
             files: Arc::default(),
             indexing: true,
+            error: None,
             matches: Vec::new(),
             selected: 0,
             scroll: UniformListScrollHandle::new(),
@@ -135,7 +141,8 @@ impl FileFinder {
 
     fn open(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(m) = self.matches.get(index) {
-            cx.emit(FileFinderEvent::Open(self.root.join(&self.files[m.index])));
+            let path = self.project.resolve(&self.files[m.index]);
+            cx.emit(FileFinderEvent::Open(path));
         }
     }
 
@@ -146,7 +153,8 @@ impl FileFinder {
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let m = &self.matches[index];
         let path = &self.files[m.index];
-        let name_start = path.rfind(MAIN_SEPARATOR).map_or(0, |i| i + 1);
+        // Local paths use the platform separator, WSL paths `/`.
+        let name_start = path.rfind(['/', MAIN_SEPARATOR]).map_or(0, |i| i + 1);
         let highlight = HighlightStyle {
             color: Some(rgb(theme::ACCENT_TEXT).into()),
             font_weight: Some(FontWeight::BOLD),
@@ -193,23 +201,6 @@ impl FileFinder {
                     .child(StyledText::new(dir).with_highlights(highlights(0..name_start))),
             )
     }
-}
-
-/// All non-ignored files under `root`, as sorted project-relative paths.
-fn index_files(root: &Path) -> Vec<String> {
-    let mut files: Vec<String> = WalkBuilder::new(root)
-        .hidden(false)
-        .filter_entry(|entry| entry.file_name() != ".git")
-        .build()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-        .filter_map(|entry| {
-            let relative = entry.path().strip_prefix(root).ok()?;
-            Some(relative.to_string_lossy().into_owned())
-        })
-        .collect();
-    files.sort_unstable();
-    files
 }
 
 /// Best `MAX_RESULTS` matches for `query`; an empty query lists files in order.
@@ -279,6 +270,8 @@ impl Render for FileFinder {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = if self.indexing {
             "Indexing…".to_owned()
+        } else if let Some(error) = &self.error {
+            error.clone()
         } else {
             format!("{} of {} files", self.matches.len(), self.files.len())
         };

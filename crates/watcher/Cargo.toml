@@ -8,3 +8,4 @@ publish.workspace = true
 futures.workspace = true
 ignore.workspace = true
 notify.workspace = true
+serde.workspace = true

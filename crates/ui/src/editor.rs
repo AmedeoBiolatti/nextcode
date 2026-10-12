@@ -19,7 +19,7 @@ use lsp::types::{
 use syntax::{HighlightSpan, Language, Syntax};
 use text::{Bias, Buffer, Change, Encoding};
 
-use crate::{lsp_store::RunningServer, theme};
+use crate::{lsp_store::RunningServer, project::Project, theme};
 
 mod completion;
 mod navigation;
@@ -183,6 +183,8 @@ pub struct Editor {
     selecting: bool,
     layout: Option<EditorLayout>,
     error: Option<SharedString>,
+    /// Where the buffer's file lives; `None` for input fields.
+    project: Option<Project>,
     syntax: Option<Syntax>,
     /// Input-field mode: no gutter or status bar; Enter, Tab and vertical
     /// motion bubble up to the parent view.
@@ -298,6 +300,7 @@ impl Editor {
             selecting: false,
             layout: None,
             error: None,
+            project: None,
             syntax,
             single_line: false,
             lsp: None,
@@ -419,9 +422,23 @@ impl Editor {
         }
     }
 
+    /// An editor for a file of `project`; the buffer must have its path.
+    pub fn for_file(buffer: Buffer, project: Project, cx: &mut Context<Self>) -> Self {
+        Self {
+            project: Some(project),
+            ..Self::new(buffer, cx)
+        }
+    }
+
     pub fn text(&self) -> String {
         self.buffer.slice(0..self.buffer.len())
     }
+
+    /// Replaces all text (as one undoable edit), e.g. to clear an input.
+    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.replace(0..self.buffer.len(), text, cx);
+    }
+
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
     }
@@ -430,9 +447,10 @@ impl Editor {
     /// Unsaved edits are only overwritten when `force` is set.
     pub fn reload_from_disk(&mut self, force: bool, cx: &mut Context<Self>) -> ReloadOutcome {
         let Some(text) = self
-            .buffer
-            .path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
+            .project
+            .as_ref()
+            .zip(self.buffer.path())
+            .and_then(|(project, path)| project.read_text(path).ok())
         else {
             return ReloadOutcome::Failed;
         };
@@ -459,8 +477,18 @@ impl Editor {
 
     pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
         let was_dirty = self.buffer.is_dirty();
-        let saved = match self.buffer.save() {
+        let written = match (&self.project, self.buffer.path()) {
+            (Some(project), Some(path)) => {
+                project.write(path, self.buffer.slice(0..self.buffer.len()).into_bytes())
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "buffer has no file",
+            )),
+        };
+        let saved = match written {
             Ok(()) => {
+                self.buffer.mark_saved();
                 self.error = None;
                 if let Some(doc) = &self.lsp {
                     doc.server

@@ -5,12 +5,11 @@ use std::{
     fs::File,
     io::{LineWriter, Write},
     path::{Path, PathBuf},
-    process::Command,
     sync::Arc,
 };
 
 use futures::StreamExt;
-use gpui::{Context, EventEmitter, SharedString, Task};
+use gpui::{AppContext, Context, EventEmitter, SharedString, Task};
 use lsp::{
     Incoming, LanguageServer, LogKind, Logger, path_to_uri,
     types::{
@@ -27,7 +26,10 @@ use serde_json::{Value, json};
 use syntax::Language;
 use text::Encoding;
 
-use crate::settings::{self, ServerConfig, Settings};
+use crate::{
+    project::Project,
+    settings::{self, ServerConfig, Settings},
+};
 
 /// Restarts allowed per server before giving up for the session.
 const MAX_RESTARTS: u32 = 3;
@@ -75,7 +77,7 @@ struct Slot {
 }
 
 pub struct LspStore {
-    root: PathBuf,
+    project: Project,
     settings: Arc<Settings>,
     slots: HashMap<Language, Slot>,
     diagnostics: HashMap<PathBuf, Vec<lsp::types::Diagnostic>>,
@@ -84,9 +86,9 @@ pub struct LspStore {
 impl EventEmitter<LspStoreEvent> for LspStore {}
 
 impl LspStore {
-    pub fn new(root: PathBuf, settings: Arc<Settings>) -> Self {
+    pub fn new(project: Project, settings: Arc<Settings>) -> Self {
         Self {
-            root,
+            project,
             settings,
             slots: HashMap::new(),
             diagnostics: HashMap::new(),
@@ -151,13 +153,30 @@ impl LspStore {
             .map(|(path, diagnostics)| (path.as_path(), diagnostics.as_slice()))
     }
 
+    /// Asks every server to shut down and exit, giving them `grace` before
+    /// their processes are ended. No server restarts afterwards.
+    pub fn shutdown_all(&mut self, grace: std::time::Duration, cx: &mut Context<Self>) -> Task<()> {
+        let connections: Vec<Arc<LanguageServer>> = self
+            .slots
+            .drain()
+            .filter_map(|(_, slot)| slot.connection)
+            .collect();
+        let timer = cx.background_executor().timer(grace);
+        cx.background_spawn(async move {
+            let all = futures::future::join_all(connections.iter().map(|c| c.shutdown()));
+            futures::future::select(Box::pin(all), timer).await;
+            // Dropping the connections ends any process still running.
+            drop(connections);
+        })
+    }
+
     fn start(&mut self, language: Language, cx: &mut Context<Self>) {
         let restarts = self.slots.get(&language).map_or(0, |slot| slot.restarts);
         let Some(mut config) = self.settings.server_config(language) else {
             return;
         };
         if language == Language::Python
-            && let Some(python) = settings::python_interpreter(&self.root)
+            && let Ok(Some(python)) = self.project.python_interpreter()
         {
             settings::merge(
                 &mut config.settings,
@@ -177,33 +196,39 @@ impl LspStore {
 
         if !config.enabled {
             slot.status = ServerStatus::Disabled;
-        } else if let Some(program) = settings::find_executable(&config.command, &self.root) {
-            let mut command = Command::new(program);
-            command.args(&config.args).current_dir(&self.root);
-            #[cfg(windows)]
-            {
-                // Don't flash a console window from a GUI process.
-                use std::os::windows::process::CommandExt;
-                command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-            }
-            match LanguageServer::spawn(&mut command, open_log(language)) {
-                Ok((connection, incoming)) => {
-                    let connection = Arc::new(connection);
-                    slot._tasks = vec![
-                        self.listen(language, incoming, cx),
-                        self.initialize(language, &connection, &config, cx),
-                    ];
-                    slot.connection = Some(connection);
+        } else {
+            match self.project.find_executable(&config.command) {
+                Ok(Some(program)) => {
+                    let started = self.project.spawn_language_server(
+                        &program,
+                        &config.args,
+                        open_log(language),
+                    );
+                    match started {
+                        Ok((connection, incoming)) => {
+                            let connection = Arc::new(connection);
+                            slot._tasks = vec![
+                                self.listen(language, incoming, cx),
+                                self.initialize(language, &connection, &config, cx),
+                            ];
+                            slot.connection = Some(connection);
+                        }
+                        Err(err) => {
+                            slot.status =
+                                ServerStatus::Failed(format!("failed to start: {err}").into())
+                        }
+                    }
+                }
+                Ok(None) => {
+                    slot.status = ServerStatus::NotFound {
+                        command: config.command.clone().into(),
+                        install_hint: config.install_hint,
+                    };
                 }
                 Err(err) => {
-                    slot.status = ServerStatus::Failed(format!("failed to start: {err}").into())
+                    slot.status = ServerStatus::Failed(format!("cannot look up: {err}").into())
                 }
             }
-        } else {
-            slot.status = ServerStatus::NotFound {
-                command: config.command.clone().into(),
-                install_hint: config.install_hint,
-            };
         }
         slot.config = Some(config);
         self.slots.insert(language, slot);
@@ -217,14 +242,16 @@ impl LspStore {
         config: &ServerConfig,
         cx: &mut Context<Self>,
     ) -> Task<()> {
-        let root_uri = path_to_uri(&self.root);
-        let folder_name = self
-            .root
+        let root = self.project.root();
+        let root_uri = path_to_uri(root);
+        let folder_name = root
             .file_name()
             .map_or_else(|| "root".into(), |name| name.to_string_lossy().into_owned());
         #[allow(deprecated)] // root_uri: older servers still read it
         let params = InitializeParams {
-            process_id: Some(std::process::id()),
+            // Servers exit when this process dies; a Windows pid means
+            // nothing (or another process) to a server running in WSL.
+            process_id: (!self.project.is_remote()).then(std::process::id),
             root_uri: root_uri.clone(),
             workspace_folders: root_uri.map(|uri| {
                 vec![WorkspaceFolder {
@@ -339,8 +366,8 @@ impl LspStore {
                             .collect(),
                     )),
                     "workspace/workspaceFolders" => Ok(json!([{
-                        "uri": path_to_uri(&self.root),
-                        "name": self.root.file_name().map(|n| n.to_string_lossy().into_owned()),
+                        "uri": path_to_uri(self.project.root()),
+                        "name": self.project.root().file_name().map(|n| n.to_string_lossy().into_owned()),
                     }])),
                     "window/workDoneProgress/create"
                     | "client/registerCapability"

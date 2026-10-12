@@ -15,6 +15,7 @@ use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
+use serde::{Deserialize, Serialize};
 
 /// Lines longer than this many bytes are truncated around their first match.
 const MAX_LINE_LEN: usize = 400;
@@ -22,7 +23,7 @@ const MAX_LINE_LEN: usize = 400;
 const TRUNCATED_CONTEXT: usize = 100;
 
 /// What to search for and where.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchQuery {
     /// The text or regular expression to search for.
     pub pattern: String,
@@ -41,7 +42,7 @@ pub struct SearchQuery {
 }
 
 /// A single matching line.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineMatch {
     /// 0-based line number.
     pub line: usize,
@@ -55,7 +56,7 @@ pub struct LineMatch {
 }
 
 /// All matching lines of one file.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMatches {
     /// Absolute path of the file.
     pub path: PathBuf,
@@ -64,7 +65,7 @@ pub struct FileMatches {
 }
 
 /// Streamed search output.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchEvent {
     /// A file with at least one match.
     File(FileMatches),
@@ -80,7 +81,7 @@ pub enum SearchEvent {
 }
 
 /// Resource limits for a search.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchLimits {
     /// Stop after reporting this many matches.
     pub max_matches: usize,

@@ -14,7 +14,7 @@ use gpui::{
 };
 use terminal::{Key, Modifiers, Palette, Rgb, Snapshot, Terminal, TerminalEvent, TerminalOptions};
 
-use crate::theme;
+use crate::{project::Project, theme};
 
 const CONTEXT: &str = "Terminal";
 
@@ -36,15 +36,26 @@ pub struct Profile {
     pub name: &'static str,
     program: &'static str,
     args: &'static [&'static str],
+    /// Runs the user's login shell where a remote project lives.
+    remote: bool,
 }
 
-/// Shells available on this platform, default first.
-pub fn profiles() -> Vec<Profile> {
+/// Shells available for `project`, default first.
+pub fn profiles(project: &Project) -> Vec<Profile> {
+    if project.is_remote() {
+        return vec![Profile {
+            name: "WSL Shell",
+            program: "",
+            args: &[],
+            remote: true,
+        }];
+    }
     if cfg!(windows) {
         let mut profiles = vec![Profile {
             name: "PowerShell",
             program: "powershell.exe",
             args: &["-NoLogo"],
+            remote: false,
         }];
         let system32 =
             std::env::var_os("SystemRoot").map(|root| PathBuf::from(root).join("System32"));
@@ -53,12 +64,14 @@ pub fn profiles() -> Vec<Profile> {
                 name: "WSL",
                 program: "wsl.exe",
                 args: &[],
+                remote: false,
             });
         }
         profiles.push(Profile {
             name: "Command Prompt",
             program: "cmd.exe",
             args: &[],
+            remote: false,
         });
         profiles
     } else {
@@ -66,6 +79,7 @@ pub fn profiles() -> Vec<Profile> {
             name: "Shell",
             program: "",
             args: &[],
+            remote: false,
         }]
     }
 }
@@ -634,7 +648,7 @@ impl Element for TerminalElement {
 }
 
 pub struct TerminalPanel {
-    cwd: PathBuf,
+    project: Project,
     tabs: Vec<(Entity<TerminalView>, Subscription)>,
     active: usize,
     focus_handle: FocusHandle,
@@ -642,9 +656,9 @@ pub struct TerminalPanel {
 }
 
 impl TerminalPanel {
-    pub fn new(cwd: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(project: Project, cx: &mut Context<Self>) -> Self {
         Self {
-            cwd,
+            project,
             tabs: Vec::new(),
             active: 0,
             focus_handle: cx.focus_handle(),
@@ -655,7 +669,7 @@ impl TerminalPanel {
     /// Focuses the active terminal, starting the default shell if none runs.
     pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_empty()
-            && let Some(profile) = profiles().into_iter().next()
+            && let Some(profile) = profiles(&self.project).into_iter().next()
         {
             self.spawn(&profile, window, cx);
         }
@@ -667,13 +681,23 @@ impl TerminalPanel {
 
     fn spawn(&mut self, profile: &Profile, window: &mut Window, cx: &mut Context<Self>) {
         let mut options = TerminalOptions::default_shell();
-        if !profile.program.is_empty() {
-            options.program = profile.program.into();
-            options.args = profile.args.iter().map(|&arg| arg.into()).collect();
-        }
-        options.cwd = Some(self.cwd.clone());
         let palette = Palette::default();
-        let (terminal, events) = match Terminal::spawn(options, palette) {
+        let started = if profile.remote {
+            self.project.spawn_remote_shell(
+                options.columns,
+                options.rows,
+                options.scrollback,
+                palette,
+            )
+        } else {
+            if !profile.program.is_empty() {
+                options.program = profile.program.into();
+                options.args = profile.args.iter().map(|&arg| arg.into()).collect();
+            }
+            options.cwd = Some(self.project.root().to_path_buf());
+            Terminal::spawn(options, palette)
+        };
+        let (terminal, events) = match started {
             Ok(started) => started,
             Err(err) => {
                 self.error = Some(format!("Could not start {}: {err}", profile.name).into());
@@ -755,7 +779,7 @@ impl Render for TerminalPanel {
                         })),
                 )
         });
-        let new_buttons = profiles().into_iter().map(|profile| {
+        let new_buttons = profiles(&self.project).into_iter().map(|profile| {
             div()
                 .id(SharedString::from(format!("new-terminal-{}", profile.name)))
                 .px_2()

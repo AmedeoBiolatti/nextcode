@@ -1,4 +1,9 @@
 //! Conversions between filesystem paths and `file://` URIs.
+//!
+//! On Windows, a rooted path without a drive (`/home/me/x.rs`) is a POSIX
+//! path of a project inside WSL, served by the agent; it maps to
+//! `file:///home/me/x.rs` like on Linux, which is what servers running in
+//! WSL send and expect.
 
 use std::path::{Path, PathBuf};
 
@@ -8,7 +13,20 @@ use url::Url;
 
 /// `file://` URI for an absolute path, percent-encoded (`C:\a b` → `file:///C:/a%20b`).
 pub fn path_to_uri(path: &Path) -> Option<Uri> {
-    Url::from_file_path(path).ok()?.as_str().parse().ok()
+    let url = match Url::from_file_path(path) {
+        Ok(url) => url,
+        Err(()) if cfg!(windows) => {
+            let posix = path.to_str()?;
+            if !posix.starts_with('/') {
+                return None;
+            }
+            let mut url = Url::parse("file:///").ok()?;
+            url.set_path(posix);
+            url
+        }
+        Err(()) => return None,
+    };
+    url.as_str().parse().ok()
 }
 
 /// Filesystem path for a `file://` URI; `None` for other schemes.
@@ -25,10 +43,12 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     if cfg!(windows) {
         // `/c:/dir/file` → `C:\dir\file`
         let path = decoded.strip_prefix('/').unwrap_or(&decoded);
-        let mut path = path.replace('/', "\\");
-        if path.as_bytes().get(1) == Some(&b':') {
-            path[..1].make_ascii_uppercase();
+        if path.as_bytes().get(1) != Some(&b':') {
+            // No drive: a WSL path, kept in POSIX form.
+            return Some(PathBuf::from(decoded.into_owned()));
         }
+        let mut path = path.replace('/', "\\");
+        path[..1].make_ascii_uppercase();
         Some(PathBuf::from(path))
     } else {
         Some(PathBuf::from(decoded.into_owned()))
@@ -62,6 +82,19 @@ mod tests {
         assert_eq!(
             uri_to_path(&uri).unwrap(),
             PathBuf::from(r"C:\dev\py\main.py")
+        );
+    }
+
+    #[test]
+    fn posix_paths_round_trip_on_every_platform() {
+        let path = PathBuf::from("/home/me/My Project/é#1.py");
+        let uri = path_to_uri(&path).unwrap();
+        assert_eq!(uri.as_str(), "file:///home/me/My%20Project/%C3%A9%231.py");
+        assert_eq!(uri_to_path(&uri).unwrap(), path);
+        assert_eq!(
+            uri_to_path(&uri).unwrap().to_str(),
+            Some("/home/me/My Project/é#1.py"),
+            "WSL paths keep their forward slashes"
         );
     }
 

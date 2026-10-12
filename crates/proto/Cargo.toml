@@ -1,0 +1,12 @@
+[package]
+name = "proto"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+postcard.workspace = true
+search.workspace = true
+serde.workspace = true
+watcher.workspace = true
+worktree.workspace = true

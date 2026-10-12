@@ -1,9 +1,6 @@
 //! Modal list of code locations (multiple definitions, references).
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::PathBuf};
 
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton, ScrollStrategy,
@@ -11,7 +8,7 @@ use gpui::{
 };
 use language::Location;
 
-use crate::theme;
+use crate::{project::Project, theme};
 
 actions!(location_picker, [SelectPrev, SelectNext, Confirm, Dismiss]);
 
@@ -57,7 +54,7 @@ impl LocationPicker {
     pub fn new(
         title: SharedString,
         locations: Vec<Location>,
-        root: &Path,
+        project: &Project,
         cx: &mut Context<Self>,
     ) -> Self {
         // One read per file; missing files just lose their preview.
@@ -67,7 +64,7 @@ impl LocationPicker {
             .map(|location| {
                 let text = files
                     .entry(location.path.clone())
-                    .or_insert_with(|| std::fs::read_to_string(&location.path).ok());
+                    .or_insert_with(|| project.read_text(&location.path).ok());
                 let line = location.range.start.line as usize;
                 let preview = text
                     .as_deref()
@@ -75,7 +72,10 @@ impl LocationPicker {
                     .unwrap_or_default()
                     .trim()
                     .to_owned();
-                let shown = location.path.strip_prefix(root).unwrap_or(&location.path);
+                let shown = location
+                    .path
+                    .strip_prefix(project.root())
+                    .unwrap_or(&location.path);
                 let file_name = shown.file_name().unwrap_or_default().to_string_lossy();
                 Entry {
                     name: format!("{file_name}:{}", line + 1).into(),

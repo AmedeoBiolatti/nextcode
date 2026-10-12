@@ -11,11 +11,7 @@
 //! } } } }
 //! ```
 
-use std::{
-    collections::HashMap,
-    env,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -167,80 +163,6 @@ pub fn section(settings: &Value, section: Option<&str>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// Finds an executable: explicit paths as given, bare names in the project's
-/// virtualenv, then `PATH`, then common per-user tool directories.
-pub fn find_executable(command: &str, project_root: &Path) -> Option<PathBuf> {
-    let command_path = Path::new(command);
-    if command_path.components().count() > 1 {
-        return with_extensions(command_path).find(|path| path.is_file());
-    }
-    let home = dirs::home_dir();
-    let path_var = env::var_os("PATH");
-    let dirs = venv_dirs(project_root)
-        .into_iter()
-        .chain(path_var.iter().flat_map(env::split_paths))
-        .chain(
-            home.iter()
-                .flat_map(|home| [home.join(".cargo/bin"), home.join(".local/bin")]),
-        );
-    for dir in dirs {
-        let candidate = dir.join(command);
-        if let Some(found) = with_extensions(&candidate).find(|path| path.is_file()) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn with_extensions(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
-    let extensions: &[&str] = if cfg!(windows) && path.extension().is_none() {
-        &["exe", "cmd", "bat"]
-    } else {
-        &[]
-    };
-    std::iter::once(path.to_path_buf()).chain(extensions.iter().map(|ext| path.with_extension(ext)))
-}
-
-/// Executable directories of the project's virtualenv, if any.
-fn venv_dirs(project_root: &Path) -> Vec<PathBuf> {
-    let bin = if cfg!(windows) { "Scripts" } else { "bin" };
-    [".venv", "venv"]
-        .iter()
-        .map(|name| project_root.join(name).join(bin))
-        .filter(|dir| dir.is_dir())
-        .collect()
-}
-
-/// The project's Python interpreter: an active virtualenv/conda env, else
-/// `.venv`/`venv` in the project root.
-pub fn python_interpreter(project_root: &Path) -> Option<PathBuf> {
-    let python = if cfg!(windows) {
-        "python.exe"
-    } else {
-        "python"
-    };
-    let from_env = ["VIRTUAL_ENV", "CONDA_PREFIX"]
-        .iter()
-        .filter_map(env::var_os)
-        .map(PathBuf::from)
-        .map(|prefix| {
-            if cfg!(windows) && prefix.join(python).is_file() {
-                prefix.join(python) // conda on Windows keeps python.exe at the root
-            } else {
-                prefix
-                    .join(if cfg!(windows) { "Scripts" } else { "bin" })
-                    .join(python)
-            }
-        });
-    from_env
-        .chain(
-            venv_dirs(project_root)
-                .into_iter()
-                .map(|dir| dir.join(python)),
-        )
-        .find(|path| path.is_file())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,20 +194,5 @@ mod tests {
     fn unknown_keys_are_rejected_instead_of_ignored() {
         let typo = json!({ "languages": { "python": { "server": { "comand": "x" } } } });
         assert!(serde_json::from_value::<Settings>(typo).is_err());
-    }
-
-    #[test]
-    fn executables_are_found_in_the_project_venv_first() {
-        let root = env::temp_dir().join(format!("next_code_find_exe_{}", std::process::id()));
-        let bin = root
-            .join(".venv")
-            .join(if cfg!(windows) { "Scripts" } else { "bin" });
-        std::fs::create_dir_all(&bin).unwrap();
-        let file = if cfg!(windows) { "tool.exe" } else { "tool" };
-        std::fs::write(bin.join(file), "").unwrap();
-
-        assert_eq!(find_executable("tool", &root), Some(bin.join(file)));
-        assert_eq!(find_executable("next_code_missing_tool", &root), None);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

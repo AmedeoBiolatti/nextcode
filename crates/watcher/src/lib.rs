@@ -19,27 +19,32 @@ use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{ModifyKind, RenameMode},
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeKind {
     Created,
     Modified,
     Removed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEvent {
     pub path: PathBuf,
     pub kind: ChangeKind,
 }
 
 /// Changes from one debounce window.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Batch {
     /// Sorted by path; at most one event per path.
     pub events: Vec<FileEvent>,
     /// The OS dropped events (e.g. buffer overflow); consumers must rescan.
     pub rescan: bool,
+    /// The git repository at the root changed (index, HEAD or refs), e.g.
+    /// a commit or checkout; its status must be re-read. Other `.git`
+    /// changes are not reported.
+    pub repository: bool,
 }
 
 /// Watches a directory tree until dropped.
@@ -172,6 +177,9 @@ fn debounce_loop(
         if pending.contains_key(&gitignore_path) {
             ignore = load_ignore(root);
         }
+        let repository = pending
+            .keys()
+            .any(|path| is_repository_state(&git_dir, path));
         let mut events: Vec<FileEvent> = pending
             .into_iter()
             .filter_map(|(path, kind)| Some(FileEvent { path, kind: kind? }))
@@ -180,14 +188,39 @@ fn debounce_loop(
             })
             .collect();
         events.sort_by(|a, b| a.path.cmp(&b.path));
-        if (!events.is_empty() || rescan)
-            && batches.unbounded_send(Batch { events, rescan }).is_err()
+        if (!events.is_empty() || rescan || repository)
+            && batches
+                .unbounded_send(Batch {
+                    events,
+                    rescan,
+                    repository,
+                })
+                .is_err()
         {
             return;
         }
         if disconnected {
             return;
         }
+    }
+}
+
+/// Whether `path` holds state that `git status` depends on: the index,
+/// HEAD, refs (commits, branch switches) or an ongoing merge.
+fn is_repository_state(git_dir: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(git_dir) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let Some(first) = components.next() else {
+        return false;
+    };
+    match first.as_os_str().to_str() {
+        Some("index" | "HEAD" | "packed-refs" | "MERGE_HEAD") => components.next().is_none(),
+        // Windows also reports the `refs` directory itself when anything
+        // below `.git` is touched; only entries inside it matter.
+        Some("refs") => components.next().is_some(),
+        _ => false,
     }
 }
 
@@ -300,7 +333,9 @@ mod tests {
 
         for value in [1, 2] {
             fs::write(&file, format!("value = {value}\n")).unwrap();
-            let events = collect(&mut rx, |events| events.iter().any(|event| event.path == file));
+            let events = collect(&mut rx, |events| {
+                events.iter().any(|event| event.path == file)
+            });
             assert_eq!(
                 kinds_for(&events, &file).last(),
                 Some(ChangeKind::Modified),
@@ -343,5 +378,31 @@ mod tests {
         let events = collect(&mut rx, |events| events.iter().any(|e| e.path == visible));
         let paths: Vec<&Path> = events.iter().map(|e| e.path.as_path()).collect();
         assert_eq!(paths, [visible.as_path()]);
+    }
+
+    #[test]
+    fn index_and_ref_updates_flag_the_repository_without_file_events() {
+        let dir = TempDir::new("repository");
+        let git = dir.0.join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+        let (_watcher, mut rx) = watch(&dir.0, DEBOUNCE).unwrap();
+        // Objects alone (e.g. `git hash-object`) do not change status.
+        fs::write(git.join("objects").join("ab"), "x").unwrap();
+        thread::sleep(DEBOUNCE * 4);
+        while let Ok(batch) = rx.try_recv() {
+            assert!(!batch.repository, "{batch:?}");
+        }
+        fs::write(git.join("refs").join("heads").join("main"), "abc").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let batch = loop {
+            match rx.try_recv() {
+                Ok(batch) if batch.repository => break batch,
+                Ok(_) => {}
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                Err(_) => panic!("no repository change reported"),
+            }
+        };
+        assert!(batch.events.is_empty(), "{batch:?}");
     }
 }

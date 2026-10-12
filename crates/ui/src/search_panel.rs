@@ -7,10 +7,11 @@ use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
     SharedString, StyledText, Subscription, Task, Window, div, prelude::*, px, rgb, uniform_list,
 };
-use search::{FileMatches, SearchEvent, SearchHandle, SearchLimits, SearchQuery};
+use search::{FileMatches, SearchEvent, SearchLimits, SearchQuery};
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    project::{Project, SearchHandle},
     theme,
 };
 
@@ -42,7 +43,7 @@ enum Toggle {
 }
 
 pub struct SearchPanel {
-    root: PathBuf,
+    project: Project,
     query: Entity<Editor>,
     include: Entity<Editor>,
     exclude: Entity<Editor>,
@@ -58,7 +59,7 @@ pub struct SearchPanel {
 }
 
 impl SearchPanel {
-    pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(project: Project, cx: &mut Context<Self>) -> Self {
         let query = cx.new(Editor::single_line);
         let include = cx.new(Editor::single_line);
         let exclude = cx.new(Editor::single_line);
@@ -74,7 +75,7 @@ impl SearchPanel {
             cx.subscribe(&exclude, on_edit),
         ];
         Self {
-            root,
+            project,
             query,
             include,
             exclude,
@@ -130,11 +131,10 @@ impl SearchPanel {
             cx.notify();
             return;
         }
-        let (handle, mut events) = match search::search(&self.root, &query, SearchLimits::default())
-        {
+        let (handle, mut events) = match self.project.search(&query, SearchLimits::default()) {
             Ok(started) => started,
             Err(err) => {
-                self.status = Some((err.to_string().into(), theme::ERROR));
+                self.status = Some((err.into(), theme::ERROR));
                 cx.notify();
                 return;
             }
@@ -226,7 +226,7 @@ impl SearchPanel {
                 let matches = &self.results[file];
                 let shown = matches
                     .path
-                    .strip_prefix(&self.root)
+                    .strip_prefix(self.project.root())
                     .unwrap_or(&matches.path);
                 let name = shown
                     .file_name()

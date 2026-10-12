@@ -17,18 +17,24 @@ grep-matcher = "0.1.9"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4"
+git = { path = "crates/git" }
 language = { path = "crates/language" }
 lsp = { path = "crates/lsp" }
+libc = "0.2"
 lsp-types = "0.97"
 nucleo-matcher = "0.3"
 notify = "8"
 parking_lot = "0.12"
 percent-encoding = "2"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+proto = { path = "crates/proto" }
+remote = { path = "crates/remote" }
 # LF-only line indexing; CR before LF is handled by `text::Buffer`.
 ropey = { version = "1.6", default-features = false, features = ["simd"] }
 search = { path = "crates/search" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+similar = "2"
 syntax = { path = "crates/syntax" }
 text = { path = "crates/text" }
 terminal = { path = "crates/terminal" }
@@ -41,3 +47,4 @@ tree-sitter-sequel = "0.3"
 unicode-segmentation = "1"
 url = "2"
 watcher = { path = "crates/watcher" }
+worktree = { path = "crates/worktree" }

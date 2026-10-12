@@ -6,9 +6,9 @@ use std::{
 };
 
 use gpui::{Context, EventEmitter, SharedString, Window, div, prelude::*, px, rgb, uniform_list};
-use ignore::WalkBuilder;
+use worktree::FileKind;
 
-use crate::theme;
+use crate::{project::Project, theme};
 
 const INDENT: f32 = 14.;
 
@@ -31,7 +31,7 @@ struct Row {
 }
 
 pub struct FileTree {
-    root: PathBuf,
+    project: Project,
     root_name: SharedString,
     expanded: HashSet<PathBuf>,
     /// Directory listings, read once per directory on first expand.
@@ -41,15 +41,16 @@ pub struct FileTree {
 }
 
 impl FileTree {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(project: Project) -> Self {
+        let root = project.root();
         let root_name = root
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.display().to_string())
             .into();
         let mut tree = Self {
-            expanded: HashSet::from([root.clone()]),
-            root,
+            expanded: HashSet::from([root.to_path_buf()]),
+            project,
             root_name,
             children: HashMap::new(),
             rows: Vec::new(),
@@ -81,17 +82,22 @@ impl FileTree {
                 }
             }
         }
-        self.expanded.retain(|dir| dir.is_dir());
+        // Keep expansion when the answer is unknown (e.g. agent disconnected).
+        let project = &self.project;
+        self.expanded
+            .retain(|dir| !matches!(project.kind(dir), Ok(None | Some(FileKind::File))));
         self.rebuild_rows();
         cx.notify();
     }
 
     fn rebuild_rows(&mut self) {
         self.rows.clear();
+        let root = self.project.root().to_path_buf();
         push_rows(
+            &self.project,
             &mut self.children,
             &self.expanded,
-            &self.root,
+            &root,
             0,
             &mut self.rows,
         );
@@ -115,30 +121,22 @@ impl FileTree {
     }
 }
 
-/// Lists one directory, honoring .gitignore (inside git repos), dirs first.
-fn read_dir(dir: &Path) -> Vec<Entry> {
-    let mut entries: Vec<Entry> = WalkBuilder::new(dir)
-        .max_depth(Some(1))
-        .hidden(false)
-        .filter_entry(|entry| entry.file_name() != ".git")
-        .build()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.depth() == 1)
+/// Lists one directory; an unreadable one shows as empty.
+fn read_dir(project: &Project, dir: &Path) -> Vec<Entry> {
+    project
+        .read_dir(dir)
+        .unwrap_or_default()
+        .into_iter()
         .map(|entry| Entry {
-            is_dir: entry.file_type().is_some_and(|kind| kind.is_dir()),
-            name: entry.file_name().to_string_lossy().into_owned().into(),
-            path: entry.into_path(),
+            path: project.join(dir, &entry.name),
+            name: entry.name.into(),
+            is_dir: entry.is_dir,
         })
-        .collect();
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    entries
+        .collect()
 }
 
 fn push_rows(
+    project: &Project,
     children: &mut HashMap<PathBuf, Vec<Entry>>,
     expanded: &HashSet<PathBuf>,
     dir: &Path,
@@ -146,7 +144,7 @@ fn push_rows(
     rows: &mut Vec<Row>,
 ) {
     if !children.contains_key(dir) {
-        children.insert(dir.to_path_buf(), read_dir(dir));
+        children.insert(dir.to_path_buf(), read_dir(project, dir));
     }
     for index in 0..children[dir].len() {
         let entry = &children[dir][index];
@@ -159,7 +157,7 @@ fn push_rows(
         });
         if recurse {
             let path = entry.path.clone();
-            push_rows(children, expanded, &path, depth + 1, rows);
+            push_rows(project, children, expanded, &path, depth + 1, rows);
         }
     }
 }

@@ -10,17 +10,25 @@ use serde::{Deserialize, Serialize};
 pub enum PanelId {
     Files,
     Search,
+    Git,
     Terminal,
     Problems,
 }
 
 impl PanelId {
-    pub const ALL: [Self; 4] = [Self::Files, Self::Search, Self::Terminal, Self::Problems];
+    pub const ALL: [Self; 5] = [
+        Self::Files,
+        Self::Search,
+        Self::Git,
+        Self::Terminal,
+        Self::Problems,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Files => "Files",
             Self::Search => "Search",
+            Self::Git => "Git",
             Self::Terminal => "Terminal",
             Self::Problems => "Problems",
         }
@@ -28,7 +36,7 @@ impl PanelId {
 
     fn default_position(self) -> DockPosition {
         match self {
-            Self::Files | Self::Search => DockPosition::Left,
+            Self::Files | Self::Search | Self::Git => DockPosition::Left,
             Self::Terminal | Self::Problems => DockPosition::Bottom,
         }
     }
@@ -91,7 +99,7 @@ impl Default for Layout {
     fn default() -> Self {
         Self {
             left: DockLayout {
-                panels: vec![PanelId::Files, PanelId::Search],
+                panels: vec![PanelId::Files, PanelId::Search, PanelId::Git],
                 active: Some(PanelId::Files),
                 size: 280.,
                 open: true,
@@ -229,8 +237,8 @@ impl Layout {
     }
 
     /// The project's layout, else the global default, else the built-in one.
-    pub fn load(project_root: &Path) -> Self {
-        let project = project_layout_path(project_root);
+    pub fn load(project_key: &str) -> Self {
+        let project = project_layout_path(project_key);
         Self::load_from(project.as_deref(), global_layout_path().as_deref())
     }
 
@@ -243,8 +251,8 @@ impl Layout {
         layout
     }
 
-    pub fn save_for_project(&self, project_root: &Path) -> std::io::Result<()> {
-        self.save_to(project_layout_path(project_root))
+    pub fn save_for_project(&self, project_key: &str) -> std::io::Result<()> {
+        self.save_to(project_layout_path(project_key))
     }
 
     /// Makes this the starting layout for projects without their own.
@@ -267,9 +275,8 @@ fn global_layout_path() -> Option<PathBuf> {
 }
 
 /// Per-project state lives outside the project so it never shows up in git.
-fn project_layout_path(project_root: &Path) -> Option<PathBuf> {
-    let key: String = project_root
-        .to_string_lossy()
+fn project_layout_path(project_key: &str) -> Option<PathBuf> {
+    let key: String = project_key
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
@@ -296,8 +303,8 @@ mod tests {
             (layout.right.active, layout.right.open),
             (Some(PanelId::Files), true)
         );
-        // The left dock falls back to its remaining panel and stays open.
-        assert_eq!(layout.left.panels, [PanelId::Search]);
+        // The left dock falls back to a remaining panel and stays open.
+        assert_eq!(layout.left.panels, [PanelId::Search, PanelId::Git]);
         assert_eq!(layout.left.active, Some(PanelId::Search));
 
         layout.move_panel(PanelId::Search, DockPosition::Bottom, Some(0));
@@ -305,6 +312,8 @@ mod tests {
             layout.bottom.panels,
             [PanelId::Search, PanelId::Terminal, PanelId::Problems]
         );
+        assert_eq!(layout.left.active, Some(PanelId::Git));
+        layout.move_panel(PanelId::Git, DockPosition::Right, None);
         assert!(!layout.left.open, "an emptied dock closes");
         assert_eq!(layout.left.active, None);
     }
@@ -345,10 +354,16 @@ mod tests {
         )
         .unwrap();
         layout.normalize();
-        // Search was missing and returns to its default (left) dock.
+        // Search was missing and returns to its default (left) dock, as does
+        // Git for layouts saved before it existed.
         assert_eq!(
             layout.left.panels,
-            [PanelId::Files, PanelId::Terminal, PanelId::Search]
+            [
+                PanelId::Files,
+                PanelId::Terminal,
+                PanelId::Search,
+                PanelId::Git
+            ]
         );
         assert_eq!(layout.left.active, Some(PanelId::Files));
         assert_eq!(layout.left.size, MIN_DOCK_SIZE);

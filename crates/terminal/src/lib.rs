@@ -1,6 +1,7 @@
 //! Terminal sessions: a shell in a pseudo-terminal (ConPTY on Windows, a Unix
-//! pty elsewhere) driven by `alacritty_terminal`'s emulator, plus a renderer-
-//! neutral snapshot of the visible screen.
+//! pty elsewhere, or a pty hosted by a remote agent) driven by
+//! `alacritty_terminal`'s emulator, plus a renderer-neutral snapshot of the
+//! visible screen.
 
 mod keys;
 
@@ -12,7 +13,9 @@ use std::{
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
     },
+    thread,
 };
 
 pub use alacritty_terminal::vte::ansi::Rgb;
@@ -23,7 +26,7 @@ use alacritty_terminal::{
     sync::FairMutex,
     term::{Config, Term, TermMode, cell::Flags, color::Colors},
     tty::{self, Shell},
-    vte::ansi::{Color, CursorShape, NamedColor},
+    vte::ansi::{Color, CursorShape, NamedColor, Processor, StdSyncHandler},
 };
 use futures::channel::mpsc;
 pub use keys::{Key, Modifiers, encode_key, encode_paste};
@@ -69,6 +72,59 @@ impl TerminalOptions {
             columns: 80,
             rows: 24,
             scrollback: 10_000,
+        }
+    }
+}
+
+/// A pseudo-terminal whose process runs elsewhere, e.g. inside WSL behind
+/// `next_code_agent`. Its output is fed to [`Terminal::attach`].
+pub trait RemotePty: Send + Sync + 'static {
+    fn write(&self, data: Vec<u8>);
+    fn resize(&self, columns: u16, rows: u16);
+    /// Ends the remote process; called when the [`Terminal`] is dropped.
+    fn close(&self);
+}
+
+/// What a [`RemotePty`] produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PtyOutput {
+    Data(Vec<u8>),
+    /// The process exited (with its exit code when known); nothing follows.
+    Exited(Option<i32>),
+}
+
+/// Where input, resizes and shutdown go.
+#[derive(Clone)]
+enum Io {
+    Local(EventLoopSender),
+    Remote(Arc<dyn RemotePty>),
+}
+
+impl Io {
+    fn input(&self, bytes: Cow<'static, [u8]>) {
+        match self {
+            Self::Local(sender) => {
+                sender.send(Msg::Input(bytes)).ok();
+            }
+            Self::Remote(pty) => pty.write(bytes.into_owned()),
+        }
+    }
+
+    fn resize(&self, size: WindowSize) {
+        match self {
+            Self::Local(sender) => {
+                sender.send(Msg::Resize(size)).ok();
+            }
+            Self::Remote(pty) => pty.resize(size.num_cols, size.num_lines),
+        }
+    }
+
+    fn shutdown(&self) {
+        match self {
+            Self::Local(sender) => {
+                sender.send(Msg::Shutdown).ok();
+            }
+            Self::Remote(pty) => pty.close(),
         }
     }
 }
@@ -232,8 +288,8 @@ impl Dimensions for Size {
 #[derive(Clone)]
 struct Listener {
     events: mpsc::UnboundedSender<TerminalEvent>,
-    /// Set right after the event loop exists; replies to terminal queries.
-    writer: Arc<OnceLock<EventLoopSender>>,
+    /// Set right after the pty exists; replies to terminal queries.
+    writer: Arc<OnceLock<Io>>,
     window_size: Arc<Mutex<WindowSize>>,
     palette: Palette,
     exited: Arc<AtomicBool>,
@@ -242,7 +298,13 @@ struct Listener {
 impl Listener {
     fn reply(&self, text: String) {
         if let Some(writer) = self.writer.get() {
-            writer.send(Msg::Input(text.into_bytes().into())).ok();
+            writer.input(text.into_bytes().into());
+        }
+    }
+
+    fn exited(&self, code: Option<i32>) {
+        if !self.exited.swap(true, Ordering::SeqCst) {
+            self.events.unbounded_send(TerminalEvent::Exited(code)).ok();
         }
     }
 }
@@ -275,7 +337,7 @@ impl EventListener for Listener {
 
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
-    sender: EventLoopSender,
+    io: Io,
     window_size: Arc<Mutex<WindowSize>>,
     palette: Palette,
 }
@@ -285,24 +347,8 @@ impl Terminal {
         options: TerminalOptions,
         palette: Palette,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<TerminalEvent>)> {
-        let (events, events_rx) = mpsc::unbounded();
-        let window_size = Arc::new(Mutex::new(window_size(options.columns, options.rows)));
-        let listener = Listener {
-            events,
-            writer: Arc::default(),
-            window_size: window_size.clone(),
-            palette,
-            exited: Arc::default(),
-        };
-        let config = Config {
-            scrolling_history: options.scrollback,
-            ..Config::default()
-        };
-        let size = Size {
-            columns: usize::from(options.columns),
-            rows: usize::from(options.rows),
-        };
-        let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
+        let (term, listener, events) =
+            Self::emulator(options.columns, options.rows, options.scrollback, palette);
 
         let mut env = options.env;
         env.entry("TERM".into())
@@ -316,24 +362,98 @@ impl Terminal {
             env,
             ..tty::Options::default()
         };
-        let pty = tty::new(&pty_options, *window_size.lock(), 0)?;
+        let pty = tty::new(&pty_options, *listener.window_size.lock(), 0)?;
         let event_loop = EventLoop::new(term.clone(), listener.clone(), pty, true, false)?;
-        let sender = event_loop.channel();
-        listener.writer.set(sender.clone()).ok();
+        let io = Io::Local(event_loop.channel());
+        listener.writer.set(io.clone()).ok();
         event_loop.spawn();
 
         let terminal = Self {
             term,
-            sender,
-            window_size,
+            io,
+            window_size: listener.window_size.clone(),
             palette,
         };
-        Ok((terminal, events_rx))
+        Ok((terminal, events))
+    }
+
+    /// Emulates a terminal for a process running behind `pty`, whose output
+    /// arrives on `output`. A closed `output` counts as an exit.
+    pub fn attach(
+        columns: u16,
+        rows: u16,
+        scrollback: usize,
+        palette: Palette,
+        pty: Arc<dyn RemotePty>,
+        output: std_mpsc::Receiver<PtyOutput>,
+    ) -> io::Result<(Self, mpsc::UnboundedReceiver<TerminalEvent>)> {
+        let (term, listener, events) = Self::emulator(columns, rows, scrollback, palette);
+        let io = Io::Remote(pty);
+        listener.writer.set(io.clone()).ok();
+        let reader_term = term.clone();
+        let reader_listener = listener.clone();
+        thread::Builder::new()
+            .name("terminal-remote".into())
+            .spawn(move || {
+                let mut parser = Processor::<StdSyncHandler>::new();
+                let mut code = None;
+                for chunk in output {
+                    match chunk {
+                        PtyOutput::Data(data) => {
+                            parser.advance(&mut *reader_term.lock(), &data);
+                            reader_listener.send_event(Event::Wakeup);
+                        }
+                        PtyOutput::Exited(exit) => {
+                            code = exit;
+                            break;
+                        }
+                    }
+                }
+                reader_listener.exited(code);
+            })?;
+
+        let terminal = Self {
+            term,
+            io,
+            window_size: listener.window_size.clone(),
+            palette,
+        };
+        Ok((terminal, events))
+    }
+
+    fn emulator(
+        columns: u16,
+        rows: u16,
+        scrollback: usize,
+        palette: Palette,
+    ) -> (
+        Arc<FairMutex<Term<Listener>>>,
+        Listener,
+        mpsc::UnboundedReceiver<TerminalEvent>,
+    ) {
+        let (events, events_rx) = mpsc::unbounded();
+        let listener = Listener {
+            events,
+            writer: Arc::default(),
+            window_size: Arc::new(Mutex::new(window_size(columns, rows))),
+            palette,
+            exited: Arc::default(),
+        };
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Config::default()
+        };
+        let size = Size {
+            columns: usize::from(columns),
+            rows: usize::from(rows),
+        };
+        let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
+        (term, listener, events_rx)
     }
 
     /// Sends input bytes to the shell.
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        self.sender.send(Msg::Input(bytes.into())).ok();
+        self.io.input(bytes.into());
     }
 
     pub fn resize(&self, columns: u16, rows: u16) {
@@ -343,7 +463,7 @@ impl Terminal {
             columns: usize::from(size.num_cols),
             rows: usize::from(size.num_lines),
         });
-        self.sender.send(Msg::Resize(size)).ok();
+        self.io.resize(size);
     }
 
     /// Scrolls the view into history (positive) or back toward the output.
@@ -448,7 +568,7 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        self.sender.send(Msg::Shutdown).ok();
+        self.io.shutdown();
     }
 }
 
@@ -533,6 +653,54 @@ mod tests {
             )),
             "no exit event"
         );
+    }
+
+    #[derive(Default)]
+    struct FakePty {
+        written: Mutex<Vec<u8>>,
+        sizes: Mutex<Vec<(u16, u16)>>,
+        closed: AtomicBool,
+    }
+
+    impl RemotePty for FakePty {
+        fn write(&self, data: Vec<u8>) {
+            self.written.lock().extend(data);
+        }
+        fn resize(&self, columns: u16, rows: u16) {
+            self.sizes.lock().push((columns, rows));
+        }
+        fn close(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn attached_terminals_render_remote_output_and_answer_through_the_remote() {
+        let pty = Arc::new(FakePty::default());
+        let (output, output_rx) = std_mpsc::channel();
+        let (terminal, mut events) =
+            Terminal::attach(30, 5, 100, Palette::default(), pty.clone(), output_rx).unwrap();
+
+        // Text plus a cursor-position query, which the emulator must answer.
+        output
+            .send(PtyOutput::Data(b"hello remote\x1b[6n".to_vec()))
+            .unwrap();
+        assert!(wait_for(&mut events, |_| terminal
+            .snapshot()
+            .text()
+            .contains("hello remote")));
+        assert_eq!(pty.written.lock().as_slice(), b"\x1b[1;13R");
+
+        terminal.write(&b"ls\r"[..]);
+        terminal.resize(50, 8);
+        assert_eq!(pty.written.lock().as_slice(), b"\x1b[1;13Rls\r");
+        assert_eq!(pty.sizes.lock().as_slice(), [(50, 8)]);
+
+        output.send(PtyOutput::Exited(Some(3))).unwrap();
+        assert!(wait_for(&mut events, |event| *event
+            == TerminalEvent::Exited(Some(3))));
+        drop(terminal);
+        assert!(pty.closed.load(Ordering::SeqCst));
     }
 
     #[test]

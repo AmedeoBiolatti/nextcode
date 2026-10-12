@@ -869,6 +869,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cobs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "cocoa"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1498,6 +1507,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-io"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef1a6892d9eef45c8fa6b9e0086428a2cca8491aca8f787c534a3d6d0bcb3ced"
+
+[[package]]
+name = "embedded-io"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2070,6 +2091,14 @@ checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
 dependencies = [
  "color_quant",
  "weezl",
+]
+
+[[package]]
+name = "git"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "similar",
 ]
 
 [[package]]
@@ -3458,12 +3487,14 @@ dependencies = [
  "anyhow",
  "dirs 7.0.0",
  "futures",
+ "git",
  "gpui",
  "ignore",
  "language",
  "lsp",
  "nucleo-matcher",
  "parking_lot",
+ "remote",
  "search",
  "serde",
  "serde_json",
@@ -3471,6 +3502,21 @@ dependencies = [
  "terminal",
  "text",
  "watcher",
+ "worktree",
+]
+
+[[package]]
+name = "next_code_agent"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "futures",
+ "libc",
+ "parking_lot",
+ "proto",
+ "search",
+ "watcher",
+ "worktree",
 ]
 
 [[package]]
@@ -4093,6 +4139,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "postcard"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24"
+dependencies = [
+ "cobs",
+ "embedded-io 0.4.0",
+ "embedded-io 0.6.1",
+ "serde",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4177,6 +4235,17 @@ checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "proto"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "search",
+ "serde",
+ "watcher",
+ "worktree",
 ]
 
 [[package]]
@@ -4613,6 +4682,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "remote"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "lsp",
+ "next_code_agent",
+ "parking_lot",
+ "proto",
+ "terminal",
+]
+
+[[package]]
 name = "resvg"
 version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4956,6 +5037,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "serde",
 ]
 
 [[package]]
@@ -5191,6 +5273,12 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "simplecss"
@@ -6477,6 +6565,7 @@ dependencies = [
  "futures",
  "ignore",
  "notify",
+ "serde",
 ]
 
 [[package]]
@@ -7138,6 +7227,15 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "worktree"
+version = "0.1.0"
+dependencies = [
+ "dirs 7.0.0",
+ "ignore",
+ "serde",
+]
 
 [[package]]
 name = "writeable"

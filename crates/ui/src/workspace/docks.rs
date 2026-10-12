@@ -15,6 +15,7 @@ actions!(
         ToggleFiles,
         ToggleSearch,
         ToggleTerminal,
+        ToggleGit,
         ToggleProblems,
         ToggleBottomDock,
         SaveLayoutAsDefault,
@@ -28,6 +29,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-e", ToggleFiles, ctx),
         KeyBinding::new("alt-1", ToggleFiles, ctx),
         KeyBinding::new("secondary-shift-f", ToggleSearch, ctx),
+        // VS Code's Source Control shortcut.
+        KeyBinding::new("ctrl-shift-g", ToggleGit, ctx),
         KeyBinding::new("ctrl-`", ToggleTerminal, ctx),
         KeyBinding::new("alt-f12", ToggleTerminal, ctx),
         KeyBinding::new("secondary-shift-m", ToggleProblems, ctx),
@@ -73,12 +76,13 @@ impl Workspace {
             PanelId::Problems => Some(self.problems.clone().into()),
             PanelId::Terminal => Some(self.terminal.clone().into()),
             PanelId::Search => Some(self.search.clone().into()),
+            PanelId::Git => Some(self.git.clone().into()),
         }
     }
 
     /// Persists the layout for this project; failures only cost the layout.
     fn layout_changed(&mut self, cx: &mut Context<Self>) {
-        if let Err(err) = self.layout.save_for_project(&self.root) {
+        if let Err(err) = self.layout.save_for_project(&self.project.state_key()) {
             self.notice = Some(format!("Could not save layout: {err}").into());
         }
         cx.notify();
@@ -120,6 +124,21 @@ impl Workspace {
     ) {
         self.show_panel(PanelId::Search, cx);
         self.search.read(cx).focus(window, cx);
+    }
+
+    /// Shows the Git panel (refreshing its status) and focuses the commit
+    /// message.
+    pub(super) fn toggle_git(
+        &mut self,
+        _: &ToggleGit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(PanelId::Git, cx);
+        self.git.update(cx, |git, cx| {
+            git.refresh(cx);
+            git.focus(window, cx);
+        });
     }
 
     /// Shows the terminal (starting a shell if none runs) and focuses it, or

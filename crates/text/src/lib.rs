@@ -6,8 +6,6 @@
 //! belongs to the line break), matching tree-sitter and LSP row numbering.
 
 use std::{
-    fs,
-    io::{self, BufWriter, Write},
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -127,32 +125,21 @@ impl Buffer {
         self.line_ending
     }
 
-    /// Opens a UTF-8 text file. Non-UTF-8 content fails with `InvalidData`.
-    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
-        let path = path.into();
-        let text = fs::read_to_string(&path)?;
-        if text.contains('\0') {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "binary file"));
-        }
-        let mut buffer = Self::new(&text);
+    /// A buffer holding the contents of the file at `path`. Reading and
+    /// writing the file is the caller's job (it may live on another machine).
+    pub fn with_path(text: &str, path: PathBuf) -> Self {
+        let mut buffer = Self::new(text);
         buffer.path = Some(path);
-        Ok(buffer)
+        buffer
     }
 
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 
-    pub fn save(&mut self) -> io::Result<()> {
-        let path = self
-            .path
-            .as_deref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "buffer has no path"))?;
-        let mut writer = BufWriter::new(fs::File::create(path)?);
-        self.rope.write_to(&mut writer)?;
-        writer.flush()?;
+    /// Records that the current text is what the file now contains.
+    pub fn mark_saved(&mut self) {
         self.saved_at = Some(self.undo.len());
-        Ok(())
     }
 
     pub fn is_dirty(&self) -> bool {

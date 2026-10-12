@@ -114,6 +114,8 @@ impl Shared {
 pub struct LanguageServer {
     shared: Arc<Shared>,
     child: Mutex<Option<Child>>,
+    /// Ends a server process running elsewhere when dropped.
+    remote_process: Mutex<Option<Box<dyn Send>>>,
 }
 
 impl LanguageServer {
@@ -154,6 +156,7 @@ impl LanguageServer {
         let server = Self {
             shared,
             child: Mutex::new(None),
+            remote_process: Mutex::new(None),
         };
         (server, incoming_rx)
     }
@@ -186,6 +189,13 @@ impl LanguageServer {
         let (server, incoming) = Self::new(stdout, stdin, logger);
         *server.child.lock() = Some(child);
         Ok((server, incoming))
+    }
+
+    /// Ties the lifetime of a server process running elsewhere (e.g. behind
+    /// an agent) to this client: `guard` is dropped on shutdown or drop, and
+    /// dropping it must end the process.
+    pub fn own_remote_process(&self, guard: Box<dyn Send>) {
+        *self.remote_process.lock() = Some(guard);
     }
 
     /// Sends a request. Dropping the returned future before it resolves
@@ -232,6 +242,7 @@ impl LanguageServer {
         // Servers that ignore `shutdown` still get `exit`; a dead one is just reaped.
         self.request::<Shutdown>(()).await.ok();
         self.notify::<Exit>(());
+        self.remote_process.lock().take();
         if let Some(mut child) = self.child.lock().take() {
             thread::spawn(move || {
                 for _ in 0..20 {
