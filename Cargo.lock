@@ -3502,6 +3502,7 @@ dependencies = [
  "terminal",
  "text",
  "watcher",
+ "windows-sys 0.61.2",
  "worktree",
 ]
 

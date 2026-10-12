@@ -464,6 +464,13 @@ impl Project {
         git::Repository::discover(Arc::new(GitRunner(self.clone())), &root)
     }
 
+    /// The repository containing the project root with its status, read
+    /// concurrently. Blocks.
+    pub fn open_repository(&self) -> io::Result<Option<(git::Repository, git::Status)>> {
+        let root = self.0.root.to_string_lossy().into_owned();
+        git::Repository::open(Arc::new(GitRunner(self.clone())), &root)
+    }
+
     /// A root-relative repository path (`/`-separated) as a project path.
     /// Paths inside the project are built from the project root, so they
     /// match the editor's paths even where git spells the root differently

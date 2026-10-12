@@ -1,3 +1,7 @@
+// No console window for the editor; command-line output still works (see
+// `startup::attach_console`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod branch_picker;
 mod change_tree;
 mod compare_view;
@@ -19,6 +23,7 @@ mod recent;
 mod revision_picker;
 mod search_panel;
 mod settings;
+mod startup;
 mod terminal_panel;
 mod theme;
 mod workspace;
@@ -57,6 +62,16 @@ fn parse_args(args: &[OsString]) -> anyhow::Result<Location> {
 }
 
 fn main() -> anyhow::Result<()> {
+    startup::init();
+    let result = run();
+    if result.is_err() {
+        // Started from a shell: show the error there.
+        startup::attach_console();
+    }
+    result
+}
+
+fn run() -> anyhow::Result<()> {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let headless = args.first().is_some_and(|arg| arg == "--headless");
     if headless {
@@ -72,11 +87,17 @@ fn main() -> anyhow::Result<()> {
         wsl => wsl,
     };
     if headless {
+        startup::attach_console();
         headless::run(location);
         return Ok(());
     }
 
-    Application::new().run(move |cx: &mut App| {
+    // Connect to WSL or read git status while gpui sets up the platform.
+    let preload = workspace::Preload::start(&location);
+    let application = Application::new();
+    startup::mark("gpui platform");
+    application.run(move |cx: &mut App| {
+        startup::mark("gpui ready");
         editor::bind_keys(cx);
         workspace::bind_keys(cx);
         file_finder::bind_keys(cx);
@@ -89,7 +110,8 @@ fn main() -> anyhow::Result<()> {
             }
         })
         .detach();
-        workspace::open_project(location, cx);
+        workspace::open_preloaded(location, Some(preload), cx);
+        startup::mark("window opened");
         cx.activate(true);
     });
     Ok(())

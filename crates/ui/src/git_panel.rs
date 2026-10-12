@@ -19,6 +19,11 @@ use crate::{
 
 const ROW_HEIGHT: f32 = 24.;
 
+/// [`Project::open_repository`] started before the window (see
+/// `workspace::Preload`).
+pub type PreloadedRepository =
+    futures::channel::oneshot::Receiver<io::Result<Option<(Repository, Status)>>>;
+
 pub enum GitPanelEvent {
     OpenDiff {
         repository: Repository,
@@ -151,7 +156,11 @@ pub fn short_revision(revision: &str) -> &str {
 }
 
 impl GitPanel {
-    pub fn new(project: Project, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        project: Project,
+        preloaded: Option<PreloadedRepository>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let message = cx.new(Editor::single_line);
         let subscription = cx.subscribe(&message, |_, _, _: &editor::EditorEvent, cx| cx.notify());
         let mut panel = Self {
@@ -169,7 +178,10 @@ impl GitPanel {
             _operation: Task::ready(()),
             _subscription: subscription,
         };
-        panel.refresh(cx);
+        match preloaded {
+            Some(preloaded) => panel.show_preloaded(preloaded, cx),
+            None => panel.refresh(cx),
+        }
         panel
     }
 
@@ -193,30 +205,43 @@ impl GitPanel {
             _ => None,
         };
         self._refresh = cx.spawn(async move |this, cx| {
-            let state = cx
+            let opened = cx
                 .background_spawn(async move {
-                    let repository = match known {
-                        Some(repository) => repository,
-                        None => match project.repository() {
-                            Ok(Some(repository)) => repository,
-                            Ok(None) => return State::NoRepository,
-                            Err(err) => return State::Failed(err.to_string().into()),
-                        },
-                    };
-                    match repository.status() {
-                        Ok(status) => State::Ready { repository, status },
-                        Err(err) => State::Failed(err.to_string().into()),
+                    match known {
+                        Some(repository) => {
+                            repository.status().map(|status| Some((repository, status)))
+                        }
+                        None => project.open_repository(),
                     }
                 })
                 .await;
-            this.update(cx, |this, cx| {
-                this.state = state;
-                this.rebuild_rows();
-                cx.emit(GitPanelEvent::Refreshed);
-                cx.notify();
+            this.update(cx, |this, cx| this.show(opened, cx)).ok();
+        });
+    }
+
+    /// Shows a repository read before the panel existed (at startup); reads
+    /// it now if that read was abandoned.
+    fn show_preloaded(&mut self, preloaded: PreloadedRepository, cx: &mut Context<Self>) {
+        self._refresh = cx.spawn(async move |this, cx| {
+            let opened = preloaded.await;
+            this.update(cx, |this, cx| match opened {
+                Ok(opened) => this.show(opened, cx),
+                Err(_) => this.refresh(cx),
             })
             .ok();
         });
+    }
+
+    fn show(&mut self, opened: io::Result<Option<(Repository, Status)>>, cx: &mut Context<Self>) {
+        crate::startup::mark_once("git status shown");
+        self.state = match opened {
+            Ok(Some((repository, status))) => State::Ready { repository, status },
+            Ok(None) => State::NoRepository,
+            Err(err) => State::Failed(err.to_string().into()),
+        };
+        self.rebuild_rows();
+        cx.emit(GitPanelEvent::Refreshed);
+        cx.notify();
     }
 
     /// Shows the outcome of a git operation run elsewhere (a picker).

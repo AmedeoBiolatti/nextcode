@@ -36,6 +36,17 @@ cargo run --release -p next_code -- C:\dev\next_code
 
 Linux additionally needs the gpui system libraries (Wayland/X11, xkbcommon, fontconfig, Vulkan).
 
+On Windows the editor is a GUI-subsystem program: no console window opens
+with it. Started from a terminal, it returns to the prompt right away;
+argument errors and `--headless` output still print to that terminal (or to
+redirected streams), and closing the terminal does not close the editor.
+
+Set `NEXT_CODE_TRACE_STARTUP=1` to print startup milestones (time since the
+process was created) to stderr, e.g. from PowerShell:
+`$env:NEXT_CODE_TRACE_STARTUP=1; .\next_code.exe C:\dev\p 2> trace.txt`.
+The WSL connection (or, for local projects, git status) starts on a thread
+before the window, alongside gpui's platform setup.
+
 ## WSL projects
 
 Projects inside a WSL distro are opened by distro and Linux path; the editor

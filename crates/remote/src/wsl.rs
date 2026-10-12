@@ -8,10 +8,10 @@
 use std::{
     env,
     ffi::OsStr,
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::Arc,
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
@@ -30,6 +30,10 @@ const INSTALL_DIR: &str = ".local/share/next_code";
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// Stderr kept for error messages.
 const STDERR_TAIL: usize = 4096;
+/// Prefixes the launcher's report lines (see [`start`]).
+const LAUNCH_MARK: &str = "NEXT_CODE_LAUNCH";
+/// Text skipped while looking for the launcher's report is capped.
+const MAX_LAUNCH_NOISE: usize = 64 * 1024;
 
 /// A project opened inside a WSL distro.
 pub struct Connection {
@@ -186,25 +190,55 @@ fn install_name(binary: &[u8]) -> String {
     )
 }
 
+/// What the launcher found in the distro.
 #[derive(Debug, PartialEq, Eq)]
-struct Probe {
-    home: String,
-    arch: String,
-    installed: bool,
+enum Launch {
+    /// The agent is starting; its banner follows.
+    Started { home: String },
+    /// No agent of this build is installed (or it cannot run on `arch`).
+    Missing { home: String, arch: String },
 }
 
-fn parse_probe(output: &str) -> Option<Probe> {
-    let field = |name: &str| {
-        output
-            .lines()
-            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
-            .map(str::to_owned)
-    };
-    Some(Probe {
-        home: field("home")?,
-        arch: field("arch")?,
-        installed: field("installed")? == "yes",
-    })
+/// Reads the launcher's report, skipping login-script output. `Err` holds
+/// what was printed instead when the launcher ended without a report.
+fn read_launch(reader: &mut impl BufRead) -> io::Result<Result<Launch, String>> {
+    let (mut home, mut arch) = (None, None);
+    let mut noise = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(Err(noise));
+        }
+        let text = line.trim_end_matches(['\n', '\r']);
+        let report = text
+            .strip_prefix(LAUNCH_MARK)
+            .and_then(|rest| rest.strip_prefix(' '));
+        match report.map(|rest| rest.split_once(' ').unwrap_or((rest, ""))) {
+            Some(("home", value)) => home = Some(value.to_owned()),
+            Some(("arch", value)) => arch = Some(value.to_owned()),
+            Some(("start", _)) => {
+                return Ok(Ok(Launch::Started {
+                    home: home.unwrap_or_default(),
+                }));
+            }
+            Some(("missing", _)) => {
+                return Ok(Ok(Launch::Missing {
+                    home: home.unwrap_or_default(),
+                    arch: arch.unwrap_or_default(),
+                }));
+            }
+            _ => {
+                noise.push_str(&line);
+                if noise.len() > MAX_LAUNCH_NOISE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the WSL login shell printed too much output before starting the agent",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Expands `~` against the distro user's home; other paths must be absolute.
@@ -226,102 +260,39 @@ fn resolve_root(root: &str, home: &str) -> io::Result<String> {
     }
 }
 
-/// Installs (if needed) and starts the agent in `distro`, then opens `root`
-/// (an absolute Linux path, or one starting with `~`).
-pub fn connect(distro: &str, root: &str) -> io::Result<Connection> {
-    let installed = distros()?;
-    let Some(distro) = installed
-        .iter()
-        .find(|name| name.eq_ignore_ascii_case(distro))
-    else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            if installed.is_empty() {
-                format!("WSL distro '{distro}' is not installed, and no distros are.")
-            } else {
-                format!(
-                    "WSL distro '{distro}' is not installed. Installed distros: {}.",
-                    installed.join(", ")
-                )
-            },
-        ));
-    };
+/// A launcher run: `wsl.exe` with the agent starting behind it, or done
+/// after reporting that the agent is missing.
+struct Launcher {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    stderr_tail: Arc<Mutex<String>>,
+    report: Result<Launch, String>,
+}
 
-    let binary_path = agent_binary()?;
-    let binary = std::fs::read(&binary_path)
-        .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", binary_path.display())))?;
-    let name = install_name(&binary);
-
+/// Starts the installed agent `name` in one `wsl.exe` call (each costs a
+/// few hundred milliseconds): a login shell reports `$HOME` and the machine,
+/// then `exec`s the agent if it is installed and can run. A login shell
+/// gives the agent (and the language servers and shells it starts) the
+/// user's PATH from ~/.profile.
+fn start(distro: &str, name: &str) -> io::Result<Launcher> {
     let script = format!(
-        r#"printf 'home=%s\narch=%s\n' "$HOME" "$(uname -m)"
-if [ -x "$HOME/{INSTALL_DIR}/$1" ]; then echo installed=yes; else echo installed=no; fi"#
+        r#"a="$HOME/{INSTALL_DIR}/$1"
+m=$(uname -m)
+printf '{LAUNCH_MARK} home %s\n{LAUNCH_MARK} arch %s\n' "$HOME" "$m"
+if [ "$m" = x86_64 ] && [ -x "$a" ]; then echo '{LAUNCH_MARK} start'; exec "$a" serve; fi
+echo '{LAUNCH_MARK} missing'"#
     );
-    let output = run(
-        wsl([
-            "-d", distro, "--exec", "/bin/sh", "-c", &script, "sh", &name,
-        ]),
-        None,
-        &format!("Starting WSL distro '{distro}'"),
-    )?;
-    let probe = parse_probe(&output).ok_or_else(|| {
-        io::Error::other(format!(
-            "WSL distro '{distro}' gave an unexpected answer: {}",
-            output.trim()
-        ))
-    })?;
-    if probe.arch != "x86_64" {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "WSL distro '{distro}' runs on {}, but the agent is built for x86_64",
-                probe.arch
-            ),
-        ));
-    }
-    let root = resolve_root(root, &probe.home)?;
-
-    if !probe.installed {
-        // Write to a temporary name and rename, so a half-copied agent is
-        // never run; then remove other builds.
-        let script = format!(
-            r#"set -e
-d="$HOME/{INSTALL_DIR}"
-mkdir -p "$d"
-t="$d/.$1.$$"
-cat > "$t"
-chmod 755 "$t"
-mv -f "$t" "$d/$1"
-for f in "$d"/{AGENT_BINARY_NAME}-*; do [ "$f" = "$d/$1" ] || rm -f "$f"; done"#
-        );
-        run(
-            wsl([
-                "-d", distro, "--exec", "/bin/sh", "-c", &script, "sh", &name,
-            ]),
-            Some(&binary),
-            &format!("Installing the agent into WSL distro '{distro}'"),
-        )?;
-    }
-
-    // A login shell gives the agent (and the language servers and shells it
-    // starts) the user's PATH from ~/.profile.
-    let agent = format!("{}/{INSTALL_DIR}/{name}", probe.home.trim_end_matches('/'));
     let mut child = wsl([
-        "-d",
-        distro,
-        "--exec",
-        "/bin/sh",
-        "-lc",
-        r#"exec "$0" serve"#,
-        &agent,
+        "-d", distro, "--exec", "/bin/sh", "-lc", &script, "sh", name,
     ])
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .spawn()
     .map_err(|err| not_available(&err))?;
-
     let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
     let mut stderr = child.stderr.take().expect("piped stderr");
     let tail = Arc::new(Mutex::new(String::new()));
     let stderr_tail = tail.clone();
@@ -342,11 +313,115 @@ for f in "$d"/{AGENT_BINARY_NAME}-*; do [ "$f" = "$d/$1" ] || rm -f "$f"; done"#
             }
         })?;
 
+    // A cold distro start or a slow login script can hang; don't wait forever.
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("agent-launch".into())
+        .spawn(move || {
+            let report = read_launch(&mut stdout);
+            tx.send((stdout, report)).ok();
+        })?;
+    match rx.recv_timeout(START_TIMEOUT) {
+        Ok((stdout, report)) => Ok(Launcher {
+            child,
+            stdin,
+            stdout,
+            stderr_tail: tail,
+            report: report?,
+        }),
+        Err(_) => {
+            child.kill().ok();
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "WSL distro '{distro}' did not start within {} s",
+                    START_TIMEOUT.as_secs()
+                ),
+            ))
+        }
+    }
+}
+
+/// Why a launcher ended without a report: an unknown distro, or whatever
+/// `wsl.exe` and the shell printed.
+fn launch_failure(distro: &str, mut launcher: Launcher, output: String) -> io::Error {
+    let status = launcher.child.wait();
+    if let Ok(installed) = distros()
+        && !installed
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(distro))
+    {
+        return io::Error::new(
+            io::ErrorKind::NotFound,
+            if installed.is_empty() {
+                format!("WSL distro '{distro}' is not installed, and no distros are.")
+            } else {
+                format!(
+                    "WSL distro '{distro}' is not installed. Installed distros: {}.",
+                    installed.join(", ")
+                )
+            },
+        );
+    }
+    let stderr = decode_output(launcher.stderr_tail.lock().as_bytes());
+    let details = [stderr.trim(), decode_output(output.as_bytes()).trim()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let status = status.map_or_else(|err| err.to_string(), |status| status.to_string());
+    io::Error::other(format!(
+        "Starting WSL distro '{distro}' failed ({status}){}",
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!(": {details}")
+        }
+    ))
+}
+
+/// Installs (if needed) and starts the agent in `distro`, then opens `root`
+/// (an absolute Linux path, or one starting with `~`).
+pub fn connect(distro: &str, root: &str) -> io::Result<Connection> {
+    // Reject relative roots before paying for a launch.
+    resolve_root(root, "/")?;
+    let binary_path = agent_binary()?;
+    let binary = std::fs::read(&binary_path)
+        .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", binary_path.display())))?;
+    let name = install_name(&binary);
+
+    let mut launcher = start(distro, &name)?;
+    let home = match std::mem::replace(&mut launcher.report, Err(String::new())) {
+        Ok(Launch::Started { home }) => home,
+        Ok(Launch::Missing { arch, .. }) if arch != "x86_64" => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("WSL distro '{distro}' runs on {arch}, but the agent is built for x86_64"),
+            ));
+        }
+        Ok(Launch::Missing { .. }) => {
+            launcher.child.wait().ok();
+            install(distro, &name, &binary)?;
+            launcher = start(distro, &name)?;
+            match std::mem::replace(&mut launcher.report, Err(String::new())) {
+                Ok(Launch::Started { home }) => home,
+                Ok(Launch::Missing { .. }) => {
+                    return Err(io::Error::other(format!(
+                        "The agent installed into WSL distro '{distro}' does not start"
+                    )));
+                }
+                Err(output) => return Err(launch_failure(distro, launcher, output)),
+            }
+        }
+        Err(output) => return Err(launch_failure(distro, launcher, output)),
+    };
+    let root = resolve_root(root, &home)?;
+
     let transport = Transport {
-        reader: Box::new(stdout),
-        writer: Box::new(stdin),
-        child: Some(child),
-        stderr: Some(tail),
+        reader: Box::new(launcher.stdout),
+        writer: Box::new(launcher.stdin),
+        child: Some(launcher.child),
+        stderr: Some(launcher.stderr_tail),
     };
     let (client, info) = AgentClient::connect(
         transport,
@@ -362,6 +437,28 @@ for f in "$d"/{AGENT_BINARY_NAME}-*; do [ "$f" = "$d/$1" ] || rm -f "$f"; done"#
         _ => err,
     })?;
     Ok(Connection { client, info })
+}
+
+/// Copies the agent into the distro under `name`. It is written to a
+/// temporary name and renamed, so a half-copied agent is never run; other
+/// builds are removed.
+fn install(distro: &str, name: &str, binary: &[u8]) -> io::Result<()> {
+    let script = format!(
+        r#"set -e
+d="$HOME/{INSTALL_DIR}"
+mkdir -p "$d"
+t="$d/.$1.$$"
+cat > "$t"
+chmod 755 "$t"
+mv -f "$t" "$d/$1"
+for f in "$d"/{AGENT_BINARY_NAME}-*; do [ "$f" = "$d/$1" ] || rm -f "$f"; done"#
+    );
+    run(
+        wsl(["-d", distro, "--exec", "/bin/sh", "-c", &script, "sh", name]),
+        Some(binary),
+        &format!("Installing the agent into WSL distro '{distro}'"),
+    )
+    .map(drop)
 }
 
 #[cfg(test)]
@@ -385,17 +482,37 @@ mod tests {
     }
 
     #[test]
-    fn probe_answers_are_parsed_despite_login_noise() {
-        let output = "Welcome!\nhome=/home/me\narch=x86_64\ninstalled=no\n";
+    fn launch_reports_are_read_despite_login_noise() {
+        let mut output = io::Cursor::new(
+            "Welcome!\nNEXT_CODE_LAUNCH home /home/me two\nNEXT_CODE_LAUNCH arch x86_64\n\
+             NEXT_CODE_LAUNCH start\nNEXT_CODE_AGENT 3 0.1.0\n",
+        );
         assert_eq!(
-            parse_probe(output),
-            Some(Probe {
-                home: "/home/me".into(),
-                arch: "x86_64".into(),
-                installed: false,
+            read_launch(&mut output).unwrap(),
+            Ok(Launch::Started {
+                home: "/home/me two".into()
             })
         );
-        assert_eq!(parse_probe("home=/home/me\n"), None);
+        // The banner stays unread for the agent client.
+        let mut rest = String::new();
+        output.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "NEXT_CODE_AGENT 3 0.1.0\n");
+
+        let mut missing = io::Cursor::new(
+            "NEXT_CODE_LAUNCH home /root\nNEXT_CODE_LAUNCH arch aarch64\nNEXT_CODE_LAUNCH missing\n",
+        );
+        assert_eq!(
+            read_launch(&mut missing).unwrap(),
+            Ok(Launch::Missing {
+                home: "/root".into(),
+                arch: "aarch64".into()
+            })
+        );
+        let mut failed = io::Cursor::new("There is no distribution with the supplied name.\n");
+        assert_eq!(
+            read_launch(&mut failed).unwrap(),
+            Err("There is no distribution with the supplied name.\n".into())
+        );
     }
 
     #[test]

@@ -82,6 +82,14 @@ pub trait Runner: Send + Sync {
 /// Context lines around each change in diffs.
 pub const DIFF_CONTEXT: usize = 3;
 
+const STATUS_ARGS: [&str; 5] = [
+    "status",
+    "--porcelain=v2",
+    "--branch",
+    "-z",
+    "--untracked-files=all",
+];
+
 /// A repository, addressed by its top-level directory.
 #[derive(Clone)]
 pub struct Repository {
@@ -123,6 +131,43 @@ impl Repository {
         }))
     }
 
+    /// [`Repository::discover`] and [`Repository::status`] at once: both
+    /// git runs go concurrently, as porcelain status paths are relative to
+    /// the repository root wherever it runs.
+    pub fn open(runner: Arc<dyn Runner>, dir: &str) -> io::Result<Option<(Self, Status)>> {
+        let status_runner = runner.clone();
+        std::thread::scope(|scope| {
+            let status = scope.spawn(|| {
+                let mut args: Vec<String> = Self::common_args(dir);
+                args.extend(STATUS_ARGS.map(String::from));
+                status_runner.run_git(&args, None)
+            });
+            let Some(repository) = Self::discover(runner, dir)? else {
+                return Ok(None);
+            };
+            let output = status
+                .join()
+                .map_err(|_| io::Error::other("git status panicked"))??;
+            if output.code != Some(0) {
+                return Err(failure(STATUS_ARGS[0], &output));
+            }
+            Ok(Some((repository, status::parse(&output.stdout)?)))
+        })
+    }
+
+    /// Options for every command run in `dir`.
+    fn common_args(dir: &str) -> Vec<String> {
+        [
+            "-C",
+            dir,
+            "--no-optional-locks",
+            "-c",
+            "core.quotepath=false",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
     /// Top-level directory as git prints it (`/`-separated, also on Windows).
     pub fn root(&self) -> &str {
         &self.root
@@ -139,15 +184,7 @@ impl Repository {
     }
 
     fn git_with_input(&self, args: &[&str], input: Option<&[u8]>) -> io::Result<Output> {
-        let mut full: Vec<String> = [
-            "-C",
-            &self.root,
-            "--no-optional-locks",
-            "-c",
-            "core.quotepath=false",
-        ]
-        .map(String::from)
-        .to_vec();
+        let mut full = Self::common_args(&self.root);
         full.extend(args.iter().map(|&arg| arg.to_owned()));
         self.runner.run_git(&full, input)
     }
@@ -174,13 +211,7 @@ impl Repository {
     }
 
     pub fn status(&self) -> io::Result<Status> {
-        let output = self.checked(&[
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "-z",
-            "--untracked-files=all",
-        ])?;
+        let output = self.checked(&STATUS_ARGS)?;
         status::parse(&output.stdout)
     }
 
@@ -575,6 +606,22 @@ mod tests {
                 ("src/a.txt".into(), None, Some(Change::Untracked)),
             ]
         );
+        // Opening from the subdirectory reads the same root-relative status.
+        let (opened, status) =
+            Repository::open(Arc::new(LocalGit), dir.join("src").to_str().unwrap())
+                .unwrap()
+                .expect("a repository");
+        assert_eq!(opened.root(), repo.root());
+        assert_eq!(status, repo.status().unwrap());
+        let outside =
+            std::env::temp_dir().join(format!("next_code_git_none_{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        assert!(
+            Repository::open(Arc::new(LocalGit), outside.to_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_dir_all(&outside).unwrap();
 
         repo.stage(&["src/a.txt".into(), "b é.txt".into()]).unwrap();
         repo.unstage(&["b é.txt".into()]).unwrap();

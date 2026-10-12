@@ -22,12 +22,12 @@ use watcher::{Batch, ChangeKind};
 use crate::{
     branch_picker::{BranchPicker, BranchPickerEvent},
     compare_view::{CompareEvent, CompareView},
-    connecting::Connecting,
+    connecting::{Connecting, PreloadedConnection},
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     editor::{Editor, EditorEvent, ReloadOutcome},
     file_finder::{FileFinder, FileFinderEvent},
     file_tree::{FileTree, OpenFile},
-    git_panel::{GitPanel, GitPanelEvent},
+    git_panel::{GitPanel, GitPanelEvent, PreloadedRepository},
     history_view::{HistoryEvent, HistoryView},
     layout::{DockPosition, Layout},
     location_picker::{LocationPicker, LocationPickerEvent},
@@ -77,9 +77,44 @@ pub fn bind_keys(cx: &mut App) {
     docks::bind_keys(cx);
 }
 
+/// Work for the first window started before gpui (whose platform setup
+/// takes a few hundred milliseconds): connecting to WSL, or reading a local
+/// project's git status.
+pub enum Preload {
+    Local(PreloadedRepository),
+    Wsl(PreloadedConnection),
+}
+
+impl Preload {
+    /// Starts the work for `location` on a thread.
+    pub fn start(location: &project::Location) -> Self {
+        use futures::channel::oneshot;
+        match location {
+            project::Location::Local(root) => {
+                let (tx, rx) = oneshot::channel();
+                let project = Project::local(root.clone());
+                std::thread::spawn(move || tx.send(project.open_repository()).ok());
+                Self::Local(rx)
+            }
+            project::Location::Wsl { distro, path } => {
+                let (tx, rx) = oneshot::channel();
+                let (distro, path) = (distro.clone(), path.clone());
+                std::thread::spawn(move || tx.send(Project::connect_wsl(&distro, &path)).ok());
+                Self::Wsl(rx)
+            }
+        }
+    }
+}
+
 /// Opens `location` in a new window, or brings forward the window that
 /// already shows it. Each window is an independent workspace.
 pub fn open_project(location: project::Location, cx: &mut App) {
+    open_preloaded(location, None, cx);
+}
+
+/// [`open_project`] with work started by [`Preload::start`] for the same
+/// location.
+pub fn open_preloaded(location: project::Location, preload: Option<Preload>, cx: &mut App) {
     let location = match location {
         project::Location::Local(root) => {
             project::Location::Local(std::path::absolute(&root).unwrap_or(root))
@@ -115,17 +150,27 @@ pub fn open_project(location: project::Location, cx: &mut App) {
         }),
         ..Default::default()
     };
-    let opened = match location {
-        project::Location::Local(root) => cx
-            .open_window(options, |window, cx| {
-                cx.new(|cx| Workspace::new(Project::local(root), window, cx))
+    let opened = match (location, preload) {
+        (project::Location::Local(root), preload) => {
+            let git = match preload {
+                Some(Preload::Local(git)) => Some(git),
+                _ => None,
+            };
+            cx.open_window(options, |window, cx| {
+                cx.new(|cx| Workspace::new(Project::local(root), git, window, cx))
             })
-            .map(drop),
-        project::Location::Wsl { distro, path } => cx
-            .open_window(options, |window, cx| {
-                cx.new(|cx| Connecting::new(distro, path, window, cx))
+            .map(drop)
+        }
+        (project::Location::Wsl { distro, path }, preload) => {
+            let connection = match preload {
+                Some(Preload::Wsl(connection)) => Some(connection),
+                _ => None,
+            };
+            cx.open_window(options, |window, cx| {
+                cx.new(|cx| Connecting::new(distro, path, connection, window, cx))
             })
-            .map(drop),
+            .map(drop)
+        }
     };
     opened.expect("failed to open window");
 }
@@ -227,7 +272,14 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(project: Project, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        project: Project,
+        git_preload: Option<PreloadedRepository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        crate::startup::mark("workspace start");
+        window.on_next_frame(|_, _| crate::startup::mark("first frame"));
         let root = project.root().to_path_buf();
         let file_tree = cx.new(|_| FileTree::new(project.clone()));
         let tree_subscription = cx.subscribe_in(
@@ -246,7 +298,7 @@ impl Workspace {
         let problems = cx.new(|cx| ProblemsPanel::new(root.clone(), lsp_store.clone(), cx));
         let terminal = cx.new(|cx| TerminalPanel::new(project.clone(), cx));
         let search = cx.new(|cx| SearchPanel::new(project.clone(), cx));
-        let git = cx.new(|cx| GitPanel::new(project.clone(), cx));
+        let git = cx.new(|cx| GitPanel::new(project.clone(), git_preload, cx));
         let git_subscription =
             cx.subscribe_in(&git, window, |this, _, event, window, cx| match event {
                 GitPanelEvent::OpenDiff { repository, source } => {
@@ -336,6 +388,7 @@ impl Workspace {
             })
         });
         recent::record(&project.location());
+        crate::startup::mark("workspace built");
         Self {
             focus_handle,
             project,
@@ -1219,6 +1272,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::startup::mark_once("first workspace render");
         let main = match self.tabs.get(self.active) {
             Some(tab) => div().flex_1().min_h_0().child(tab.view()),
             None => div()
