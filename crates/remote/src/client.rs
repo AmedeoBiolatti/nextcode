@@ -519,14 +519,15 @@ impl AgentClient {
         Ok((server, incoming))
     }
 
-    /// Runs `program` in `cwd` on the agent's machine to completion,
-    /// killing it after `timeout`.
+    /// Runs `program` in `cwd` on the agent's machine to completion with
+    /// `input` on its stdin (then end of file), killing it after `timeout`.
     pub fn run(
         self: &Arc<Self>,
         program: &str,
         args: &[String],
         cwd: &str,
         env: &[(&str, &str)],
+        input: Option<&[u8]>,
         timeout: Duration,
     ) -> io::Result<RunOutput> {
         let (tx, rx) = std_mpsc::channel();
@@ -543,6 +544,10 @@ impl AgentClient {
         let handle = self.start_stream(request, move |event| {
             tx.send(event).ok();
         })?;
+        if let Some(input) = input {
+            handle.input(input.to_vec())?;
+        }
+        handle.close_input()?;
         let deadline = Instant::now() + timeout;
         let mut output = RunOutput::default();
         loop {
@@ -648,6 +653,10 @@ impl StreamHandle {
             .send(&ClientMessage::Resize { id: self.id, size })
     }
 
+    /// Ends the process's stdin.
+    pub fn close_input(&self) -> io::Result<()> {
+        self.client.send(&ClientMessage::CloseInput { id: self.id })
+    }
     pub fn cancel(&self) {
         self.client
             .send(&ClientMessage::Cancel { id: self.id })

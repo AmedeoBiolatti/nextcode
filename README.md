@@ -15,7 +15,7 @@ Native, AI-first IDE written in Rust on [gpui](https://crates.io/crates/gpui).
 | `crates/proto` | Versioned editor ↔ agent wire protocol (framing, requests, events) |
 | `crates/agent` | `next_code_agent`: headless Linux process serving files, watching, search, language servers and shells |
 | `crates/remote` | Agent client and the WSL bootstrap (install, start, version check) |
-| `crates/git` | Git through its CLI: porcelain v2 status, stage/unstage/discard/commit, line diffs |
+| `crates/git` | Git through its CLI: porcelain v2 status, stage/unstage/discard/commit, hunk patches, branches, worktrees, fetch/pull/push, history, diffs |
 | `crates/ui` | `next_code` binary: editor, docks, LSP, terminal, search, problems, git panel and diffs, fuzzy file finder (`Ctrl+P`) |
 
 ## Build and run
@@ -76,12 +76,33 @@ as a compact folder tree (single-folder chains like `src/editor` collapse
 into one row; folders fold) or as a flat list. Rows stage (`+`), unstage
 (`−`) or discard (`↺`, asks first; untracked files are deleted); clicking a
 row opens its diff in a tab, and clicking a diff line opens the file there.
-Enter in the message box commits what is staged. Git runs where the project
-lives (inside WSL for WSL projects), and the panel refreshes on file changes
-and on index/ref changes (commits or checkouts from a terminal).
+Enter in the message box commits what is staged; "Amend" rewrites the last
+commit instead (with what is staged, or just its message). Git runs where the
+project lives (inside WSL for WSL projects), and the panel refreshes on file
+changes and on index/ref changes (commits or checkouts from a terminal).
 
 Diffs show unified or side by side, and changed hunks only or the whole
-file; the last choice sticks for new diffs.
+file; the last choice sticks for new diffs. Diffs of changes in the index
+or working tree come from `git diff` itself and act per hunk: "Stage hunk"
+and "Discard" (asks first) on unstaged changes, "Unstage hunk" on staged
+ones.
+
+**Branches**: clicking the branch name opens the branch picker: switch to a
+branch, a remote branch (checks out a tracking branch) or a tag (detached),
+type a new name to create a branch from HEAD and switch to it, or `×` to
+delete a branch (asks; "Force Delete" for unmerged ones). In History,
+"Create branch here…" starts a branch at the selected commit.
+
+**Fetch / Pull / Push** sit under the branch name with the behind/ahead
+counts. Fetch is `--all --prune`, pull is fast-forward only (diverged
+branches are left to a terminal), and the first push of a branch sets its
+upstream on `origin` (or the only remote). Git never prompts: credentials
+come from your credential helper or SSH agent, and failures are shown.
+
+**Worktrees…** lists the repository's worktrees; choosing one opens it in
+its own window. Typing a branch name adds a worktree for it (creating the
+branch if needed) next to the repository as `<repository>-<branch>` and
+opens it; `×` removes one (asks; its branch is kept).
 
 **History** (panel toolbar) opens the commit graph of all branches (or the
 current one): lanes, branch/tag labels, author and age. Selecting a commit
@@ -119,9 +140,12 @@ cargo run --release -p next_code -- --headless --wsl Ubuntu ~/project
 Commands: `info`, `list_dir`, `list_files`, `read`, `write`, `stat`,
 `search`, `watch`/`unwatch`, `open`/`close` (language server documents),
 `diagnostics`, `definition`, `exec` (shell command in the project root, where
-the project lives), `git_status`, `git_diff`, `git_stage`, `git_unstage`,
-`git_discard`, `git_commit`, `git_log`, `git_refs`, `git_changes`,
-`git_commit_changes`, `shutdown`. Parameters and results are documented in
+the project lives), `git_status`, `git_diff`, `git_apply_hunk`, `git_stage`,
+`git_unstage`, `git_discard`, `git_commit`, `git_branch_create`,
+`git_switch`, `git_branch_delete`, `git_fetch`, `git_pull`, `git_push`,
+`git_worktrees`, `git_worktree_add`, `git_worktree_remove`, `git_log`,
+`git_refs`, `git_changes`, `git_commit_changes`, `shutdown`. Parameters and
+results are documented in
 `crates/ui/src/headless.rs`.
 
 ## Roadmap
@@ -131,6 +155,7 @@ the project lives), `git_status`, `git_diff`, `git_stage`, `git_unstage`,
 - **M2** host agent protocol, WSL projects — *done*
 - **M3** git panel and diff view, multiple workspaces — *done*
 - **M4** git review: commit graph, compare with branches/commits, compact change trees, side-by-side and whole-file diffs — *done*
-- **M5** AI inline completion, chat, agent
-- **M6** devcontainers, debugger (DAP)
-- **M7** WASM extension API
+- **M5** git operations: branches, worktrees (one window each), fetch/pull/push, amend, hunk staging — *done*
+- **M6** AI inline completion, chat, agent
+- **M7** devcontainers, debugger (DAP)
+- **M8** WASM extension API

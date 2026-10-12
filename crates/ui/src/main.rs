@@ -1,3 +1,4 @@
+mod branch_picker;
 mod change_tree;
 mod compare_view;
 mod connecting;
@@ -21,6 +22,7 @@ mod settings;
 mod terminal_panel;
 mod theme;
 mod workspace;
+mod worktree_picker;
 
 use std::ffi::OsString;
 #[cfg(test)]

@@ -34,7 +34,7 @@ pub use watcher::Batch;
 pub use worktree::{DirEntry, FileKind};
 
 /// Bumped on every incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 pub const BANNER_PREFIX: &str = "NEXT_CODE_AGENT";
 
@@ -89,6 +89,10 @@ pub enum ClientMessage {
     Resize {
         id: RequestId,
         size: PtySize,
+    },
+    /// Closes a spawned process's stdin (end of input); it keeps running.
+    CloseInput {
+        id: RequestId,
     },
 }
 

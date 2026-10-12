@@ -390,6 +390,26 @@ mod processes {
     }
 
     #[test]
+    fn runs_read_their_input_to_end_of_file() {
+        let root = temp_dir("run_input");
+        let (client, _, _agent) = connect(&root);
+        // `wc -l` only answers once stdin is closed.
+        let output = client
+            .run(
+                "/bin/sh",
+                &["-c".into(), "wc -l".into()],
+                path_str(&root),
+                &[],
+                Some(b"a\nb\nc\n"),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(output.code, Some(0));
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "3");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn language_server_traffic_crosses_the_agent_both_ways() {
         use lsp::{Incoming, types::request::Shutdown};
 

@@ -258,6 +258,94 @@ fn headless_mode_stages_diffs_and_commits_with_git() {
     let clean = headless.call(json!({ "cmd": "git_status" }));
     assert_eq!(clean["result"]["entries"], json!([]), "{clean}");
 
+    // Hunks: stage one of two edits, then discard the other.
+    let lines: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+    fs::write(root.join("b.txt"), &lines).unwrap();
+    git(&["add", "b.txt"]);
+    git(&["commit", "-q", "-m", "add b"]);
+    fs::write(
+        root.join("b.txt"),
+        lines
+            .replace("line 2\n", "line two\n")
+            .replace("line 19\n", "line nineteen\n"),
+    )
+    .unwrap();
+    let hunks = |diff: &Value| -> Vec<Value> {
+        diff["result"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row.get("hunk").cloned())
+            .collect()
+    };
+    let diff = headless.call(json!({ "cmd": "git_diff", "path": "b.txt" }));
+    assert_eq!(hunks(&diff).len(), 2, "{diff}");
+    let staged = headless.call(json!({
+        "cmd": "git_apply_hunk", "path": "b.txt", "hunk": 1, "action": "stage",
+    }));
+    assert_eq!(staged["ok"], true, "{staged}");
+    let diff = headless.call(json!({ "cmd": "git_diff", "path": "b.txt", "staged": true }));
+    let staged_hunks = hunks(&diff);
+    assert_eq!(staged_hunks.len(), 1, "{diff}");
+    let header = staged_hunks[0]["header"].as_str().unwrap();
+    assert!(header.starts_with("@@ -16"), "{header}");
+    let discarded = headless.call(json!({
+        "cmd": "git_apply_hunk", "path": "b.txt", "hunk": 0, "action": "discard",
+    }));
+    assert_eq!(discarded["ok"], true, "{discarded}");
+    assert_eq!(
+        fs::read_to_string(root.join("b.txt")).unwrap(),
+        lines.replace("line 19\n", "line nineteen\n")
+    );
+    let amend = headless.call(json!({
+        "cmd": "git_commit", "message": "add b, edited", "amend": true,
+    }));
+    assert!(
+        amend["result"]["summary"]
+            .as_str()
+            .unwrap()
+            .ends_with(" add b, edited"),
+        "{amend}"
+    );
+    let log = headless.call(json!({ "cmd": "git_log", "limit": 10 }));
+    assert_eq!(
+        log["result"]["commits"].as_array().unwrap().len(),
+        3,
+        "{log}"
+    );
+
+    // Branches: create and switch, switch back, delete.
+    let created = headless.call(json!({ "cmd": "git_branch_create", "name": "topic" }));
+    assert_eq!(created["ok"], true, "{created}");
+    let status = headless.call(json!({ "cmd": "git_status" }));
+    assert_eq!(status["result"]["branch"], "topic");
+    let back = headless.call(json!({ "cmd": "git_switch", "name": "main" }));
+    assert_eq!(back["ok"], true, "{back}");
+    let deleted = headless.call(json!({ "cmd": "git_branch_delete", "name": "topic" }));
+    assert_eq!(deleted["ok"], true, "{deleted}");
+    let bad = headless.call(json!({ "cmd": "git_branch_create", "name": "a..b" }));
+    assert_eq!(bad["ok"], false, "{bad}");
+
+    // Worktrees: add one next to the repository, list, remove.
+    let added = headless.call(json!({
+        "cmd": "git_worktree_add", "name": "side", "create": true,
+    }));
+    let path = added["result"]["path"]
+        .as_str()
+        .expect("worktree path")
+        .to_owned();
+    let worktrees = headless.call(json!({ "cmd": "git_worktrees" }));
+    let worktrees = worktrees["result"].as_array().unwrap();
+    assert_eq!(worktrees.len(), 2);
+    assert_eq!(worktrees[0]["current"], true);
+    assert_eq!(worktrees[1]["branch"], "side");
+    let removed = headless.call(json!({ "cmd": "git_worktree_remove", "path": path }));
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert!(!std::path::Path::new(&path).exists());
+    // No remote: pushing fails with git's message rather than prompting.
+    let push = headless.call(json!({ "cmd": "git_push" }));
+    assert_eq!(push["ok"], false, "{push}");
+
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
     assert!(headless.child.wait().unwrap().success());
     fs::remove_dir_all(&root).unwrap();

@@ -19,6 +19,8 @@ pub(crate) const GRACE: Duration = Duration::from_secs(2);
 
 pub(crate) trait Process: Send + Sync {
     fn write(&self, data: Vec<u8>);
+    /// Ends the input: a piped process then reads end of file.
+    fn close_input(&self);
     fn resize(&self, size: PtySize);
     /// Asks the process to end (closes its input), killing it after [`GRACE`].
     fn terminate(&self);
@@ -143,6 +145,10 @@ impl Process for Piped {
         if let Some(input) = &*self.input.lock() {
             input.send(data).ok();
         }
+    }
+
+    fn close_input(&self) {
+        self.input.lock().take();
     }
 
     fn resize(&self, _: PtySize) {}

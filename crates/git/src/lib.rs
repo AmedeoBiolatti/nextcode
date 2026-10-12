@@ -1,11 +1,14 @@
-//! Git through its command line: status, staging, commits, history,
-//! comparisons between revisions, and file diffs.
+//! Git through its command line: status, staging (whole files or hunks),
+//! commits, branches, remotes, worktrees, history, comparisons between
+//! revisions, and file diffs.
 //!
 //! Commands go through a [`Runner`], so the same code drives `git` on this
 //! machine or inside WSL behind the agent.
 
 mod diff;
 mod history;
+mod operations;
+mod patch;
 mod status;
 
 use std::{io, sync::Arc};
@@ -14,6 +17,8 @@ use serde::Serialize;
 
 pub use diff::{FULL_FILE, FileDiff, LineKind, Row, SideLine, SplitRow, diff, side_by_side};
 pub use history::{Commit, GraphRow, graph};
+pub use operations::Worktree;
+pub use patch::{Hunk, HunkAction, Patch, parse_patch};
 pub use status::{Change, Entry, Status};
 
 /// A file that differs between two revisions.
@@ -66,11 +71,12 @@ pub struct Output {
     pub stderr: Vec<u8>,
 }
 
-/// Runs `git` with arguments where the repository lives. Implementations
-/// must not let git prompt (set `GIT_TERMINAL_PROMPT=0`); an `io::Error`
-/// means git could not be run at all (`NotFound`: not installed).
+/// Runs `git` with arguments (and optional stdin) where the repository
+/// lives. Implementations must not let git prompt (set
+/// `GIT_TERMINAL_PROMPT=0`); an `io::Error` means git could not be run at
+/// all (`NotFound`: not installed).
 pub trait Runner: Send + Sync {
-    fn run_git(&self, args: &[String]) -> io::Result<Output>;
+    fn run_git(&self, args: &[String], input: Option<&[u8]>) -> io::Result<Output>;
 }
 
 /// Context lines around each change in diffs.
@@ -88,7 +94,7 @@ impl Repository {
     /// The repository containing `dir`, or `None` outside any repository.
     pub fn discover(runner: Arc<dyn Runner>, dir: &str) -> io::Result<Option<Self>> {
         let args = ["-C", dir, "rev-parse", "--show-toplevel", "--show-prefix"].map(String::from);
-        let output = runner.run_git(&args).map_err(|err| {
+        let output = runner.run_git(&args, None).map_err(|err| {
             if err.kind() == io::ErrorKind::NotFound {
                 io::Error::new(
                     err.kind(),
@@ -129,6 +135,10 @@ impl Repository {
     }
 
     fn git(&self, args: &[&str]) -> io::Result<Output> {
+        self.git_with_input(args, None)
+    }
+
+    fn git_with_input(&self, args: &[&str], input: Option<&[u8]>) -> io::Result<Output> {
         let mut full: Vec<String> = [
             "-C",
             &self.root,
@@ -139,12 +149,16 @@ impl Repository {
         .map(String::from)
         .to_vec();
         full.extend(args.iter().map(|&arg| arg.to_owned()));
-        self.runner.run_git(&full)
+        self.runner.run_git(&full, input)
     }
 
     /// Runs a command that must succeed.
     fn checked(&self, args: &[&str]) -> io::Result<Output> {
-        let output = self.git(args)?;
+        self.checked_with_input(args, None)
+    }
+
+    fn checked_with_input(&self, args: &[&str], input: Option<&[u8]>) -> io::Result<Output> {
+        let output = self.git_with_input(args, input)?;
         if output.code == Some(0) {
             Ok(output)
         } else {
@@ -218,15 +232,20 @@ impl Repository {
         Ok(())
     }
 
-    /// Commits what is staged; returns the new commit's `<hash> <subject>`.
-    pub fn commit(&self, message: &str) -> io::Result<String> {
+    /// Commits what is staged (or, with `amend`, replaces the last commit
+    /// with it); returns the new commit's `<hash> <subject>`.
+    pub fn commit(&self, message: &str, amend: bool) -> io::Result<String> {
         if message.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the commit message is empty",
             ));
         }
-        self.checked(&["commit", "-q", "-m", message])?;
+        let mut args = vec!["commit", "-q", "-m", message];
+        if amend {
+            args.push("--amend");
+        }
+        self.checked(&args)?;
         let output = self.checked(&["log", "-1", "--format=%h %s"])?;
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
@@ -483,11 +502,21 @@ mod tests {
     struct LocalGit;
 
     impl Runner for LocalGit {
-        fn run_git(&self, args: &[String]) -> io::Result<Output> {
-            let output = Command::new("git")
+        fn run_git(&self, args: &[String], input: Option<&[u8]>) -> io::Result<Output> {
+            use std::{io::Write, process::Stdio};
+            let mut child = Command::new("git")
                 .args(args)
                 .env("GIT_TERMINAL_PROMPT", "0")
-                .output()?;
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            if let Some(input) = input {
+                stdin.write_all(input)?;
+            }
+            drop(stdin);
+            let output = child.wait_with_output()?;
             Ok(Output {
                 code: output.status.code(),
                 stdout: output.stdout,
@@ -553,7 +582,7 @@ mod tests {
             state(&repo)[1],
             ("src/a.txt".into(), Some(Change::Added), None)
         );
-        let summary = repo.commit("first commit").unwrap();
+        let summary = repo.commit("first commit", false).unwrap();
         assert!(summary.ends_with(" first commit"), "{summary}");
         let status = repo.status().unwrap();
         assert!(!status.unborn);
@@ -583,7 +612,7 @@ mod tests {
         );
         assert!(!dir.join("b é.txt").exists(), "untracked files are removed");
 
-        let err = repo.commit("nothing staged").unwrap_err();
+        let err = repo.commit("nothing staged", false).unwrap_err();
         assert!(err.to_string().contains("git commit failed"), "{err}");
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -603,7 +632,7 @@ mod tests {
         assert_eq!(repo.log(10, true).unwrap(), [], "no commits yet");
         let commit = |message: &str| {
             repo.stage(&[".".into()]).unwrap();
-            repo.commit(message).unwrap();
+            repo.commit(message, false).unwrap();
         };
         fs::write(dir.join("old.txt"), "same\n").unwrap();
         fs::write(dir.join("keep.txt"), "v1\n").unwrap();
@@ -713,5 +742,132 @@ mod tests {
             }]
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hunks_are_staged_unstaged_and_discarded_individually() {
+        let (dir, repo) = temp_repo("hunks");
+        let file = dir.join("f.txt");
+        let original: String = (1..=20).map(|n| format!("line {n}\r\n")).collect();
+        fs::write(&file, &original).unwrap();
+        repo.stage(&["f.txt".into()]).unwrap();
+        repo.commit("base", false).unwrap();
+        // Two separate edits, far apart: two hunks. CRLF must survive.
+        let edited = original
+            .replace("line 2\r\n", "line two\r\n")
+            .replace("line 18\r\n", "line eighteen\r\n");
+        fs::write(&file, &edited).unwrap();
+        let entry = repo.status().unwrap().entries[0].clone();
+
+        let unstaged = repo
+            .index_patch(&entry, false, DIFF_CONTEXT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unstaged.hunks.len(), 2);
+        let rows = unstaged.to_file_diff();
+        assert_eq!((rows.added, rows.removed), (2, 2));
+        repo.apply_hunk(&unstaged, 1, HunkAction::Stage).unwrap();
+        let entry = repo.status().unwrap().entries[0].clone();
+        assert_eq!(
+            (entry.staged, entry.unstaged),
+            (Some(Change::Modified), Some(Change::Modified))
+        );
+        let staged = repo
+            .index_patch(&entry, true, DIFF_CONTEXT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.hunks.len(), 1);
+        assert!(
+            staged.hunks[0].header.starts_with("@@ -15"),
+            "{}",
+            staged.hunks[0].header
+        );
+
+        // Unstage it again, then discard the first edit from the worktree.
+        repo.apply_hunk(&staged, 0, HunkAction::Unstage).unwrap();
+        let unstaged = repo
+            .index_patch(&entry, false, DIFF_CONTEXT)
+            .unwrap()
+            .unwrap();
+        repo.apply_hunk(&unstaged, 0, HunkAction::Discard).unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            original.replace("line 18\r\n", "line eighteen\r\n")
+        );
+        let entry = repo.status().unwrap().entries[0].clone();
+        assert_eq!(entry.staged, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn branches_remotes_and_worktrees_round_trip() {
+        let (dir, repo) = temp_repo("branches");
+        fs::write(dir.join("a.txt"), "a\n").unwrap();
+        repo.stage(&["a.txt".into()]).unwrap();
+        repo.commit("first", false).unwrap();
+
+        // Branches: create from HEAD, switch, amend, delete.
+        repo.create_branch("feature/x", None, true).unwrap();
+        assert_eq!(repo.status().unwrap().branch.as_deref(), Some("feature/x"));
+        assert_eq!(
+            repo.create_branch("bad name", None, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let summary = repo.commit("first, reworded", true).unwrap();
+        assert!(summary.ends_with("first, reworded"), "{summary}");
+        let main = repo
+            .refs()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "main")
+            .unwrap();
+        repo.switch_branch(&main).unwrap();
+        assert!(
+            repo.delete_branch("feature/x", false).is_err(),
+            "unmerged amend"
+        );
+        repo.delete_branch("feature/x", true).unwrap();
+
+        // A bare remote: first push sets the upstream, then fetch/pull.
+        // Built from git's own root path: `canonicalize` gives `\\?\` paths
+        // on Windows, which git cannot use.
+        let remote = PathBuf::from(format!("{}.remote.git", repo.root()));
+        fs::remove_dir_all(&remote).ok();
+        let git = |args: &[&str]| repo.git(args).unwrap();
+        assert!(repo.push(&repo.status().unwrap()).is_err(), "no remote yet");
+        let bare = Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        assert!(bare.success());
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        repo.push(&repo.status().unwrap()).unwrap();
+        let status = repo.status().unwrap();
+        assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+        repo.fetch().unwrap();
+        repo.pull().unwrap();
+        assert!(
+            repo.refs()
+                .unwrap()
+                .iter()
+                .any(|r| r.kind == RefKind::Remote && r.name == "origin/main")
+        );
+
+        // A worktree on a new branch next to the repository.
+        let path = repo.default_worktree_path("wt/one");
+        assert!(path.ends_with("-wt-one"), "{path}");
+        repo.add_worktree(&path, "wt-one", true, None).unwrap();
+        let worktrees = repo.worktrees().unwrap();
+        assert_eq!(worktrees.len(), 2);
+        assert!(worktrees[0].current);
+        assert_eq!(worktrees[1].branch.as_deref(), Some("wt-one"));
+        repo.remove_worktree(&path, false).unwrap();
+        assert_eq!(repo.worktrees().unwrap().len(), 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&remote).unwrap();
     }
 }

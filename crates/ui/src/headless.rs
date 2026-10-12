@@ -26,8 +26,16 @@
 //! | `exec` | `command`, `timeout_ms`? | `{code, stdout, stderr}`; runs in the project root where it lives |
 //! | `git_status` | | `{root, prefix, branch, unborn, upstream, ahead, behind, entries: [{path, orig_path, staged, unstaged}]}` |
 //! | `git_stage` / `git_unstage` / `git_discard` | `paths` (repository-relative) | `null`; discarding deletes untracked files |
-//! | `git_commit` | `message` | `{summary}` (`<hash> <subject>`) |
-//! | `git_diff` | `path` (repository-relative); `staged`?, or `old` (revision) and `new`? (revision or `"worktree"`, the default); `whole_file`? | `{rows, added, removed, binary}` |
+//! | `git_commit` | `message`, `amend`? | `{summary}` (`<hash> <subject>`) |
+//! | `git_diff` | `path` (repository-relative); `staged`?, or `old` (revision) and `new`? (revision or `"worktree"`, the default); `whole_file`? | `{rows, added, removed, binary}`; index diffs come from `git diff` and include `hunk` rows `{index, header}` |
+//! | `git_apply_hunk` | `path`, `hunk` (index from `git_diff`), `action` (`"stage"` \| `"unstage"` \| `"discard"`), `staged`?, `whole_file`? (as for the `git_diff` that numbered the hunk) | `null` |
+//! | `git_branch_create` | `name`, `start`? (revision; HEAD), `switch`? (true) | `null` |
+//! | `git_switch` | `name` (branch, remote branch: tracked locally, or tag: detached) | `null` |
+//! | `git_branch_delete` | `name`, `force`? | `null` |
+//! | `git_fetch` / `git_pull` / `git_push` | | `null`; fetch is `--all --prune`, pull is fast-forward only, a first push sets the upstream |
+//! | `git_worktrees` | | `[{path, head, branch, current, bare, locked, prunable}]` |
+//! | `git_worktree_add` | `name` (branch), `create`? (new branch), `start`?, `path`? (default: `<repository>-<branch>` next to it) | `{path}` |
+//! | `git_worktree_remove` | `path`, `force`? | `null` |
 //! | `git_log` | `limit`? (200), `all`? (true: every branch) | `{commits, graph}`: graph rows give each commit's lane and edges |
 //! | `git_refs` | | `[{name, kind, target, head}]` |
 //! | `git_changes` | `base` (revision), `target`? (revision or `"worktree"`) | `[{path, orig_path, change}]` |
@@ -451,6 +459,14 @@ impl Session {
         let commit = request["commit"].as_str().map(str::to_owned);
         let limit = request["limit"].as_u64().unwrap_or(200) as usize;
         let all = request["all"].as_bool().unwrap_or(true);
+        let amend = request["amend"].as_bool().unwrap_or(false);
+        let force = request["force"].as_bool().unwrap_or(false);
+        let name = request["name"].as_str().map(str::to_owned);
+        let start = request["start"].as_str().map(str::to_owned);
+        let switch = request["switch"].as_bool().unwrap_or(true);
+        let create = request["create"].as_bool().unwrap_or(false);
+        let hunk = request["hunk"].as_u64().map(|hunk| hunk as usize);
+        let action = request["action"].as_str().map(str::to_owned);
         let command = command.to_owned();
         self.blocking(id, cx, move |project| {
             let repository = project.repository()?.ok_or_else(|| {
@@ -464,6 +480,16 @@ impl Session {
                     io::ErrorKind::InvalidInput,
                     format!("missing parameter `{name}`"),
                 )
+            };
+            let changed_entry = |path: &str| {
+                repository
+                    .status()?
+                    .entries
+                    .into_iter()
+                    .find(|entry| entry.path == path)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, format!("{path} has no changes"))
+                    })
             };
             match command.as_str() {
                 "git_status" => {
@@ -483,24 +509,14 @@ impl Session {
                         .collect();
                     repository.discard(&entries).map(|()| Value::Null)
                 }
-                "git_commit" => Ok(json!({ "summary": repository.commit(&message)? })),
+                "git_commit" => Ok(json!({ "summary": repository.commit(&message, amend)? })),
                 "git_diff" => {
                     let path = path.ok_or_else(|| missing("path"))?;
                     let source = match (old, new) {
-                        (None, None) => {
-                            let entry = repository
-                                .status()?
-                                .entries
-                                .into_iter()
-                                .find(|entry| entry.path == path)
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::NotFound,
-                                        format!("{path} has no changes"),
-                                    )
-                                })?;
-                            DiffSource::Index { entry, staged }
-                        }
+                        (None, None) => DiffSource::Index {
+                            entry: changed_entry(&path)?,
+                            staged,
+                        },
                         (old, new) => {
                             let old = old.ok_or_else(|| missing("old"))?;
                             let new = new.unwrap_or(git::Side::Worktree);
@@ -523,7 +539,70 @@ impl Session {
                             DiffSource::Revisions { old, new, change }
                         }
                     };
-                    Ok(json!(source.compute(project, &repository, context)?))
+                    Ok(json!(source.compute(project, &repository, context)?.0))
+                }
+                "git_apply_hunk" => {
+                    let path = path.ok_or_else(|| missing("path"))?;
+                    let hunk = hunk.ok_or_else(|| missing("hunk"))?;
+                    let action = match action.as_deref() {
+                        Some("stage") => git::HunkAction::Stage,
+                        Some("unstage") => git::HunkAction::Unstage,
+                        Some("discard") => git::HunkAction::Discard,
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "`action` must be \"stage\", \"unstage\" or \"discard\"",
+                            ));
+                        }
+                    };
+                    let entry = changed_entry(&path)?;
+                    let patch = repository
+                        .index_patch(&entry, staged, context)?
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("{path} has no textual hunks on that side"),
+                            )
+                        })?;
+                    repository.apply_hunk(&patch, hunk, action)?;
+                    Ok(Value::Null)
+                }
+                "git_branch_create" => {
+                    let name = name.ok_or_else(|| missing("name"))?;
+                    repository.create_branch(&name, start.as_deref(), switch)?;
+                    Ok(Value::Null)
+                }
+                "git_switch" => {
+                    let name = name.ok_or_else(|| missing("name"))?;
+                    let mut refs = repository.refs()?;
+                    refs.retain(|r| r.name == name);
+                    // A local branch wins over a remote branch or tag of that name.
+                    refs.sort_by_key(|r| r.kind as u8);
+                    let target = refs.into_iter().next().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, format!("no branch or tag {name}"))
+                    })?;
+                    repository.switch_branch(&target)?;
+                    Ok(Value::Null)
+                }
+                "git_branch_delete" => {
+                    let name = name.ok_or_else(|| missing("name"))?;
+                    repository.delete_branch(&name, force)?;
+                    Ok(Value::Null)
+                }
+                "git_fetch" => repository.fetch().map(|()| Value::Null),
+                "git_pull" => repository.pull().map(|()| Value::Null),
+                "git_push" => repository.push(&repository.status()?).map(|()| Value::Null),
+                "git_worktrees" => Ok(json!(repository.worktrees()?)),
+                "git_worktree_add" => {
+                    let branch = name.ok_or_else(|| missing("name"))?;
+                    let path = path.unwrap_or_else(|| repository.default_worktree_path(&branch));
+                    repository.add_worktree(&path, &branch, create, start.as_deref())?;
+                    Ok(json!({ "path": path }))
+                }
+                "git_worktree_remove" => {
+                    let path = path.ok_or_else(|| missing("path"))?;
+                    repository.remove_worktree(&path, force)?;
+                    Ok(Value::Null)
                 }
                 "git_log" => {
                     let commits = repository.log(limit, all)?;

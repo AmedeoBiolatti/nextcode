@@ -227,6 +227,11 @@ impl Agent {
                     process.resize(size);
                 }
             }
+            ClientMessage::CloseInput { id } => {
+                if let Some(process) = self.process(id) {
+                    process.close_input();
+                }
+            }
         }
     }
 

@@ -5,12 +5,12 @@
 use std::{ops::Range, path::PathBuf};
 
 use git::{
-    DIFF_CONTEXT, Entry, FULL_FILE, FileChange, FileDiff, LineKind, Repository, Row, Side,
-    SideLine, SplitRow,
+    DIFF_CONTEXT, Entry, FULL_FILE, FileChange, FileDiff, HunkAction, LineKind, Patch, Repository,
+    Row, Side, SideLine, SplitRow,
 };
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, Global, SharedString, Task, Window, div,
-    prelude::*, px, rgb, uniform_list,
+    App, Context, EventEmitter, FocusHandle, Focusable, Global, PromptLevel, SharedString, Task,
+    Window, div, prelude::*, px, rgb, uniform_list,
 };
 
 use crate::{git_panel::short_revision, project::Project, theme};
@@ -63,21 +63,30 @@ impl DiffSource {
     }
 
     /// Computes the diff with `context` lines, reading the working tree
-    /// where the project lives. Blocks.
+    /// where the project lives. Index diffs come from `git diff` itself, with
+    /// the patch kept for hunk actions; other files (untracked, binary) and
+    /// revision comparisons are diffed here. Blocks.
     pub fn compute(
         &self,
         project: &Project,
         repository: &Repository,
         context: usize,
-    ) -> std::io::Result<FileDiff> {
+    ) -> std::io::Result<(FileDiff, Option<Patch>)> {
         let worktree = || project.worktree_file(repository, self.path());
         match self {
             Self::Index { entry, staged } => {
-                repository.file_diff(entry, *staged, context, worktree)
+                if let Some(patch) = repository.index_patch(entry, *staged, context)? {
+                    return Ok((patch.to_file_diff(), Some(patch)));
+                }
+                Ok((
+                    repository.file_diff(entry, *staged, context, worktree)?,
+                    None,
+                ))
             }
-            Self::Revisions { old, new, change } => {
-                repository.revision_diff(old, new, change, context, worktree)
-            }
+            Self::Revisions { old, new, change } => Ok((
+                repository.revision_diff(old, new, change, context, worktree)?,
+                None,
+            )),
         }
     }
 }
@@ -94,6 +103,8 @@ impl Global for DiffOptions {}
 pub enum DiffViewEvent {
     /// Open the file at a 0-based line (from clicking a line).
     OpenFile { path: PathBuf, line: usize },
+    /// A hunk was staged, unstaged or discarded.
+    RepositoryChanged,
 }
 
 impl EventEmitter<DiffViewEvent> for DiffView {}
@@ -105,10 +116,13 @@ pub struct DiffView {
     path: PathBuf,
     options: DiffOptions,
     diff: Option<FileDiff>,
+    /// The `git diff` behind an index diff, for hunk actions.
+    patch: Option<Patch>,
     split: Vec<SplitRow>,
     error: Option<SharedString>,
     focus_handle: FocusHandle,
     _load: Task<()>,
+    _apply: Task<()>,
 }
 
 impl DiffView {
@@ -127,10 +141,12 @@ impl DiffView {
             path,
             options,
             diff: None,
+            patch: None,
             split: Vec::new(),
             error: None,
             focus_handle: cx.focus_handle(),
             _load: Task::ready(()),
+            _apply: Task::ready(()),
         };
         view.reload(cx);
         view
@@ -169,9 +185,10 @@ impl DiffView {
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(diff) => {
+                    Ok((diff, patch)) => {
                         this.split = git::side_by_side(&diff.rows);
                         this.diff = Some(diff);
+                        this.patch = patch;
                         this.error = None;
                     }
                     Err(err) => this.error = Some(err.to_string().into()),
@@ -180,6 +197,96 @@ impl DiffView {
             })
             .ok();
         });
+    }
+
+    /// The hunk actions this diff offers.
+    fn hunk_actions(&self) -> &'static [(HunkAction, &'static str)] {
+        match (&self.source, &self.patch) {
+            (DiffSource::Index { staged: false, .. }, Some(_)) => &[
+                (HunkAction::Discard, "Discard"),
+                (HunkAction::Stage, "Stage hunk"),
+            ],
+            (DiffSource::Index { staged: true, .. }, Some(_)) => {
+                &[(HunkAction::Unstage, "Unstage hunk")]
+            }
+            _ => &[],
+        }
+    }
+
+    fn apply_hunk(
+        &mut self,
+        hunk: usize,
+        action: HunkAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(patch) = self.patch.clone() else {
+            return;
+        };
+        let confirm = (action == HunkAction::Discard).then(|| {
+            window.prompt(
+                PromptLevel::Warning,
+                "Discard this change?",
+                Some("The working tree loses it. This cannot be undone."),
+                &["Discard", "Cancel"],
+                cx,
+            )
+        });
+        let repository = self.repository.clone();
+        self._apply = cx.spawn(async move |this, cx| {
+            if let Some(confirm) = confirm
+                && confirm.await != Ok(0)
+            {
+                return;
+            }
+            let result = cx
+                .background_spawn(async move { repository.apply_hunk(&patch, hunk, action) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(err) = result {
+                    this.error = Some(err.to_string().into());
+                }
+                this.reload(cx);
+                cx.emit(DiffViewEvent::RepositoryChanged);
+            })
+            .ok();
+        });
+    }
+
+    /// A hunk's `@@` line with its actions.
+    fn render_hunk(
+        &self,
+        row: usize,
+        hunk: usize,
+        header: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .h(px(ROW_HEIGHT))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .bg(rgb(theme::PANEL))
+            .text_color(rgb(theme::ACCENT_TEXT))
+            .child(div().flex_1().min_w_0().truncate().child(header.to_owned()))
+            .children(self.hunk_actions().iter().map(|&(action, label)| {
+                div()
+                    .id((label, row))
+                    .px_2()
+                    .rounded_sm()
+                    .font_family(theme::UI_FONT)
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT))
+                    .bg(rgb(theme::BORDER))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::ACTIVE_ROW)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.apply_hunk(hunk, action, window, cx)
+                    }))
+            }))
+            .into_any_element()
     }
 
     fn set_options(&mut self, options: DiffOptions, cx: &mut Context<Self>) {
@@ -254,6 +361,10 @@ impl DiffView {
         };
         match &diff.rows[index] {
             Row::Skipped { lines } => Self::skipped(*lines),
+            Row::Hunk {
+                index: hunk,
+                header,
+            } => self.render_hunk(index, *hunk, header, cx),
             Row::Line {
                 kind,
                 old,
@@ -274,6 +385,10 @@ impl DiffView {
     fn render_split(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         match &self.split[index] {
             SplitRow::Skipped { lines } => Self::skipped(*lines),
+            SplitRow::Hunk {
+                index: hunk,
+                header,
+            } => self.render_hunk(index, *hunk, header, cx),
             SplitRow::Pair { left, right } => {
                 let half = |side: &Option<SideLine>, id: &'static str| -> gpui::AnyElement {
                     match side {

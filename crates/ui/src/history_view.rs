@@ -40,6 +40,11 @@ pub enum HistoryEvent {
         base: String,
         target: Side,
     },
+    /// Create a branch at `start`.
+    CreateBranch {
+        repository: Repository,
+        start: String,
+    },
 }
 
 impl EventEmitter<HistoryEvent> for HistoryView {}
@@ -350,6 +355,7 @@ impl HistoryView {
             .collect::<Vec<_>>()
             .join(", ");
         let compare_id = commit.id.clone();
+        let branch_id = commit.id.clone();
         let files: gpui::AnyElement = match &selected.changes {
             None => div()
                 .p_2()
@@ -450,6 +456,24 @@ impl HistoryView {
                                         repository: this.repository.clone(),
                                         base: compare_id.clone(),
                                         target: Side::Worktree,
+                                    })
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("branch-here")
+                                .px_2()
+                                .py_px()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(theme::BORDER))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                                .child("Create branch here…")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.emit(HistoryEvent::CreateBranch {
+                                        repository: this.repository.clone(),
+                                        start: branch_id.clone(),
                                     })
                                 })),
                         ),

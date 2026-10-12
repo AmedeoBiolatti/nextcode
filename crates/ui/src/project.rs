@@ -154,6 +154,18 @@ impl Project {
         }
     }
 
+    /// Another directory reached the same way as this project (e.g. a git
+    /// worktree path as git prints it).
+    pub fn location_of(&self, path: &str) -> Location {
+        match &self.0.backend {
+            Backend::Local => Location::Local(PathBuf::from(path)),
+            Backend::Wsl { distro, .. } => Location::Wsl {
+                distro: distro.clone(),
+                path: path.to_owned(),
+            },
+        }
+    }
+
     /// Identifies the project in per-project state such as the saved layout.
     pub fn state_key(&self) -> String {
         match &self.0.backend {
@@ -358,29 +370,45 @@ impl Project {
         } else {
             ("cmd.exe", "/C")
         };
-        self.run_program(shell, &[flag.into(), command_line.into()], &[], timeout)
+        self.run_program(
+            shell,
+            &[flag.into(), command_line.into()],
+            &[],
+            None,
+            timeout,
+        )
     }
 
-    /// Runs `program` in the project root where the project lives, killing
-    /// it after `timeout`.
+    /// Runs `program` in the project root where the project lives with
+    /// `input` on its stdin, killing it after `timeout`.
     pub fn run_program(
         &self,
         program: &str,
         args: &[String],
         env: &[(&str, &str)],
+        input: Option<&[u8]>,
         timeout: Duration,
     ) -> io::Result<RunOutput> {
         match &self.0.backend {
-            Backend::Wsl { client, .. } => {
-                client.run(program, args, agent_path(&self.0.root)?, env, timeout)
-            }
+            Backend::Wsl { client, .. } => client.run(
+                program,
+                args,
+                agent_path(&self.0.root)?,
+                env,
+                input,
+                timeout,
+            ),
             Backend::Local => {
                 let mut command = Command::new(program);
                 command
                     .args(args)
                     .envs(env.iter().copied())
                     .current_dir(&self.0.root)
-                    .stdin(Stdio::null())
+                    .stdin(if input.is_some() {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    })
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
                 #[cfg(windows)]
@@ -389,6 +417,14 @@ impl Project {
                     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
                 }
                 let mut child = command.spawn()?;
+                if let (Some(mut stdin), Some(input)) = (child.stdin.take(), input) {
+                    let input = input.to_vec();
+                    // Written on a thread so a full output pipe cannot deadlock.
+                    thread::spawn(move || {
+                        use std::io::Write;
+                        stdin.write_all(&input).ok();
+                    });
+                }
                 let collect = |mut pipe: Box<dyn Read + Send>| {
                     thread::spawn(move || {
                         let mut data = Vec::new();
@@ -461,11 +497,12 @@ struct GitRunner(Project);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl git::Runner for GitRunner {
-    fn run_git(&self, args: &[String]) -> io::Result<git::Output> {
+    fn run_git(&self, args: &[String], input: Option<&[u8]>) -> io::Result<git::Output> {
         let output = self.0.run_program(
             "git",
             args,
             &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")],
+            input,
             GIT_TIMEOUT,
         )?;
         Ok(git::Output {

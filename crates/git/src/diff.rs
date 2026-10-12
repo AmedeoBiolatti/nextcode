@@ -25,6 +25,8 @@ pub enum Row {
     },
     /// Unchanged lines left out between hunks.
     Skipped { lines: usize },
+    /// Start of hunk `index` of a git patch (see `Patch::to_file_diff`).
+    Hunk { index: usize, header: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -58,6 +60,10 @@ pub enum SplitRow {
     },
     Skipped {
         lines: usize,
+    },
+    Hunk {
+        index: usize,
+        header: String,
     },
 }
 
@@ -127,6 +133,13 @@ pub fn side_by_side(rows: &[Row]) -> Vec<SplitRow> {
             Row::Skipped { lines } => {
                 flush(&mut out, &mut removed, &mut added);
                 out.push(SplitRow::Skipped { lines: *lines });
+            }
+            Row::Hunk { index, header } => {
+                flush(&mut out, &mut removed, &mut added);
+                out.push(SplitRow::Hunk {
+                    index: *index,
+                    header: header.clone(),
+                });
             }
         }
     }
@@ -216,6 +229,7 @@ mod tests {
                     format!("{sign}{text}")
                 }
                 Row::Skipped { lines } => format!("…{lines}"),
+                Row::Hunk { header, .. } => header.clone(),
             })
             .collect()
     }
@@ -255,7 +269,9 @@ mod tests {
             .iter()
             .map(|row| match row {
                 SplitRow::Pair { left, right } => (text(left), text(right)),
-                SplitRow::Skipped { .. } => panic!("full diffs skip nothing"),
+                SplitRow::Skipped { .. } | SplitRow::Hunk { .. } => {
+                    panic!("similar diffs have no skips or hunk rows in whole-file mode")
+                }
             })
             .collect();
         assert_eq!(

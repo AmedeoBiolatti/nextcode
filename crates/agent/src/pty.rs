@@ -147,6 +147,10 @@ impl Process for PtyProcess {
         }
     }
 
+    fn close_input(&self) {
+        self.input.lock().take();
+    }
+
     fn resize(&self, size: PtySize) {
         if let Some(pty) = &mut *self.pty.lock() {
             pty.on_resize(window_size(size));

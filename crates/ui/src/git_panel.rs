@@ -29,6 +29,10 @@ pub enum GitPanelEvent {
     OpenHistory(Repository),
     /// Pick a revision to compare the working tree with.
     Compare(Repository),
+    /// Open the branch picker.
+    Branches(Repository),
+    /// Open the worktree picker.
+    Worktrees(Repository),
     /// Status was re-read; open diffs may be stale.
     Refreshed,
 }
@@ -100,6 +104,8 @@ pub struct GitPanel {
     /// Result of the last operation (errors in red).
     feedback: Option<(SharedString, u32)>,
     busy: bool,
+    /// The next commit replaces the last one.
+    amend: bool,
     /// Files as a compact folder tree (else a flat list).
     as_tree: bool,
     collapsed: HashSet<(SectionKey, String)>,
@@ -111,6 +117,23 @@ pub struct GitPanel {
 
 /// `Section` as a hashable key for collapsed folders.
 type SectionKey = u8;
+
+#[derive(Debug, Clone, Copy)]
+enum SyncAction {
+    Fetch,
+    Pull,
+    Push,
+}
+
+impl SyncAction {
+    fn done(self) -> &'static str {
+        match self {
+            Self::Fetch => "Fetched",
+            Self::Pull => "Pulled",
+            Self::Push => "Pushed",
+        }
+    }
+}
 
 pub fn change_color(change: Change) -> u32 {
     match change {
@@ -138,6 +161,7 @@ impl GitPanel {
             message,
             feedback: None,
             busy: false,
+            amend: false,
             as_tree: true,
             collapsed: HashSet::new(),
             focus_handle: cx.focus_handle(),
@@ -193,6 +217,12 @@ impl GitPanel {
             })
             .ok();
         });
+    }
+
+    /// Shows the outcome of a git operation run elsewhere (a picker).
+    pub fn report(&mut self, message: String, cx: &mut Context<Self>) {
+        self.feedback = Some((message.into(), theme::MUTED));
+        cx.notify();
     }
 
     fn rebuild_rows(&mut self) {
@@ -359,11 +389,12 @@ impl GitPanel {
     fn commit(&mut self, cx: &mut Context<Self>) {
         let message = self.message.read(cx).text();
         let staged = !self.entries(Section::Staged).is_empty();
+        let amend = self.amend;
         if message.trim().is_empty() {
             self.feedback = Some(("Enter a commit message".into(), theme::ERROR));
             return cx.notify();
         }
-        if !staged {
+        if !staged && !amend {
             self.feedback = Some((
                 "Nothing is staged; stage changes first".into(),
                 theme::ERROR,
@@ -373,13 +404,36 @@ impl GitPanel {
         self.operate(
             cx,
             move |repo| {
-                repo.commit(&message)
-                    .map(|summary| Some(format!("Committed {summary}")))
+                repo.commit(&message, amend).map(|summary| {
+                    let verb = if amend { "Amended" } else { "Committed" };
+                    Some(format!("{verb} {summary}"))
+                })
             },
             |this, cx| {
+                this.amend = false;
                 this.message
                     .update(cx, |editor, cx| editor.set_text("", cx));
             },
+        );
+    }
+
+    /// Fetch, pull (fast-forward only) or push, off the main thread.
+    fn sync(&mut self, action: SyncAction, cx: &mut Context<Self>) {
+        let State::Ready { status, .. } = &self.state else {
+            return;
+        };
+        let status = status.clone();
+        self.operate(
+            cx,
+            move |repo| {
+                match action {
+                    SyncAction::Fetch => repo.fetch()?,
+                    SyncAction::Pull => repo.pull()?,
+                    SyncAction::Push => repo.push(&status)?,
+                }
+                Ok(Some(action.done().into()))
+            },
+            |_, _| {},
         );
     }
 
@@ -599,7 +653,7 @@ impl GitPanel {
     }
 
     fn render_branch(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let text = match &self.state {
+        let (text, ahead, behind) = match &self.state {
             State::Ready { status, .. } => {
                 let mut text = status
                     .branch
@@ -608,23 +662,17 @@ impl GitPanel {
                 if status.unborn {
                     text.push_str(" (no commits yet)");
                 }
-                if status.ahead > 0 {
-                    text.push_str(&format!(" ↑{}", status.ahead));
-                }
-                if status.behind > 0 {
-                    text.push_str(&format!(" ↓{}", status.behind));
-                }
-                text
+                (text, status.ahead, status.behind)
             }
-            State::Loading => "Reading repository…".into(),
-            State::NoRepository => "No git repository".into(),
-            State::Failed(_) => "Git unavailable".into(),
+            State::Loading => ("Reading repository…".into(), 0, 0),
+            State::NoRepository => ("No git repository".into(), 0, 0),
+            State::Failed(_) => ("Git unavailable".into(), 0, 0),
         };
         let repository = match &self.state {
             State::Ready { repository, .. } => Some(repository.clone()),
             _ => None,
         };
-        let tool = |id: &'static str, label: &'static str| {
+        let tool = |id: &'static str, label: SharedString| {
             div()
                 .id(id)
                 .px_1()
@@ -634,48 +682,107 @@ impl GitPanel {
                 .cursor_pointer()
                 .child(label)
         };
+        let busy = self.busy;
         let tools = div()
             .flex()
             .items_center()
             .gap_1()
-            .when_some(repository, |tools, repository| {
-                let compare = repository.clone();
+            .when_some(repository.clone(), |tools, repository| {
+                let (compare, worktrees) = (repository.clone(), repository.clone());
                 tools
-                    .child(tool("git-history", "History").on_click(cx.listener(
+                    .child(tool("git-history", "History".into()).on_click(cx.listener(
                         move |_, _, _, cx| cx.emit(GitPanelEvent::OpenHistory(repository.clone())),
                     )))
-                    .child(tool("git-compare", "Compare…").on_click(cx.listener(
+                    .child(tool("git-compare", "Compare…".into()).on_click(cx.listener(
                         move |_, _, _, cx| cx.emit(GitPanelEvent::Compare(compare.clone())),
                     )))
                     .child(
-                        tool("git-layout", if self.as_tree { "List" } else { "Tree" }).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.as_tree = !this.as_tree;
-                                this.rebuild_rows();
-                                cx.notify();
-                            }),
-                        ),
+                        tool("git-worktrees", "Worktrees…".into()).on_click(cx.listener(
+                            move |_, _, _, cx| cx.emit(GitPanelEvent::Worktrees(worktrees.clone())),
+                        )),
+                    )
+                    .child(
+                        tool(
+                            "git-layout",
+                            if self.as_tree { "List" } else { "Tree" }.into(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.as_tree = !this.as_tree;
+                            this.rebuild_rows();
+                            cx.notify();
+                        })),
                     )
             })
             .child(
-                tool("git-refresh", "⟳").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                tool("git-refresh", "⟳".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             );
+        let branch = div()
+            .id("git-branch")
+            .min_w_0()
+            .truncate()
+            .px_1()
+            .rounded_sm()
+            .text_color(rgb(theme::TEXT))
+            .child(format!("⎇ {text} ▾"))
+            .when_some(repository.clone(), |branch, repository| {
+                branch
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(GitPanelEvent::Branches(repository.clone()))
+                    }))
+            });
+        let count = |label: &str, n: u32, arrow: &str| {
+            if n > 0 {
+                format!("{label} {arrow}{n}")
+            } else {
+                label.to_owned()
+            }
+        };
+        let sync = repository.is_some().then(|| {
+            div().px_2().pb_1().flex().gap_2().children(
+                [
+                    (SyncAction::Fetch, "git-fetch", "Fetch".to_owned()),
+                    (SyncAction::Pull, "git-pull", count("Pull", behind, "↓")),
+                    (SyncAction::Push, "git-push", count("Push", ahead, "↑")),
+                ]
+                .map(|(action, id, label)| {
+                    div()
+                        .id(id)
+                        .px_2()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(theme::BORDER))
+                        .text_xs()
+                        .text_color(rgb(if busy { theme::MUTED } else { theme::TEXT }))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.busy {
+                                this.sync(action, cx)
+                            }
+                        }))
+                }),
+            )
+        });
         div()
-            .px_2()
-            .py_1()
             .flex()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .text_sm()
+            .flex_col()
             .child(
                 div()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(rgb(theme::TEXT))
-                    .child(format!("⎇ {text}")),
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_sm()
+                    .child(branch)
+                    .child(tools),
             )
-            .child(tools)
+            .children(sync)
     }
 }
 
@@ -749,6 +856,25 @@ impl Render for GitPanel {
                         )
                         .child(
                             div()
+                                .id("git-amend")
+                                .flex_none()
+                                .px_1()
+                                .py_1()
+                                .text_xs()
+                                .text_color(rgb(if self.amend {
+                                    theme::TEXT
+                                } else {
+                                    theme::MUTED
+                                }))
+                                .cursor_pointer()
+                                .child(if self.amend { "☑ Amend" } else { "☐ Amend" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.amend = !this.amend;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
                                 .id("git-commit")
                                 .px_3()
                                 .py_1()
@@ -761,7 +887,11 @@ impl Render for GitPanel {
                                 }))
                                 .text_color(rgb(0xffffff))
                                 .cursor_pointer()
-                                .child(if self.busy { "…" } else { "Commit" })
+                                .child(match (self.busy, self.amend) {
+                                    (true, _) => "…",
+                                    (false, true) => "Amend",
+                                    (false, false) => "Commit",
+                                })
                                 .on_click(cx.listener(|this, _, _, cx| this.commit(cx))),
                         ),
                 )

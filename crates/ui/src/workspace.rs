@@ -20,6 +20,7 @@ use text::Buffer;
 use watcher::{Batch, ChangeKind};
 
 use crate::{
+    branch_picker::{BranchPicker, BranchPickerEvent},
     compare_view::{CompareEvent, CompareView},
     connecting::Connecting,
     diff_view::{DiffSource, DiffView, DiffViewEvent},
@@ -40,6 +41,7 @@ use crate::{
     settings::Settings,
     terminal_panel::TerminalPanel,
     theme,
+    worktree_picker::{WorktreePicker, WorktreePickerEvent},
 };
 
 mod docks;
@@ -205,6 +207,8 @@ pub struct Workspace {
     location_picker: Option<(Entity<LocationPicker>, Subscription)>,
     project_picker: Option<(Entity<ProjectPicker>, Subscription)>,
     revision_picker: Option<(Entity<RevisionPicker>, Subscription)>,
+    /// The branch or worktree picker.
+    git_modal: Option<(AnyView, Subscription)>,
     back: Vec<NavEntry>,
     forward: Vec<NavEntry>,
     lsp_store: Entity<LspStore>,
@@ -254,6 +258,12 @@ impl Workspace {
                 }
                 GitPanelEvent::Compare(repository) => {
                     this.pick_revision(repository.clone(), RevisionPurpose::NewCompare, window, cx)
+                }
+                GitPanelEvent::Branches(repository) => {
+                    this.open_branch_picker(repository.clone(), None, window, cx)
+                }
+                GitPanelEvent::Worktrees(repository) => {
+                    this.open_worktree_picker(repository.clone(), window, cx)
                 }
                 GitPanelEvent::Refreshed => this.reload_diffs(cx),
             });
@@ -341,6 +351,7 @@ impl Workspace {
             location_picker: None,
             project_picker: None,
             revision_picker: None,
+            git_modal: None,
             back: Vec::new(),
             forward: Vec::new(),
             lsp_store,
@@ -442,6 +453,7 @@ impl Workspace {
                         editor.update(cx, |editor, cx| editor.go_to_line(*line, 0, cx));
                     }
                 }
+                DiffViewEvent::RepositoryChanged => this.repository_changed(None, cx),
             });
         let title = view.read(cx).title();
         self.push_tab(
@@ -498,6 +510,9 @@ impl Workspace {
                     target,
                 } => {
                     this.open_compare(repository.clone(), base.clone(), target.clone(), window, cx)
+                }
+                HistoryEvent::CreateBranch { repository, start } => {
+                    this.open_branch_picker(repository.clone(), Some(start.clone()), window, cx)
                 }
             });
         let root = self.project.root().to_path_buf();
@@ -617,6 +632,65 @@ impl Workspace {
         window.focus(&picker.focus_handle(cx));
         self.revision_picker = Some((picker, subscription));
         cx.notify();
+    }
+
+    fn open_branch_picker(
+        &mut self,
+        repository: git::Repository,
+        start: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picker = cx.new(|cx| BranchPicker::new(repository, start, cx));
+        let subscription = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {
+            this.git_modal = None;
+            this.focus_active(window, cx);
+            if let BranchPickerEvent::Changed(message) = event {
+                this.repository_changed(Some(message.clone()), cx);
+            }
+        });
+        window.focus(&picker.focus_handle(cx));
+        self.git_modal = Some((picker.into(), subscription));
+        cx.notify();
+    }
+
+    fn open_worktree_picker(
+        &mut self,
+        repository: git::Repository,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picker = cx.new(|cx| WorktreePicker::new(repository, cx));
+        let subscription = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {
+            this.git_modal = None;
+            this.focus_active(window, cx);
+            match event {
+                WorktreePickerEvent::Open(path) => {
+                    let location = this.project.location_of(path);
+                    this.repository_changed(None, cx);
+                    open_project(location, cx);
+                }
+                WorktreePickerEvent::Changed(message) => {
+                    this.repository_changed(Some(message.clone()), cx)
+                }
+                WorktreePickerEvent::Dismissed => {}
+            }
+        });
+        window.focus(&picker.focus_handle(cx));
+        self.git_modal = Some((picker.into(), subscription));
+        cx.notify();
+    }
+
+    /// Re-reads git state everywhere after an operation from a view or
+    /// picker; `message` is reported in the Git panel.
+    fn repository_changed(&mut self, message: Option<String>, cx: &mut Context<Self>) {
+        self.git.update(cx, |git, cx| {
+            if let Some(message) = message {
+                git.report(message, cx);
+            }
+            git.refresh(cx);
+        });
+        self.reload_history(cx);
     }
 
     /// Recomputes open diffs and comparisons after the repository or the
@@ -1241,6 +1315,16 @@ impl Render for Workspace {
                     .child(picker.clone())
             }))
             .children(self.revision_picker.as_ref().map(|(picker, _)| {
+                div()
+                    .absolute()
+                    .top(px(72.))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(picker.clone())
+            }))
+            .children(self.git_modal.as_ref().map(|(picker, _)| {
                 div()
                     .absolute()
                     .top(px(72.))
