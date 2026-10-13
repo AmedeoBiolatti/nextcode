@@ -376,6 +376,12 @@ impl PythonPanel {
         if let Some(locked) = info.locked_packages {
             details.push(format!("{locked} locked"));
         }
+        if !info.project.workspace_members.is_empty() {
+            details.push(format!(
+                "workspace: {}",
+                info.project.workspace_members.join(", ")
+            ));
+        }
         div()
             .px_2()
             .py_1()
