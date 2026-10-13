@@ -146,6 +146,46 @@ impl LspStore {
         }
     }
 
+    /// Re-reads the project's Python interpreter (after `uv sync` made or
+    /// changed `.venv`) and tells a running Python server, which pulls its
+    /// settings again.
+    pub fn refresh_python_interpreter(&mut self, cx: &mut Context<Self>) {
+        if !self.slots.contains_key(&Language::Python) {
+            return;
+        }
+        let project = self.project.clone();
+        cx.spawn(async move |this, cx| {
+            let python = cx
+                .background_spawn(async move { project.python_interpreter() })
+                .await;
+            let Ok(Some(python)) = python else {
+                return;
+            };
+            this.update(cx, |this, _| {
+                let Some(slot) = this.slots.get_mut(&Language::Python) else {
+                    return;
+                };
+                if let Some(config) = &mut slot.config {
+                    settings::merge(
+                        &mut config.settings,
+                        json!({ "python": { "pythonPath": python } }),
+                    );
+                }
+                if let Some(server) = &slot.running {
+                    server
+                        .connection
+                        .notify::<notification::DidChangeConfiguration>(
+                            lsp::types::DidChangeConfigurationParams {
+                                settings: Value::Null,
+                            },
+                        );
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Every file's diagnostics, in no particular order.
     pub fn all_diagnostics(&self) -> impl Iterator<Item = (&Path, &[lsp::types::Diagnostic])> {
         self.diagnostics

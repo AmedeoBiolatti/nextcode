@@ -14,9 +14,11 @@ Native, AI-first IDE written in Rust on [gpui](https://crates.io/crates/gpui).
 | `crates/worktree` | Project file operations shared by the editor and the agent: listing, ignore rules, tool lookup |
 | `crates/proto` | Versioned editor ↔ agent wire protocol (framing, requests, events) |
 | `crates/agent` | `next_code_agent`: headless Linux process serving files, watching, search, language servers and shells |
-| `crates/remote` | Agent client and the WSL bootstrap (install, start, version check) |
+| `crates/remote` | Agent client and the bootstraps that install and start it in WSL or a container (`docker exec`) |
+| `crates/devcontainer` | `devcontainer.json` (JSONC) and bringing dev containers up with the docker CLI |
+| `crates/python` | `pyproject.toml` / `uv.lock`, uv command lines, pytest node ids and traceback locations |
 | `crates/git` | Git through its CLI: porcelain v2 status, stage/unstage/discard/commit, hunk patches, branches, worktrees, fetch/pull/push, history, diffs |
-| `crates/ui` | `next_code` binary: editor, docks, LSP, terminal, search, problems, git panel and diffs, fuzzy file finder (`Ctrl+P`) |
+| `crates/ui` | `next_code` binary: editor, docks, LSP, terminal, search, problems, git and Python panels, diffs, fuzzy file finder (`Ctrl+P`) |
 
 ## Build and run
 
@@ -80,6 +82,62 @@ $env:NEXT_CODE_WSL_AGENT = "$PWD\target\release\next_code_agent"
 $env:NEXT_CODE_TEST_WSL_DISTRO = "Ubuntu"
 cargo test -p remote --test wsl -- --ignored
 ```
+
+## Dev containers
+
+A folder with `.devcontainer/devcontainer.json` (or `.devcontainer.json`,
+or `.devcontainer/<name>/devcontainer.json`) offers **Reopen in Container**
+when opened. The container is brought up with the `docker` CLI where the
+folder lives (Docker Desktop on Windows, or docker inside the WSL distro for
+WSL folders), then the same agent as for WSL is copied into it and started
+with `docker exec`: files, search, git, language servers and terminals all run
+in the container, as `remoteUser`, in `workspaceFolder`, with `remoteEnv`.
+
+```powershell
+next_code --devcontainer C:\src\project
+next_code --devcontainer --wsl Ubuntu /home/me/project
+```
+
+`devcontainer:<location>` also works in Open Recent. Supported: `image`,
+`build` (Dockerfile, args, target), `dockerComposeFile` + `service` (+
+`runServices`), `workspaceFolder`, `workspaceMount`, `mounts` (not for
+compose), `containerEnv`, `remoteEnv` (`${containerEnv:PATH}` and the other
+`${…}` variables), `remoteUser`, `containerUser`, `runArgs`, `init`,
+`privileged`, `capAdd`, `securityOpt`, `overrideCommand`, `shutdownAction`,
+and the lifecycle commands (`initializeCommand` on the host; `onCreate`,
+`updateContent`, `postCreate` after creation; `postStart` after a start;
+`postAttach` each time). Dev Container Features are not installed (a note
+names them). The Dev Containers CLI is not needed.
+
+Containers are found by the labels VS Code uses (compose ones by project
+and service, named as VS Code names them), so a container VS Code created is
+reused. A stopped one is started; one that no longer starts (e.g. a mount
+from an old session is gone) is recreated. Containers the editor created or
+started are stopped as `shutdownAction` says when its window closes.
+
+## Python (uv)
+
+The **Python** panel (left dock) reads `pyproject.toml` and `uv.lock`:
+project, interpreter (`.venv`), pinned version (`.python-version`) and the
+dependencies of each section with their locked versions. It runs uv where
+the project lives (Windows, WSL or a dev container):
+
+- **Sync**, **Lock**, **Upgrade all**, per-package **↑** (upgrade in the
+  lock) and **×** (remove); a requirement typed in *Add dependency* goes to
+  the section shown next to it (click to cycle: dependencies, `dev`, other
+  groups, extras).
+- **Python…** lists interpreters (`uv python list`) and pins one.
+- When `.venv` is out of date with `uv.lock`/`pyproject.toml`
+  (`uv sync --check`), the editor offers **Sync**. After a sync the
+  language server re-reads the interpreter.
+- **Run**: `[project.scripts]` entry points, the current file, all tests,
+  the current file's tests, or the test under the cursor (pytest node id
+  from the enclosing `test_*` function / `Test*` class), each with `uv run`
+  in a new terminal tab. Ctrl+click on a traceback line (`File "…", line N`
+  or pytest's `path:N:`) opens it.
+
+New terminals activate `.venv` (`VIRTUAL_ENV`/`PATH` locally;
+`. .venv/bin/activate` in WSL and containers).
 
 ## Git and multiple projects
 
@@ -157,7 +215,11 @@ the project lives), `git_status`, `git_diff`, `git_apply_hunk`, `git_stage`,
 `git_unstage`, `git_discard`, `git_commit`, `git_branch_create`,
 `git_switch`, `git_branch_delete`, `git_fetch`, `git_pull`, `git_push`,
 `git_worktrees`, `git_worktree_add`, `git_worktree_remove`, `git_log`,
-`git_refs`, `git_changes`, `git_commit_changes`, `shutdown`. Parameters and
+`git_refs`, `git_changes`, `git_commit_changes`, `python_info`, `python_sync`,
+`python_lock`, `python_add`, `python_remove`, `python_pin`,
+`python_interpreters`, `python_test_at`, `devcontainer_configs`, `shutdown`;
+`--devcontainer` opens the folder's container (with `progress` events).
+Parameters and
 results are documented in
 `crates/ui/src/headless.rs`.
 
@@ -169,6 +231,7 @@ results are documented in
 - **M3** git panel and diff view, multiple workspaces — *done*
 - **M4** git review: commit graph, compare with branches/commits, compact change trees, side-by-side and whole-file diffs — *done*
 - **M5** git operations: branches, worktrees (one window each), fetch/pull/push, amend, hunk staging — *done*
-- **M6** AI inline completion, chat, agent
-- **M7** devcontainers, debugger (DAP)
-- **M8** WASM extension API
+- **M6** uv projects (Python panel, environments, run/test) and dev containers — *done*
+- **M7** AI inline completion, chat, agent
+- **M8** debugger (DAP)
+- **M9** WASM extension API

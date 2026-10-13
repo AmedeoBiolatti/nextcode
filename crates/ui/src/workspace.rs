@@ -22,24 +22,25 @@ use watcher::{Batch, ChangeKind};
 use crate::{
     branch_picker::{BranchPicker, BranchPickerEvent},
     compare_view::{CompareEvent, CompareView},
-    connecting::{Connecting, PreloadedConnection},
+    connecting::{Connecting, PendingConnection},
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     editor::{Editor, EditorEvent, ReloadOutcome},
     file_finder::{FileFinder, FileFinderEvent},
     file_tree::{FileTree, OpenFile},
     git_panel::{GitPanel, GitPanelEvent, PreloadedRepository},
     history_view::{HistoryEvent, HistoryView},
-    layout::{DockPosition, Layout},
+    layout::{DockPosition, Layout, PanelId},
     location_picker::{LocationPicker, LocationPickerEvent},
     lsp_store::{LspStore, LspStoreEvent, ServerStatus},
     problems::{ProblemsEvent, ProblemsPanel},
     project::{self, Project, WatchHandle},
     project_picker::{ProjectPicker, ProjectPickerEvent},
+    python_panel::{PythonPanel, PythonPanelEvent, RunRequest},
     recent,
     revision_picker::{RevisionPicker, RevisionPickerEvent},
     search_panel::{SearchPanel, SearchPanelEvent},
     settings::Settings,
-    terminal_panel::TerminalPanel,
+    terminal_panel::{TerminalPanel, TerminalPanelEvent},
     theme,
     worktree_picker::{WorktreePicker, WorktreePickerEvent},
 };
@@ -78,30 +79,24 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 /// Work for the first window started before gpui (whose platform setup
-/// takes a few hundred milliseconds): connecting to WSL, or reading a local
-/// project's git status.
+/// takes a few hundred milliseconds): connecting to WSL or a dev
+/// container, or reading a local project's git status.
 pub enum Preload {
     Local(PreloadedRepository),
-    Wsl(PreloadedConnection),
+    Remote(PendingConnection),
 }
 
 impl Preload {
     /// Starts the work for `location` on a thread.
     pub fn start(location: &project::Location) -> Self {
-        use futures::channel::oneshot;
         match location {
             project::Location::Local(root) => {
-                let (tx, rx) = oneshot::channel();
+                let (tx, rx) = futures::channel::oneshot::channel();
                 let project = Project::local(root.clone());
                 std::thread::spawn(move || tx.send(project.open_repository()).ok());
                 Self::Local(rx)
             }
-            project::Location::Wsl { distro, path } => {
-                let (tx, rx) = oneshot::channel();
-                let (distro, path) = (distro.clone(), path.clone());
-                std::thread::spawn(move || tx.send(Project::connect_wsl(&distro, &path)).ok());
-                Self::Wsl(rx)
-            }
+            remote => Self::Remote(PendingConnection::start(remote.clone())),
         }
     }
 }
@@ -115,21 +110,16 @@ pub fn open_project(location: project::Location, cx: &mut App) {
 /// [`open_project`] with work started by [`Preload::start`] for the same
 /// location.
 pub fn open_preloaded(location: project::Location, preload: Option<Preload>, cx: &mut App) {
-    let location = match location {
-        project::Location::Local(root) => {
-            project::Location::Local(std::path::absolute(&root).unwrap_or(root))
-        }
-        wsl => wsl,
-    };
+    let location = location.absolute();
     for window in cx.windows() {
         let shows = if let Some(workspace) = window.downcast::<Workspace>() {
             workspace
                 .read(cx)
-                .is_ok_and(|workspace| workspace.project.location() == location)
+                .is_ok_and(|workspace| workspace.project.location().opens_same(&location))
         } else if let Some(connecting) = window.downcast::<Connecting>() {
             connecting
                 .read(cx)
-                .is_ok_and(|connecting| connecting.location() == location)
+                .is_ok_and(|connecting| connecting.location().opens_same(&location))
         } else {
             false
         };
@@ -161,13 +151,13 @@ pub fn open_preloaded(location: project::Location, preload: Option<Preload>, cx:
             })
             .map(drop)
         }
-        (project::Location::Wsl { distro, path }, preload) => {
-            let connection = match preload {
-                Some(Preload::Wsl(connection)) => Some(connection),
+        (remote, preload) => {
+            let pending = match preload {
+                Some(Preload::Remote(pending)) => Some(pending),
                 _ => None,
             };
             cx.open_window(options, |window, cx| {
-                cx.new(|cx| Connecting::new(distro, path, connection, window, cx))
+                cx.new(|cx| Connecting::new(remote, pending, window, cx))
             })
             .map(drop)
         }
@@ -236,6 +226,29 @@ impl Tab {
     }
 }
 
+/// A suggestion above the editor, with an action button and "Not now".
+struct Offer {
+    kind: OfferKind,
+    message: SharedString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OfferKind {
+    /// The folder has this `devcontainer.json`.
+    ReopenInContainer { config: String },
+    /// `.venv` is out of date with the lock or `pyproject.toml`.
+    PythonSync,
+}
+
+impl OfferKind {
+    fn action(&self) -> &'static str {
+        match self {
+            Self::ReopenInContainer { .. } => "Reopen in Container",
+            Self::PythonSync => "Sync",
+        }
+    }
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     project: Project,
@@ -244,6 +257,7 @@ pub struct Workspace {
     terminal: Entity<TerminalPanel>,
     search: Entity<SearchPanel>,
     git: Entity<GitPanel>,
+    python: Entity<PythonPanel>,
     layout: Layout,
     /// Dock being resized by dragging its handle.
     resizing: Option<DockPosition>,
@@ -260,6 +274,8 @@ pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
     notice: Option<SharedString>,
+    /// Suggestions with buttons, above the editor.
+    offers: Vec<Offer>,
     /// Why the WSL agent connection was lost; stays until restart.
     connection_error: Option<SharedString>,
     /// Set once the user confirmed discarding unsaved changes on window close.
@@ -319,6 +335,35 @@ impl Workspace {
                 }
                 GitPanelEvent::Refreshed => this.reload_diffs(cx),
             });
+        let python = cx.new(|cx| PythonPanel::new(project.clone(), cx));
+        let python_subscription =
+            cx.subscribe_in(&python, window, |this, _, event, window, cx| match event {
+                PythonPanelEvent::Run(request) => this.run_python(request.clone(), window, cx),
+                PythonPanelEvent::EnvironmentChanged => this
+                    .lsp_store
+                    .update(cx, |store, cx| store.refresh_python_interpreter(cx)),
+                PythonPanelEvent::SyncNeeded(true) => this.offer(
+                    OfferKind::PythonSync,
+                    "The Python environment (.venv) is out of date with uv.lock / pyproject.toml.",
+                    cx,
+                ),
+                PythonPanelEvent::SyncNeeded(false) => {
+                    this.withdraw_offer(&OfferKind::PythonSync, cx)
+                }
+            });
+        let terminal_subscription = cx.subscribe_in(
+            &terminal,
+            window,
+            |this, _, event: &TerminalPanelEvent, window, cx| match event {
+                TerminalPanelEvent::OpenFile { path, line } => {
+                    this.record_position(cx);
+                    this.forward.clear();
+                    if let Some(editor) = this.open_editor(path, window, cx) {
+                        editor.update(cx, |editor, cx| editor.go_to_line(*line, 0, cx));
+                    }
+                }
+            },
+        );
         let search_subscription =
             cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
                 SearchPanelEvent::Open { path, line, column } => {
@@ -387,6 +432,26 @@ impl Workspace {
                 }
             })
         });
+        // A folder with a dev container: offer to reopen it inside.
+        let configs_project = project.clone();
+        cx.spawn(async move |this, cx| {
+            let configs = cx
+                .background_spawn(async move { configs_project.devcontainer_configs() })
+                .await
+                .unwrap_or_default();
+            if let Some(config) = configs.into_iter().next() {
+                this.update(cx, |this, cx| {
+                    this.offer(
+                        OfferKind::ReopenInContainer { config },
+                        "This folder has a dev container. Reopen it inside the container to \
+                         use its tools, language servers and terminals.",
+                        cx,
+                    )
+                })
+                .ok();
+            }
+        })
+        .detach();
         recent::record(&project.location());
         crate::startup::mark("workspace built");
         Self {
@@ -397,6 +462,7 @@ impl Workspace {
             terminal,
             search,
             git,
+            python,
             layout,
             resizing: None,
             panel_menu: None,
@@ -411,6 +477,7 @@ impl Workspace {
             tabs: Vec::new(),
             active: 0,
             notice,
+            offers: Vec::new(),
             connection_error: None,
             close_confirmed: false,
             reload_prompts: HashSet::new(),
@@ -422,6 +489,8 @@ impl Workspace {
                 problems_subscription,
                 search_subscription,
                 git_subscription,
+                python_subscription,
+                terminal_subscription,
             ],
         }
     }
@@ -439,6 +508,17 @@ impl Workspace {
         self.lsp_store.read(cx).notify_file_changes(&batch.events);
         // Worktree edits change status as much as commits do.
         self.git.update(cx, |git, cx| git.schedule_refresh(cx));
+        let python_files = ["pyproject.toml", "uv.lock", ".python-version"];
+        if batch.rescan
+            || batch.events.iter().any(|event| {
+                event
+                    .path
+                    .file_name()
+                    .is_some_and(|name| python_files.iter().any(|file| name == *file))
+            })
+        {
+            self.python.update(cx, |python, cx| python.refresh(cx));
+        }
         if batch.repository || batch.rescan {
             self.reload_history(cx);
         }
@@ -719,9 +799,20 @@ impl Workspace {
             this.focus_active(window, cx);
             match event {
                 WorktreePickerEvent::Open(path) => {
-                    let location = this.project.location_of(path);
                     this.repository_changed(None, cx);
-                    open_project(location, cx);
+                    match this.project.location_of(path) {
+                        Some(location) => open_project(location, cx),
+                        None => {
+                            this.notice = Some(
+                                format!(
+                                    "{path} is inside the dev container; open it from a terminal \
+                                     or add it to the container's workspace instead"
+                                )
+                                .into(),
+                            );
+                            cx.notify();
+                        }
+                    }
                 }
                 WorktreePickerEvent::Changed(message) => {
                     this.repository_changed(Some(message.clone()), cx)
@@ -1037,6 +1128,138 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shows a suggestion (once per kind).
+    pub(crate) fn offer(&mut self, kind: OfferKind, message: &str, cx: &mut Context<Self>) {
+        self.offers.retain(|offer| offer.kind != kind);
+        self.offers.push(Offer {
+            kind,
+            message: message.to_owned().into(),
+        });
+        cx.notify();
+    }
+
+    /// Removes a suggestion, e.g. once its condition is gone.
+    pub(crate) fn withdraw_offer(&mut self, kind: &OfferKind, cx: &mut Context<Self>) {
+        let before = self.offers.len();
+        self.offers.retain(|offer| &offer.kind != kind);
+        if self.offers.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// Runs a Python script, file or tests in a new terminal tab with
+    /// `uv run`, where the project lives.
+    fn run_python(&mut self, request: RunRequest, window: &mut Window, cx: &mut Context<Self>) {
+        use python::uv::{Run, run_line};
+        let active = self.tabs.get(self.active).and_then(|tab| {
+            let editor = tab.editor()?.read(cx);
+            let line = editor.buffer().line_of(editor.cursor());
+            Some((tab.path.clone(), line, editor.text()))
+        });
+        let file = active
+            .as_ref()
+            .map(|(path, _, _)| crate::python_panel::project_relative(&self.project, path));
+        let need_file = || "Open a Python file first".to_owned();
+        let run = match request {
+            RunRequest::Script(name) => Ok((format!("Run {name}"), Run::Script(name))),
+            RunRequest::CurrentFile => file
+                .clone()
+                .map(|file| (format!("Run {file}"), Run::File(file)))
+                .ok_or_else(need_file),
+            RunRequest::Tests => Ok(("Tests".to_owned(), Run::Pytest(String::new()))),
+            RunRequest::TestFile => file
+                .clone()
+                .map(|file| (format!("Test {file}"), Run::Pytest(file)))
+                .ok_or_else(need_file),
+            RunRequest::TestAtCursor => match (&active, &file) {
+                (Some((_, line, text)), Some(file)) => python::test_at(text, *line)
+                    .map(|node| {
+                        (
+                            format!("Test {node}"),
+                            Run::Pytest(format!("{file}::{node}")),
+                        )
+                    })
+                    .ok_or_else(|| "The cursor is not in a test function or class".to_owned()),
+                _ => Err(need_file()),
+            },
+        };
+        match run {
+            Ok((title, run)) => {
+                self.show_panel(PanelId::Terminal, cx);
+                self.terminal.update(cx, |terminal, cx| {
+                    terminal.run_command(&title, &run_line(&run), window, cx)
+                });
+            }
+            Err(message) => {
+                self.notice = Some(message.into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn accept_offer(&mut self, kind: OfferKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.withdraw_offer(&kind, cx);
+        match kind {
+            OfferKind::PythonSync => self.python.update(cx, |python, cx| python.sync(cx)),
+            OfferKind::ReopenInContainer { config } => {
+                let location = project::Location::DevContainer {
+                    folder: Box::new(self.project.location()),
+                    config: Some(config),
+                };
+                let dirty = self.tabs.iter().any(|tab| tab.is_dirty(cx));
+                open_project(location, cx);
+                // Like reopening: this window goes, unless it has edits.
+                if !dirty {
+                    window.remove_window();
+                }
+            }
+        }
+    }
+
+    fn render_offers(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        self.offers
+            .iter()
+            .enumerate()
+            .map(|(index, offer)| {
+                let button = |id: &'static str, label: &'static str| {
+                    div()
+                        .id((id, index))
+                        .px_2()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(theme::BORDER))
+                        .text_xs()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                        .child(label)
+                };
+                let (accept_kind, dismiss_kind) = (offer.kind.clone(), offer.kind.clone());
+                div()
+                    .px_3()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .bg(rgb(theme::PANEL))
+                    .border_b_1()
+                    .border_color(rgb(theme::BORDER))
+                    .text_sm()
+                    .child(div().flex_1().min_w_0().child(offer.message.clone()))
+                    .child(
+                        button("offer-accept", offer.kind.action()).on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.accept_offer(accept_kind.clone(), window, cx)
+                            },
+                        )),
+                    )
+                    .child(button("offer-dismiss", "Not now").on_click(
+                        cx.listener(move |this, _, _, cx| this.withdraw_offer(&dismiss_kind, cx)),
+                    ))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
     fn toggle_file_finder(
         &mut self,
         _: &ToggleFileFinder,
@@ -1333,6 +1556,7 @@ impl Render for Workspace {
                                     .child(notice)
                             }),
                     )
+                    .children(self.render_offers(cx))
                     .child(main)
                     .children(self.render_dock(DockPosition::Bottom, window, cx)),
             )

@@ -24,6 +24,8 @@ watcher.workspace = true
 remote.workspace = true
 worktree.workspace = true
 git.workspace = true
+devcontainer.workspace = true
+python.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # The version gpui uses (no second copy): startup warm-up (`startup::prewarm`).

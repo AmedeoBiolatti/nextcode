@@ -40,10 +40,19 @@
 //! | `git_refs` | | `[{name, kind, target, head}]` |
 //! | `git_changes` | `base` (revision), `target`? (revision or `"worktree"`) | `[{path, orig_path, change}]` |
 //! | `git_commit_changes` | `commit` | `{commit, changes}` (against its first parent) |
+//! | `python_info` | | `null` without `pyproject.toml`, else `{name, version, requires_python, locked_packages, interpreter, environment_python, pinned, uv, in_sync, dependencies: [{name, specifier, kind, locked}], scripts}` |
+//! | `python_sync` / `python_lock` | `upgrade`? (lock) | `{code, stdout, stderr}` of `uv sync` / `uv lock` |
+//! | `python_add` | `requirement`, `group`? or `optional`? (extra) | `{code, stdout, stderr}` of `uv add` |
+//! | `python_remove` | `name`, `group`? or `optional`? | `{code, stdout, stderr}` of `uv remove` |
+//! | `python_pin` | `version` | `{code, stdout, stderr}` of `uv python pin` |
+//! | `python_interpreters` | | `[{version, implementation, path}]` (`path` null: downloadable) |
+//! | `python_test_at` | `path`, `line` (0-based) | pytest node suffix (`TestX::test_y`) or `null` |
+//! | `devcontainer_configs` | | `devcontainer.json` paths of the project folder |
 //! | `shutdown` | | stops language servers and exits |
 //!
-//! Events: `ready` (after connecting), `files_changed`, `diagnostics`,
-//! `server_status`, `disconnected`, `error` (startup failure, then exit 1).
+//! Events: `progress` (while a dev container opens), `ready` (after
+//! connecting), `files_changed`, `diagnostics`, `server_status`,
+//! `disconnected`, `error` (startup failure, then exit 1).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -135,12 +144,12 @@ async fn serve(
     cx: &mut AsyncApp,
 ) {
     let connect = location.clone();
+    let progress = out.clone();
     let project = cx
         .background_spawn(async move {
-            match connect {
-                Location::Local(root) => Ok(Project::local(root)),
-                Location::Wsl { distro, path } => Project::connect_wsl(&distro, &path),
-            }
+            Project::open(&connect, &mut |line| {
+                progress.event("progress", json!({ "message": line }));
+            })
         })
         .await;
     let project = match project {
@@ -419,6 +428,10 @@ impl Session {
                 Err(err) => self.out.reply(&id, Err(err)),
             },
             command if command.starts_with("git_") => self.git(id, command, &request, cx),
+            command if command.starts_with("python_") => self.python(id, command, &request, cx),
+            "devcontainer_configs" => {
+                self.blocking(id, cx, |project| Ok(json!(project.devcontainer_configs()?)))
+            }
             "shutdown" => {
                 self.out.reply(&id, Ok(Value::Null));
                 return true;
@@ -627,6 +640,105 @@ impl Session {
                     format!("unknown command `{other}`"),
                 )),
             }
+        });
+    }
+
+    /// `python_*` commands: the uv project in the project root.
+    fn python(&self, id: Value, command: &str, request: &Value, cx: &mut Context<Self>) {
+        let text = |name: &str| request[name].as_str().map(str::to_owned);
+        let (name, requirement, version, path) = (
+            text("name"),
+            text("requirement"),
+            text("version"),
+            text("path"),
+        );
+        let kind = match (text("group"), text("optional")) {
+            (Some(group), _) => python::DependencyKind::Group(group),
+            (None, Some(extra)) => python::DependencyKind::Optional(extra),
+            (None, None) => python::DependencyKind::Main,
+        };
+        let upgrade = request["upgrade"].as_bool().unwrap_or(false);
+        let line = request["line"].as_u64().map(|line| line as usize);
+        let command = command.to_owned();
+        self.blocking(id, cx, move |project| {
+            let missing = |name: &str| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing parameter `{name}`"),
+                )
+            };
+            if command == "python_test_at" {
+                let path = path.ok_or_else(|| missing("path"))?;
+                let line = line.ok_or_else(|| missing("line"))?;
+                let text = project.read_text(&project.path(&path))?;
+                return Ok(json!(python::test_at(&text, line)));
+            }
+            let info = crate::python_panel::load(project)?;
+            if command == "python_info" {
+                return Ok(match info {
+                    None => Value::Null,
+                    Some(info) => {
+                        let mut value = json!(info);
+                        value["dependencies"] = info
+                            .dependencies
+                            .iter()
+                            .map(|dependency| {
+                                json!({
+                                    "name": dependency.requirement.name,
+                                    "specifier": dependency.requirement.specifier,
+                                    "kind": dependency.kind.label(),
+                                    "locked": dependency.locked,
+                                })
+                            })
+                            .collect();
+                        value["scripts"] = json!(info.project.scripts);
+                        value
+                    }
+                });
+            }
+            let uv = info.and_then(|info| info.uv).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no pyproject.toml, or uv is not installed where the project lives",
+                )
+            })?;
+            let args = match command.as_str() {
+                "python_sync" => python::uv::sync(),
+                "python_lock" => python::uv::lock(upgrade),
+                "python_add" => {
+                    python::uv::add(&requirement.ok_or_else(|| missing("requirement"))?, &kind)
+                }
+                "python_remove" => python::uv::remove(&name.ok_or_else(|| missing("name"))?, &kind),
+                "python_pin" => python::uv::pin(&version.ok_or_else(|| missing("version"))?),
+                "python_interpreters" => {
+                    let output =
+                        crate::python_panel::run_uv(project, &uv, &python::uv::python_list())?;
+                    let interpreters =
+                        python::parse_python_list(&String::from_utf8_lossy(&output.stdout))?;
+                    return Ok(interpreters
+                        .iter()
+                        .map(|interpreter| {
+                            json!({
+                                "version": interpreter.version,
+                                "implementation": interpreter.implementation,
+                                "path": interpreter.path,
+                            })
+                        })
+                        .collect());
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unknown command `{other}`"),
+                    ));
+                }
+            };
+            let output = crate::python_panel::run_uv(project, &uv, &args)?;
+            Ok(json!({
+                "code": output.code,
+                "stdout": String::from_utf8_lossy(&output.stdout),
+                "stderr": String::from_utf8_lossy(&output.stderr),
+            }))
         });
     }
 

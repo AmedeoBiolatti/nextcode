@@ -11,15 +11,17 @@ pub enum PanelId {
     Files,
     Search,
     Git,
+    Python,
     Terminal,
     Problems,
 }
 
 impl PanelId {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Files,
         Self::Search,
         Self::Git,
+        Self::Python,
         Self::Terminal,
         Self::Problems,
     ];
@@ -29,6 +31,7 @@ impl PanelId {
             Self::Files => "Files",
             Self::Search => "Search",
             Self::Git => "Git",
+            Self::Python => "Python",
             Self::Terminal => "Terminal",
             Self::Problems => "Problems",
         }
@@ -36,7 +39,7 @@ impl PanelId {
 
     fn default_position(self) -> DockPosition {
         match self {
-            Self::Files | Self::Search | Self::Git => DockPosition::Left,
+            Self::Files | Self::Search | Self::Git | Self::Python => DockPosition::Left,
             Self::Terminal | Self::Problems => DockPosition::Bottom,
         }
     }
@@ -99,7 +102,12 @@ impl Default for Layout {
     fn default() -> Self {
         Self {
             left: DockLayout {
-                panels: vec![PanelId::Files, PanelId::Search, PanelId::Git],
+                panels: vec![
+                    PanelId::Files,
+                    PanelId::Search,
+                    PanelId::Git,
+                    PanelId::Python,
+                ],
                 active: Some(PanelId::Files),
                 size: 280.,
                 open: true,
@@ -304,7 +312,10 @@ mod tests {
             (Some(PanelId::Files), true)
         );
         // The left dock falls back to a remaining panel and stays open.
-        assert_eq!(layout.left.panels, [PanelId::Search, PanelId::Git]);
+        assert_eq!(
+            layout.left.panels,
+            [PanelId::Search, PanelId::Git, PanelId::Python]
+        );
         assert_eq!(layout.left.active, Some(PanelId::Search));
 
         layout.move_panel(PanelId::Search, DockPosition::Bottom, Some(0));
@@ -314,6 +325,7 @@ mod tests {
         );
         assert_eq!(layout.left.active, Some(PanelId::Git));
         layout.move_panel(PanelId::Git, DockPosition::Right, None);
+        layout.move_panel(PanelId::Python, DockPosition::Right, None);
         assert!(!layout.left.open, "an emptied dock closes");
         assert_eq!(layout.left.active, None);
     }
@@ -354,15 +366,16 @@ mod tests {
         )
         .unwrap();
         layout.normalize();
-        // Search was missing and returns to its default (left) dock, as does
-        // Git for layouts saved before it existed.
+        // Search was missing and returns to its default (left) dock, as do
+        // Git and Python for layouts saved before they existed.
         assert_eq!(
             layout.left.panels,
             [
                 PanelId::Files,
                 PanelId::Terminal,
                 PanelId::Search,
-                PanelId::Git
+                PanelId::Git,
+                PanelId::Python
             ]
         );
         assert_eq!(layout.left.active, Some(PanelId::Files));

@@ -13,6 +13,7 @@ use gpui::{
     prelude::*, px, relative, rgb, size,
 };
 use terminal::{Key, Modifiers, Palette, Rgb, Snapshot, Terminal, TerminalEvent, TerminalOptions};
+use worktree::FileKind;
 
 use crate::{project::Project, theme};
 
@@ -43,8 +44,12 @@ pub struct Profile {
 /// Shells available for `project`, default first.
 pub fn profiles(project: &Project) -> Vec<Profile> {
     if project.is_remote() {
+        let name = match project.location() {
+            crate::project::Location::DevContainer { .. } => "Container Shell",
+            _ => "WSL Shell",
+        };
         return vec![Profile {
-            name: "WSL Shell",
+            name,
             program: "",
             args: &[],
             remote: true,
@@ -91,6 +96,12 @@ fn to_hsla(color: Rgb) -> Hsla {
 pub enum TerminalViewEvent {
     TitleChanged,
     Exited,
+    /// Ctrl+click on a line naming a file and line (a Python traceback, a
+    /// pytest failure): the path as printed and its 1-based line.
+    OpenLocation {
+        path: String,
+        line: usize,
+    },
 }
 
 impl EventEmitter<TerminalViewEvent> for TerminalView {}
@@ -327,6 +338,21 @@ impl TerminalView {
     ) {
         window.focus(&self.focus_handle);
         let cell = self.cell_at(event.position);
+        if event.modifiers.control {
+            let snapshot = self.terminal.snapshot();
+            if cell.row < snapshot.rows {
+                let text: String = snapshot
+                    .row(cell.row)
+                    .iter()
+                    .filter(|cell| !cell.spacer)
+                    .map(|cell| cell.c)
+                    .collect();
+                if let Some((path, line)) = python::traceback_location(&text) {
+                    cx.emit(TerminalViewEvent::OpenLocation { path, line });
+                    return;
+                }
+            }
+        }
         self.selection = Some((cell, cell));
         self.selecting = true;
         cx.notify();
@@ -647,6 +673,13 @@ impl Element for TerminalElement {
     }
 }
 
+pub enum TerminalPanelEvent {
+    /// Open a file at a 0-based line (Ctrl+click in a terminal).
+    OpenFile { path: PathBuf, line: usize },
+}
+
+impl EventEmitter<TerminalPanelEvent> for TerminalPanel {}
+
 pub struct TerminalPanel {
     project: Project,
     tabs: Vec<(Entity<TerminalView>, Subscription)>,
@@ -679,9 +712,51 @@ impl TerminalPanel {
         }
     }
 
-    fn spawn(&mut self, profile: &Profile, window: &mut Window, cx: &mut Context<Self>) {
+    /// Runs `command_line` in a new tab of the default shell, so its output
+    /// stays visible and it can be run again.
+    pub fn run_command(
+        &mut self,
+        title: &str,
+        command_line: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = profiles(&self.project).into_iter().next() else {
+            return;
+        };
+        if let Some(view) = self.spawn(&profile, window, cx) {
+            let title: SharedString = title.to_owned().into();
+            let line = format!("{command_line}\r");
+            view.update(cx, |view, cx| {
+                view.title = title;
+                view.write(line.into_bytes(), cx);
+            });
+        }
+    }
+
+    /// The project's virtualenv (`.venv`) as `(dir, bin dir)`, if any.
+    fn venv(&self) -> Option<(PathBuf, PathBuf)> {
+        let venv = self.project.resolve(".venv");
+        let bin = self.project.join(
+            &venv,
+            if self.project.is_remote() || !cfg!(windows) {
+                "bin"
+            } else {
+                "Scripts"
+            },
+        );
+        matches!(self.project.kind(&bin), Ok(Some(FileKind::Dir))).then_some((venv, bin))
+    }
+
+    fn spawn(
+        &mut self,
+        profile: &Profile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TerminalView>> {
         let mut options = TerminalOptions::default_shell();
         let palette = Palette::default();
+        let venv = self.venv();
         let started = if profile.remote {
             self.project.spawn_remote_shell(
                 options.columns,
@@ -695,6 +770,20 @@ impl TerminalPanel {
                 options.args = profile.args.iter().map(|&arg| arg.into()).collect();
             }
             options.cwd = Some(self.project.root().to_path_buf());
+            // The project's virtualenv, activated as its `activate` would.
+            if let Some((venv, bin)) = &venv {
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                let path = std::env::join_paths(
+                    std::iter::once(bin.clone()).chain(std::env::split_paths(&path)),
+                )
+                .unwrap_or(path);
+                options
+                    .env
+                    .insert("VIRTUAL_ENV".into(), venv.to_string_lossy().into_owned());
+                options
+                    .env
+                    .insert("PATH".into(), path.to_string_lossy().into_owned());
+            }
             Terminal::spawn(options, palette)
         };
         let (terminal, events) = match started {
@@ -702,12 +791,18 @@ impl TerminalPanel {
             Err(err) => {
                 self.error = Some(format!("Could not start {}: {err}", profile.name).into());
                 cx.notify();
-                return;
+                return None;
             }
         };
         self.error = None;
         let name = profile.name;
         let view = cx.new(|cx| TerminalView::new(terminal, events, name, palette, cx));
+        // Remote login shells set PATH from their profiles: activate after.
+        if profile.remote && venv.is_some() {
+            view.update(cx, |view, cx| {
+                view.write(b". .venv/bin/activate\r".to_vec(), cx)
+            });
+        }
         let subscription =
             cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
                 TerminalViewEvent::TitleChanged => cx.notify(),
@@ -717,11 +812,19 @@ impl TerminalPanel {
                         this.close(index, window, cx);
                     }
                 }
+                TerminalViewEvent::OpenLocation { path, line } => {
+                    let path = this.project.path(path);
+                    cx.emit(TerminalPanelEvent::OpenFile {
+                        path,
+                        line: line.saturating_sub(1),
+                    });
+                }
             });
         window.focus(&view.focus_handle(cx));
-        self.tabs.push((view, subscription));
+        self.tabs.push((view.clone(), subscription));
         self.active = self.tabs.len() - 1;
         cx.notify();
+        Some(view)
     }
 
     fn close(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -788,7 +891,9 @@ impl Render for TerminalPanel {
                 .cursor_pointer()
                 .hover(|style| style.text_color(rgb(theme::TEXT)))
                 .child(format!("+ {}", profile.name))
-                .on_click(cx.listener(move |this, _, window, cx| this.spawn(&profile, window, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.spawn(&profile, window, cx);
+                }))
         });
         div()
             .track_focus(&self.focus_handle)

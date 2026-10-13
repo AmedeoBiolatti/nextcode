@@ -33,6 +33,13 @@ pub enum Location {
         distro: String,
         path: String,
     },
+    /// A folder (local or in WSL) opened inside its dev container.
+    DevContainer {
+        folder: Box<Location>,
+        /// The `devcontainer.json` (in the folder's path syntax); `None` is
+        /// the folder's first one.
+        config: Option<String>,
+    },
 }
 
 impl fmt::Display for Location {
@@ -40,18 +47,28 @@ impl fmt::Display for Location {
         match self {
             Self::Local(root) => write!(f, "{}", root.display()),
             Self::Wsl { distro, path } => write!(f, "{path} [WSL: {distro}]"),
+            Self::DevContainer { folder, .. } => write!(f, "{folder} [Dev Container]"),
         }
     }
 }
 
+/// Prefix of typed dev container locations (`devcontainer:C:\src\p`).
+const DEVCONTAINER_PREFIX: &str = "devcontainer:";
+
 impl Location {
     /// Reads a typed location: `\\wsl.localhost\<distro>\path` (or
-    /// `\\wsl$\...`), `<distro>:/linux/path` (or `<distro>:~/...`), else a
-    /// local path.
+    /// `\\wsl$\...`), `<distro>:/linux/path` (or `<distro>:~/...`),
+    /// `devcontainer:<one of those or a local path>`, else a local path.
     pub fn parse(input: &str) -> Option<Self> {
         let input = input.trim();
         if input.is_empty() {
             return None;
+        }
+        if let Some(folder) = input.strip_prefix(DEVCONTAINER_PREFIX) {
+            return Some(Self::DevContainer {
+                folder: Box::new(Self::parse(folder)?),
+                config: None,
+            });
         }
         if let Some(wsl) = wsl_unc_path(input) {
             return Some(wsl);
@@ -68,6 +85,36 @@ impl Location {
             });
         }
         Some(Self::Local(PathBuf::from(input)))
+    }
+
+    /// Local paths made absolute (also inside a dev container location).
+    pub fn absolute(self) -> Self {
+        match self {
+            Self::Local(root) => Self::Local(std::path::absolute(&root).unwrap_or(root)),
+            Self::DevContainer { folder, config } => Self::DevContainer {
+                folder: Box::new(folder.absolute()),
+                config,
+            },
+            wsl => wsl,
+        }
+    }
+
+    /// Whether both open the same project; a dev container location without
+    /// a config means the folder's first one, whichever that is.
+    pub fn opens_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::DevContainer {
+                    folder: a,
+                    config: config_a,
+                },
+                Self::DevContainer {
+                    folder: b,
+                    config: config_b,
+                },
+            ) => a == b && (config_a.is_none() || config_b.is_none() || config_a == config_b),
+            _ => self == other,
+        }
     }
 }
 
@@ -101,10 +148,43 @@ struct Inner {
 
 enum Backend {
     Local,
-    Wsl {
-        distro: String,
+    /// Behind `next_code_agent`.
+    Remote {
         client: Arc<AgentClient>,
+        host: RemoteHost,
     },
+}
+
+enum RemoteHost {
+    Wsl { distro: String },
+    Container(Box<ContainerHost>),
+}
+
+/// A dev container and what is needed to stop it.
+struct ContainerHost {
+    /// The folder the container was opened for.
+    folder: Location,
+    config: String,
+    docker: remote::container::DockerHost,
+    /// Set when the editor created or started the container: it is stopped
+    /// (as `shutdownAction` says) when the project is closed.
+    stop: Option<Vec<String>>,
+}
+
+impl Drop for ContainerHost {
+    fn drop(&mut self) {
+        // Detached, so it finishes even when the editor exits right after.
+        if let Some(args) = &self.stop {
+            self.docker
+                .docker()
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok();
+        }
+    }
 }
 
 /// Stops watching when dropped.
@@ -133,11 +213,108 @@ impl Project {
         let connection = remote::wsl::connect(distro, path)?;
         Ok(Self(Arc::new(Inner {
             root: PathBuf::from(connection.info.root),
-            backend: Backend::Wsl {
-                distro: distro.to_owned(),
+            backend: Backend::Remote {
                 client: connection.client,
+                host: RemoteHost::Wsl {
+                    distro: distro.to_owned(),
+                },
             },
         })))
+    }
+
+    /// Opens `location`, reporting steps of slow ones (dev containers) to
+    /// `progress`. Blocks.
+    pub fn open(location: &Location, progress: &mut dyn FnMut(&str)) -> io::Result<Self> {
+        match location {
+            Location::Local(root) => Ok(Self::local(root.clone())),
+            Location::Wsl { distro, path } => Self::connect_wsl(distro, path),
+            Location::DevContainer { folder, config } => {
+                Self::connect_devcontainer(folder, config.as_deref(), progress)
+            }
+        }
+    }
+
+    /// Brings up the dev container of `folder` and opens its workspace
+    /// folder through an agent inside it.
+    fn connect_devcontainer(
+        folder: &Location,
+        config: Option<&str>,
+        progress: &mut dyn FnMut(&str),
+    ) -> io::Result<Self> {
+        let (host_project, docker) = match folder {
+            Location::Local(root) => (
+                Self::local(root.clone()),
+                remote::container::DockerHost::Local,
+            ),
+            Location::Wsl { distro, path } => {
+                progress(&format!("Connecting to WSL distro '{distro}'"));
+                (
+                    Self::connect_wsl(distro, path)?,
+                    remote::container::DockerHost::Wsl(distro.clone()),
+                )
+            }
+            Location::DevContainer { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a dev container cannot contain another one",
+                ));
+            }
+        };
+        let host = FolderHost(host_project.clone());
+        let folder_path = host_project.root().to_string_lossy().into_owned();
+        let config = match config {
+            Some(config) => config.to_owned(),
+            None => devcontainer::find_configs(&host, &folder_path)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{folder} has no .devcontainer/devcontainer.json"),
+                    )
+                })?,
+        };
+        let started = devcontainer::up(&host, &config, progress)?;
+        progress(&format!("Starting the editor agent in {}", started.name));
+        let target = remote::container::Container {
+            host: docker.clone(),
+            id: started.id.clone(),
+            name: started.name.clone(),
+            user: started.user.clone(),
+            env: started.remote_env.clone(),
+            workdir: Some(started.workspace_folder.clone()),
+        };
+        let container = ContainerHost {
+            folder: folder.clone(),
+            config: config.clone(),
+            docker,
+            stop: started
+                .started
+                .then(|| devcontainer::stop_args(&started.shutdown))
+                .flatten(),
+        };
+        let connection = remote::container::connect(&target, &started.workspace_folder)?;
+        Ok(Self(Arc::new(Inner {
+            root: PathBuf::from(connection.info.root),
+            backend: Backend::Remote {
+                client: connection.client,
+                host: RemoteHost::Container(Box::new(container)),
+            },
+        })))
+    }
+
+    /// The `devcontainer.json` files of this project's folder (none for a
+    /// project already in a container). Blocks.
+    pub fn devcontainer_configs(&self) -> io::Result<Vec<String>> {
+        if let Backend::Remote {
+            host: RemoteHost::Container(_),
+            ..
+        } = &self.0.backend
+        {
+            return Ok(Vec::new());
+        }
+        let host = FolderHost(self.clone());
+        devcontainer::find_configs(&host, &self.0.root.to_string_lossy())
     }
 
     pub fn root(&self) -> &Path {
@@ -147,22 +324,40 @@ impl Project {
     pub fn location(&self) -> Location {
         match &self.0.backend {
             Backend::Local => Location::Local(self.0.root.clone()),
-            Backend::Wsl { distro, .. } => Location::Wsl {
+            Backend::Remote {
+                host: RemoteHost::Wsl { distro },
+                ..
+            } => Location::Wsl {
                 distro: distro.clone(),
                 path: self.0.root.to_string_lossy().into_owned(),
+            },
+            Backend::Remote {
+                host: RemoteHost::Container(container),
+                ..
+            } => Location::DevContainer {
+                folder: Box::new(container.folder.clone()),
+                config: Some(container.config.clone()),
             },
         }
     }
 
     /// Another directory reached the same way as this project (e.g. a git
-    /// worktree path as git prints it).
-    pub fn location_of(&self, path: &str) -> Location {
+    /// worktree path as git prints it); `None` inside a container, whose
+    /// other directories cannot be opened on their own.
+    pub fn location_of(&self, path: &str) -> Option<Location> {
         match &self.0.backend {
-            Backend::Local => Location::Local(PathBuf::from(path)),
-            Backend::Wsl { distro, .. } => Location::Wsl {
+            Backend::Local => Some(Location::Local(PathBuf::from(path))),
+            Backend::Remote {
+                host: RemoteHost::Wsl { distro },
+                ..
+            } => Some(Location::Wsl {
                 distro: distro.clone(),
                 path: path.to_owned(),
-            },
+            }),
+            Backend::Remote {
+                host: RemoteHost::Container(_),
+                ..
+            } => None,
         }
     }
 
@@ -170,19 +365,30 @@ impl Project {
     pub fn state_key(&self) -> String {
         match &self.0.backend {
             Backend::Local => self.0.root.to_string_lossy().into_owned(),
-            Backend::Wsl { distro, .. } => format!("wsl:{distro}:{}", self.0.root.display()),
+            Backend::Remote {
+                host: RemoteHost::Wsl { distro },
+                ..
+            } => format!("wsl:{distro}:{}", self.0.root.display()),
+            Backend::Remote {
+                host: RemoteHost::Container(container),
+                ..
+            } => format!(
+                "devcontainer:{}:{}",
+                container.config,
+                self.0.root.display()
+            ),
         }
     }
 
     pub fn is_remote(&self) -> bool {
-        matches!(self.0.backend, Backend::Wsl { .. })
+        matches!(self.0.backend, Backend::Remote { .. })
     }
 
     /// Receives why the agent disconnected; `None` for local projects.
     pub fn disconnects(&self) -> Option<UnboundedReceiver<String>> {
         match &self.0.backend {
             Backend::Local => None,
-            Backend::Wsl { client, .. } => Some(client.disconnects()),
+            Backend::Remote { client, .. } => Some(client.disconnects()),
         }
     }
 
@@ -192,7 +398,7 @@ impl Project {
         match &self.0.backend {
             // Rebuilt from components so `/` becomes `\` on Windows.
             Backend::Local => dir.join(name).components().collect(),
-            Backend::Wsl { .. } => {
+            Backend::Remote { .. } => {
                 let dir = dir.to_string_lossy();
                 PathBuf::from(format!("{}/{name}", dir.trim_end_matches('/')))
             }
@@ -210,8 +416,8 @@ impl Project {
     pub fn path(&self, input: &str) -> PathBuf {
         match &self.0.backend {
             Backend::Local => self.0.root.join(input).components().collect(),
-            Backend::Wsl { .. } if input.starts_with('/') => PathBuf::from(input),
-            Backend::Wsl { .. } => self.resolve(input),
+            Backend::Remote { .. } if input.starts_with('/') => PathBuf::from(input),
+            Backend::Remote { .. } => self.resolve(input),
         }
     }
 
@@ -219,7 +425,7 @@ impl Project {
     pub fn read_dir(&self, dir: &Path) -> io::Result<Vec<DirEntry>> {
         match &self.0.backend {
             Backend::Local => worktree::read_dir(dir),
-            Backend::Wsl { client, .. } => client.read_dir(agent_path(dir)?),
+            Backend::Remote { client, .. } => client.read_dir(agent_path(dir)?),
         }
     }
 
@@ -227,7 +433,7 @@ impl Project {
     pub fn list_files(&self) -> io::Result<Vec<String>> {
         match &self.0.backend {
             Backend::Local => Ok(worktree::list_files(&self.0.root)),
-            Backend::Wsl { client, .. } => client.list_files(agent_path(&self.0.root)?),
+            Backend::Remote { client, .. } => client.list_files(agent_path(&self.0.root)?),
         }
     }
 
@@ -235,7 +441,7 @@ impl Project {
     pub fn read_bytes(&self, path: &Path) -> io::Result<Vec<u8>> {
         match &self.0.backend {
             Backend::Local => fs::read(path),
-            Backend::Wsl { client, .. } => client.read_file(agent_path(path)?),
+            Backend::Remote { client, .. } => client.read_file(agent_path(path)?),
         }
     }
 
@@ -247,7 +453,7 @@ impl Project {
     pub fn write(&self, path: &Path, data: Vec<u8>) -> io::Result<()> {
         match &self.0.backend {
             Backend::Local => worktree::write_file(path, &data),
-            Backend::Wsl { client, .. } => client.write_file(agent_path(path)?, data),
+            Backend::Remote { client, .. } => client.write_file(agent_path(path)?, data),
         }
     }
 
@@ -255,7 +461,7 @@ impl Project {
     pub fn kind(&self, path: &Path) -> io::Result<Option<FileKind>> {
         match &self.0.backend {
             Backend::Local => worktree::kind(path),
-            Backend::Wsl { client, .. } => client.stat(agent_path(path)?),
+            Backend::Remote { client, .. } => client.stat(agent_path(path)?),
         }
     }
 
@@ -266,7 +472,7 @@ impl Project {
                     watcher::watch(&self.0.root, debounce).map_err(io::Error::other)?;
                 Ok((WatchHandle::Local(watcher), batches))
             }
-            Backend::Wsl { client, .. } => {
+            Backend::Remote { client, .. } => {
                 let (handle, batches) = client.watch(agent_path(&self.0.root)?, debounce)?;
                 Ok((WatchHandle::Remote(handle), batches))
             }
@@ -283,7 +489,7 @@ impl Project {
             Backend::Local => search::search(&self.0.root, query, limits)
                 .map(|(handle, events)| (SearchHandle::Local(handle), events))
                 .map_err(|err| err.to_string()),
-            Backend::Wsl { client, .. } => agent_path(&self.0.root)
+            Backend::Remote { client, .. } => agent_path(&self.0.root)
                 .and_then(|root| client.search(root, query, limits))
                 .map(|(handle, events)| (SearchHandle::Remote(handle), events))
                 .map_err(|err| err.to_string()),
@@ -294,7 +500,7 @@ impl Project {
     pub fn find_executable(&self, command: &str) -> io::Result<Option<PathBuf>> {
         match &self.0.backend {
             Backend::Local => Ok(worktree::find_executable(command, &self.0.root)),
-            Backend::Wsl { client, .. } => Ok(client
+            Backend::Remote { client, .. } => Ok(client
                 .find_executable(command, agent_path(&self.0.root)?)?
                 .map(PathBuf::from)),
         }
@@ -303,7 +509,7 @@ impl Project {
     pub fn python_interpreter(&self) -> io::Result<Option<PathBuf>> {
         match &self.0.backend {
             Backend::Local => Ok(worktree::python_interpreter(&self.0.root)),
-            Backend::Wsl { client, .. } => Ok(client
+            Backend::Remote { client, .. } => Ok(client
                 .python_interpreter(agent_path(&self.0.root)?)?
                 .map(PathBuf::from)),
         }
@@ -320,15 +526,10 @@ impl Project {
             Backend::Local => {
                 let mut command = Command::new(program);
                 command.args(args).current_dir(&self.0.root);
-                #[cfg(windows)]
-                {
-                    // Don't flash a console window from a GUI process.
-                    use std::os::windows::process::CommandExt;
-                    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-                }
+                remote::launch::no_window(&mut command);
                 LanguageServer::spawn(&mut command, logger)
             }
-            Backend::Wsl { client, .. } => client.spawn_language_server(
+            Backend::Remote { client, .. } => client.spawn_language_server(
                 agent_path(program)?,
                 args,
                 agent_path(&self.0.root)?,
@@ -351,7 +552,7 @@ impl Project {
                 io::ErrorKind::Unsupported,
                 "local projects start shells directly",
             )),
-            Backend::Wsl { client, .. } => client.spawn_terminal(
+            Backend::Remote { client, .. } => client.spawn_terminal(
                 agent_path(&self.0.root)?,
                 columns,
                 rows,
@@ -390,7 +591,7 @@ impl Project {
         timeout: Duration,
     ) -> io::Result<RunOutput> {
         match &self.0.backend {
-            Backend::Wsl { client, .. } => client.run(
+            Backend::Remote { client, .. } => client.run(
                 program,
                 args,
                 agent_path(&self.0.root)?,
@@ -411,11 +612,7 @@ impl Project {
                     })
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-                }
+                remote::launch::no_window(&mut command);
                 let mut child = command.spawn()?;
                 if let (Some(mut stdin), Some(input)) = (child.stdin.take(), input) {
                     let input = input.to_vec();
@@ -517,5 +714,90 @@ impl git::Runner for GitRunner {
             stdout: output.stdout,
             stderr: output.stderr,
         })
+    }
+}
+
+/// The machine where a project folder lives, for `devcontainer`: docker and
+/// files go through the project (locally or through the WSL agent).
+struct FolderHost(Project);
+
+impl devcontainer::Host for FolderHost {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> io::Result<devcontainer::Output> {
+        let output = self.0.run_program(program, args, &[], input, timeout)?;
+        Ok(devcontainer::Output {
+            code: output.code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+
+    fn read_file(&self, path: &str) -> io::Result<Option<Vec<u8>>> {
+        match self.0.read_bytes(Path::new(path)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn write_file(&self, path: &str, data: &[u8]) -> io::Result<()> {
+        self.0.write(Path::new(path), data.to_vec())
+    }
+
+    fn list_dirs(&self, path: &str) -> io::Result<Vec<String>> {
+        match self.0.read_dir(Path::new(path)) {
+            Ok(entries) => Ok(entries
+                .into_iter()
+                .filter(|entry| entry.is_dir)
+                .map(|entry| entry.name)
+                .collect()),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(Vec::new())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn temp_dir(&self) -> String {
+        if self.0.is_remote() {
+            "/tmp".into()
+        } else {
+            std::env::temp_dir().to_string_lossy().into_owned()
+        }
+    }
+
+    fn env_var(&self, name: &str) -> Option<String> {
+        if !self.0.is_remote() {
+            return std::env::var(name).ok();
+        }
+        let output = self
+            .0
+            .run_program(
+                "printenv",
+                &[name.to_owned()],
+                &[],
+                None,
+                Duration::from_secs(30),
+            )
+            .ok()?;
+        (output.code == Some(0)).then(|| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end_matches('\n')
+                .to_owned()
+        })
+    }
+
+    fn windows(&self) -> bool {
+        cfg!(windows) && !self.0.is_remote()
     }
 }

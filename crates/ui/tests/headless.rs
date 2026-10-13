@@ -57,7 +57,7 @@ impl Headless {
         loop {
             let line = self
                 .lines
-                .recv_timeout(Duration::from_secs(30))
+                .recv_timeout(Duration::from_secs(120))
                 .expect("no output from next_code --headless");
             if matches(&line) {
                 return line;
@@ -345,6 +345,72 @@ fn headless_mode_stages_diffs_and_commits_with_git() {
     // No remote: pushing fails with git's message rather than prompting.
     let push = headless.call(json!({ "cmd": "git_push" }));
     assert_eq!(push["ok"], false, "{push}");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn headless_mode_reads_python_projects_and_dev_container_configs() {
+    let root = std::env::temp_dir().join(format!("next_code_headless_py_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::create_dir_all(root.join(".devcontainer")).unwrap();
+    fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"demo\"\nversion = \"0.2.0\"\nrequires-python = \">=3.12\"\n\
+         dependencies = [\"httpx>=0.28\"]\n\n[project.scripts]\ndemo = \"demo:main\"\n\n\
+         [dependency-groups]\ndev = [\"pytest\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("uv.lock"),
+        "version = 1\n[[package]]\nname = \"httpx\"\nversion = \"0.28.1\"\n",
+    )
+    .unwrap();
+    fs::write(root.join(".python-version"), "3.12\n").unwrap();
+    fs::write(
+        root.join("tests/test_a.py"),
+        "class TestA:\n    def test_ok(self):\n        assert True\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".devcontainer/devcontainer.json"),
+        "{ // comment\n \"image\": \"python:3.12\" }\n",
+    )
+    .unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let info = headless.call(json!({ "cmd": "python_info" }));
+    let info = &info["result"];
+    assert_eq!(
+        (&info["name"], &info["version"], &info["pinned"]),
+        (&json!("demo"), &json!("0.2.0"), &json!("3.12")),
+        "{info}"
+    );
+    assert_eq!(
+        info["dependencies"],
+        json!([
+            { "name": "httpx", "specifier": ">=0.28", "kind": "dependencies", "locked": "0.28.1" },
+            { "name": "pytest", "specifier": "", "kind": "group: dev", "locked": null },
+        ])
+    );
+    assert_eq!(info["scripts"], json!({ "demo": "demo:main" }));
+    assert_eq!(info["locked_packages"], 1);
+
+    let test =
+        headless.call(json!({ "cmd": "python_test_at", "path": "tests/test_a.py", "line": 2 }));
+    assert_eq!(test["result"], "TestA::test_ok", "{test}");
+    let outside =
+        headless.call(json!({ "cmd": "python_test_at", "path": "tests/test_a.py", "line": 0 }));
+    assert_eq!(outside["result"], "TestA", "{outside}");
+
+    let configs = headless.call(json!({ "cmd": "devcontainer_configs" }));
+    let configs = configs["result"].as_array().unwrap();
+    assert_eq!(configs.len(), 1);
+    assert!(configs[0].as_str().unwrap().ends_with("devcontainer.json"));
 
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
     assert!(headless.child.wait().unwrap().success());

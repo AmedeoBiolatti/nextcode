@@ -77,6 +77,7 @@ impl Workspace {
             PanelId::Terminal => Some(self.terminal.clone().into()),
             PanelId::Search => Some(self.search.clone().into()),
             PanelId::Git => Some(self.git.clone().into()),
+            PanelId::Python => Some(self.python.clone().into()),
         }
     }
 

@@ -19,6 +19,7 @@ mod lsp_store;
 mod problems;
 mod project;
 mod project_picker;
+mod python_panel;
 mod recent;
 mod revision_picker;
 mod search_panel;
@@ -38,12 +39,17 @@ use gpui::{App, Application};
 
 use crate::project::Location;
 
-const USAGE: &str = "usage: next_code [--headless] [PROJECT_DIR]\n       next_code [--headless] --wsl <DISTRO> <LINUX_PATH>\n\n--headless serves JSON-line commands on stdin instead of opening a window.";
+const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).";
 
 /// Reads the command line: a local directory (default: the current one), a
-/// `\\wsl.localhost\<distro>\...` path, or `--wsl <distro> <linux path>`.
+/// `\\wsl.localhost\<distro>\...` path, or `--wsl <distro> <linux path>`,
+/// optionally preceded by `--devcontainer`.
 fn parse_args(args: &[OsString]) -> anyhow::Result<Location> {
     match args {
+        [flag, rest @ ..] if flag == "--devcontainer" => Ok(Location::DevContainer {
+            folder: Box::new(parse_args(rest)?),
+            config: None,
+        }),
         [] => Ok(Location::Local(
             std::env::current_dir().context("reading current directory")?,
         )),
@@ -59,6 +65,23 @@ fn parse_args(args: &[OsString]) -> anyhow::Result<Location> {
             .ok_or_else(|| anyhow::anyhow!("empty project path\n{USAGE}")),
         _ => anyhow::bail!("{USAGE}"),
     }
+}
+
+/// Local folders made absolute and checked.
+fn checked(location: Location) -> anyhow::Result<Location> {
+    Ok(match location {
+        Location::Local(root) => {
+            let root = std::path::absolute(&root)
+                .with_context(|| format!("resolving {}", root.display()))?;
+            anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
+            Location::Local(root)
+        }
+        Location::DevContainer { folder, config } => Location::DevContainer {
+            folder: Box::new(checked(*folder)?),
+            config,
+        },
+        wsl => wsl,
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -77,15 +100,7 @@ fn run() -> anyhow::Result<()> {
     if headless {
         args.remove(0);
     }
-    let location = match parse_args(&args)? {
-        Location::Local(root) => {
-            let root = std::path::absolute(&root)
-                .with_context(|| format!("resolving {}", root.display()))?;
-            anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
-            Location::Local(root)
-        }
-        wsl => wsl,
-    };
+    let location = checked(parse_args(&args)?)?;
     if headless {
         startup::attach_console();
         headless::run(location);
@@ -163,5 +178,32 @@ mod tests {
             Location::Local(PathBuf::from("C:/dev/p"))
         );
         assert!(parse_args(&args(&["--wsl", "/home/me/p"])).is_err());
+    }
+
+    #[test]
+    fn dev_container_locations_wrap_a_folder() {
+        let in_container = |folder: Location| Location::DevContainer {
+            folder: Box::new(folder),
+            config: None,
+        };
+        assert_eq!(
+            parse_args(&args(&["--devcontainer", "--wsl", "Ubuntu", "/home/me/p"])).unwrap(),
+            in_container(wsl("Ubuntu", "/home/me/p"))
+        );
+        assert_eq!(
+            parse_args(&args(&["--devcontainer", r"C:\dev\p"])).unwrap(),
+            in_container(Location::Local(PathBuf::from(r"C:\dev\p")))
+        );
+        assert_eq!(
+            Location::parse("devcontainer:Ubuntu:~/p").unwrap(),
+            in_container(wsl("Ubuntu", "~/p"))
+        );
+        // The config a running project reports matches a request without one.
+        let opened = Location::DevContainer {
+            folder: Box::new(wsl("Ubuntu", "/p")),
+            config: Some("/p/.devcontainer/devcontainer.json".into()),
+        };
+        assert!(opened.opens_same(&in_container(wsl("Ubuntu", "/p"))));
+        assert!(!opened.opens_same(&wsl("Ubuntu", "/p")));
     }
 }

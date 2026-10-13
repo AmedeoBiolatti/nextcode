@@ -1,5 +1,6 @@
 //! "Open Recent" modal: recent projects plus whatever location is typed
-//! (a local folder, `Distro:/linux/path`, or `\\wsl.localhost\...`).
+//! (a local folder, `Distro:/linux/path`, `\\wsl.localhost\...`, or any of
+//! those after `devcontainer:`).
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton,
@@ -112,7 +113,7 @@ impl Focusable for ProjectPicker {
 impl Render for ProjectPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let hint = if self.rows.is_empty() {
-            "Type a folder, Distro:/linux/path or \\\\wsl.localhost\\Distro\\path"
+            "Type a folder, Distro:/linux/path, \\\\wsl.localhost\\Distro\\path, or devcontainer:<folder>"
         } else {
             "Enter opens in a new window (or switches to it)"
         };
