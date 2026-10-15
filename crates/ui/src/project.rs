@@ -173,16 +173,19 @@ struct ContainerHost {
 
 impl Drop for ContainerHost {
     fn drop(&mut self) {
-        // Detached, so it finishes even when the editor exits right after.
+        // Detached, so it finishes even when the editor exits right after;
+        // on Unix also in its own process group, so whatever ends the
+        // editor's group (a supervisor, Ctrl+C in a terminal) spares it.
         if let Some(args) = &self.stop {
-            self.docker
-                .docker()
+            let mut command = self.docker.docker();
+            command
                 .args(args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok();
+                .stderr(Stdio::null());
+            #[cfg(unix)]
+            std::os::unix::process::CommandExt::process_group(&mut command, 0);
+            command.spawn().ok();
         }
     }
 }

@@ -48,3 +48,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+# Already in the tree (alacritty_terminal): clean exit on SIGTERM/SIGINT.
+signal-hook = "0.4"

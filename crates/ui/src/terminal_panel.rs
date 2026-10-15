@@ -697,6 +697,9 @@ pub struct TerminalPanel {
     active: usize,
     focus_handle: FocusHandle,
     error: Option<SharedString>,
+    /// A shell was started (or offered to start) once; later the panel
+    /// stays as the user leaves it.
+    started: bool,
 }
 
 impl TerminalPanel {
@@ -707,6 +710,7 @@ impl TerminalPanel {
             active: 0,
             focus_handle: cx.focus_handle(),
             error: None,
+            started: false,
         }
     }
 
@@ -839,6 +843,7 @@ impl TerminalPanel {
                     });
                 }
             });
+        self.started = true;
         window.focus(&view.focus_handle(cx));
         self.tabs.push((view.clone(), subscription));
         self.active = self.tabs.len() - 1;
@@ -867,7 +872,24 @@ impl Focusable for TerminalPanel {
 }
 
 impl Render for TerminalPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Shown without a shell (restored open from the saved layout):
+        // start one, as opening the panel does, but leave focus where it is.
+        // Only the first time: closing every shell keeps the panel empty.
+        if !self.started {
+            self.started = true;
+            cx.defer_in(window, |this, window, cx| {
+                if this.tabs.is_empty()
+                    && let Some(profile) = profiles(&this.project).into_iter().next()
+                {
+                    let focused = window.focused(cx);
+                    this.spawn(&profile, window, cx);
+                    if let Some(focused) = focused {
+                        window.focus(&focused);
+                    }
+                }
+            });
+        }
         let tabs = self.tabs.iter().enumerate().map(|(index, (view, _))| {
             let active = index == self.active;
             div()

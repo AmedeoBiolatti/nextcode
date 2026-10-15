@@ -150,6 +150,7 @@ fn run() -> anyhow::Result<()> {
             }
         })
         .detach();
+        startup::close_on_termination(cx);
         shell::open_window(location, Some(preload), cx);
         // The window's renderer exists now.
         prewarm.finish();

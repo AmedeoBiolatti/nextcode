@@ -138,7 +138,9 @@ def main():
                 time.sleep(.1)
             if window is None:
                 raise RuntimeError('NextCode did not create a visible window within 60 seconds')
-            run(['xdotool', 'windowsize', window, str(args.width), str(args.height)])
+            # The editor centers its window; the display is the whole screen.
+            run(['xdotool', 'windowmove', '--sync', window, '0', '0'])
+            run(['xdotool', 'windowsize', '--sync', window, str(args.width), str(args.height)])
             run(['xdotool', 'windowfocus', '--sync', window])
 
             def execute(request):
@@ -240,14 +242,16 @@ def main():
     finally:
         if server:
             server.server_close()
+        # Newest first, one at a time: the editor closes its windows on
+        # SIGTERM (stopping dev containers it started, shutting down
+        # language servers), which needs the display still running.
         for child in reversed(children):
             try:
                 os.killpg(child.pid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
-        for child in reversed(children):
+                continue
             try:
-                child.wait(timeout=3)
+                child.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()

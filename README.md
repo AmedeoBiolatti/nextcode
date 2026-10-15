@@ -349,7 +349,14 @@ X11 button numbers, including additional buttons; move between them to drag.
 `text` pastes Unicode through the private display's clipboard. Clipboard paste
 requires the target control's normal paste binding. Key events remain available
 for controls with different bindings. `shutdown` stops the server and children;
-Ctrl+C or terminating the supervisor also ends the session.
+Ctrl+C or terminating the supervisor also ends the session. The editor closes
+its windows on SIGTERM/SIGINT/SIGHUP (no unsaved-files prompt), so dev
+containers it started are stopped as on a normal exit; a second signal ends it
+immediately.
+
+When the GUI panics, the message and a backtrace are appended to
+`next_code/crash.log` in the local data dir (`%LOCALAPPDATA%` on Windows,
+`~/.local/share` on Linux); without a console there is otherwise no trace.
 
 Requests execute serially. Input acknowledgements mean the platform operation
 finished, not that asynchronous application work or a rendered frame completed.

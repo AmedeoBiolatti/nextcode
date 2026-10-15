@@ -1,5 +1,6 @@
-//! Process-level startup concerns: the console on Windows and the
-//! `NEXT_CODE_TRACE_STARTUP` timeline.
+//! Process-level startup concerns: the console on Windows, the
+//! `NEXT_CODE_TRACE_STARTUP` timeline, the crash log, and closing cleanly
+//! on termination signals.
 //!
 //! The binary uses the Windows GUI subsystem, so no console window opens
 //! with it. Command-line output (errors, `--headless`) goes to redirected
@@ -24,10 +25,103 @@ static BEFORE_MAIN: LazyLock<Duration> = LazyLock::new(|| match *TRACE {
     None => Duration::ZERO,
 });
 
-/// Starts the startup timeline; call first thing in `main`.
+/// Starts the startup timeline and the crash log; call first thing in
+/// `main`.
 pub fn init() {
     mark("main");
+    log_panics();
 }
+
+/// `next_code/crash.log` in the local data dir.
+pub fn crash_log_path() -> Option<std::path::PathBuf> {
+    Some(dirs::data_local_dir()?.join("next_code").join("crash.log"))
+}
+
+/// Appends every panic, with a backtrace, to [`crash_log_path`]. A GUI
+/// process has no console, so without this a panic (which ends the
+/// process with code 101 and no Windows error report) leaves no trace.
+/// The default hook still prints to stderr.
+fn log_panics() {
+    use std::io::Write;
+    const LIMIT: u64 = 1024 * 1024;
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let Some(path) = crash_log_path() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        // Keep the newest crashes: start over past the limit.
+        let fresh = std::fs::metadata(&path).is_ok_and(|meta| meta.len() > LIMIT);
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(!fresh)
+            .write(true)
+            .truncate(fresh)
+            .open(&path)
+        else {
+            return;
+        };
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let thread = std::thread::current();
+        writeln!(
+            file,
+            "--- next_code {} panicked at unix time {seconds}, pid {}, thread {}\n{info}\n{}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            thread.name().unwrap_or("<unnamed>"),
+            std::backtrace::Backtrace::force_capture(),
+        )
+        .ok();
+    }));
+}
+
+/// Closes every window (as their close buttons would, but without asking
+/// about unsaved files) on SIGTERM, SIGINT or SIGHUP, so dev containers
+/// and language servers are shut down as on a normal exit. A second
+/// signal falls back to the default action.
+#[cfg(unix)]
+pub fn close_on_termination(cx: &mut gpui::App) {
+    use futures::StreamExt;
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) else {
+        return;
+    };
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    std::thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            let mut received = signals.forever();
+            if let Some(signal) = received.next() {
+                tx.unbounded_send(signal).ok();
+            }
+            // Closing is under way; a second signal ends the process now.
+            if let Some(signal) = received.next() {
+                signal_hook::low_level::emulate_default_handler(signal).ok();
+            }
+        })
+        .ok();
+    cx.spawn(async move |cx| {
+        if rx.next().await.is_some() {
+            cx.update(|cx| {
+                for window in cx.windows() {
+                    window
+                        .update(cx, |_, window, _| window.remove_window())
+                        .ok();
+                }
+            })
+            .ok();
+        }
+    })
+    .detach();
+}
+
+#[cfg(not(unix))]
+pub fn close_on_termination(_: &mut gpui::App) {}
 
 /// Prints `label` with the time since the process was created (when
 /// tracing).

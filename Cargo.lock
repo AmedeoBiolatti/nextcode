@@ -3580,6 +3580,7 @@ dependencies = [
  "search",
  "serde",
  "serde_json",
+ "signal-hook",
  "syntax",
  "terminal",
  "text",
