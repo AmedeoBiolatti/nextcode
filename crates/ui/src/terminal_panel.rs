@@ -273,6 +273,17 @@ impl TerminalView {
             return;
         }
 
+        if let Some(bytes) = Self::key_bytes(keystroke, self.app_cursor) {
+            self.write(bytes, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// What a key press sends to the shell, if anything. `app_cursor` is the
+    /// terminal's DECCKM mode.
+    fn key_bytes(keystroke: &gpui::Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
+        let m = keystroke.modifiers;
+        let key = keystroke.key.as_str();
         let mods = Modifiers {
             shift: m.shift,
             alt: m.alt,
@@ -282,6 +293,10 @@ impl TerminalView {
             "enter" => Some(Key::Enter),
             "tab" => Some(Key::Tab),
             "backspace" => Some(Key::Backspace),
+            // gpui on Windows gives space no `key_char` (the character comes
+            // as text input, which this view does not take): send it here.
+            // Ctrl+Space is NUL, Alt+Space ESC + space.
+            "space" => Some(Key::Char(' ')),
             "escape" => Some(Key::Escape),
             "up" => Some(Key::Up),
             "down" => Some(Key::Down),
@@ -301,12 +316,12 @@ impl TerminalView {
         };
         // AltGr arrives as ctrl+alt with the composed character; type that.
         let alt_gr = m.control && m.alt && keystroke.key_char.is_some();
-        let bytes = if let Some(named) = named {
-            terminal::encode_key(named, mods, self.app_cursor)
+        if let Some(named) = named {
+            terminal::encode_key(named, mods, app_cursor)
         } else if (m.control || m.alt) && !alt_gr {
             let mut chars = key.chars();
             match (chars.next(), chars.next()) {
-                (Some(c), None) => terminal::encode_key(Key::Char(c), mods, self.app_cursor),
+                (Some(c), None) => terminal::encode_key(Key::Char(c), mods, app_cursor),
                 _ => None,
             }
         } else {
@@ -314,10 +329,6 @@ impl TerminalView {
                 .key_char
                 .as_ref()
                 .map(|text| text.as_bytes().to_vec())
-        };
-        if let Some(bytes) = bytes {
-            self.write(bytes, cx);
-            cx.stop_propagation();
         }
     }
 
@@ -938,5 +949,26 @@ impl Render for TerminalPanel {
                     .min_h_0()
                     .children(self.tabs.get(self.active).map(|(view, _)| view.clone())),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(keys: &str, key_char: Option<&str>) -> Option<Vec<u8>> {
+        let mut keystroke = gpui::Keystroke::parse(keys).unwrap();
+        keystroke.key_char = key_char.map(Into::into);
+        TerminalView::key_bytes(&keystroke, false)
+    }
+
+    #[test]
+    fn space_types_even_without_a_key_char() {
+        // As gpui reports it on Windows: no `key_char` for space.
+        assert_eq!(press("space", None), Some(b" ".to_vec()));
+        assert_eq!(press("ctrl-space", None), Some(vec![0]));
+        assert_eq!(press("alt-space", None), Some(b"\x1b ".to_vec()));
+        assert_eq!(press("backspace", None), Some(vec![0x7f]));
+        assert_eq!(press("a", Some("a")), Some(b"a".to_vec()));
     }
 }

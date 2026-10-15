@@ -44,7 +44,7 @@ use gpui::{App, Application};
 
 use crate::project::Location;
 
-const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).";
+const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code --automation [--port PORT] [--width PX] [--height PX] -- [PROJECT_DIR]\n\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).";
 
 /// Reads the command line: a local directory (default: the current one), a
 /// `\\wsl.localhost\<distro>\...` path, or `--wsl <distro> <linux path>`,
@@ -101,6 +101,19 @@ fn main() -> anyhow::Result<()> {
 
 fn run() -> anyhow::Result<()> {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--automation") {
+        startup::attach_console();
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(include_str!("../../../scripts/automation.py"))
+            .arg("--binary")
+            .arg(std::env::current_exe()?)
+            .args(&args[1..])
+            .status()
+            .context("starting UI automation (requires Linux and Python 3)")?;
+        anyhow::ensure!(status.success(), "UI automation exited with {status}");
+        return Ok(());
+    }
     let headless = args.first().is_some_and(|arg| arg == "--headless");
     if headless {
         args.remove(0);

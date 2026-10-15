@@ -310,6 +310,62 @@ change.
 
 ## Headless mode
 
+### UI automation (Linux / WSL)
+
+`next_code --automation [--port 0] [--width 1440] [--height 900] -- PROJECT_DIR`
+starts the normal GUI on a private Xvfb display, without a visible desktop or
+terminal window. An agent or supervisor launches this process and reads its
+single `ready` JSON line containing a loopback HTTP URL and bearer token.
+Keep the process running for the session. All existing UI code, key bindings,
+menus, and rendering are used unchanged. This is separate from the service
+mode described below.
+
+Requires Python 3, Xvfb, xauth, xdotool, ImageMagick (`import`), xclip, and the
+normal Linux GPUI graphics libraries and fonts. On Debian/Ubuntu the automation
+tools are available with `apt install xvfb xauth xdotool imagemagick xclip`.
+A working Vulkan driver is still required; a software Vulkan driver can be
+used on machines without a GPU. This backend currently supports Linux, including
+WSL, rather than native Windows or macOS.
+
+Send JSON requests to the reported URL with `Authorization: Bearer TOKEN`:
+
+```json
+{"id":1,"cmd":"key","key":"ctrl+p"}
+{"id":2,"cmd":"text","text":"src/main.rs"}
+{"id":3,"cmd":"key","key":"Return"}
+{"id":4,"cmd":"mouse_move","x":500,"y":300}
+{"id":5,"cmd":"click","button":1,"count":2}
+{"id":6,"cmd":"screenshot"}
+```
+
+Replies contain `id`, `ok`, and `result` or `error`. Screenshots return
+`{mime_type, base64, width, height}` containing a PNG of the private display,
+including application dialogs. Coordinates are display pixels at scale 1.
+`info` lists the available operations. Keyboard names use X11 keysyms (for
+example `Return`, `Escape`, `Left`, `F1`, `ctrl+shift+p`). `key_down` and
+`key_up` allow held keys and modifiers. `mouse_down` and `mouse_up` accept
+X11 button numbers, including additional buttons; move between them to drag.
+`scroll` accepts `direction` (`up`, `down`, `left`, `right`) and `count`.
+`text` pastes Unicode through the private display's clipboard. Clipboard paste
+requires the target control's normal paste binding. Key events remain available
+for controls with different bindings. `shutdown` stops the server and children;
+Ctrl+C or terminating the supervisor also ends the session.
+
+Requests execute serially. Input acknowledgements mean the platform operation
+finished, not that asynchronous application work or a rendered frame completed.
+Use `wait` with `ms` (0–10000), then inspect a screenshot; repeat with a bounded
+deadline when waiting for search results, language servers, or other work.
+Frame completion tracking and structured action discovery are not exposed by
+this backend yet; commands can be selected through the normal command palette.
+
+The server binds only to loopback and requires its random session token. The
+display requires an X authority cookie and disables TCP connections. Settings
+and caches are isolated for each session; project files are real and UI actions
+have their usual effects. The implementation is embedded in the executable from
+`scripts/automation.py`, so distributing a separate script is unnecessary.
+Its API uses platform input and pixels and contains no panel-specific logic;
+new UI features are available without updating the automation backend.
+
 `--headless` runs the same project services without a window, for scripts,
 agents and end-to-end tests. Commands are JSON lines on stdin; each gets one
 JSON reply line on stdout, and events (`files_changed`, `diagnostics`,
