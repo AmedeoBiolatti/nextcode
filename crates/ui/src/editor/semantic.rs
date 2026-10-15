@@ -307,7 +307,13 @@ impl<'a> Styler<'a> {
         {
             style = self.styles[highlight.index()].over(style);
         }
-        let mut bits = token.modifiers;
+        // rust-analyzer marks `+=` on a mutable binding `mutable` too;
+        // modifier decorations are for names, not operators.
+        let symbol = token.highlight.is_some_and(|highlight| {
+            let scope = highlight.scope();
+            scope.starts_with("operator") || scope.starts_with("punctuation")
+        });
+        let mut bits = if symbol { 0 } else { token.modifiers };
         while bits != 0 {
             let bit = bits.trailing_zeros() as usize;
             bits &= bits - 1;
@@ -607,6 +613,14 @@ mod tests {
                 .style(variable, Some(&token("variable", 0b10)))
                 .underline,
             Some(true)
+        );
+        // …but not on `+=` marked mutable.
+        let operator = Highlight::from_scope("operator");
+        assert_eq!(
+            styler
+                .style(operator, Some(&token("operator", 0b10)))
+                .underline,
+            syntax("operator").underline
         );
         assert_eq!(styler.style(variable, None), syntax("variable"));
     }

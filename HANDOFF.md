@@ -72,7 +72,8 @@ Debug builds look for `target\debug\next_code_agent` (`-Profile debug`), or set 
 
 ## Open points
 
-- Check on screen (with the user's go-ahead): Git panel tree/list, sync row and amend, diff toggles and hunk buttons, History graph and Compare tabs, revision/worktree pickers, the WSL terminal tab (`pwd` should be the project root), and semantic highlighting colors (verified only headless and in unit tests).
+- Check on screen (with the user's go-ahead): Git panel tree/list, sync row and amend, diff toggles and hunk buttons, History graph and Compare tabs, revision/worktree pickers, the WSL terminal tab (`pwd` should be the project root).
+- Highlighting checked on screen (release, Windows): Dark and Light (switched live via Select Theme…) on Rust with rust-analyzer semantic tokens, Python with basedpyright, JSON, Markdown, TypeScript, Dockerfile; menus and panels in Light. Fixed there: markup/tag/regex scopes had no theme colors; `mutable` underline no longer applies to operators (rust-analyzer marks `+=`). Known: Markdown links/emphasis need the inline grammar (not wired); code inside fences is not injected.
 - Do not test on screen without asking the user; use `--headless` for automation.
 - Git: no merge/rebase/stash, blame or editor gutter markers yet; pull is fast-forward only; hunk actions are whole hunks (no line selection); history loads the latest 2000 commits; comparisons against the working tree omit untracked files.
 - Agent requests are synchronous on the UI thread for tree/open/save (30 s timeout). Move them to background tasks if latency shows.
