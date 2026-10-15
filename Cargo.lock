@@ -3582,6 +3582,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "similar",
  "syntax",
  "terminal",
  "text",

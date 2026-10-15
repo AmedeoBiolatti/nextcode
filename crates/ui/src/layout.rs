@@ -14,16 +14,20 @@ pub enum PanelId {
     Python,
     Terminal,
     Problems,
+    Outline,
+    CallHierarchy,
 }
 
 impl PanelId {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Files,
         Self::Search,
         Self::Git,
         Self::Python,
         Self::Terminal,
         Self::Problems,
+        Self::Outline,
+        Self::CallHierarchy,
     ];
 
     pub fn title(self) -> &'static str {
@@ -34,13 +38,16 @@ impl PanelId {
             Self::Python => "Python",
             Self::Terminal => "Terminal",
             Self::Problems => "Problems",
+            Self::Outline => "Outline",
+            Self::CallHierarchy => "Call Hierarchy",
         }
     }
 
     fn default_position(self) -> DockPosition {
         match self {
             Self::Files | Self::Search | Self::Git | Self::Python => DockPosition::Left,
-            Self::Terminal | Self::Problems => DockPosition::Bottom,
+            Self::Outline => DockPosition::Right,
+            Self::Terminal | Self::Problems | Self::CallHierarchy => DockPosition::Bottom,
         }
     }
 }
@@ -113,11 +120,13 @@ impl Default for Layout {
                 open: true,
             },
             right: DockLayout {
+                panels: vec![PanelId::Outline],
+                active: Some(PanelId::Outline),
                 size: 320.,
-                ..DockLayout::default()
+                open: false,
             },
             bottom: DockLayout {
-                panels: vec![PanelId::Terminal, PanelId::Problems],
+                panels: vec![PanelId::Terminal, PanelId::Problems, PanelId::CallHierarchy],
                 active: Some(PanelId::Terminal),
                 size: 260.,
                 open: false,
@@ -324,7 +333,7 @@ mod tests {
         let mut layout = Layout::default();
         layout.move_panel(PanelId::Files, DockPosition::Right, None);
 
-        assert_eq!(layout.right.panels, [PanelId::Files]);
+        assert_eq!(layout.right.panels, [PanelId::Outline, PanelId::Files]);
         assert_eq!(
             (layout.right.active, layout.right.open),
             (Some(PanelId::Files), true)
@@ -339,7 +348,12 @@ mod tests {
         layout.move_panel(PanelId::Search, DockPosition::Bottom, Some(0));
         assert_eq!(
             layout.bottom.panels,
-            [PanelId::Search, PanelId::Terminal, PanelId::Problems]
+            [
+                PanelId::Search,
+                PanelId::Terminal,
+                PanelId::Problems,
+                PanelId::CallHierarchy
+            ]
         );
         assert_eq!(layout.left.active, Some(PanelId::Git));
         layout.move_panel(PanelId::Git, DockPosition::Right, None);
@@ -352,9 +366,15 @@ mod tests {
     fn reordering_within_a_dock_keeps_the_panel_once() {
         let mut layout = Layout::default();
         layout.move_panel(PanelId::Problems, DockPosition::Bottom, Some(0));
-        assert_eq!(layout.bottom.panels, [PanelId::Problems, PanelId::Terminal]);
+        assert_eq!(
+            layout.bottom.panels,
+            [PanelId::Problems, PanelId::Terminal, PanelId::CallHierarchy]
+        );
         layout.move_panel(PanelId::Problems, DockPosition::Bottom, Some(99));
-        assert_eq!(layout.bottom.panels, [PanelId::Terminal, PanelId::Problems]);
+        assert_eq!(
+            layout.bottom.panels,
+            [PanelId::Terminal, PanelId::CallHierarchy, PanelId::Problems]
+        );
     }
 
     #[test]
@@ -372,6 +392,10 @@ mod tests {
         );
         layout.toggle_panel(PanelId::Terminal);
         assert!(!layout.bottom.open);
+        layout.toggle_dock(DockPosition::Right);
+        assert!(layout.right.open, "the Outline lives in the right dock");
+        layout.move_panel(PanelId::Outline, DockPosition::Left, None);
+        assert!(!layout.right.open, "an emptied dock closes");
         layout.toggle_dock(DockPosition::Right);
         assert!(!layout.right.open, "an empty dock cannot open");
     }
@@ -398,7 +422,9 @@ mod tests {
         );
         assert_eq!(layout.left.active, Some(PanelId::Files));
         assert_eq!(layout.left.size, MIN_DOCK_SIZE);
-        assert!(layout.right.panels.is_empty(), "duplicate dropped");
+        // The duplicate terminal is dropped; the Outline returns to its
+        // default (right) dock, as panels missing from older layouts do.
+        assert_eq!(layout.right.panels, [PanelId::Outline]);
         // Missing panels return to their default docks.
         assert_eq!(
             layout.position_of(PanelId::Problems),

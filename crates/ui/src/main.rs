@@ -3,6 +3,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod branch_picker;
+mod call_hierarchy;
 mod change_tree;
 mod command_palette;
 mod commands;
@@ -19,6 +20,7 @@ mod layout;
 mod location_picker;
 mod lsp_store;
 mod menus;
+mod outline_panel;
 mod problems;
 mod project;
 mod project_picker;
@@ -29,10 +31,12 @@ mod search_panel;
 mod settings;
 mod shell;
 mod startup;
+mod symbol_picker;
 mod terminal_panel;
 mod theme;
 mod theme_picker;
 mod workspace;
+mod workspace_edit;
 mod worktree_picker;
 
 use std::ffi::OsString;
@@ -140,6 +144,9 @@ fn run() -> anyhow::Result<()> {
         workspace::bind_keys(cx);
         file_finder::bind_keys(cx);
         location_picker::bind_keys(cx);
+        call_hierarchy::bind_keys(cx);
+        outline_panel::bind_keys(cx);
+        symbol_picker::bind_keys(cx);
         project_picker::bind_keys(cx);
         theme_picker::bind_keys(cx);
         terminal_panel::bind_keys(cx);

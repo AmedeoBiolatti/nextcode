@@ -115,6 +115,43 @@ impl DisplayRow {
     }
 }
 
+/// Text a language server shows inside a line (an inlay hint): drawn
+/// before the char at `offset`, never part of the buffer. Rows count its
+/// columns when wrapping, and screen columns include it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Inlay {
+    pub offset: usize,
+    pub label: String,
+    /// A space before/after the label (outside its background).
+    pub padding_left: bool,
+    pub padding_right: bool,
+}
+
+impl Inlay {
+    /// Screen columns taken, padding included.
+    pub fn columns(&self) -> usize {
+        self.label.chars().map(char_width).sum::<usize>()
+            + usize::from(self.padding_left)
+            + usize::from(self.padding_right)
+    }
+}
+
+/// Columns of the inlays in `inlays` (sorted) at exactly `offset`, from
+/// index `*next` on; advances `*next` past them.
+fn inlay_columns_at(inlays: &[Inlay], next: &mut usize, offset: usize) -> usize {
+    let mut columns = 0;
+    while let Some(inlay) = inlays.get(*next) {
+        if inlay.offset > offset {
+            break;
+        }
+        if inlay.offset == offset {
+            columns += inlay.columns();
+        }
+        *next += 1;
+    }
+    columns
+}
+
 /// Columns a char takes on screen. Tabs render as one space for now.
 pub(super) fn char_width(c: char) -> usize {
     if c == '\t' { 1 } else { c.width().unwrap_or(1) }
@@ -127,9 +164,13 @@ pub(super) fn char_width(c: char) -> usize {
 /// breaks anywhere. Whitespace never starts a row (it hangs past the
 /// edge). Continuation rows are indented like the line (VS Code's
 /// `wrappingIndent: same`) unless that leaves less than half the width.
+/// `inlays` (sorted; buffer offsets, the line starting at `start`) take
+/// columns before the char at their offset and move to the next row
+/// with it.
 pub(super) fn wrap_line(
     chars: impl Iterator<Item = char>,
     width: usize,
+    (inlays, start): (&[Inlay], usize),
     mut on_break: impl FnMut(usize),
 ) -> usize {
     let width = width.max(1);
@@ -143,8 +184,11 @@ pub(super) fn wrap_line(
     let mut previous_space = false;
     let mut previous_wide = false;
     let mut offset = 0;
+    let mut next_inlay = 0;
     for c in chars {
         let w = char_width(c);
+        // An inlay before the char travels with it.
+        let span = inlay_columns_at(inlays, &mut next_inlay, start + offset) + w;
         let space = c.is_whitespace();
         if leading {
             if space {
@@ -157,7 +201,7 @@ pub(super) fn wrap_line(
             if offset > row_start && (previous_space || previous_wide || w > 1) {
                 opportunity = Some((offset, column));
             }
-            if column + w > width && offset > row_start {
+            if column + span > width && offset > row_start {
                 let (at, at_column) = opportunity
                     .filter(|&(at, _)| at > row_start)
                     .unwrap_or((offset, column));
@@ -165,14 +209,14 @@ pub(super) fn wrap_line(
                 row_start = at;
                 column = continuation(indent) + column - at_column;
                 opportunity = None;
-                if column + w > width && offset > row_start {
+                if column + span > width && offset > row_start {
                     on_break(offset);
                     row_start = offset;
                     column = continuation(indent);
                 }
             }
         }
-        column += w;
+        column += span;
         previous_space = space;
         previous_wide = w > 1;
         offset += c.len_utf8();
@@ -193,6 +237,8 @@ pub(super) struct DisplayMap {
     /// then the row count; empty while every line is one row.
     row_starts: Vec<usize>,
     line_count: usize,
+    /// Inlay hints, sorted by offset; moved through edits.
+    inlays: Vec<Inlay>,
 }
 
 impl DisplayMap {
@@ -204,7 +250,56 @@ impl DisplayMap {
             hidden: Vec::new(),
             row_starts: Vec::new(),
             line_count: buffer.line_count(),
+            inlays: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn inlays(&self) -> &[Inlay] {
+        &self.inlays
+    }
+
+    /// The inlays from `range.start` through `range.end` (inclusive).
+    pub fn inlays_in(&self, range: Range<usize>) -> &[Inlay] {
+        Self::inlays_between(&self.inlays, range)
+    }
+
+    fn inlays_between(inlays: &[Inlay], range: Range<usize>) -> &[Inlay] {
+        let first = inlays.partition_point(|inlay| inlay.offset < range.start);
+        let rest = &inlays[first..];
+        &rest[..rest.partition_point(|inlay| inlay.offset <= range.end)]
+    }
+
+    fn line_inlays<'a>(inlays: &'a [Inlay], buffer: &Buffer, line: usize) -> &'a [Inlay] {
+        Self::inlays_between(inlays, buffer.line_start(line)..buffer.line_end(line))
+    }
+
+    /// Replaces the inlays (any order; offsets past the end are dropped)
+    /// and rewraps the lines they were or are on. Returns whether
+    /// anything changed.
+    pub fn set_inlays(&mut self, buffer: &Buffer, mut inlays: Vec<Inlay>) -> bool {
+        inlays.retain(|inlay| inlay.offset <= buffer.len());
+        inlays.sort_by_key(|inlay| inlay.offset);
+        if inlays == self.inlays {
+            return false;
+        }
+        let old = std::mem::replace(&mut self.inlays, inlays);
+        if let Some(width) = self.wrap {
+            let mut lines: Vec<usize> = old
+                .iter()
+                .chain(&self.inlays)
+                .map(|inlay| buffer.line_of(inlay.offset.min(buffer.len())))
+                .collect();
+            lines.sort_unstable();
+            lines.dedup();
+            for line in lines {
+                if let Some(rows) = self.line_rows.get_mut(line) {
+                    *rows = Self::count_rows(buffer, line, width, &self.inlays);
+                }
+            }
+            self.rebuild(buffer);
+        }
+        true
     }
 
     /// Wraps at `columns` (`None`: no wrapping). Counts every line's rows
@@ -217,15 +312,22 @@ impl DisplayMap {
         self.line_rows.clear();
         if let Some(width) = columns {
             self.line_rows = (0..buffer.line_count())
-                .map(|line| Self::count_rows(buffer, line, width))
+                .map(|line| Self::count_rows(buffer, line, width, &self.inlays))
                 .collect();
         }
         self.rebuild(buffer);
     }
 
-    fn count_rows(buffer: &Buffer, line: usize, width: usize) -> u32 {
+    fn count_rows(buffer: &Buffer, line: usize, width: usize, inlays: &[Inlay]) -> u32 {
         let mut rows = 1;
-        wrap_line(Self::line_chars(buffer, line), width, |_| rows += 1);
+        let inlays = Self::line_inlays(inlays, buffer, line);
+        let start = buffer.line_start(line);
+        wrap_line(
+            Self::line_chars(buffer, line),
+            width,
+            (inlays, start),
+            |_| rows += 1,
+        );
         rows
     }
 
@@ -258,14 +360,21 @@ impl DisplayMap {
                     std::iter::repeat_n(0, new_lines),
                 );
             }
+            // Inlays move with the text; ones inside replaced text go.
+            self.inlays.retain_mut(|inlay| {
+                let inside = change.start < inlay.offset && inlay.offset < change.old_end;
+                inlay.offset = change.map_offset(inlay.offset, Bias::Right);
+                !inside
+            });
         }
         self.folds.retain(|fold| fold.is_valid(buffer));
         self.sort_folds();
         if let Some(width) = self.wrap {
             self.line_rows.resize(buffer.line_count(), 0);
+            let inlays = &self.inlays;
             for (line, rows) in self.line_rows.iter_mut().enumerate() {
                 if *rows == 0 {
-                    *rows = Self::count_rows(buffer, line, width);
+                    *rows = Self::count_rows(buffer, line, width, inlays);
                 }
             }
         }
@@ -418,9 +527,12 @@ impl DisplayMap {
         let start = buffer.line_start(line);
         let mut starts = vec![start];
         let indent = match self.wrap {
-            Some(width) => wrap_line(Self::line_chars(buffer, line), width, |at| {
-                starts.push(start + at)
-            }),
+            Some(width) => wrap_line(
+                Self::line_chars(buffer, line),
+                width,
+                (Self::line_inlays(&self.inlays, buffer, line), start),
+                |at| starts.push(start + at),
+            ),
             None => 0,
         };
         (starts, indent)
@@ -477,11 +589,19 @@ impl DisplayMap {
         (row, rows.into_iter().nth(index).expect("a line has a row"))
     }
 
-    /// Row and screen column of a cursor at `offset`.
+    /// Row and screen column of a cursor at `offset` (inlays before it on
+    /// the row count; one at `offset` is drawn after the cursor).
     pub fn point(&self, buffer: &Buffer, offset: usize, at_row_end: bool) -> (usize, usize) {
         let offset = self.clip(buffer, offset, Bias::Left);
         let (row, display_row) = self.row_of(buffer, offset, at_row_end);
+        let inlays: usize = self
+            .inlays_in(display_row.range.start..offset)
+            .iter()
+            .filter(|inlay| inlay.offset < offset)
+            .map(Inlay::columns)
+            .sum();
         let column = display_row.indent
+            + inlays
             + buffer
                 .chunks(display_row.range.start..offset)
                 .flat_map(str::chars)
@@ -496,17 +616,20 @@ impl DisplayMap {
         let line = self.row_line(row);
         let rows = self.line_display_rows(buffer, line);
         let index = (row.saturating_sub(self.line_row(line))).min(rows.len() - 1);
-        Self::offset_in_row(buffer, &rows[index], column)
+        self.offset_in_row(buffer, &rows[index], column)
     }
 
-    pub fn offset_in_row(buffer: &Buffer, row: &DisplayRow, column: usize) -> (usize, bool) {
+    pub fn offset_in_row(&self, buffer: &Buffer, row: &DisplayRow, column: usize) -> (usize, bool) {
         let mut at = row.range.start;
         let mut current = row.indent;
+        let inlays = self.inlays_in(row.range.clone());
+        let mut next_inlay = 0;
         for c in buffer.chunks(row.range.clone()).flat_map(str::chars) {
             if current >= column {
                 break;
             }
-            let w = char_width(c);
+            // The inlay before the char is skipped together with it.
+            let w = inlay_columns_at(inlays, &mut next_inlay, at) + char_width(c);
             // A wide char across the column: stop before it when the
             // column is nearer its left edge.
             if current + w > column && column - current < current + w - column {
@@ -526,7 +649,7 @@ mod tests {
     /// `text` wrapped at `width`, as rows (continuation indent as spaces).
     fn wrapped(text: &str, width: usize) -> Vec<String> {
         let mut breaks = Vec::new();
-        let indent = wrap_line(text.chars(), width, |at| breaks.push(at));
+        let indent = wrap_line(text.chars(), width, (&[], 0), |at| breaks.push(at));
         let mut rows = Vec::new();
         let mut start = 0;
         for (i, end) in breaks.iter().copied().chain([text.len()]).enumerate() {
@@ -677,5 +800,88 @@ mod tests {
         assert_eq!(map.row_count(), 4);
         map.set_wrap(&buffer, None);
         assert_eq!(map.row_count(), 2);
+    }
+
+    fn inlay(offset: usize, label: &str) -> Inlay {
+        Inlay {
+            offset,
+            label: label.into(),
+            padding_left: false,
+            padding_right: false,
+        }
+    }
+
+    #[test]
+    fn inlays_take_columns_when_wrapping_and_move_with_their_char() {
+        let rows = |text: &str, inlays: &[Inlay], width: usize| {
+            let mut breaks = Vec::new();
+            wrap_line(text.chars(), width, (inlays, 0), |at| breaks.push(at));
+            breaks
+        };
+        assert!(rows("let x = 1;", &[], 12).is_empty());
+        // `let x: i32 = 1;` is 15 columns: the line now wraps.
+        assert_eq!(rows("let x = 1;", &[inlay(5, ": i32")], 12), [8]);
+        // A hint before a word goes to the next row with the word.
+        assert_eq!(rows("aaa bbb", &[inlay(4, "xy")], 7), [4]);
+        // Padding counts too.
+        let padded = Inlay {
+            padding_left: true,
+            ..inlay(4, "x")
+        };
+        assert_eq!(padded.columns(), 2);
+        assert!(rows("aaa bbb", &[inlay(4, "x")], 8).is_empty());
+        assert_eq!(rows("aaa bbbb", &[padded], 8), [4]);
+    }
+
+    #[test]
+    fn screen_columns_count_inlays_and_columns_inside_one_snap_to_a_side() {
+        let buffer = buffer("let x = 1;\nfoo(a, b)\n");
+        let mut map = DisplayMap::new(&buffer);
+        // `let x: i32 = 1;` and `foo(a, second: b)`.
+        let b = buffer.line_start(1) + "foo(a, ".len();
+        assert!(map.set_inlays(&buffer, vec![inlay(b, "second: "), inlay(5, ": i32")]));
+        assert!(!map.set_inlays(&buffer, vec![inlay(5, ": i32"), inlay(b, "second: ")]));
+        // The cursor at a hint is drawn before it, one char later after it.
+        assert_eq!(map.point(&buffer, 5, false), (0, 5));
+        assert_eq!(map.point(&buffer, 6, false), (0, 11));
+        assert_eq!(map.point(&buffer, b, false), (1, 7));
+        assert_eq!(map.point(&buffer, b + 1, false), (1, 16));
+        // Vertical motion into a hint lands on its nearer side.
+        assert_eq!(map.offset_at(&buffer, 0, 6).0, 5);
+        assert_eq!(map.offset_at(&buffer, 0, 10).0, 6);
+        assert_eq!(map.offset_at(&buffer, 1, 9).0, b);
+        assert_eq!(map.offset_at(&buffer, 1, 13).0, b + 1);
+        // Every offset round-trips through its screen column.
+        for offset in 0..=buffer.len() {
+            let (row, column) = map.point(&buffer, offset, false);
+            assert_eq!(map.offset_at(&buffer, row, column).0, offset);
+        }
+    }
+
+    #[test]
+    fn inlays_follow_edits_and_rewrap_their_lines() {
+        let mut buffer = buffer("let x = 1;\nlet y = 2;\n");
+        let mut map = DisplayMap::new(&buffer);
+        map.set_wrap(&buffer, Some(12));
+        assert_eq!(map.row_count(), 3);
+        map.set_inlays(&buffer, vec![inlay(5, ": i32"), inlay(16, ": i32")]);
+        assert_eq!(map.row_count(), 5, "both lines wrap with their hints");
+        // Typing at the end of `x` pushes its hint along; a line above
+        // moves both.
+        buffer.edit(5..5, "x");
+        buffer.edit(0..0, "\n");
+        let changes: Vec<Change> = buffer.drain_changes().collect();
+        map.edit(&buffer, &changes);
+        let offsets: Vec<usize> = map.inlays().iter().map(|inlay| inlay.offset).collect();
+        assert_eq!(offsets, [7, 18]);
+        // Deleting the text around a hint drops it.
+        buffer.edit(15..20, "");
+        let changes: Vec<Change> = buffer.drain_changes().collect();
+        map.edit(&buffer, &changes);
+        assert_eq!(map.inlays().len(), 1);
+        assert_eq!(buffer.slice(0..buffer.len()), "\nlet xx = 1;\nle 2;\n");
+        assert_eq!(map.row_count(), 5, "the edited line lost its wrap");
+        map.set_inlays(&buffer, Vec::new());
+        assert_eq!(map.row_count(), 4);
     }
 }

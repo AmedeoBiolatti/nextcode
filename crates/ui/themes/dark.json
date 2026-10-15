@@ -19,6 +19,8 @@
     "find_match_active": "#d1993170",
     "bracket_match": "#3b514d",
     "fold_placeholder": "#43454a",
+    "inlay_hint": "#8c8f96",
+    "inlay_hint_background": "#2b2d30",
     "diff_added": "#294436",
     "diff_removed": "#4b2b2e",
     "git_added": "#6aab73",
@@ -28,7 +30,8 @@
     "git_conflicted": "#f75464",
     "graph_lanes": ["#56a8f5", "#6aab73", "#c77dbb", "#e0a458", "#2aacb8", "#f75464"],
     "branch": "#393b40",
-    "tag": "#8a6d1f"
+    "tag": "#8a6d1f",
+    "lightbulb": "#56a8f5"
   },
   "terminal": {
     "foreground": "#bcbec4",

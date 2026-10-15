@@ -18,6 +18,8 @@ regex.workspace = true
 serde.workspace = true
 search.workspace = true
 serde_json.workspace = true
+# Already in the tree (git): minimal edits for formatter output.
+similar.workspace = true
 syntax.workspace = true
 terminal.workspace = true
 text.workspace = true

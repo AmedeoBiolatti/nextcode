@@ -10,7 +10,12 @@
 //!   "auto_close_brackets": true,
 //!   "restore_session": true,
 //!   "word_wrap": false,
-//!   "languages": { "markdown": { "word_wrap": true }, "python": { "server": {
+//!   "inlay_hints": true,
+//!   "format_on_save": false,
+//!   "languages": { "markdown": { "word_wrap": true }, "python": { "inlay_hints": false,
+//!     "format_on_save": true,
+//!     "formatter": { "command": "ruff", "args": ["format", "--stdin-filename", "{file}", "-"] },
+//!     "server": {
 //!     "command": "basedpyright-langserver", "args": ["--stdio"],
 //!     "settings": { "basedpyright": { "analysis": { "typeCheckingMode": "strict" } } }
 //! } } } }
@@ -19,13 +24,15 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock},
 };
 
+use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use syntax::Language;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     /// The theme's name (see `theme`); `None` for the default.
@@ -38,6 +45,11 @@ pub struct Settings {
     pub restore_session: bool,
     /// Wrap long lines at the editor's width (Alt+Z toggles per editor).
     pub word_wrap: bool,
+    /// Show language servers' inlay hints (inferred types, parameter
+    /// names) inside the text.
+    pub inlay_hints: bool,
+    /// Format files when saving them with Ctrl+S (see `formatter`).
+    pub format_on_save: bool,
     pub languages: HashMap<String, LanguageSettings>,
 }
 
@@ -49,17 +61,26 @@ impl Default for Settings {
             auto_close_brackets: true,
             restore_session: true,
             word_wrap: false,
+            inlay_hints: true,
+            format_on_save: false,
             languages: HashMap::new(),
         }
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LanguageSettings {
     pub server: ServerOverrides,
     /// Overrides `word_wrap` for the language (Markdown wraps by default).
     pub word_wrap: Option<bool>,
+    /// Overrides `inlay_hints` for the language.
+    pub inlay_hints: Option<bool>,
+    /// Overrides `format_on_save` for the language.
+    pub format_on_save: Option<bool>,
+    /// How to format the language's files (default: the language server;
+    /// for Python, `ruff format` when it is installed).
+    pub formatter: Option<FormatterSetting>,
 }
 
 impl Settings {
@@ -70,10 +91,101 @@ impl Settings {
             .and_then(|settings| settings.word_wrap);
         configured.unwrap_or(self.word_wrap || language == Some(Language::Markdown))
     }
+
+    /// Whether editors of `language` show inlay hints.
+    pub fn inlay_hints(&self, language: Option<Language>) -> bool {
+        language
+            .and_then(|language| self.languages.get(language.id()))
+            .and_then(|settings| settings.inlay_hints)
+            .unwrap_or(self.inlay_hints)
+    }
+
+    /// Whether saving a `language` file formats it first.
+    pub fn format_on_save(&self, language: Option<Language>) -> bool {
+        language
+            .and_then(|language| self.languages.get(language.id()))
+            .and_then(|settings| settings.format_on_save)
+            .unwrap_or(self.format_on_save)
+    }
+
+    /// How `language` files are formatted.
+    pub fn formatter(&self, language: Language) -> Formatter {
+        let configured = self
+            .languages
+            .get(language.id())
+            .and_then(|settings| settings.formatter.clone());
+        match configured {
+            Some(FormatterSetting::Named(FormatterName::LanguageServer)) => Formatter::Server,
+            Some(FormatterSetting::External(external)) => Formatter::External {
+                command: external.command,
+                args: external.args,
+                fallback: false,
+            },
+            None if language == Language::Python => Formatter::External {
+                command: "ruff".into(),
+                args: ["format", "--stdin-filename", "{file}", "-"]
+                    .map(str::to_owned)
+                    .into(),
+                fallback: true,
+            },
+            None => Formatter::Server,
+        }
+    }
+}
+
+/// `"formatter"`: `"language_server"`, or a program reading the text on
+/// stdin and writing the formatted text to stdout.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum FormatterSetting {
+    Named(FormatterName),
+    External(ExternalFormatter),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatterName {
+    LanguageServer,
+}
+
+/// Run where the project lives, in its root; `{file}` in `args` becomes
+/// the file's path.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalFormatter {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// A resolved formatter choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Formatter {
+    /// The language server's `textDocument/formatting`.
+    Server,
+    /// A program; with `fallback`, the language server formats when the
+    /// program is not installed.
+    External {
+        command: String,
+        args: Vec<String>,
+        fallback: bool,
+    },
+}
+
+/// The settings as of the last `theme::refresh` (the GUI re-reads them when
+/// `settings.json` changes).
+static CURRENT: LazyLock<RwLock<Arc<Settings>>> = LazyLock::new(Default::default);
+
+pub fn current() -> Arc<Settings> {
+    CURRENT.read().clone()
+}
+
+pub fn set_current(settings: Settings) {
+    *CURRENT.write() = Arc::new(settings);
 }
 
 /// User overrides; unset fields keep the built-in default.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerOverrides {
     pub enabled: Option<bool>,
@@ -275,6 +387,38 @@ mod tests {
     fn unknown_keys_are_rejected_instead_of_ignored() {
         let typo = json!({ "languages": { "python": { "server": { "comand": "x" } } } });
         assert!(serde_json::from_value::<Settings>(typo).is_err());
+    }
+
+    #[test]
+    fn formatters_and_format_on_save_resolve_per_language() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.formatter(Language::Rust), Formatter::Server);
+        assert!(matches!(
+            defaults.formatter(Language::Python),
+            Formatter::External { ref command, fallback: true, .. } if command == "ruff"
+        ));
+        assert!(!defaults.format_on_save(Some(Language::Rust)));
+        let settings: Settings = serde_json::from_value(json!({
+            "format_on_save": true,
+            "languages": {
+                "python": { "formatter": "language_server", "format_on_save": false },
+                "rust": { "formatter": { "command": "rustfmt", "args": ["--emit", "stdout"] } },
+            }
+        }))
+        .unwrap();
+        assert_eq!(settings.formatter(Language::Python), Formatter::Server);
+        assert_eq!(
+            settings.formatter(Language::Rust),
+            Formatter::External {
+                command: "rustfmt".into(),
+                args: vec!["--emit".into(), "stdout".into()],
+                fallback: false,
+            }
+        );
+        assert!(!settings.format_on_save(Some(Language::Python)));
+        assert!(settings.format_on_save(Some(Language::Rust)));
+        let unknown = json!({ "languages": { "rust": { "formatter": "prettier" } } });
+        assert!(serde_json::from_value::<Settings>(unknown).is_err());
     }
 
     #[test]

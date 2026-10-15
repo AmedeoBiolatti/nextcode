@@ -8,6 +8,7 @@ import base64
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import shlex
@@ -104,7 +105,10 @@ def main():
                     display = spawn(['Xvfb', *([f':{candidate}'] if candidate is not None else []),
                                      '-displayfd', str(write_fd), '-screen', '0',
                                      f'{args.width}x{args.height}x24', '-nolisten', 'tcp', *extra,
-                                     '-auth', authority],
+                                     '-auth', authority,
+                                     # Keep the keymap set below when its
+                                     # client (xkbcomp) disconnects.
+                                     '-noreset'],
                                     pass_fds=(write_fd,), stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
                 finally:
@@ -125,6 +129,15 @@ def main():
                 raise RuntimeError('Xvfb failed to allocate a display')
             env['DISPLAY'] = ':' + display_number
             run(['xauth', '-f', authority, 'add', env['DISPLAY'], '.', cookie])
+            # Xvfb's keymap gives F1-F12 the CTRL+ALT key type (VT
+            # switching), and xdotool then sends them with Alt held: F2
+            # arrives as Alt+F2. Give them a plain one-level type instead.
+            if shutil.which('xkbcomp'):
+                keymap = run(['xkbcomp', '-w', '0', env['DISPLAY'], '-']).decode()
+                keymap = re.sub(r'key <(FK\d\d)> \{\s*type= "CTRL\+ALT",\s*'
+                                r'symbols\[Group1\]= \[\s*(F\d+),[^\]]*\]\s*\};',
+                                r'key <\1> { [ \2 ] };', keymap)
+                run(['xkbcomp', '-w', '0', '-', env['DISPLAY']], input=keymap.encode())
             env.pop('WAYLAND_DISPLAY', None)
             env['WINIT_UNIX_BACKEND'] = 'x11'
             # Keep automated edits to preferences, recent projects and the

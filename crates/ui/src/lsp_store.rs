@@ -35,6 +35,37 @@ use crate::{
 /// Restarts allowed per server before giving up for the session.
 const MAX_RESTARTS: u32 = 3;
 
+/// LSP error code servers answer while their analysis is out of date
+/// (rust-analyzer while indexing).
+pub const CONTENT_MODIFIED: i64 = -32801;
+
+/// Sends `R`, retrying up to `retries` times `delay` apart while the server
+/// answers "content modified".
+pub async fn request_retrying<R: lsp::types::request::Request>(
+    server: &RunningServer,
+    params: R::Params,
+    executor: &gpui::BackgroundExecutor,
+    retries: u32,
+    delay: std::time::Duration,
+) -> Result<R::Result, lsp::Error>
+where
+    R::Params: Clone,
+{
+    let mut attempt = 0;
+    loop {
+        let result = server.connection.request::<R>(params.clone()).await;
+        match result {
+            Err(lsp::Error::Response { code, .. })
+                if code == CONTENT_MODIFIED && attempt < retries =>
+            {
+                attempt += 1;
+                executor.timer(delay).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// An initialized server, shared with the editors that sync documents to it.
 pub struct RunningServer {
     pub connection: Arc<LanguageServer>,
@@ -67,6 +98,39 @@ pub enum LspStoreEvent {
     DiagnosticsUpdated(PathBuf),
     /// The server asked to re-request semantic tokens of open documents.
     SemanticTokensRefresh(Language),
+    /// The server asked to re-request inlay hints of open documents.
+    InlayHintsRefresh(Language),
+    /// The server asked to apply a workspace edit (`workspace/applyEdit`);
+    /// unanswered requests answer "not applied" when dropped.
+    ApplyEdit(Arc<ApplyEditRequest>),
+}
+
+/// A server's `workspace/applyEdit` request.
+pub struct ApplyEditRequest {
+    pub label: Option<String>,
+    pub edit: lsp::types::WorkspaceEdit,
+    /// The server's position encoding.
+    pub encoding: Encoding,
+    reply: Mutex<Option<(Arc<LanguageServer>, lsp::RequestId)>>,
+}
+
+impl ApplyEditRequest {
+    /// Answers the server (only the first answer counts).
+    pub fn respond(&self, response: lsp::types::ApplyWorkspaceEditResponse) {
+        if let Some((connection, id)) = self.reply.lock().take() {
+            connection.respond(id, Ok(json!(response)));
+        }
+    }
+}
+
+impl Drop for ApplyEditRequest {
+    fn drop(&mut self) {
+        self.respond(lsp::types::ApplyWorkspaceEditResponse {
+            applied: false,
+            failure_reason: Some("no editor applied the edit".into()),
+            failed_change: None,
+        });
+    }
 }
 
 struct Slot {
@@ -112,11 +176,24 @@ impl LspStore {
         self.slots.get(&language)?.running.clone()
     }
 
+    /// The settings the store was created with.
+    pub fn settings(&self) -> Arc<Settings> {
+        self.settings.clone()
+    }
+
     /// Server name and status, for the status bar.
     pub fn status(&self, language: Language) -> Option<(SharedString, ServerStatus)> {
         self.slots
             .get(&language)
             .map(|slot| (slot.name.clone(), slot.status.clone()))
+    }
+
+    /// Every running server with its language (none are started).
+    pub fn running_servers(&self) -> Vec<(Language, Arc<RunningServer>)> {
+        self.slots
+            .iter()
+            .filter_map(|(language, slot)| Some((*language, slot.running.clone()?)))
+            .collect()
     }
 
     pub fn diagnostics(&self, path: &Path) -> &[lsp::types::Diagnostic] {
@@ -423,7 +500,29 @@ impl LspStore {
                         cx.emit(LspStoreEvent::SemanticTokensRefresh(language));
                         Ok(Value::Null)
                     }
-                    "workspace/applyEdit" => Ok(json!({ "applied": false })),
+                    "workspace/inlayHint/refresh" => {
+                        cx.emit(LspStoreEvent::InlayHintsRefresh(language));
+                        Ok(Value::Null)
+                    }
+                    "workspace/applyEdit" => {
+                        match serde_json::from_value::<lsp::types::ApplyWorkspaceEditParams>(params)
+                        {
+                            Ok(params) => {
+                                let encoding = slot
+                                    .running
+                                    .as_ref()
+                                    .map_or(Encoding::Utf16, |server| server.encoding);
+                                cx.emit(LspStoreEvent::ApplyEdit(Arc::new(ApplyEditRequest {
+                                    label: params.label,
+                                    edit: params.edit,
+                                    encoding,
+                                    reply: Mutex::new(Some((connection.clone(), id))),
+                                })));
+                                return;
+                            }
+                            Err(err) => Err(json!({ "code": -32602, "message": err.to_string() })),
+                        }
+                    }
                     _ => {
                         Err(json!({ "code": -32601, "message": format!("unsupported: {method}") }))
                     }
@@ -528,12 +627,28 @@ fn client_capabilities() -> ClientCapabilities {
             },
             "hover": { "contentFormat": ["markdown", "plaintext"] },
             "definition": { "linkSupport": true },
+            "declaration": { "linkSupport": true },
+            "typeDefinition": { "linkSupport": true },
+            "implementation": { "linkSupport": true },
             "references": {},
+            "signatureHelp": {
+                "contextSupport": true,
+                "signatureInformation": {
+                    "documentationFormat": ["markdown", "plaintext"],
+                    "parameterInformation": { "labelOffsetSupport": true },
+                    "activeParameterSupport": true,
+                },
+            },
+            "inlayHint": {},
+            "documentSymbol": {
+                "hierarchicalDocumentSymbolSupport": true,
+                "symbolKind": { "valueSet": (1..=26).collect::<Vec<u32>>() },
+            },
+            "callHierarchy": {},
             "completion": {
                 "contextSupport": true,
                 "completionItem": {
-                    // Snippet placeholders are not supported yet: servers send plain text.
-                    "snippetSupport": false,
+                    "snippetSupport": true,
                     "insertReplaceSupport": true,
                     "labelDetailsSupport": true,
                     "deprecatedSupport": true,
@@ -555,12 +670,41 @@ fn client_capabilities() -> ClientCapabilities {
                 "multilineTokenSupport": false,
                 "augmentsSyntaxTokens": true,
             },
+            "codeAction": {
+                "codeActionLiteralSupport": {
+                    "codeActionKind": {
+                        "valueSet": [
+                            "", "quickfix", "refactor", "refactor.extract", "refactor.inline",
+                            "refactor.rewrite", "source", "source.organizeImports",
+                            "source.fixAll",
+                        ],
+                    },
+                },
+                "isPreferredSupport": true,
+                "dataSupport": true,
+                "resolveSupport": { "properties": ["edit"] },
+            },
+            "rename": { "prepareSupport": true },
+            "formatting": {},
+            "rangeFormatting": {},
         },
         "workspace": {
+            "applyEdit": true,
+            "workspaceEdit": {
+                "documentChanges": true,
+                "resourceOperations": ["create", "rename", "delete"],
+                // Versioned edits are checked before anything changes; any
+                // other failure stops the remaining operations.
+                "failureHandling": "abort",
+                "normalizesLineEndings": true,
+            },
+            "executeCommand": {},
             "configuration": true,
             "workspaceFolders": true,
             "didChangeWatchedFiles": { "dynamicRegistration": true },
             "semanticTokens": { "refreshSupport": true },
+            "inlayHint": { "refreshSupport": true },
+            "symbol": { "symbolKind": { "valueSet": (1..=26).collect::<Vec<u32>>() } },
         },
         "window": { "workDoneProgress": true },
     }))

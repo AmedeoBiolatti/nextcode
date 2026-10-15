@@ -242,6 +242,9 @@ ui_colors! {
     bracket_match,
     /// Background of the `⋯` shown after a folded line.
     fold_placeholder,
+    /// Inlay hints (inferred types, parameter names): text and background.
+    inlay_hint,
+    inlay_hint_background,
     /// Diff line backgrounds.
     diff_added,
     diff_removed,
@@ -254,6 +257,9 @@ ui_colors! {
     /// History ref labels: branches (other than HEAD's, which uses `accent`) and tags.
     branch,
     tag,
+    /// The code-action lightbulb in the editor gutter (quick fixes use
+    /// `warning`).
+    lightbulb,
 }
 
 /// The color of commit graph lane `index`.
@@ -601,13 +607,28 @@ static AUTO_CLOSE_BRACKETS: AtomicBool = AtomicBool::new(true);
 /// `"word_wrap"` per language as of the last refresh: bit 0 for plain
 /// text, bit `i + 1` for `Language::ALL[i]`.
 static WORD_WRAP: LazyLock<AtomicU32> =
-    LazyLock::new(|| AtomicU32::new(word_wrap_mask(&crate::settings::Settings::default())));
+    LazyLock::new(|| AtomicU32::new(language_mask(&Settings::default(), Settings::word_wrap)));
+/// `"inlay_hints"` per language, like [`WORD_WRAP`].
+static INLAY_HINTS: LazyLock<AtomicU32> =
+    LazyLock::new(|| AtomicU32::new(language_mask(&Settings::default(), Settings::inlay_hints)));
 
-fn word_wrap_mask(settings: &crate::settings::Settings) -> u32 {
+/// A per-language setting as bits: bit 0 for plain text, bit `i + 1` for
+/// `Language::ALL[i]`.
+fn language_mask(settings: &Settings, value: fn(&Settings, Option<Language>) -> bool) -> u32 {
     let languages = Language::ALL.iter().enumerate();
-    languages.fold(settings.word_wrap(None) as u32, |mask, (i, &language)| {
-        mask | (settings.word_wrap(Some(language)) as u32) << (i + 1)
+    languages.fold(value(settings, None) as u32, |mask, (i, &language)| {
+        mask | (value(settings, Some(language)) as u32) << (i + 1)
     })
+}
+
+fn language_bit(mask: &AtomicU32, language: Option<Language>) -> bool {
+    let bit = language.map_or(0, |language| {
+        1 + Language::ALL
+            .iter()
+            .position(|&known| known == language)
+            .unwrap_or(0)
+    });
+    mask.load(Ordering::Relaxed) & (1 << bit) != 0
 }
 
 /// Whether editors layer language-server semantic tokens over syntax
@@ -623,13 +644,12 @@ pub fn auto_close_brackets() -> bool {
 
 /// Whether editors of `language` (`None`: plain text) start wrapped.
 pub fn word_wrap(language: Option<Language>) -> bool {
-    let bit = language.map_or(0, |language| {
-        1 + Language::ALL
-            .iter()
-            .position(|&known| known == language)
-            .unwrap_or(0)
-    });
-    WORD_WRAP.load(Ordering::Relaxed) & (1 << bit) != 0
+    language_bit(&WORD_WRAP, language)
+}
+
+/// Whether editors of `language` show inlay hints (`"inlay_hints"`).
+pub fn inlay_hints(language: Option<Language>) -> bool {
+    language_bit(&INLAY_HINTS, language)
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -659,8 +679,17 @@ pub fn refresh(cx: &mut App) {
             let problem = problem.map(|problem| format!("Settings ignored: {problem}"));
             SEMANTIC_HIGHLIGHTING.store(settings.semantic_highlighting, Ordering::Relaxed);
             AUTO_CLOSE_BRACKETS.store(settings.auto_close_brackets, Ordering::Relaxed);
-            WORD_WRAP.store(word_wrap_mask(&settings), Ordering::Relaxed);
-            (settings.theme, problem)
+            WORD_WRAP.store(
+                language_mask(&settings, Settings::word_wrap),
+                Ordering::Relaxed,
+            );
+            INLAY_HINTS.store(
+                language_mask(&settings, Settings::inlay_hints),
+                Ordering::Relaxed,
+            );
+            let theme = settings.theme.clone();
+            crate::settings::set_current(settings);
+            (theme, problem)
         }
         None => (None, None),
     };

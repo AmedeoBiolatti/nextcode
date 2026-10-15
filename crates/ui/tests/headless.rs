@@ -495,3 +495,397 @@ fn headless_mode_decodes_rust_analyzer_semantic_tokens() {
     assert!(headless.child.wait().unwrap().success());
     fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn headless_mode_shows_rust_analyzer_call_hierarchy() {
+    if Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("skipped: rust-analyzer is not on PATH");
+        return;
+    }
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_calls_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"calls\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("main.rs"),
+        "fn leaf() {}\n\nfn caller() {\n    leaf();\n}\n\nfn main() {\n    caller();\n}\n",
+    )
+    .unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let open =
+        headless.call(json!({ "cmd": "open", "path": "src/main.rs", "timeout_ms": 120_000 }));
+    assert_eq!(open["ok"], true, "{open}");
+
+    // Until rust-analyzer has loaded the crate, it may find no calls.
+    let mut calls = |cmd: &str, line: u64| {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let reply = headless
+                .call(json!({ "cmd": cmd, "path": "src/main.rs", "line": line, "character": 4 }));
+            assert_eq!(reply["ok"], true, "{reply}");
+            let calls = reply["result"].as_array().unwrap().clone();
+            if !calls.is_empty() || Instant::now() >= deadline {
+                break calls;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    };
+
+    let incoming = calls("incoming_calls", 0);
+    assert_eq!(incoming.len(), 1, "{incoming:?}");
+    let caller = &incoming[0];
+    assert_eq!(caller["name"], "caller", "{caller}");
+    assert_eq!(caller["kind"], 12, "a function: {caller}");
+    assert!(
+        caller["path"].as_str().unwrap().ends_with("main.rs"),
+        "{caller}"
+    );
+    assert_eq!(caller["selection_range"]["start"]["line"], 2, "{caller}");
+    assert_eq!(
+        caller["from_ranges"],
+        json!([{ "start": { "line": 3, "character": 4 }, "end": { "line": 3, "character": 8 } }]),
+        "the call site inside `caller`"
+    );
+
+    let outgoing = calls("outgoing_calls", 2);
+    assert_eq!(outgoing.len(), 1, "{outgoing:?}");
+    assert_eq!(outgoing[0]["name"], "leaf", "{}", outgoing[0]);
+    assert_eq!(outgoing[0]["selection_range"]["start"]["line"], 0);
+
+    let nothing = headless
+        .call(json!({ "cmd": "incoming_calls", "path": "src/main.rs", "line": 1, "character": 0 }));
+    assert_eq!(nothing["result"], json!([]), "{nothing}");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn headless_mode_lists_rust_analyzer_symbols() {
+    if Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("skipped: rust-analyzer is not on PATH");
+        return;
+    }
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_symbols_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"symbols\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("main.rs"),
+        "struct Point {\n    x: i32,\n}\n\n\
+         impl Point {\n    fn new(x: i32) -> Self {\n        Point { x }\n    }\n}\n\n\
+         fn farthest_distance(point: Point) -> i32 {\n    point.x\n}\n\n\
+         fn main() {\n    println!(\"{}\", farthest_distance(Point::new(1)));\n}\n",
+    )
+    .unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let open =
+        headless.call(json!({ "cmd": "open", "path": "src/main.rs", "timeout_ms": 120_000 }));
+    assert_eq!(open["ok"], true, "{open}");
+
+    let reply = headless.call(json!({ "cmd": "document_symbols", "path": "src/main.rs" }));
+    assert_eq!(reply["ok"], true, "{reply}");
+    let symbols = reply["result"].as_array().unwrap().clone();
+    println!("document_symbols: {}", json!(symbols));
+    let find = |name: &str| {
+        symbols
+            .iter()
+            .position(|symbol| symbol["name"] == name)
+            .unwrap_or_else(|| panic!("no symbol {name}: {symbols:?}"))
+    };
+    let point = &symbols[find("Point")];
+    assert_eq!(point["kind"], 23, "a struct: {point}");
+    assert_eq!(point["kind_name"], "struct");
+    assert_eq!(point["depth"], 0);
+    assert_eq!(point["selection_range"]["start"]["line"], 0);
+    let x = &symbols[find("x")];
+    assert_eq!(
+        (&x["depth"], &x["parent"]),
+        (&json!(1), &json!(find("Point")))
+    );
+    // The method sits one level down, under its impl block.
+    let new = &symbols[find("new")];
+    assert_eq!(new["depth"], 1, "{new}");
+    let parent = &symbols[new["parent"].as_u64().unwrap() as usize];
+    assert_eq!(parent["depth"], 0, "{parent}");
+    assert!(
+        parent["name"].as_str().unwrap().contains("Point"),
+        "{parent}"
+    );
+    assert_eq!(new["selection_range"]["start"]["line"], 5, "{new}");
+    // Pre-order by position: the struct, its field, the impl, its method.
+    assert!(find("Point") < find("x") && find("x") < find("new"));
+    assert!(find("new") < find("farthest_distance") && find("farthest_distance") < find("main"));
+
+    // Until rust-analyzer has indexed the crate, workspace search may be
+    // empty.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let found = loop {
+        let reply = headless.call(json!({ "cmd": "workspace_symbols", "query": "farthest_dist" }));
+        assert_eq!(reply["ok"], true, "{reply}");
+        let found = reply["result"].as_array().unwrap().clone();
+        if !found.is_empty() || Instant::now() >= deadline {
+            break found;
+        }
+        thread::sleep(Duration::from_secs(1));
+    };
+    let function = found
+        .iter()
+        .find(|symbol| symbol["name"] == "farthest_distance")
+        .unwrap_or_else(|| panic!("farthest_distance not found: {found:?}"));
+    assert_eq!(function["kind"], 12, "a function: {function}");
+    assert!(
+        function["path"].as_str().unwrap().ends_with("main.rs"),
+        "{function}"
+    );
+    assert_eq!(function["range"]["start"]["line"], 10, "{function}");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn headless_mode_shows_rust_analyzer_signatures_hints_and_implementations() {
+    if Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("skipped: rust-analyzer is not on PATH");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("next_code_headless_nav_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"nav\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let source = "trait Shape {\n    fn area(&self) -> f64;\n}\n\n\
+                  struct Square(f64);\n\n\
+                  impl Shape for Square {\n    fn area(&self) -> f64 {\n        self.0 * self.0\n    }\n}\n\n\
+                  fn scale(shape: &dyn Shape, factor: f64) -> f64 {\n    shape.area() * factor\n}\n\n\
+                  fn main() {\n    let square = Square(2.0);\n    let total = scale(&square, 3.0);\n    println!(\"{total}\");\n}\n";
+    fs::write(root.join("src").join("main.rs"), source).unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let open =
+        headless.call(json!({ "cmd": "open", "path": "src/main.rs", "timeout_ms": 120_000 }));
+    assert_eq!(open["ok"], true, "{open}");
+
+    // Until rust-analyzer has loaded the crate, answers may be empty.
+    let mut until = |request: Value, done: &dyn Fn(&Value) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let reply = headless.call(request.clone());
+            assert_eq!(reply["ok"], true, "{reply}");
+            if done(&reply["result"]) || Instant::now() >= deadline {
+                break reply["result"].clone();
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    };
+    let file = |cmd: &str, line: u64, character: u64| json!({ "cmd": cmd, "path": "src/main.rs", "line": line, "character": character });
+
+    // Type hints after `let` names, parameter names before arguments.
+    let hints = until(
+        json!({ "cmd": "inlay_hints", "path": "src/main.rs", "start_line": 16 }),
+        &|hints| hints.as_array().is_some_and(|hints| hints.len() >= 3),
+    );
+    println!("inlay_hints: {hints}");
+    let hint = |line: u64, label: &str| {
+        hints
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hint| hint["line"] == line && hint["label"].as_str().unwrap().contains(label))
+            .cloned()
+            .unwrap_or_else(|| panic!("no `{label}` hint on line {line}: {hints}"))
+    };
+    let square = hint(17, "Square");
+    assert_eq!(square["kind"], "type", "{square}");
+    assert_eq!(square["character"], 14, "after `square`: {square}");
+    let factor = hint(18, "factor");
+    assert_eq!(factor["kind"], "parameter", "{factor}");
+    assert_eq!(factor["character"], 31, "before `3.0`: {factor}");
+
+    // Inside `scale(&square, 3.0)`, at the second argument.
+    let help = until(file("signature_help", 18, 31), &|help| !help.is_null());
+    println!("signature_help: {help}");
+    let signature = &help["signatures"][0];
+    let label = signature["label"].as_str().unwrap();
+    assert!(label.contains("fn scale("), "{help}");
+    let active = &signature["active"];
+    let (start, end) = (
+        active[0].as_u64().unwrap() as usize,
+        active[1].as_u64().unwrap() as usize,
+    );
+    assert_eq!(&label[start..end], "factor: f64", "{help}");
+    assert_eq!(
+        signature["parameters"].as_array().unwrap().len(),
+        2,
+        "{help}"
+    );
+    let outside = until(file("signature_help", 16, 0), &|_| true);
+    assert_eq!(outside, Value::Null, "outside a call");
+
+    let line_of = |locations: &Value| locations[0]["range"]["start"]["line"].clone();
+    let found = |locations: &Value| locations.as_array().is_some_and(|l| !l.is_empty());
+    // The trait method's implementation, the `square` variable's type.
+    let implementations = until(file("implementation", 1, 7), &found);
+    assert_eq!(line_of(&implementations), 7, "{implementations}");
+    let type_definition = until(file("type_definition", 17, 8), &found);
+    assert_eq!(line_of(&type_definition), 4, "{type_definition}");
+    let declaration = until(file("declaration", 13, 11), &found);
+    assert!(
+        [json!(1), json!(7)].contains(&line_of(&declaration)),
+        "{declaration}"
+    );
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn headless_mode_renames_fixes_and_formats_with_rust_analyzer() {
+    if Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("skipped: rust-analyzer is not on PATH");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("next_code_headless_edit_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"edits\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    let main = "mod util;\n\nfn main() {\n    util::helper();\n    println!(\"{}\", name(Color::Red));\n}\n\n\
+                enum Color {\n    Red,\n    Green,\n}\n\n\
+                fn name(color: Color) -> &'static str {\n    match color {\n    }\n}\n";
+    fs::write(root.join("src").join("main.rs"), main).unwrap();
+    fs::write(root.join("src").join("util.rs"), "pub fn helper() {}\n").unwrap();
+    let root = root.canonicalize().unwrap();
+    let read = |name: &str| fs::read_to_string(root.join("src").join(name)).unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let open =
+        headless.call(json!({ "cmd": "open", "path": "src/main.rs", "timeout_ms": 120_000 }));
+    assert_eq!(open["ok"], true, "{open}");
+    let at = |cmd: &str, line: u64, character: u64| json!({ "cmd": cmd, "path": "src/main.rs", "line": line, "character": character });
+    // Until rust-analyzer has loaded the crate, `helper` leads nowhere.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let reply = headless.call(at("definition", 3, 10));
+        let found = reply["result"].as_array().is_some_and(|l| !l.is_empty());
+        if found || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    // Rename from the call site: the open file and the unopened module.
+    let mut rename = at("rename", 3, 10);
+    rename["new_name"] = "assist".into();
+    let renamed = headless.call(rename);
+    assert_eq!(renamed["ok"], true, "{renamed}");
+    assert_eq!(renamed["result"]["applied"], true, "{renamed}");
+    assert_eq!(
+        renamed["result"]["changed"].as_array().map(Vec::len),
+        Some(2),
+        "{renamed}"
+    );
+    assert_eq!(read("util.rs"), "pub fn assist() {}\n");
+    assert!(
+        read("main.rs").contains("    util::assist();\n"),
+        "{}",
+        read("main.rs")
+    );
+
+    // A quick fix on the empty `match` ("Add 2 missing match arms" from the
+    // diagnostic, or the "Fill match arms" assist).
+    let is_fill = |action: &Value| {
+        action["title"]
+            .as_str()
+            .is_some_and(|title| title.contains("match arms"))
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let actions = loop {
+        let reply = headless.call(at("code_actions", 13, 6));
+        assert_eq!(reply["ok"], true, "{reply}");
+        let actions = reply["result"].as_array().unwrap().clone();
+        if actions.iter().any(is_fill) || Instant::now() >= deadline {
+            break actions;
+        }
+        thread::sleep(Duration::from_secs(1));
+    };
+    println!("code_actions: {}", json!(actions));
+    let fill = actions
+        .iter()
+        .find(|a| is_fill(a))
+        .expect("a match-arms fix");
+    assert_eq!(fill["kind"], "quickfix", "{fill}");
+    let applied = headless.call(json!({ "cmd": "apply_code_action", "index": fill["index"] }));
+    assert_eq!(applied["result"]["applied"], true, "{applied}");
+    let fixed = read("main.rs");
+    assert!(
+        fixed.contains("Color::Red =>") && fixed.contains("Color::Green =>"),
+        "{fixed}"
+    );
+
+    // Format Document through rust-analyzer (rustfmt) fixes indentation.
+    if Command::new("rustfmt").arg("--version").output().is_ok() {
+        let open = headless.call(json!({ "cmd": "open", "path": "src/util.rs" }));
+        assert_eq!(open["ok"], true, "{open}");
+        let messy = "pub fn assist() {\nlet x = 1;\n      println!(\"{}\", x);\n}\n";
+        let write = headless.call(json!({ "cmd": "write", "path": "src/util.rs", "text": messy }));
+        assert_eq!(write["ok"], true, "{write}");
+        let formatted = headless.call(json!({ "cmd": "format", "path": "src/util.rs" }));
+        assert_eq!(formatted["ok"], true, "{formatted}");
+        let expected = "pub fn assist() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n";
+        assert_eq!(formatted["result"]["text"], expected, "{formatted}");
+        assert_eq!(formatted["result"]["changed"], true);
+        assert_eq!(read("util.rs"), expected);
+    } else {
+        println!("format skipped: rustfmt is not on PATH");
+    }
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}

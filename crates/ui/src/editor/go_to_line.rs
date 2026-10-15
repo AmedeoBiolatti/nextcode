@@ -33,6 +33,11 @@ pub(super) struct GoToLineInput {
 }
 
 impl Editor {
+    #[cfg(test)]
+    pub(crate) fn go_to_line_input(&self) -> Option<Entity<Editor>> {
+        Some(self.go_to_line.as_ref()?.input.clone())
+    }
+
     pub(super) fn go_to_line_action(
         &mut self,
         _: &GoToLine,

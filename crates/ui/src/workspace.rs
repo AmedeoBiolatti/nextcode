@@ -22,6 +22,7 @@ use watcher::{Batch, ChangeKind};
 
 use crate::{
     branch_picker::{BranchPicker, BranchPickerEvent},
+    call_hierarchy::{CallHierarchyEvent, CallHierarchyPanel},
     compare_view::{CompareEvent, CompareView},
     connecting::PendingConnection,
     diff_view::{DiffSource, DiffView, DiffViewEvent},
@@ -33,6 +34,7 @@ use crate::{
     layout::{DockPosition, Layout, PanelId},
     location_picker::{LocationPicker, LocationPickerEvent},
     lsp_store::{LspStore, LspStoreEvent, ServerStatus},
+    outline_panel::OutlinePanel,
     problems::{ProblemsEvent, ProblemsPanel},
     project::{self, Project, WatchHandle},
     python_panel::{PythonPanel, PythonPanelEvent, RunRequest},
@@ -40,14 +42,17 @@ use crate::{
     revision_picker::{RevisionPicker, RevisionPickerEvent},
     search_panel::{SearchPanel, SearchPanelEvent},
     settings::Settings,
+    symbol_picker::SymbolPicker,
     terminal_panel::{TerminalPanel, TerminalPanelEvent},
     theme,
     worktree_picker::{WorktreePicker, WorktreePickerEvent},
 };
 
 mod docks;
+mod edits;
 mod panes;
 mod session;
+mod symbols;
 #[cfg(test)]
 mod tests;
 
@@ -98,6 +103,7 @@ pub fn bind_keys(cx: &mut App) {
     ]);
     docks::bind_keys(cx);
     panes::bind_keys(cx);
+    symbols::bind_keys(cx);
 }
 
 /// Work for the first window started before gpui (whose platform setup
@@ -228,12 +234,17 @@ pub struct Workspace {
     search: Entity<SearchPanel>,
     git: Entity<GitPanel>,
     python: Entity<PythonPanel>,
+    call_hierarchy: Entity<CallHierarchyPanel>,
+    /// Follows the active editor (set while rendering).
+    outline: Entity<OutlinePanel>,
     layout: Layout,
     /// Dock being resized by dragging its handle.
     resizing: Option<DockPosition>,
     panel_menu: Option<docks::PanelMenu>,
     file_finder: Option<(Entity<FileFinder>, Subscription)>,
     location_picker: Option<(Entity<LocationPicker>, Subscription)>,
+    /// Go to Symbol (file/workspace) and breadcrumb lists.
+    symbol_picker: Option<(Entity<SymbolPicker>, Subscription)>,
     revision_picker: Option<(Entity<RevisionPicker>, Subscription)>,
     /// The branch or worktree picker.
     git_modal: Option<(AnyView, Subscription)>,
@@ -372,6 +383,14 @@ impl Workspace {
                 ProblemsEvent::Open(location) => this.jump_to(location, window, cx),
             },
         );
+        let call_hierarchy = cx.new(CallHierarchyPanel::new);
+        let call_hierarchy_subscription = cx.subscribe_in(
+            &call_hierarchy,
+            window,
+            |this, _, event, window, cx| match event {
+                CallHierarchyEvent::Jump(location) => this.jump_to(location, window, cx),
+            },
+        );
 
         // Workspace key bindings (e.g. Ctrl+P) need focus inside the workspace.
         let focus_handle = cx.focus_handle();
@@ -458,11 +477,14 @@ impl Workspace {
             search,
             git,
             python,
+            call_hierarchy,
+            outline: cx.new(OutlinePanel::new),
             layout,
             resizing: None,
             panel_menu: None,
             file_finder: None,
             location_picker: None,
+            symbol_picker: None,
             revision_picker: None,
             git_modal: None,
             back: Vec::new(),
@@ -488,6 +510,7 @@ impl Workspace {
                 search_subscription,
                 git_subscription,
                 python_subscription,
+                call_hierarchy_subscription,
                 terminal_subscription,
                 release_subscription,
                 quit_subscription,
@@ -942,6 +965,12 @@ impl Workspace {
                     editor.update(cx, |editor, cx| editor.refresh_semantic_tokens(cx));
                 }
             }
+            &LspStoreEvent::InlayHintsRefresh(language) => {
+                for editor in self.editors_for(language, true, cx) {
+                    editor.update(cx, |editor, cx| editor.refresh_inlay_hints(cx));
+                }
+            }
+            LspStoreEvent::ApplyEdit(request) => self.apply_edit_request(request, cx),
         }
     }
 
@@ -1041,11 +1070,30 @@ impl Workspace {
                     EditorEvent::Navigate { locations, title } => {
                         this.navigate(locations.clone(), title.clone(), window, cx);
                     }
+                    EditorEvent::CallHierarchy { server, items } => {
+                        this.show_call_hierarchy(server.clone(), items.clone(), window, cx);
+                    }
                     EditorEvent::DirtyChanged | EditorEvent::Edited => {
                         this.sync_views(editor, cx);
                         cx.notify();
                     }
-                    EditorEvent::Saved => {}
+                    EditorEvent::Saved | EditorEvent::SymbolsChanged => {}
+                    EditorEvent::ApplyEdit {
+                        edit,
+                        server,
+                        command,
+                        label,
+                    } => this.apply_editor_edit(
+                        editor,
+                        edit.clone(),
+                        server.clone(),
+                        command.clone(),
+                        label,
+                        cx,
+                    ),
+                    EditorEvent::Pick(request) => {
+                        this.open_pick_request(editor.clone(), request.clone(), window, cx);
+                    }
                 },
             );
         if let Some(language) = editor.read(cx).language() {
@@ -1525,6 +1573,17 @@ impl Workspace {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn file_finder_query(&self, cx: &App) -> Option<Entity<Editor>> {
+        let (finder, _) = self.file_finder.as_ref()?;
+        Some(finder.read(cx).query().clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_editor(&self) -> Option<Entity<Editor>> {
+        self.active_tab().and_then(Tab::editor).cloned()
+    }
+
     fn toggle_file_finder(
         &mut self,
         _: &ToggleFileFinder,
@@ -1631,10 +1690,18 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::startup::mark_once("first workspace render");
+        // The Outline shows the active editor's symbols.
+        let active_editor = self.active_tab().and_then(Tab::editor).cloned();
+        self.outline
+            .update(cx, |outline, cx| outline.set_editor(active_editor, cx));
+        // Flex, not block, down to the panes' content: in block containers
+        // a right dock left inputs over an editor (go to line, rename) laid
+        // out zero wide. See also the editor area in `Shell::render`.
         let main = div()
             .flex_1()
             .min_h_0()
             .min_w_0()
+            .flex()
             .child(self.render_panes(cx));
 
         div()
@@ -1667,6 +1734,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_python))
             .on_action(cx.listener(Self::toggle_problems))
+            .on_action(cx.listener(Self::toggle_call_hierarchy))
+            .on_action(cx.listener(Self::toggle_outline))
+            .on_action(cx.listener(Self::go_to_workspace_symbol))
             .on_action(cx.listener(Self::toggle_bottom_dock))
             .on_action(cx.listener(Self::save_layout_as_default))
             .on_action(cx.listener(Self::reset_layout))
@@ -1724,6 +1794,16 @@ impl Render for Workspace {
                     .flex()
                     .justify_center()
                     .child(finder.clone())
+            }))
+            .children(self.symbol_picker.as_ref().map(|(picker, _)| {
+                div()
+                    .absolute()
+                    .top(px(72.))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(picker.clone())
             }))
             .children(self.location_picker.as_ref().map(|(picker, _)| {
                 div()

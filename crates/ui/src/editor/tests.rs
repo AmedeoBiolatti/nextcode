@@ -7,7 +7,7 @@ use gpui::{Modifiers, TestAppContext, WindowHandle};
 use super::{selections::SelectionState, *};
 
 /// An editor for `marked` (see `parse`) as file `name`.
-fn editor(name: &str, marked: &str, cx: &mut TestAppContext) -> WindowHandle<Editor> {
+pub(super) fn editor(name: &str, marked: &str, cx: &mut TestAppContext) -> WindowHandle<Editor> {
     let (text, selections) = parse(marked);
     let window = cx.add_window(|_, cx| {
         let mut editor = Editor::new(Buffer::with_path(&text, PathBuf::from(name)), cx);
@@ -20,7 +20,7 @@ fn editor(name: &str, marked: &str, cx: &mut TestAppContext) -> WindowHandle<Edi
 
 /// Text with `|` for cursors and `«…»` for selections (anchor at `«`);
 /// the last one is primary.
-fn parse(marked: &str) -> (String, SelectionSet) {
+pub(super) fn parse(marked: &str) -> (String, SelectionSet) {
     let mut text = String::new();
     let mut items = Vec::new();
     let mut anchor = None;
@@ -37,7 +37,7 @@ fn parse(marked: &str) -> (String, SelectionSet) {
 }
 
 /// The editor's text with its selections marked as in `parse`.
-fn marked(editor: &Editor) -> String {
+pub(super) fn marked(editor: &Editor) -> String {
     let text = editor.text();
     let mut out = String::new();
     let mut last = 0;
@@ -57,7 +57,7 @@ fn marked(editor: &Editor) -> String {
     out
 }
 
-fn update<R>(
+pub(super) fn update<R>(
     window: WindowHandle<Editor>,
     cx: &mut TestAppContext,
     f: impl FnOnce(&mut Editor, &mut Window, &mut Context<Editor>) -> R,
@@ -65,11 +65,11 @@ fn update<R>(
     window.update(cx, f).unwrap()
 }
 
-fn state(window: WindowHandle<Editor>, cx: &mut TestAppContext) -> String {
+pub(super) fn state(window: WindowHandle<Editor>, cx: &mut TestAppContext) -> String {
     window.read_with(cx, |editor, _| marked(editor)).unwrap()
 }
 
-fn type_text(window: WindowHandle<Editor>, text: &str, cx: &mut TestAppContext) {
+pub(super) fn type_text(window: WindowHandle<Editor>, text: &str, cx: &mut TestAppContext) {
     for c in text.chars() {
         update(window, cx, |editor, window, cx| {
             editor.replace_text_in_range(None, &c.to_string(), window, cx)
@@ -735,4 +735,127 @@ fn state_round_trips_folds(cx: &mut TestAppContext) {
     let other = editor("a.py", "def f():\n    x = 1\nz = 2\n|", cx);
     update(other, cx, |e, _, cx| e.restore_state(&saved, cx));
     assert_eq!(row_count(other, cx), 3);
+}
+
+/// `let x: i32 = 1;` and `foo(a, second: b);` as inlay hints.
+fn with_hints(window: WindowHandle<Editor>, cx: &mut TestAppContext) -> usize {
+    let b = update(window, cx, |e, _, cx| {
+        let b = e.buffer.line_start(1) + "foo(a, ".len();
+        let hint = |offset, label: &str, padding_right| display_map::Inlay {
+            offset,
+            label: label.into(),
+            padding_left: false,
+            padding_right,
+        };
+        let inlays = vec![hint(5, ": i32", false), hint(b, "second:", true)];
+        e.display.set_inlays(&e.buffer, inlays);
+        cx.notify();
+        b
+    });
+    cx.run_until_parked();
+    b
+}
+
+#[gpui::test]
+fn cursors_step_over_inlay_hints_which_never_enter_the_text(cx: &mut TestAppContext) {
+    let window = editor("a.txt", "let x| = 1;\nfoo(a, b);", cx);
+    with_hints(window, cx);
+    // One Right moves one char, past the hint drawn before it.
+    assert_eq!(cursor_point(window, cx), (0, 5), "drawn before `: i32`");
+    update(window, cx, |e, w, cx| e.right(&Right, w, cx));
+    assert_eq!(state(window, cx), "let x |= 1;\nfoo(a, b);");
+    assert_eq!(cursor_point(window, cx), (0, 11));
+    // Down keeps the screen column: column 11 falls inside `second: `
+    // (columns 7-15) nearer its start, so the cursor lands before it.
+    update(window, cx, |e, w, cx| e.down(&Down, w, cx));
+    assert_eq!(state(window, cx), "let x = 1;\nfoo(a, |b);");
+    update(window, cx, |e, w, cx| e.right(&Right, w, cx));
+    assert_eq!(cursor_point(window, cx), (1, 16));
+    // Copy, typing and find see only the buffer's text.
+    update(window, cx, |e, w, cx| {
+        e.select_all(&SelectAll, w, cx);
+        e.copy(&Copy, w, cx);
+    });
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("let x = 1;\nfoo(a, b);".into())
+    );
+    update(window, cx, |e, _, cx| e.set_cursor(6, cx));
+    type_text(window, "y", cx);
+    assert_eq!(state(window, cx), "let x y|= 1;\nfoo(a, b);");
+    let offsets = window
+        .read_with(cx, |e, _| {
+            e.display
+                .inlays()
+                .iter()
+                .map(|inlay| inlay.offset)
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert_eq!(offsets, [5, 19], "hints move with the text");
+}
+
+#[gpui::test]
+fn clicks_on_an_inlay_hint_land_beside_it(cx: &mut TestAppContext) {
+    let window = editor("a.txt", "|let x = 1;\nfoo(a, b);", cx);
+    let b = with_hints(window, cx);
+    let click = |e: &mut Editor,
+                 line: usize,
+                 offset: usize,
+                 shift: f32,
+                 w: &mut Window,
+                 cx: &mut Context<Editor>| {
+        let layout = e.layout.as_ref().expect("laid out");
+        let row = &layout.rows[line];
+        let x = layout.text_left(row, e.scroll.x) + row.x_for(offset) + layout.em_width * shift;
+        let y = layout.row_top(line, e.scroll.y) + layout.line_height / 2.;
+        let position = point(x, y);
+        e.on_mouse_down(
+            &MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            },
+            w,
+            cx,
+        );
+        e.on_mouse_up(
+            &MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            },
+            w,
+            cx,
+        );
+        // Hovering a hint is not hovering text.
+        e.character_at(position)
+    };
+    // `: i32` spans five columns after `x`: anywhere on it is offset 5.
+    for shift in [0.6, 2.5, 4.4] {
+        let under = update(window, cx, |e, w, cx| click(e, 0, 5, shift, w, cx));
+        assert_eq!(state(window, cx), "let x| = 1;\nfoo(a, b);", "{shift}");
+        assert_eq!(under, None);
+    }
+    // Past the hint: the text after it.
+    let under = update(window, cx, |e, w, cx| click(e, 0, 5, 5.6, w, cx));
+    assert_eq!(state(window, cx), "let x |= 1;\nfoo(a, b);");
+    assert_eq!(under.map(|(_, offset)| offset), Some(5));
+    update(window, cx, |e, w, cx| click(e, 1, b, 3.0, w, cx));
+    assert_eq!(state(window, cx), "let x = 1;\nfoo(a, |b);");
+}
+
+#[gpui::test]
+fn wrapped_rows_count_inlay_hints(cx: &mut TestAppContext) {
+    let window = editor("a.txt", "|let x = 1;\nfoo(a, b);", cx);
+    wrap_at(window, 12, cx);
+    assert_eq!(row_count(window, cx), 2);
+    with_hints(window, cx);
+    // `let x: i32 = 1;` (15 columns) and `foo(a, second: b);` (18) wrap.
+    assert_eq!(row_count(window, cx), 4);
+    update(window, cx, |e, _, _| e.clear_inlay_hints());
+    assert_eq!(row_count(window, cx), 2);
 }

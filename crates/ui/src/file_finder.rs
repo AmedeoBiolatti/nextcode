@@ -62,6 +62,11 @@ pub struct FileFinder {
 }
 
 impl FileFinder {
+    #[cfg(test)]
+    pub fn query(&self) -> &Entity<Editor> {
+        &self.query
+    }
+
     pub fn new(project: Project, cx: &mut Context<Self>) -> Self {
         let query = cx.new(Editor::single_line);
         let subscription = cx.subscribe(&query, |this, _, event, cx| {

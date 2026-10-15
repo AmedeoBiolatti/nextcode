@@ -785,8 +785,10 @@ impl Workspace {
         let id = split.id;
         let horizontal = split.axis == SplitAxis::Horizontal;
         let bounds = split.bounds.clone();
+        // Flex, not block: see `main` in `Workspace::render`.
         let first = div()
             .flex_none()
+            .flex()
             .overflow_hidden()
             .child(self.render_node(&split.first, cx));
         let first = if horizontal {
@@ -798,6 +800,7 @@ impl Workspace {
             .flex_1()
             .min_w_0()
             .min_h_0()
+            .flex()
             .overflow_hidden()
             .child(self.render_node(&split.second, cx));
         let handle = div()
@@ -846,7 +849,7 @@ impl Workspace {
     fn render_pane(&self, pane: &Pane, cx: &mut Context<Self>) -> AnyElement {
         let id = pane.id;
         let content = match pane.active_tab() {
-            Some(tab) => div().size_full().child(tab.view()),
+            Some(tab) => div().size_full().flex().child(tab.view()),
             None => div()
                 .size_full()
                 .flex()
@@ -871,6 +874,7 @@ impl Workspace {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .flex()
                     .child(content)
                     .when(cx.has_active_drag(), |area| {
                         area.child(self.render_drop_zones(id, cx))

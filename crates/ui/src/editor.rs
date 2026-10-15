@@ -27,16 +27,25 @@ use crate::{
 };
 
 mod brackets;
+mod call_hierarchy;
+mod code_actions;
 mod completion;
 mod display_map;
 mod editing;
 mod find;
 mod folds;
+pub(crate) mod format;
 mod go_to_line;
+mod inlay_hints;
 mod lines;
 mod navigation;
+mod rename;
 mod selections;
 pub(crate) mod semantic;
+mod server_edits;
+pub(crate) mod signature_help;
+pub(crate) mod snippets;
+mod symbols;
 #[cfg(test)]
 mod tests;
 
@@ -44,25 +53,41 @@ use display_map::{DisplayMap, DisplayRow};
 use editing::{HistoryEntry, SelectionEdit};
 use find::FindBar;
 use go_to_line::GoToLineInput;
+use inlay_hints::RowInlays;
 use lines::IndentStyle;
 use selections::{Selection, SelectionSet, is_whole_word, is_word_char};
 
 pub use brackets::JumpToBracket;
+pub use call_hierarchy::ShowCallHierarchy;
+pub use code_actions::{
+    CloseCodeActions, ConfirmCodeAction, QuickFix, SelectNextCodeAction, SelectPrevCodeAction,
+};
+pub(crate) use code_actions::{
+    execute_command, info as code_action_info, resolve as resolve_code_action,
+    usable as usable_code_actions,
+};
+pub(crate) use completion::symbol_kind_badge;
 pub use find::{
     CloseFind, Find, FindNext, FindPrevious, FindReplace, ReplaceAll, ReplaceNext,
     SelectAllMatches, ToggleMatchCase, ToggleRegex, ToggleWholeWord,
 };
 pub use folds::{Fold, FoldAll, FoldRecursively, ToggleFold, Unfold, UnfoldAll, UnfoldRecursively};
+pub use format::{FormatDocument, FormatSelection};
 pub use go_to_line::{CancelGoToLine, ConfirmGoToLine, GoToLine};
+pub use inlay_hints::ToggleInlayHints;
 pub use lines::{
     CopyLineDown, CopyLineUp, DeleteLine, Indent, InsertLineAbove, InsertLineBelow, MoveLineDown,
     MoveLineUp, Outdent, ToggleBlockComment, ToggleLineComment,
 };
-pub use navigation::{FindReferences, GoToDefinition};
+pub use navigation::{FindReferences, GoToDefinition, GoToImplementation, GoToTypeDefinition};
+pub use rename::{CancelRename, ConfirmRename, RenameSymbol};
 pub use selections::{
     AddCursorAbove, AddCursorBelow, CollapseSelections, EditorState, SelectAllOccurrences,
     SelectNextOccurrence,
 };
+pub use signature_help::{CloseSignatureHelp, NextSignature, PreviousSignature, ShowSignatureHelp};
+pub use snippets::{EndSnippet, NextTabStop, PreviousTabStop};
+pub use symbols::{GoToSymbol, PickRequest, SymbolsStatus};
 
 actions!(
     editor,
@@ -170,6 +195,16 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-b", GoToDefinition, ctx),
         KeyBinding::new("shift-f12", FindReferences, ctx),
         KeyBinding::new("alt-f7", FindReferences, ctx),
+        // VS Code's Ctrl+F12, JetBrains' Ctrl+Alt+B and Ctrl+Shift+B.
+        KeyBinding::new("secondary-f12", GoToImplementation, ctx),
+        KeyBinding::new("secondary-alt-b", GoToImplementation, ctx),
+        KeyBinding::new("secondary-shift-b", GoToTypeDefinition, ctx),
+        KeyBinding::new("ctrl-shift-space", ShowSignatureHelp, ctx),
+        KeyBinding::new("ctrl-alt-i", ToggleInlayHints, ctx),
+        // VS Code; JetBrains' Ctrl+Alt+H.
+        KeyBinding::new("shift-alt-h", ShowCallHierarchy, ctx),
+        KeyBinding::new("ctrl-alt-h", ShowCallHierarchy, ctx),
+        KeyBinding::new("secondary-shift-o", GoToSymbol, ctx),
         KeyBinding::new("ctrl-space", ShowCompletions, ctx),
         // Multiple cursors (VS Code).
         KeyBinding::new("secondary-d", SelectNextOccurrence, ctx),
@@ -213,6 +248,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-k secondary-j", UnfoldAll, ctx),
         KeyBinding::new("secondary-k secondary-[", FoldRecursively, ctx),
         KeyBinding::new("secondary-k secondary-]", UnfoldRecursively, ctx),
+        // Refactoring: VS Code, then JetBrains (Shift+F6, Alt+Enter).
+        KeyBinding::new("f2", RenameSymbol, ctx),
+        KeyBinding::new("shift-f6", RenameSymbol, ctx),
+        KeyBinding::new("secondary-.", QuickFix, ctx),
+        // The find bar's Select All Matches keeps Alt+Enter while it is open.
+        KeyBinding::new("alt-enter", QuickFix, Some("Editor && !find_open")),
+        KeyBinding::new("shift-alt-f", FormatDocument, ctx),
+        KeyBinding::new("secondary-k secondary-f", FormatSelection, ctx),
     ]);
     // Find bar: from its inputs and from the text while it is open. Bound
     // after the plain editor keys so they win in the inputs.
@@ -234,6 +277,26 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-enter", ReplaceAll, pane),
         KeyBinding::new("enter", ConfirmGoToLine, Some("GoToLine > Editor")),
         KeyBinding::new("escape", CancelGoToLine, Some("GoToLine")),
+        KeyBinding::new("enter", ConfirmRename, Some("RenameInput > Editor")),
+        KeyBinding::new("escape", CancelRename, Some("RenameInput")),
+    ]);
+    // Snippet tab stops; before the signature-help and completion keys,
+    // which win while those popovers show.
+    let snippet = Some("Editor && in_snippet");
+    cx.bind_keys([
+        KeyBinding::new("tab", NextTabStop, snippet),
+        KeyBinding::new("shift-tab", PreviousTabStop, snippet),
+        KeyBinding::new("escape", EndSnippet, snippet),
+    ]);
+    // Before the completion keys, which win while both popovers show.
+    let signature = Some("Editor && showing_signature_help");
+    let signatures = Some("Editor && showing_signature_help && multiple_signatures");
+    cx.bind_keys([
+        KeyBinding::new("escape", CloseSignatureHelp, signature),
+        KeyBinding::new("up", PreviousSignature, signatures),
+        KeyBinding::new("down", NextSignature, signatures),
+        KeyBinding::new("alt-up", PreviousSignature, signatures),
+        KeyBinding::new("alt-down", NextSignature, signatures),
     ]);
     // Bound after the plain editor keys so they win while the menu is open.
     let menu = Some("Editor && showing_completions");
@@ -243,6 +306,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", ConfirmCompletion, menu),
         KeyBinding::new("tab", ConfirmCompletion, menu),
         KeyBinding::new("escape", CloseCompletions, menu),
+    ]);
+    // After the completion keys: the two menus never show together.
+    let actions = Some("Editor && showing_code_actions");
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPrevCodeAction, actions),
+        KeyBinding::new("down", SelectNextCodeAction, actions),
+        KeyBinding::new("enter", ConfirmCodeAction, actions),
+        KeyBinding::new("tab", ConfirmCodeAction, actions),
+        KeyBinding::new("escape", CloseCodeActions, actions),
     ]);
 }
 
@@ -266,6 +338,24 @@ pub enum EditorEvent {
     Navigate {
         locations: Vec<language::Location>,
         title: SharedString,
+    },
+    /// Show the call hierarchy of these items (from `prepareCallHierarchy`).
+    CallHierarchy {
+        server: Arc<RunningServer>,
+        items: Vec<lsp::types::CallHierarchyItem>,
+    },
+    /// The document symbols were replaced (fresh from the server or
+    /// cleared).
+    SymbolsChanged,
+    /// Open a picker (Go to Symbol in File, a breadcrumb segment).
+    Pick(PickRequest),
+    /// Apply a language server's workspace edit (rename, code action)
+    /// across the project, then run `command` on that server.
+    ApplyEdit {
+        edit: lsp::types::WorkspaceEdit,
+        server: Arc<RunningServer>,
+        command: Option<lsp::types::Command>,
+        label: SharedString,
     },
 }
 
@@ -323,6 +413,15 @@ pub struct Editor {
     /// Sorted by start; kept in sync with edits until the server republishes.
     diagnostics: Vec<EditorDiagnostic>,
     semantic: semantic::SemanticState,
+    symbols: symbols::SymbolState,
+    inlay: inlay_hints::InlayHintState,
+    signature: signature_help::SignatureHelpState,
+    /// The identifier underlined while Ctrl is held over it (Ctrl+click
+    /// goes to its definition).
+    link: Option<Range<usize>>,
+    /// Where the mouse last moved over the text, for `link` when only a
+    /// modifier changes.
+    mouse_position: Option<Point<Pixels>>,
     hover: Option<HoverPopover>,
     _hover_delay: Option<Task<()>>,
     /// Word the hover popover shows, or is waiting to show, information for.
@@ -339,6 +438,12 @@ pub struct Editor {
     center_cursor: bool,
     find: Option<FindBar>,
     go_to_line: Option<GoToLineInput>,
+    rename: Option<rename::RenameInput>,
+    _rename_task: Option<Task<()>>,
+    code_actions: code_actions::CodeActionState,
+    format: format::FormatState,
+    /// Tab stops of the snippet last inserted, until it is left.
+    snippet: Option<snippets::SnippetSession>,
 }
 
 /// A mouse drag in progress.
@@ -388,6 +493,8 @@ struct EditorDiagnostic {
     unnecessary: bool,
     /// Rendered struck through.
     deprecated: bool,
+    /// As the server sent it (code actions get it back, at `range`).
+    lsp: lsp::types::Diagnostic,
 }
 
 /// Popover shown when the mouse rests on text: diagnostics and hover docs.
@@ -444,6 +551,32 @@ struct RowLayout {
     chevron: Option<bool>,
     /// On the last row of a folded line: the fold's start (its `⋯`).
     folded: Option<usize>,
+    /// Inlay hints spliced into `shaped`.
+    inlays: RowInlays,
+}
+
+impl RowLayout {
+    /// x of buffer `offset` (on this row) from the row's text start; an
+    /// inlay hint at `offset` is drawn after it.
+    fn x_for(&self, offset: usize) -> Pixels {
+        let index = self.inlays.display_index(offset - self.row.range.start);
+        self.shaped.x_for_index(index)
+    }
+
+    /// The buffer offset nearest `x` (from the row's text start); clicks
+    /// on an inlay hint land beside it.
+    fn offset_closest_to(&self, x: Pixels) -> usize {
+        let index = self.shaped.closest_index_for_x(x);
+        self.row.range.start + self.inlays.buffer_offset(index)
+    }
+
+    /// The buffer offset of the character under `x`, if text (not an
+    /// inlay hint) is there.
+    fn offset_under(&self, x: Pixels) -> Option<usize> {
+        let index = self.shaped.index_for_x(x)?;
+        (!self.inlays.is_inlay(index))
+            .then(|| self.row.range.start + self.inlays.buffer_offset(index))
+    }
 }
 
 impl EditorLayout {
@@ -529,6 +662,11 @@ impl Editor {
             changes: Vec::new(),
             diagnostics: Vec::new(),
             semantic: semantic::SemanticState::new(),
+            symbols: symbols::SymbolState::new(),
+            inlay: inlay_hints::InlayHintState::default(),
+            signature: signature_help::SignatureHelpState::default(),
+            link: None,
+            mouse_position: None,
             hover: None,
             _hover_delay: None,
             hover_word: None,
@@ -541,6 +679,11 @@ impl Editor {
             center_cursor: false,
             find: None,
             go_to_line: None,
+            rename: None,
+            _rename_task: None,
+            code_actions: code_actions::CodeActionState::default(),
+            format: format::FormatState::default(),
+            snippet: None,
         }
     }
 
@@ -608,11 +751,17 @@ impl Editor {
             version: 1,
         });
         self.refresh_semantic_tokens(cx);
+        self.symbols_attached(cx);
+        self.refresh_inlay_hints(cx);
     }
 
     /// Forgets the server; `close` also tells it the document closed.
     pub fn detach_server(&mut self, close: bool) {
         self.clear_semantic_tokens();
+        self.clear_symbols();
+        self.clear_inlay_hints();
+        self.dismiss_signature_help();
+        self.link = None;
         if let Some(doc) = self.lsp.take()
             && close
             && !doc.server.connection.has_exited()
@@ -631,6 +780,10 @@ impl Editor {
     pub fn take_server(&mut self) -> Option<ServerDocument> {
         let doc = self.lsp.take()?;
         self.clear_semantic_tokens();
+        self.symbols_handed_over();
+        self.clear_inlay_hints();
+        self.dismiss_signature_help();
+        self.link = None;
         self.hover = None;
         self.hover_word = None;
         self._hover_delay = None;
@@ -644,6 +797,8 @@ impl Editor {
     pub fn adopt_server(&mut self, doc: ServerDocument, cx: &mut Context<Self>) {
         self.lsp = Some(doc.0);
         self.refresh_semantic_tokens(cx);
+        self.symbols_attached(cx);
+        self.refresh_inlay_hints(cx);
     }
 
     /// Sends the drained `changes` to the server: one incremental edit when
@@ -724,6 +879,12 @@ impl Editor {
 
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
+    }
+
+    /// The width the text was last laid out at.
+    #[cfg(test)]
+    pub(crate) fn text_width(&self) -> Option<Pixels> {
+        Some(self.layout.as_ref()?.text_bounds.size.width)
     }
 
     /// Brings in the file's current contents after an external change.
@@ -968,6 +1129,8 @@ impl Editor {
             });
         }
         self.shift_semantic_tokens();
+        self.map_symbols();
+        self.snippet_edited();
         // Folds move with the text (or open when edited inside); edited
         // lines wrap again.
         self.display.edit(&self.buffer, &self.changes);
@@ -988,12 +1151,15 @@ impl Editor {
         }
         if edited && self.sync_changes() {
             self.semantic_tokens_edited(cx);
+            self.symbols_edited(cx);
+            self.inlay_hints_edited(cx);
         }
         if edited {
             cx.emit(EditorEvent::Edited);
         }
         if edited {
             self.update_completion_menu(cx);
+            self.signature_help_moved(cx);
         }
         if was_dirty != self.buffer.is_dirty() {
             cx.emit(EditorEvent::DirtyChanged);
@@ -1119,7 +1285,7 @@ impl Editor {
     }
 
     fn save_action(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
-        self.save(cx);
+        self.save_with_format(cx);
     }
 
     fn offset_for_position(&self, position: Point<Pixels>) -> usize {
@@ -1136,7 +1302,7 @@ impl Editor {
         let x = position.x - layout.text_bounds.left() + self.scroll.x;
         match layout.row_layout_at(position.y, self.scroll.y) {
             Some((_, row)) => {
-                let offset = row.row.range.start + row.shaped.closest_index_for_x(x - row.indent);
+                let offset = row.offset_closest_to(x - row.indent);
                 let offset = offset.min(row.row.range.end);
                 (offset, row.row.wraps_at(offset))
             }
@@ -1173,6 +1339,8 @@ impl Editor {
         self.hover_word = None;
         self._hover_delay = None;
         self.completion = None;
+        self.rename = None;
+        self.code_actions.menu = None;
     }
 
     fn start_column_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
@@ -1189,7 +1357,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.start_mouse(window);
-        if !self.single_line && self.fold_click(event.position, cx) {
+        if !self.single_line
+            && (self.lightbulb_click(event.position, cx) || self.fold_click(event.position, cx))
+        {
             return;
         }
         let (offset, at_row_end) = self.cursor_for_position(event.position);
@@ -1286,6 +1456,8 @@ impl Editor {
                     self.gutter_hovered = over_gutter;
                     cx.notify();
                 }
+                self.mouse_position = Some(event.position);
+                self.update_link(Some(event.position), event.modifiers.secondary(), cx);
                 self.update_hover(event.position, cx)
             }
         }
@@ -1330,10 +1502,8 @@ impl Editor {
             return None;
         }
         let (index, row) = layout.row_layout_at(position.y, self.scroll.y)?;
-        let index_in_row = row
-            .shaped
-            .index_for_x(position.x - layout.text_left(row, self.scroll.x))?;
-        Some((layout.first_row + index, row.row.range.start + index_in_row))
+        let offset = row.offset_under(position.x - layout.text_left(row, self.scroll.x))?;
+        Some((layout.first_row + index, offset))
     }
 
     /// Where `offset` is drawn, if its row is laid out: window x and the
@@ -1345,8 +1515,7 @@ impl Editor {
             .iter()
             .position(|row| row.row.shows(offset, false))?;
         let row = &layout.rows[index];
-        let x = layout.text_left(row, self.scroll.x)
-            + row.shaped.x_for_index(offset - row.row.range.start);
+        let x = layout.text_left(row, self.scroll.x) + row.x_for(offset);
         let top = layout.line_height * (layout.first_row + index) as f32 - self.scroll.y;
         Some((x, top))
     }
@@ -1362,6 +1531,22 @@ impl Editor {
             self._hover_delay = None;
             cx.notify();
         }
+        if !hovered {
+            self.mouse_position = None;
+            if self.link.take().is_some() {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Pressing or releasing Ctrl over an identifier shows or hides its link.
+    fn on_modifiers_changed(
+        &mut self,
+        event: &gpui::ModifiersChangedEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_link(self.mouse_position, event.modifiers.secondary(), cx);
     }
 
     /// Replaces diagnostics with a server's, given in its position encoding.
@@ -1400,12 +1585,14 @@ impl Editor {
                     source: diagnostic.source.clone().map(Into::into),
                     unnecessary: tags.contains(&DiagnosticTag::UNNECESSARY),
                     deprecated: tags.contains(&DiagnosticTag::DEPRECATED),
+                    lsp: diagnostic.clone(),
                 }
             })
             .collect();
         self.diagnostics
             .sort_by_key(|d| (d.range.start, d.severity));
         self.hover = None;
+        self.code_action_diagnostics_changed();
         cx.notify();
     }
 
@@ -1474,6 +1661,7 @@ impl Editor {
         self.scroll.y = (self.scroll.y - delta.y).max(px(0.));
         self.hover = None;
         self._hover_delay = None;
+        self.link = None;
         cx.notify();
     }
 
@@ -1510,11 +1698,13 @@ impl Editor {
         let em_width = shape("m".into(), &[run(1, style.color)]).width;
         let line_count = self.buffer.line_count();
         let digits = line_count.to_string().len().max(3);
-        // Gutter: line numbers, then the fold chevrons' column.
+        // Gutter: the code-action lightbulb, line numbers, then the fold
+        // chevrons' column.
         let (numbers_right, fold_left, gutter_width) = if self.single_line {
             (bounds.left(), bounds.left(), px(0.))
         } else {
-            let numbers = GUTTER_PADDING + em_width * digits as f32;
+            let bulb = em_width * code_actions::LIGHTBULB_COLUMNS;
+            let numbers = GUTTER_PADDING + bulb + em_width * digits as f32;
             let fold_left = numbers + GUTTER_PADDING / 2.;
             let gutter = fold_left + em_width * 1.5 + GUTTER_PADDING / 2.;
             (bounds.left() + numbers, bounds.left() + fold_left, gutter)
@@ -1608,6 +1798,11 @@ impl Editor {
             .map(|s| self.buffer.line_of(s.head))
             .collect();
         cursor_lines.dedup();
+        let inlay_run = TextRun {
+            background_color: Some(theme::inlay_hint_background()),
+            ..run(0, theme::inlay_hint())
+        };
+        let mut row_inlays = Vec::new();
         for row in display_rows {
             let range = row.range.clone();
             // Tabs render as one space for now; byte offsets stay aligned.
@@ -1630,6 +1825,18 @@ impl Editor {
                 &base_run,
                 &mut cuts,
             );
+            // Inlay hints on the row: one at its end belongs to the next
+            // row of the line, if there is one.
+            row_inlays.clear();
+            row_inlays.extend(
+                self.display
+                    .inlays_in(row.range.clone())
+                    .iter()
+                    .filter(|inlay| inlay.offset < row.range.end || row.last)
+                    .map(|inlay| (inlay.offset - row.range.start, inlay)),
+            );
+            let (text, runs, inlays) =
+                inlay_hints::splice_inlays(&text, runs, &row_inlays, &inlay_run);
             let shaped = shape(text, &runs);
 
             let line = row.line;
@@ -1670,6 +1877,7 @@ impl Editor {
                 number,
                 mark,
                 chevron,
+                inlays,
             });
         }
 
@@ -1679,7 +1887,7 @@ impl Editor {
                 .iter()
                 .find(|row| row.row.shows(primary_head, primary_at_row_end))
         {
-            let x = row.shaped.x_for_index(primary_head - row.row.range.start);
+            let x = row.x_for(primary_head);
             let margin = em_width * 2.;
             if x < self.scroll.x {
                 self.scroll.x = (x - margin).max(px(0.));
@@ -1746,6 +1954,9 @@ impl Editor {
                 let x = layout.fold_left + (column - chevron.width) / 2.;
                 chevron.paint(point(x, top), line_height, window, cx).ok();
             }
+            if row.number.is_some() {
+                self.paint_lightbulb(layout, row.row.line, top, window);
+            }
         }
 
         window.with_content_mask(
@@ -1768,8 +1979,8 @@ impl Editor {
                         if !last && range.start == end {
                             return;
                         }
-                        let x0 = shaped.x_for_index(range.start.max(start) - start);
-                        let mut x1 = shaped.x_for_index(range.end.min(end) - start);
+                        let x0 = row.x_for(range.start.max(start));
+                        let mut x1 = row.x_for(range.end.min(end));
                         if range.end > end && last {
                             // Show the selected line break.
                             x1 += layout.em_width / 2.;
@@ -1802,6 +2013,20 @@ impl Editor {
                         .paint(point(text_left, top), line_height, window, cx)
                         .ok();
 
+                    // The Ctrl+hover link to a definition.
+                    if let Some(link) = &self.link
+                        && link.start < end
+                        && start < link.end
+                    {
+                        let x0 = text_left + row.x_for(link.start.max(start));
+                        let x1 = text_left + row.x_for(link.end.min(end));
+                        let y = top + line_height - px(3.);
+                        window.paint_quad(fill(
+                            Bounds::from_corners(point(x0, y), point(x1, y + px(1.))),
+                            theme::accent_text(),
+                        ));
+                    }
+
                     if let Some(fold_start) = row.folded {
                         let placeholder = layout.placeholder_bounds(i, self.scroll);
                         let fold_end = self
@@ -1828,7 +2053,7 @@ impl Editor {
 
                     if focused {
                         for s in on_row().filter(|s| row.row.shows(s.head, s.at_row_end)) {
-                            let x = text_left + shaped.x_for_index(s.head - start);
+                            let x = text_left + row.x_for(s.head);
                             window.paint_quad(fill(
                                 Bounds::from_corners(
                                     point(x, top),
@@ -2034,6 +2259,9 @@ impl EntityInputHandler for Editor {
         }
         self.marked = None;
         self.on_typed(text, cx);
+        if !self.single_line {
+            self.signature_help_typed(text, cx);
+        }
     }
 
     fn replace_and_mark_text_in_range(
@@ -2079,7 +2307,7 @@ impl EntityInputHandler for Editor {
         let end = end.min(row.row.range.end);
         let left = layout.text_left(row, self.scroll.x);
         let top = layout.row_top(index, self.scroll.y);
-        let x = |offset: usize| left + row.shaped.x_for_index(offset - row.row.range.start);
+        let x = |offset: usize| left + row.x_for(offset);
         Some(Bounds::from_corners(
             point(x(start), top),
             point(x(end), top + layout.line_height),
@@ -2181,6 +2409,16 @@ impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // `settings.json` may have toggled semantic highlighting.
         self.sync_semantic_setting(cx);
+        if !self.single_line {
+            // The inlay-hint setting or toggle, and hints for scrolled-to
+            // lines.
+            self.sync_inlay_hints(cx);
+            // Edits and cursor moves (by any path) close the code-action
+            // menu and ask again for the lightbulb, and end a snippet left
+            // behind.
+            self.follow_cursor_for_code_actions(cx);
+            self.snippet_selections_changed();
+        }
         // Alt+Z in another editor.
         if let Some(&WordWrapOverride(wrap)) = cx.try_global::<WordWrapOverride>()
             && self.word_wrap != Some(wrap)
@@ -2235,8 +2473,20 @@ impl Render for Editor {
                 if self.completion.is_some() {
                     context.add("showing_completions");
                 }
+                if let Some(popover) = &self.signature.popover {
+                    context.add("showing_signature_help");
+                    if popover.has_several() {
+                        context.add("multiple_signatures");
+                    }
+                }
                 if self.selections.len() > 1 {
                     context.add("multiple_selections");
+                }
+                if self.code_actions.menu.is_some() {
+                    context.add("showing_code_actions");
+                }
+                if self.in_snippet() {
+                    context.add("in_snippet");
                 }
                 context
             })
@@ -2293,6 +2543,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::toggle_block_comment))
                     .on_action(cx.listener(Self::jump_to_bracket))
                     .on_action(cx.listener(Self::go_to_line_action))
+                    .on_action(cx.listener(Self::go_to_symbol))
                     .on_action(cx.listener(Self::toggle_word_wrap))
                     .on_action(cx.listener(Self::fold))
                     .on_action(cx.listener(Self::unfold))
@@ -2312,19 +2563,47 @@ impl Render for Editor {
             .on_action(cx.listener(Self::next_diagnostic))
             .on_action(cx.listener(Self::prev_diagnostic))
             .on_action(cx.listener(Self::go_to_definition))
+            .on_action(cx.listener(Self::go_to_declaration))
+            .on_action(cx.listener(Self::go_to_type_definition))
+            .on_action(cx.listener(Self::go_to_implementation))
             .on_action(cx.listener(Self::find_references))
+            .on_action(cx.listener(Self::show_call_hierarchy))
+            .on_action(cx.listener(Self::show_signature_help))
+            .on_action(cx.listener(Self::close_signature_help))
+            .on_action(cx.listener(Self::next_signature))
+            .on_action(cx.listener(Self::previous_signature))
+            .on_action(cx.listener(Self::toggle_inlay_hints))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_action(cx.listener(Self::show_completions))
             .on_action(cx.listener(Self::select_prev_completion))
             .on_action(cx.listener(Self::select_next_completion))
             .on_action(cx.listener(Self::confirm_completion))
             .on_action(cx.listener(Self::close_completions))
+            .when(!self.single_line, |editor| {
+                editor
+                    .on_action(cx.listener(Self::rename_symbol))
+                    .on_action(cx.listener(Self::quick_fix))
+                    .on_action(cx.listener(Self::select_prev_code_action))
+                    .on_action(cx.listener(Self::select_next_code_action))
+                    .on_action(cx.listener(Self::confirm_code_action))
+                    .on_action(cx.listener(Self::close_code_actions))
+                    .on_action(cx.listener(Self::format_document))
+                    .on_action(cx.listener(Self::format_selection))
+                    .on_action(cx.listener(Self::next_tab_stop))
+                    .on_action(cx.listener(Self::previous_tab_stop))
+                    .on_action(cx.listener(Self::end_snippet))
+            })
             .child(
                 div()
                     .id("editor-text")
                     .flex_1()
                     .relative()
                     .overflow_hidden()
-                    .cursor(CursorStyle::IBeam)
+                    .cursor(if self.link.is_some() {
+                        CursorStyle::PointingHand
+                    } else {
+                        CursorStyle::IBeam
+                    })
                     .font_family(theme::MONO_FONT)
                     .text_size(px(theme::EDITOR_FONT_SIZE))
                     .line_height(px(theme::EDITOR_LINE_HEIGHT))
@@ -2342,7 +2621,11 @@ impl Render for Editor {
                         editor: cx.entity(),
                     })
                     .when(focused, |text| text.children(self.render_hover()))
-                    .children(self.render_completions(cx)),
+                    .when(focused, |text| {
+                        text.children(self.render_signature_help(cx))
+                    })
+                    .children(self.render_completions(cx))
+                    .children(self.render_code_actions(cx)),
             )
             .when(!self.single_line, |editor| {
                 editor.child(
@@ -2433,9 +2716,13 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_regex))
             .on_action(cx.listener(Self::confirm_go_to_line))
             .on_action(cx.listener(Self::cancel_go_to_line))
+            .on_action(cx.listener(Self::confirm_rename))
+            .on_action(cx.listener(Self::cancel_rename))
+            .children(self.render_breadcrumbs(cx))
             .children(self.render_find_bar(cx))
             .child(div().flex_1().min_h_0().child(editor))
             .children(self.render_go_to_line(cx))
+            .children(self.render_rename())
             .into_any_element()
     }
 }

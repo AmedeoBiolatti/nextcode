@@ -7,7 +7,10 @@ use gpui::{
 };
 
 use super::*;
-use crate::layout::{DockPosition, MIN_DOCK_SIZE, PanelId};
+use crate::{
+    layout::{DockPosition, MIN_DOCK_SIZE, PanelId},
+    lsp_store::RunningServer,
+};
 
 actions!(
     workspace,
@@ -18,6 +21,8 @@ actions!(
         ToggleGit,
         TogglePython,
         ToggleProblems,
+        ToggleCallHierarchy,
+        ToggleOutline,
         ToggleBottomDock,
         SaveLayoutAsDefault,
         ResetLayout,
@@ -35,6 +40,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-`", ToggleTerminal, ctx),
         KeyBinding::new("alt-f12", ToggleTerminal, ctx),
         KeyBinding::new("secondary-shift-m", ToggleProblems, ctx),
+        // JetBrains' Structure tool window.
+        KeyBinding::new("alt-7", ToggleOutline, ctx),
         KeyBinding::new("secondary-j", ToggleBottomDock, ctx),
     ]);
 }
@@ -79,6 +86,8 @@ impl Workspace {
             PanelId::Search => Some(self.search.clone().into()),
             PanelId::Git => Some(self.git.clone().into()),
             PanelId::Python => Some(self.python.clone().into()),
+            PanelId::Outline => Some(self.outline.clone().into()),
+            PanelId::CallHierarchy => Some(self.call_hierarchy.clone().into()),
         }
     }
 
@@ -183,6 +192,53 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.toggle_panel(PanelId::Python, cx);
+    }
+
+    pub(super) fn toggle_call_hierarchy(
+        &mut self,
+        _: &ToggleCallHierarchy,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel(PanelId::CallHierarchy, cx);
+    }
+
+    /// Shows the Outline (focusing it for keyboard navigation) or hides
+    /// it and returns focus to the editor.
+    pub(super) fn toggle_outline(
+        &mut self,
+        _: &ToggleOutline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel(PanelId::Outline, cx);
+        let visible = self
+            .layout
+            .position_of(PanelId::Outline)
+            .is_some_and(|position| {
+                let dock = self.layout.dock(position);
+                dock.open && dock.active == Some(PanelId::Outline)
+            });
+        if visible {
+            self.outline
+                .update(cx, |outline, cx| outline.focus(window, cx));
+        } else {
+            self.focus_active(window, cx);
+        }
+    }
+
+    /// Shows the Call Hierarchy panel rooted at `items` (Show Call
+    /// Hierarchy in an editor) and focuses it.
+    pub(super) fn show_call_hierarchy(
+        &mut self,
+        server: Arc<RunningServer>,
+        items: Vec<lsp::types::CallHierarchyItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(PanelId::CallHierarchy, cx);
+        self.call_hierarchy
+            .update(cx, |panel, cx| panel.show(server, items, window, cx));
     }
 
     pub(super) fn toggle_bottom_dock(

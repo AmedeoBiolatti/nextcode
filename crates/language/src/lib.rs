@@ -4,6 +4,7 @@
 
 pub mod completion;
 pub mod markdown;
+pub mod symbols;
 
 use std::{ops::Range, path::PathBuf};
 

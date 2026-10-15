@@ -277,6 +277,11 @@ impl Buffer {
         self.path.as_deref()
     }
 
+    /// Points this view at another file (e.g. after a rename on disk).
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = Some(path);
+    }
+
     /// Records that the current text is what the file now contains.
     pub fn mark_saved(&mut self) {
         let mut document = lock(&self.document);

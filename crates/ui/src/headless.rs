@@ -22,8 +22,17 @@
 //! | `open` | `path`, `timeout_ms`? | starts the language server, opens the document: `{language, server, encoding}` |
 //! | `close` | `path` | `null` |
 //! | `diagnostics` | `path`?, `wait_ms`? | `[{path, diagnostics}]` (raw LSP); `wait_ms` waits until the server published for `path` and stayed idle 1 s |
-//! | `definition` | `path`, `line`, `character` (LSP position) | `[{path, range}]` |
+//! | `definition` / `declaration` / `type_definition` / `implementation` | `path` (open), `line`, `character` (LSP position) | `[{path, range}]` |
+//! | `incoming_calls` / `outgoing_calls` | `path` (open), `line`, `character` | `[{name, kind, detail, path, range, selection_range, from_ranges}]`: the callers / callees of the first call hierarchy item there (`kind`: LSP `SymbolKind`; `from_ranges`: call sites, in the caller's file for incoming, in `path` for outgoing); `[]` when there is none |
+//! | `document_symbols` | `path` (open) | `[{name, detail, kind, kind_name, depth, parent, range, selection_range}]`: the symbol tree in pre-order (siblings by position; flat server answers nested by range containment); `kind` is the LSP `SymbolKind` number, `parent` an index into the list |
+//! | `workspace_symbols` | `query` | `[{name, kind, container, path, range}]` from every running server that lists workspace symbols (`range` `null` when the server gave only the file) |
 //! | `semantic_tokens` | `path` (open) | `[{line, start, end, text, scope, modifiers}]`: the server's tokens as the editor decodes them; `start`/`end` are UTF-8 byte columns, `scope` is the highlight scope (`null`: modifiers only) |
+//! | `signature_help` | `path` (open), `line`, `character` | `null` outside a call, else `{active_signature, active_parameter, signatures: [{label, parameters, active}]}`: `parameters` are the parameters' label texts, `active` the highlighted one's byte range in `label` (as the popover shows it) or `null` |
+//! | `inlay_hints` | `path` (open), `start_line`? (0), `end_line`? (last line) | `[{line, character, label, kind, padding_left, padding_right}]` (LSP position; `kind`: `"type"`, `"parameter"` or `null`) |
+//! | `rename` | `path` (open), `line`, `character`, `new_name` | `{applied, changed, failure}`: the server's workspace edit, written to disk (open documents synced); `changed` lists edited/created/renamed files, `failure` `{index, path, message}` or `null` |
+//! | `code_actions` | `path` (open), `line`, `character`, `end_line`?, `end_character`? | `[{index, title, kind, preferred}]`, quick fixes first; the diagnostics touching the range are sent along |
+//! | `apply_code_action` | `index` (from the last `code_actions`) | `{applied, changed, failure}` after resolving the action, applying its edit and running its command |
+//! | `format` | `path` | `{text, changed}`: formats like Format Document (settings' `formatter`, else the language server, which needs the file `open`) and writes the file |
 //! | `exec` | `command`, `timeout_ms`? | `{code, stdout, stderr}`; runs in the project root where it lives |
 //! | `git_status` | | `{root, prefix, branch, unborn, upstream, ahead, behind, entries: [{path, orig_path, staged, unstaged}]}` |
 //! | `git_stage` / `git_unstage` / `git_discard` | `paths` (repository-relative) | `null`; discarding deletes untracked files |
@@ -68,10 +77,15 @@ use futures::{StreamExt, channel::mpsc};
 use gpui::{App, AppContext, Application, AsyncApp, Context, Entity, Subscription, Task};
 use lsp::types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, GotoDefinitionParams, Position, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
-    VersionedTextDocumentIdentifier, notification,
-    request::{GotoDefinition, SemanticTokensFullRequest},
+    DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, InlayHint,
+    InlayHintKind, InlayHintLabel, InlayHintParams, ParameterLabel, Position, SignatureHelp,
+    SignatureHelpContext, SignatureHelpParams, SignatureHelpTriggerKind,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier, notification,
+    request::{
+        GotoDeclaration, GotoDefinition, GotoImplementation, GotoTypeDefinition, InlayHintRequest,
+        SemanticTokensFullRequest, SignatureHelpRequest,
+    },
 };
 use parking_lot::Mutex;
 use search::{SearchEvent, SearchLimits, SearchQuery};
@@ -83,11 +97,13 @@ use worktree::FileKind;
 
 use crate::{
     diff_view::DiffSource,
-    editor::semantic,
-    lsp_store::{LspStore, LspStoreEvent, RunningServer, ServerStatus},
+    editor::{semantic, signature_help},
+    lsp_store::{LspStore, LspStoreEvent, RunningServer, ServerStatus, request_retrying},
     project::{Location, Project, WatchHandle},
     settings::Settings,
 };
+
+mod edits;
 
 const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a server must be idle before waited-for diagnostics count as final.
@@ -211,6 +227,33 @@ struct Document {
     text: String,
 }
 
+/// An open document with its running server, for LSP requests.
+struct OpenDocument {
+    uri: Uri,
+    /// The text as last synced to the server.
+    text: String,
+    server: Arc<RunningServer>,
+}
+
+/// The request's `line` and `character` (an LSP position).
+fn position(request: &Value) -> Result<Position, String> {
+    match (request["line"].as_u64(), request["character"].as_u64()) {
+        (Some(line), Some(character)) => Ok(Position::new(line as u32, character as u32)),
+        _ => Err("missing `line` and `character`".into()),
+    }
+}
+
+/// Definition-like results as `[{path, range}]`.
+fn locations_json(response: Option<GotoDefinitionResponse>) -> Value {
+    let locations: Vec<Value> = response
+        .map(language::definition_locations)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|location| json!({ "path": path_json(&location.path), "range": location.range }))
+        .collect();
+    json!(locations)
+}
+
 struct Session {
     project: Project,
     store: Entity<LspStore>,
@@ -220,6 +263,8 @@ struct Session {
     published: HashSet<PathBuf>,
     watch: Option<(WatchHandle, Task<()>)>,
     _disconnects: Option<Task<()>>,
+    /// The last `code_actions` answer, for `apply_code_action`.
+    code_actions: Option<(Arc<RunningServer>, Vec<lsp::types::CodeActionOrCommand>)>,
     _subscription: Subscription,
 }
 
@@ -285,6 +330,7 @@ impl Session {
             published: HashSet::new(),
             watch: None,
             _disconnects: disconnects,
+            code_actions: None,
             _subscription: subscription,
         }
     }
@@ -325,7 +371,10 @@ impl Session {
                     }
                 }
             }
-            LspStoreEvent::ServerStopped(_) | LspStoreEvent::SemanticTokensRefresh(_) => {}
+            LspStoreEvent::ServerStopped(_)
+            | LspStoreEvent::SemanticTokensRefresh(_)
+            | LspStoreEvent::InlayHintsRefresh(_) => {}
+            LspStoreEvent::ApplyEdit(request) => self.apply_edit_request(request, cx),
         }
     }
 
@@ -414,8 +463,19 @@ impl Session {
                 Err(err) => self.out.reply(&id, Err(err)),
             },
             "diagnostics" => self.diagnostics(id, &request, cx),
-            "definition" => self.definition(id, &request, cx),
+            "definition" | "declaration" | "type_definition" | "implementation" => {
+                self.goto(id, cmd, &request, cx)
+            }
+            "incoming_calls" | "outgoing_calls" => self.calls(id, cmd, &request, cx),
             "semantic_tokens" => self.semantic_tokens(id, &request, cx),
+            "rename" => self.rename(id, &request, cx),
+            "code_actions" => self.code_actions(id, &request, cx),
+            "apply_code_action" => self.apply_code_action(id, &request, cx),
+            "format" => self.format(id, &request, cx),
+            "document_symbols" => self.document_symbols(id, &request, cx),
+            "workspace_symbols" => self.workspace_symbols(id, &request, cx),
+            "signature_help" => self.signature_help(id, &request, cx),
+            "inlay_hints" => self.inlay_hints(id, &request, cx),
             "exec" => match param_str(&request, "command") {
                 Ok(command) => {
                     let command = command.to_owned();
@@ -766,6 +826,65 @@ impl Session {
             .update(cx, |store, cx| store.server(language, cx))
     }
 
+    /// The open document the request's `path` names and its running
+    /// server; replies with the error and returns `None` otherwise.
+    fn document(
+        &mut self,
+        id: &Value,
+        request: &Value,
+        cx: &mut Context<Self>,
+    ) -> Option<OpenDocument> {
+        let path = match param_str(request, "path") {
+            Ok(path) => self.project.path(path),
+            Err(err) => {
+                self.out.reply(id, Err(err));
+                return None;
+            }
+        };
+        let Some(document) = self.documents.get(&path) else {
+            self.out.reply(
+                id,
+                Err(format!("{} is not open; send `open` first", path.display())),
+            );
+            return None;
+        };
+        let (uri, text, language) = (
+            document.uri.clone(),
+            document.text.clone(),
+            document.language,
+        );
+        let Some(server) = self.running(language, cx) else {
+            self.out
+                .reply(id, Err("the language server is not running".into()));
+            return None;
+        };
+        Some(OpenDocument { uri, text, server })
+    }
+
+    /// Sends `R` (retrying while the server is still analyzing, which
+    /// rust-analyzer reports as "content modified"), then replies with
+    /// `map` of the result, off the main thread.
+    fn reply_request<R: lsp::types::request::Request>(
+        &self,
+        id: Value,
+        server: Arc<RunningServer>,
+        params: R::Params,
+        map: impl FnOnce(R::Result) -> Value + Send + 'static,
+        cx: &mut Context<Self>,
+    ) where
+        R::Params: Clone,
+    {
+        let out = self.out.clone();
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
+            let result =
+                request_retrying::<R>(&server, params, &executor, 10, Duration::from_millis(500))
+                    .await;
+            out.reply(&id, result.map(map).map_err(|err| err.to_string()));
+        })
+        .detach();
+    }
+
     fn write(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
         let (path, text) = match (param_str(request, "path"), param_str(request, "text")) {
             (Ok(path), Ok(text)) => (self.project.path(path), text.to_owned()),
@@ -1073,64 +1192,334 @@ impl Session {
         .detach();
     }
 
-    fn definition(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
-        let path = match param_str(request, "path") {
-            Ok(path) => self.project.path(path),
+    /// `definition`, `declaration`, `type_definition`, `implementation`.
+    fn goto(&mut self, id: Value, cmd: &str, request: &Value, cx: &mut Context<Self>) {
+        let position = match position(request) {
+            Ok(position) => position,
             Err(err) => return self.out.reply(&id, Err(err)),
         };
-        let (Some(line), Some(character)) =
-            (request["line"].as_u64(), request["character"].as_u64())
-        else {
-            return self
-                .out
-                .reply(&id, Err("missing `line` and `character`".into()));
-        };
-        let Some(document) = self.documents.get(&path) else {
-            return self.out.reply(
-                &id,
-                Err(format!("{} is not open; send `open` first", path.display())),
-            );
-        };
-        let uri = document.uri.clone();
-        let Some(server) = self.running(document.language, cx) else {
-            return self
-                .out
-                .reply(&id, Err("the language server is not running".into()));
+        let Some(document) = self.document(&id, request, cx) else {
+            return;
         };
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier::new(uri),
-                position: Position::new(line as u32, character as u32),
+                text_document: TextDocumentIdentifier::new(document.uri),
+                position,
             },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let server = document.server;
+        match cmd {
+            "declaration" => {
+                self.reply_request::<GotoDeclaration>(id, server, params, locations_json, cx)
+            }
+            "type_definition" => {
+                self.reply_request::<GotoTypeDefinition>(id, server, params, locations_json, cx)
+            }
+            "implementation" => {
+                self.reply_request::<GotoImplementation>(id, server, params, locations_json, cx)
+            }
+            _ => self.reply_request::<GotoDefinition>(id, server, params, locations_json, cx),
+        }
+    }
+
+    /// `incoming_calls` / `outgoing_calls`: prepares the call hierarchy at
+    /// the position, then asks for the first item's calls.
+    fn calls(&mut self, id: Value, cmd: &str, request: &Value, cx: &mut Context<Self>) {
+        use crate::call_hierarchy::{self, Direction};
+        use lsp::types::{CallHierarchyPrepareParams, request::CallHierarchyPrepare};
+
+        let position = match position(request) {
+            Ok(position) => position,
+            Err(err) => return self.out.reply(&id, Err(err)),
+        };
+        let Some(document) = self.document(&id, request, cx) else {
+            return;
+        };
+        let direction = if cmd == "outgoing_calls" {
+            Direction::Outgoing
+        } else {
+            Direction::Incoming
+        };
+        let params = CallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier::new(document.uri),
+                position,
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let server = document.server;
+        let out = self.out.clone();
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
+            let delay = Duration::from_millis(500);
+            let result = async {
+                let items =
+                    request_retrying::<CallHierarchyPrepare>(&server, params, &executor, 10, delay)
+                        .await?;
+                let Some(item) = items.and_then(|items| items.into_iter().next()) else {
+                    return Ok(Vec::new());
+                };
+                call_hierarchy::calls(&server, direction, item, &executor, 10, delay).await
+            }
+            .await;
+            let result = result.map_err(|err| err.to_string()).map(|calls| {
+                let calls: Vec<Value> = calls
+                    .into_iter()
+                    .map(|call| {
+                        json!({
+                            "name": call.item.name,
+                            "kind": call.item.kind,
+                            "detail": call.item.detail,
+                            "path": lsp::uri_to_path(&call.item.uri).as_deref().map(path_json),
+                            "range": call.item.range,
+                            "selection_range": call.item.selection_range,
+                            "from_ranges": call.from_ranges,
+                        })
+                    })
+                    .collect();
+                json!(calls)
+            });
+            out.reply(&id, result);
+        })
+        .detach();
+    }
+
+    /// The signature help at a position, with each signature's highlighted
+    /// parameter resolved as the editor's popover does.
+    fn signature_help(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
+        let position = match position(request) {
+            Ok(position) => position,
+            Err(err) => return self.out.reply(&id, Err(err)),
+        };
+        let Some(document) = self.document(&id, request, cx) else {
+            return;
+        };
+        let encoding = document.server.encoding;
+        let params = SignatureHelpParams {
+            context: Some(SignatureHelpContext {
+                trigger_kind: SignatureHelpTriggerKind::INVOKED,
+                trigger_character: None,
+                is_retrigger: false,
+                active_signature_help: None,
+            }),
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier::new(document.uri),
+                position,
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let map = move |help: Option<SignatureHelp>| {
+            let Some(help) = help.filter(|help| !help.signatures.is_empty()) else {
+                return Value::Null;
+            };
+            let signatures: Vec<Value> = help
+                .signatures
+                .iter()
+                .map(|signature| {
+                    let active =
+                        signature_help::active_parameter(&help, signature).and_then(|index| {
+                            signature_help::parameter_range(signature, index, encoding)
+                        });
+                    let parameters: Vec<String> = signature
+                        .parameters
+                        .iter()
+                        .flatten()
+                        .enumerate()
+                        .map(|(index, parameter)| match &parameter.label {
+                            ParameterLabel::Simple(text) => text.clone(),
+                            ParameterLabel::LabelOffsets(_) => {
+                                signature_help::parameter_range(signature, index, encoding)
+                                    .map(|range| signature.label[range].to_owned())
+                                    .unwrap_or_default()
+                            }
+                        })
+                        .collect();
+                    json!({
+                        "label": signature.label,
+                        "parameters": parameters,
+                        "active": active.map(|range| [range.start, range.end]),
+                    })
+                })
+                .collect();
+            json!({
+                "active_signature": help.active_signature,
+                "active_parameter": help.active_parameter,
+                "signatures": signatures,
+            })
+        };
+        self.reply_request::<SignatureHelpRequest>(id, document.server, params, map, cx);
+    }
+
+    /// Inlay hints of a line range (default: the whole document).
+    fn inlay_hints(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
+        let Some(document) = self.document(&id, request, cx) else {
+            return;
+        };
+        let buffer = text::Buffer::new(&document.text);
+        let last_line = buffer.line_count() - 1;
+        let line = |name: &str, default: usize| {
+            request[name]
+                .as_u64()
+                .map_or(default, |line| (line as usize).min(last_line))
+        };
+        let (start, end) = (line("start_line", 0), line("end_line", last_line));
+        let encoding = document.server.encoding;
+        let range = lsp::types::Range::new(
+            language::to_position(&buffer, buffer.line_start(start), encoding),
+            language::to_position(&buffer, buffer.line_end(end.max(start)), encoding),
+        );
+        let params = InlayHintParams {
+            text_document: TextDocumentIdentifier::new(document.uri),
+            range,
+            work_done_progress_params: Default::default(),
+        };
+        let map = |hints: Option<Vec<InlayHint>>| {
+            let hints: Vec<Value> = hints
+                .unwrap_or_default()
+                .into_iter()
+                .map(|hint| {
+                    let label: String = match hint.label {
+                        InlayHintLabel::String(label) => label,
+                        InlayHintLabel::LabelParts(parts) => {
+                            parts.into_iter().map(|part| part.value).collect()
+                        }
+                    };
+                    json!({
+                        "line": hint.position.line,
+                        "character": hint.position.character,
+                        "label": label,
+                        "kind": match hint.kind {
+                            Some(InlayHintKind::TYPE) => Some("type"),
+                            Some(InlayHintKind::PARAMETER) => Some("parameter"),
+                            _ => None,
+                        },
+                        "padding_left": hint.padding_left.unwrap_or(false),
+                        "padding_right": hint.padding_right.unwrap_or(false),
+                    })
+                })
+                .collect();
+            json!(hints)
+        };
+        self.reply_request::<InlayHintRequest>(id, document.server, params, map, cx);
+    }
+
+    fn document_symbols(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
+        use language::symbols;
+        use lsp::types::{DocumentSymbolParams, request::DocumentSymbolRequest};
+        let Some(document) = self.document(&id, request, cx) else {
+            return;
+        };
+        let params = DocumentSymbolParams {
+            text_document: TextDocumentIdentifier::new(document.uri),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let map = |response: Option<lsp::types::DocumentSymbolResponse>| {
+            let list: Vec<Value> = response
+                .map(symbols::flatten)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|symbol| {
+                    let range = |range: std::ops::Range<Position>| {
+                        lsp::types::Range::new(range.start, range.end)
+                    };
+                    json!({
+                        "kind_name": symbols::kind_name(symbol.kind),
+                        "name": symbol.name,
+                        "detail": symbol.detail,
+                        "kind": symbol.kind,
+                        "depth": symbol.depth,
+                        "parent": symbol.parent,
+                        "range": range(symbol.range),
+                        "selection_range": range(symbol.selection_range),
+                    })
+                })
+                .collect();
+            json!(list)
+        };
+        self.reply_request::<DocumentSymbolRequest>(id, document.server, params, map, cx);
+    }
+
+    /// `workspace_symbols`: asks every running server that serves
+    /// `workspace/symbol` and merges their answers.
+    fn workspace_symbols(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
+        use language::symbols;
+        use lsp::types::{OneOf, WorkspaceSymbolParams, request::WorkspaceSymbolRequest};
+        let query = match param_str(request, "query") {
+            Ok(query) => query.to_owned(),
+            Err(err) => return self.out.reply(&id, Err(err)),
+        };
+        let servers: Vec<Arc<RunningServer>> = self
+            .store
+            .read(cx)
+            .running_servers()
+            .into_iter()
+            .map(|(_, server)| server)
+            .filter(|server| {
+                server
+                    .capabilities
+                    .workspace_symbol_provider
+                    .as_ref()
+                    .is_some_and(|provider| !matches!(provider, OneOf::Left(false)))
+            })
+            .collect();
+        if servers.is_empty() {
+            return self.out.reply(
+                &id,
+                Err(
+                    "no running language server lists workspace symbols; `open` a file first"
+                        .into(),
+                ),
+            );
+        }
+        let params = WorkspaceSymbolParams {
+            query,
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         };
         let out = self.out.clone();
         let executor = cx.background_executor().clone();
         cx.background_spawn(async move {
-            // Servers still analyzing answer "content modified"; retry like
-            // the editor does.
-            let mut attempts = 0;
-            let response = loop {
-                let result = server.connection.request::<GotoDefinition>(params.clone()).await;
-                match result {
-                    Err(lsp::Error::Response { code: -32801, .. }) if attempts < 10 => {
-                        attempts += 1;
-                        executor.timer(Duration::from_millis(500)).await;
-                    }
-                    other => break other,
-                }
-            };
-            let result = response.map_err(|err| err.to_string()).map(|response| {
-                let locations: Vec<Value> = response
-                    .map(language::definition_locations)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|location| json!({ "path": path_json(&location.path), "range": location.range }))
-                    .collect();
-                json!(locations)
+            let requests = servers.iter().map(|server| {
+                request_retrying::<WorkspaceSymbolRequest>(
+                    server,
+                    params.clone(),
+                    &executor,
+                    10,
+                    Duration::from_millis(500),
+                )
             });
-            out.reply(&id, result);
+            let mut items = Vec::new();
+            let mut error = None;
+            for result in futures::future::join_all(requests).await {
+                match result {
+                    Ok(response) => items.extend(
+                        response
+                            .map(symbols::workspace_symbols)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|symbol| {
+                                json!({
+                                    "name": symbol.name,
+                                    "kind": symbol.kind,
+                                    "container": symbol.container,
+                                    "path": path_json(&symbol.path),
+                                    "range": symbol.range,
+                                })
+                            }),
+                    ),
+                    Err(err) => error = Some(err.to_string()),
+                }
+            }
+            out.reply(
+                &id,
+                match error {
+                    Some(error) if items.is_empty() => Err(error),
+                    _ => Ok(json!(items)),
+                },
+            );
         })
         .detach();
     }

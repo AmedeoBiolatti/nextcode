@@ -6,7 +6,7 @@ use gpui::{
 use language::completion::{self as complete, Candidate};
 use lsp::types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
-    CompletionTriggerKind, Documentation,
+    CompletionTriggerKind, Documentation, InsertTextFormat, SymbolKind,
     request::{Completion, ResolveCompletionItem},
 };
 
@@ -322,8 +322,18 @@ impl Editor {
         let accepted = complete::accept(&self.buffer, item, word_start, head, encoding);
         // Accepted at the primary cursor; other cursors keep their text.
         let mut edits = accepted.edits;
+        let mut cursor = accepted.cursor;
+        // A snippet expands in the main edit (the first); its tab stops
+        // start where that edit's text lands.
+        let snippet = (item.insert_text_format == Some(InsertTextFormat::SNIPPET)).then(|| {
+            let source = std::mem::take(&mut edits[0].1);
+            let snippet = self.expand_snippet(&source, edits[0].0.start);
+            let base = cursor.saturating_sub(source.len());
+            edits[0].1.clone_from(&snippet.text);
+            cursor = base + snippet.text.len();
+            (snippet, base)
+        });
         edits.sort_by_key(|(range, _)| range.start);
-        let cursor = accepted.cursor;
         let primary = self.selections.primary_index();
         let others: Vec<Selection> = self.selections.all().to_vec();
         let mapped: Vec<Selection> = others
@@ -348,6 +358,17 @@ impl Editor {
             self.record_history(transaction, before);
             self.autoscroll = true;
             self.finish_change(was_dirty, cx);
+            if let Some((snippet, base)) = snippet {
+                let others = self
+                    .selections
+                    .all()
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != self.selections.primary_index())
+                    .map(|(_, s)| *s)
+                    .collect();
+                self.start_snippet(snippet, base, others, cx);
+            }
             // Accepting must not reopen the menu on the inserted word.
             self.close_menu(cx);
         }
@@ -597,4 +618,32 @@ fn kind_badge(
         Some(CompletionItemKind::SNIPPET) => ("s", theme::muted()),
         _ => ("·", theme::muted()),
     }
+}
+
+/// The badge of a document/workspace/call-hierarchy symbol: the same letters
+/// and colors as the completion kinds.
+pub(crate) fn symbol_kind_badge(
+    kind: SymbolKind,
+    language: Option<Language>,
+) -> (&'static str, Hsla) {
+    let completion_kind = match kind {
+        SymbolKind::FUNCTION => CompletionItemKind::FUNCTION,
+        SymbolKind::METHOD => CompletionItemKind::METHOD,
+        SymbolKind::CONSTRUCTOR => CompletionItemKind::CONSTRUCTOR,
+        SymbolKind::VARIABLE => CompletionItemKind::VARIABLE,
+        SymbolKind::FIELD => CompletionItemKind::FIELD,
+        SymbolKind::PROPERTY => CompletionItemKind::PROPERTY,
+        SymbolKind::CLASS => CompletionItemKind::CLASS,
+        SymbolKind::STRUCT => CompletionItemKind::STRUCT,
+        SymbolKind::INTERFACE => CompletionItemKind::INTERFACE,
+        SymbolKind::TYPE_PARAMETER => CompletionItemKind::TYPE_PARAMETER,
+        SymbolKind::ENUM => CompletionItemKind::ENUM,
+        SymbolKind::ENUM_MEMBER => CompletionItemKind::ENUM_MEMBER,
+        SymbolKind::MODULE | SymbolKind::NAMESPACE | SymbolKind::PACKAGE => {
+            CompletionItemKind::MODULE
+        }
+        SymbolKind::CONSTANT => CompletionItemKind::CONSTANT,
+        _ => return ("·", theme::muted()),
+    };
+    kind_badge(Some(completion_kind), language)
 }

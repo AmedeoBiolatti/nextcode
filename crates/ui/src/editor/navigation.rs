@@ -1,20 +1,96 @@
-//! Hover popover, go-to-definition and find-references.
+//! Hover popover, go to definition/declaration/type definition/
+//! implementation, find references, and the Ctrl+hover link.
 
 use language::markdown::{self, Block};
 use lsp::types::{
-    GotoDefinitionParams, HoverParams, HoverProviderCapability, OneOf, ReferenceContext,
-    ReferenceParams, TextDocumentIdentifier, TextDocumentPositionParams,
-    request::{GotoDefinition, HoverRequest, References},
+    DeclarationCapability, GotoDefinitionParams, HoverParams, HoverProviderCapability,
+    ImplementationProviderCapability, OneOf, ReferenceContext, ReferenceParams, ServerCapabilities,
+    TextDocumentIdentifier, TextDocumentPositionParams, TypeDefinitionProviderCapability,
+    request::{
+        GotoDeclaration, GotoDefinition, GotoImplementation, GotoTypeDefinition, HoverRequest,
+        References,
+    },
 };
 
 use super::*;
+use crate::lsp_store::{CONTENT_MODIFIED, request_retrying};
 
-actions!(editor, [GoToDefinition, FindReferences]);
+actions!(
+    editor,
+    [
+        GoToDefinition,
+        GoToDeclaration,
+        GoToTypeDefinition,
+        GoToImplementation,
+        FindReferences
+    ]
+);
 
 /// How long the mouse must rest before the hover popover appears.
 const HOVER_DELAY: Duration = Duration::from_millis(350);
-/// rust-analyzer answers "content modified" while it is still indexing.
-const CONTENT_MODIFIED: i64 = -32801;
+/// Wait before retrying a request the server answered "content modified".
+const RETRY_DELAY: Duration = Duration::from_millis(400);
+
+/// What a go-to command looks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Goto {
+    Definition,
+    Declaration,
+    TypeDefinition,
+    Implementation,
+}
+
+impl Goto {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Definition => "definition",
+            Self::Declaration => "declaration",
+            Self::TypeDefinition => "type definition",
+            Self::Implementation => "implementation",
+        }
+    }
+
+    /// The locations picker's title.
+    fn title(self) -> &'static str {
+        match self {
+            Self::Definition => "Definitions",
+            Self::Declaration => "Declarations",
+            Self::TypeDefinition => "Type Definitions",
+            Self::Implementation => "Implementations",
+        }
+    }
+
+    fn supported(self, capabilities: &ServerCapabilities) -> bool {
+        match self {
+            Self::Definition => matches!(
+                capabilities.definition_provider,
+                Some(OneOf::Left(true) | OneOf::Right(_))
+            ),
+            Self::Declaration => matches!(
+                capabilities.declaration_provider,
+                Some(
+                    DeclarationCapability::Simple(true)
+                        | DeclarationCapability::RegistrationOptions(_)
+                        | DeclarationCapability::Options(_)
+                )
+            ),
+            Self::TypeDefinition => matches!(
+                capabilities.type_definition_provider,
+                Some(
+                    TypeDefinitionProviderCapability::Simple(true)
+                        | TypeDefinitionProviderCapability::Options(_)
+                )
+            ),
+            Self::Implementation => matches!(
+                capabilities.implementation_provider,
+                Some(
+                    ImplementationProviderCapability::Simple(true)
+                        | ImplementationProviderCapability::Options(_)
+                )
+            ),
+        }
+    }
+}
 
 impl Editor {
     pub(super) fn server(&self) -> Option<Arc<RunningServer>> {
@@ -29,7 +105,7 @@ impl Editor {
         ))
     }
 
-    fn show_notice(&mut self, notice: impl Into<SharedString>, cx: &mut Context<Self>) {
+    pub(crate) fn show_notice(&mut self, notice: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.notice = Some(notice.into());
         cx.notify();
     }
@@ -50,6 +126,7 @@ impl Editor {
         self.reveal_selections();
         self.auto_closed.clear();
         self.completion = None;
+        self.dismiss_signature_help();
         self.center_cursor = true;
         cx.notify();
     }
@@ -78,18 +155,51 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.request_definition(self.primary().head, cx);
+        self.request_goto(Goto::Definition, self.primary().head, cx);
+    }
+
+    pub(super) fn go_to_declaration(
+        &mut self,
+        _: &GoToDeclaration,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_goto(Goto::Declaration, self.primary().head, cx);
+    }
+
+    pub(super) fn go_to_type_definition(
+        &mut self,
+        _: &GoToTypeDefinition,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_goto(Goto::TypeDefinition, self.primary().head, cx);
+    }
+
+    pub(super) fn go_to_implementation(
+        &mut self,
+        _: &GoToImplementation,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_goto(Goto::Implementation, self.primary().head, cx);
     }
 
     pub(super) fn request_definition(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.request_goto(Goto::Definition, offset, cx);
+    }
+
+    /// Asks for `goto`'s targets at `offset`: one jumps, several open the
+    /// locations picker.
+    pub(super) fn request_goto(&mut self, goto: Goto, offset: usize, cx: &mut Context<Self>) {
         let Some(server) = self.server() else {
             return self.show_notice("No language server for this file", cx);
         };
-        if !matches!(
-            server.capabilities.definition_provider,
-            Some(OneOf::Left(true) | OneOf::Right(_))
-        ) {
-            return self.show_notice("The language server cannot go to definitions", cx);
+        if !goto.supported(&server.capabilities) {
+            return self.show_notice(
+                format!("The language server cannot go to {}s", goto.noun()),
+                cx,
+            );
         }
         let Some(position) = self.position_params(offset) else {
             return;
@@ -100,31 +210,66 @@ impl Editor {
             partial_result_params: Default::default(),
         };
         self._navigation_task = Some(cx.spawn(async move |this, cx| {
-            let mut result = server
-                .connection
-                .request::<GotoDefinition>(params.clone())
-                .await;
-            if is_content_modified(&result) {
-                cx.background_executor()
-                    .timer(Duration::from_millis(400))
-                    .await;
-                result = server.connection.request::<GotoDefinition>(params).await;
-            }
+            let executor = cx.background_executor().clone();
+            let (server, retries) = (&server, 1);
+            let result = match goto {
+                Goto::Definition => {
+                    request_retrying::<GotoDefinition>(
+                        server,
+                        params,
+                        &executor,
+                        retries,
+                        RETRY_DELAY,
+                    )
+                    .await
+                }
+                Goto::Declaration => {
+                    request_retrying::<GotoDeclaration>(
+                        server,
+                        params,
+                        &executor,
+                        retries,
+                        RETRY_DELAY,
+                    )
+                    .await
+                }
+                Goto::TypeDefinition => {
+                    request_retrying::<GotoTypeDefinition>(
+                        server,
+                        params,
+                        &executor,
+                        retries,
+                        RETRY_DELAY,
+                    )
+                    .await
+                }
+                Goto::Implementation => {
+                    request_retrying::<GotoImplementation>(
+                        server,
+                        params,
+                        &executor,
+                        retries,
+                        RETRY_DELAY,
+                    )
+                    .await
+                }
+            };
             this.update(cx, |this, cx| {
                 let locations = match result {
                     Ok(response) => response
                         .map(language::definition_locations)
                         .unwrap_or_default(),
                     Err(err) => {
-                        return this.show_notice(format!("Go to definition failed: {err}"), cx);
+                        return this
+                            .show_notice(format!("Go to {} failed: {err}", goto.noun()), cx);
                     }
                 };
                 if locations.is_empty() {
-                    this.show_notice("No definition found", cx);
+                    this.show_notice(format!("No {} found", goto.noun()), cx);
                 } else {
                     cx.emit(EditorEvent::Navigate {
                         locations,
-                        title: "Definitions".into(),
+                        title: goto.title().into(),
                     });
                 }
             })
@@ -207,6 +352,36 @@ impl Editor {
         }
         let end = offset + word_len;
         language::completion::word_start(&self.buffer, end)..end
+    }
+
+    /// While Ctrl (Cmd on macOS) is held, underlines the identifier under
+    /// the mouse as a link to its definition (Ctrl+click follows it).
+    pub(super) fn update_link(
+        &mut self,
+        position: Option<Point<Pixels>>,
+        held: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let can_follow = held
+            && !self.single_line
+            && self
+                .server()
+                .is_some_and(|server| Goto::Definition.supported(&server.capabilities));
+        let link = position
+            .filter(|_| can_follow)
+            .and_then(|position| self.character_at(position))
+            .map(|(_, offset)| self.word_at(offset))
+            .filter(|word| {
+                self.buffer
+                    .slice(word.clone())
+                    .chars()
+                    .next()
+                    .is_some_and(is_word_char)
+            });
+        if link != self.link {
+            self.link = link;
+            cx.notify();
+        }
     }
 
     /// After the mouse rests on a word, shows its diagnostics and the

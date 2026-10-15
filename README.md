@@ -339,6 +339,149 @@ Folds are saved with the session.
 | Fold / unfold recursively | `Ctrl+K Ctrl+[` / `Ctrl+K Ctrl+]` |
 | Fold all / unfold all | `Ctrl+K Ctrl+0` / `Ctrl+K Ctrl+J` |
 
+## Code navigation
+
+### Go to definition and friends
+
+| Command (Go menu) | Keys |
+|---|---|
+| Go to Definition | `F12`, `Ctrl+B`, `Ctrl+click` |
+| Go to Declaration | Go menu / command bar |
+| Go to Type Definition (of the variable or expression's type) | `Ctrl+Shift+B` |
+| Go to Implementation (of a trait/interface or its method) | `Ctrl+F12`, `Ctrl+Alt+B` |
+| Find References | `Shift+F12`, `Alt+F7` |
+
+One result opens directly, several open the locations picker; `Alt+Left`
+goes back. While `Ctrl` is held, the identifier under the mouse is
+underlined and the pointer becomes a hand: a click goes to its definition.
+Commands the server does not support say so in the status bar.
+
+### Parameter hints and inlay hints
+
+**Parameter hints** (signature help) appear above the cursor when typing
+one of the server's trigger characters (`(` and `,` for most servers) or
+with `Ctrl+Shift+Space`: the signature with the current parameter in
+bold, then that parameter's and the function's documentation. They follow
+the cursor and close when it leaves the call, on `Escape`, or on a jump.
+With several signatures (overloads), `Up`/`Down` (or `Alt+Up`/`Alt+Down`,
+or the arrows in the popover) switch between them. The completion menu
+can show at the same time; its keys win while it is open.
+
+**Inlay hints** show what the server infers inside the text, muted: types
+after `let` names and closure parameters, parameter names before
+arguments, chained types, and so on (whatever the server sends). They
+are not text: the cursor steps over them, clicks on one land beside it,
+and they are never selected, copied or found. Word wrap counts their
+width. The visible lines (and a screen above and below) are asked for
+250 ms after edits and when scrolling. `"inlay_hints": false` in
+`settings.json` (or `"languages": { "<id>": { "inlay_hints": … } }`) turns
+them off, live; View > Inlay Hints (`Ctrl+Alt+I`) toggles them for every
+editor until the app exits. Theme keys: `inlay_hint`, `inlay_hint_background`.
+
+### Call hierarchy
+
+**Show Call Hierarchy** (`Shift+Alt+H`, JetBrains `Ctrl+Alt+H`; Go menu)
+asks the language server about the symbol at the cursor and opens the
+**Call Hierarchy** panel (bottom dock; View > Call Hierarchy toggles it). The
+header names the symbol and switches between **Incoming** (who calls it, the
+default) and **Outgoing** (what it calls); switching starts over from the
+symbol. Each level is fetched when it is expanded, so recursive calls can be
+followed as deep as wanted. Rows show the kind, name, detail and `file:line`.
+`Up`/`Down` select, `Right`/`Left` expand/collapse (or step into the first
+child / out to the parent), `Enter` or a click opens the location (an
+incoming caller opens at its call site, an outgoing callee at its name; Back
+returns), double-click or the chevron expands/collapses.
+
+### Symbols: outline, breadcrumbs, Go to Symbol
+
+Each file editor asks its language server for the document's symbols when it
+opens and 300 ms after edits (until then the previous ones move with the
+text).
+
+- **Outline** panel (right dock; `Alt+7`, View > Outline): the active editor's
+  symbol tree with kind badges, follows tab and pane switches, highlights the
+  symbol around the cursor as it moves, and says when there is no language
+  server or no symbols. Click a row (or `Enter`) to jump there; the chevron
+  collapses/expands. With the panel focused (`Alt+7` focuses it),
+  `Up`/`Down` select and `Right`/`Left` expand/collapse or step in/out.
+- **Breadcrumbs** above the text: the project-relative path, then the symbols
+  containing the cursor. A folder segment lists its entries (choosing a folder
+  enters it, `..` goes up; through the project, so WSL and containers work),
+  the file segment lists its folder, and a symbol segment lists its siblings.
+- **Go to Symbol in File…** (`Ctrl+Shift+O`; Go menu): fuzzy picker over the
+  file's symbols (tree order until you type; kind, name, detail or container,
+  line). `Enter` jumps (Back returns), `Escape` closes. Opened before the
+  symbols arrive, it fills in when they do.
+- **Go to Symbol in Workspace…** (`Ctrl+T`, JetBrains `Ctrl+Alt+Shift+N`; Go
+  menu): `workspace/symbol` 150 ms after each keystroke (older answers are
+  dropped) to the active file's language server, or every running one when
+  the active tab has none; rows show kind, name, container and
+  `path:line`, and `Enter` opens the file there.
+
+## Refactoring and formatting
+
+Through the file's language server (the server runs where the project
+lives: locally, in WSL or in the dev container).
+
+| Command (Refactor menu) | Keys |
+|---|---|
+| Rename Symbol… | `F2`, `Shift+F6` |
+| Quick Fix… (code actions at the cursor or selection) | `Ctrl+.`, `Alt+Enter` |
+| Format Document | `Shift+Alt+F` |
+| Format Selection | `Ctrl+K Ctrl+F` |
+
+**Rename** opens an input over the symbol with its name selected (the range
+and placeholder come from the server's `prepareRename`; its refusal, e.g.
+"cannot rename a keyword", shows in the status bar). `Enter` renames it in
+every file, `Escape` (or a click elsewhere) cancels. Open files change in
+their editor (one undo step per file, unsaved like any edit); other files
+change on disk. Servers' file renames (e.g. renaming a Rust module) move the
+file and the open tab with it. The status bar reports how many files
+changed, or which one failed.
+
+**Code actions.** `Ctrl+.` / `Alt+Enter` (while the find bar is open,
+`Alt+Enter` keeps selecting all matches) lists the server's actions for the
+selection and the diagnostics under it: quick fixes first, the server's
+preferred fix in bold. `Up`/`Down`, `Enter` (or a click) applies, `Escape`
+closes. A lightbulb in the gutter marks the cursor line when actions exist
+(amber when one is a quick fix); clicking it opens the menu. Actions are
+resolved when the server defers their edits, and their commands run after
+the edit; edits a command makes come back as `workspace/applyEdit` and are
+applied the same way.
+
+**Formatting.** Format Document and Format Selection use the language
+server (Format Selection needs its range formatting). Settings choose
+another formatter per language; it runs where the project lives, in the
+project root, with the text on stdin and `{file}` replaced by the file's
+path:
+
+```json
+{ "format_on_save": true,
+  "languages": {
+    "python": { "formatter": { "command": "ruff", "args": ["format", "--stdin-filename", "{file}", "-"] } },
+    "rust": { "format_on_save": false },
+    "json": { "formatter": "language_server" } } }
+```
+
+Python uses `ruff format` by default when `ruff` is installed (the
+project's `.venv` first, then `PATH`), else the language server. The result
+replaces the text as one undo step through the smallest edits, so cursors
+and selections stay where they were. The editor's indentation (tabs or N
+spaces, from the status bar) is sent as the server's formatting options.
+`"format_on_save"` (global, or per language) formats on `Ctrl+S`; if the
+formatter takes longer than 2 seconds (or fails), the file is saved
+unformatted with a note in the status bar. Save All and saving from the
+close prompt don't format.
+
+**Snippets.** Completions that insert snippets (e.g. rust-analyzer's
+`fn name($1) {$0}`, basedpyright's call snippets) place the cursor on the
+first placeholder with its text selected; every copy of a placeholder gets a
+cursor, so typing changes them together. `Tab` / `Shift+Tab` move to the
+next / previous placeholder, the last `Tab` goes to the snippet's end
+position; `Escape` or moving the cursor out of the snippet ends it. Choices
+(`${1|a,b|}`) insert the first option; snippet variables (`$TM_FILENAME`,
+`$TM_SELECTED_TEXT`, …) are filled where known.
+
 ## Split editor and session restore
 
 The editor area splits into panes (VS Code's editor groups), each with its
@@ -543,8 +686,15 @@ cargo run --release -p next_code -- --headless --wsl Ubuntu ~/project
 
 Commands: `info`, `list_dir`, `list_files`, `read`, `write`, `stat`,
 `search`, `watch`/`unwatch`, `open`/`close` (language server documents),
-`diagnostics`, `definition`, `semantic_tokens` (decoded as the editor draws
-them), `exec` (shell command in the project root, where
+`diagnostics`, `definition`/`declaration`/`type_definition`/`implementation`,
+`signature_help` (with the highlighted parameter), `inlay_hints` (a line
+range), `incoming_calls`/`outgoing_calls` (call
+hierarchy at a position), `document_symbols`, `workspace_symbols`,
+`semantic_tokens` (decoded as the editor draws
+them), `rename`, `code_actions` / `apply_code_action` (edits are written to
+disk and open documents synced; servers' `workspace/applyEdit` requests are
+applied too and reported as `applied_edit` events), `format`, `exec` (shell
+command in the project root, where
 the project lives), `git_status`, `git_diff`, `git_apply_hunk`, `git_stage`,
 `git_unstage`, `git_discard`, `git_commit`, `git_branch_create`,
 `git_switch`, `git_branch_delete`, `git_fetch`, `git_pull`, `git_push`,

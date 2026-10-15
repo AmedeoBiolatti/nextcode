@@ -1437,7 +1437,10 @@ impl Render for Shell {
                         cx.notify();
                     }))
             }))
-            .child(div().flex_1().min_h_0().child(content))
+            // A flex container: in a block one, panels in the right dock
+            // left the workspace's inputs (finder, go to line, rename)
+            // laid out zero wide, so their text never showed.
+            .child(div().flex_1().min_h_0().flex().child(content))
             // Clicking anywhere below the menu bar closes an open menu.
             .when(self.menu.is_some(), |shell| {
                 shell.child(
@@ -1569,6 +1572,62 @@ mod tests {
         cx.dispatch_action(window.into(), CloseProject);
         assert_eq!(tabs(window, cx), (Vec::new(), 0));
         assert_eq!(title(cx), "next_code");
+        cleanup(root);
+    }
+
+    #[gpui::test]
+    fn workspace_inputs_get_the_width_of_their_box(cx: &mut gpui::TestAppContext) {
+        // The default layout has the Outline in the right dock, which used
+        // to leave inputs over the workspace (file finder) and over an
+        // editor (go to line) zero wide: their text was invisible.
+        let (root, alpha, _) = two_projects("input-width");
+        let window = open_shell(alpha, cx);
+        let workspace = window
+            .read_with(cx, |shell, _| match &shell.tabs[0].content {
+                Content::Workspace(workspace) => workspace.clone(),
+                Content::Connecting(_) => panic!("a local project opens at once"),
+            })
+            .unwrap();
+        cx.dispatch_action(window.into(), crate::workspace::ToggleFileFinder);
+        cx.run_until_parked();
+        let query = workspace
+            .read_with(cx, |workspace, cx| workspace.file_finder_query(cx))
+            .expect("Ctrl+P opens the file finder");
+        let width = query.read_with(cx, |query, _| query.text_width()).unwrap();
+        assert!(width > gpui::px(100.), "finder input {width:?} wide");
+
+        cx.dispatch_action(window.into(), crate::file_finder::Dismiss);
+        let main_py = root.join("alpha").join("main.py");
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| workspace.open(&main_py, window, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let go_to_line_width = |cx: &mut gpui::TestAppContext| {
+            cx.dispatch_action(window.into(), crate::editor::GoToLine);
+            cx.run_until_parked();
+            let input = workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace.active_editor()?.read(cx).go_to_line_input()
+                })
+                .expect("Ctrl+G opens the go-to-line input");
+            input.read_with(cx, |input, _| input.text_width()).unwrap()
+        };
+        let width = go_to_line_width(cx);
+        assert!(width > gpui::px(100.), "go-to-line input {width:?} wide");
+        // In the second pane of a split too.
+        let split = cx.update(|cx| cx.build_action("workspace::SplitRight", None).unwrap());
+        cx.dispatch_action(window.into(), crate::editor::CancelGoToLine);
+        window
+            .update(cx, |_, window, cx| window.dispatch_action(split, cx))
+            .unwrap();
+        cx.run_until_parked();
+        let width = go_to_line_width(cx);
+        assert!(
+            width > gpui::px(100.),
+            "split: go-to-line input {width:?} wide"
+        );
         cleanup(root);
     }
 

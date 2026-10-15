@@ -256,6 +256,8 @@ impl Editor {
         self.autoscroll = true;
         self.auto_closed.clear();
         self.update_completion_menu(cx);
+        self.signature_help_moved(cx);
+        self.snippet_selections_changed();
         cx.notify();
     }
 

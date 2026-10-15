@@ -468,6 +468,54 @@ impl Project {
         }
     }
 
+    /// Creates `dir` and its missing parents.
+    pub fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+        match &self.0.backend {
+            Backend::Local => fs::create_dir_all(dir),
+            Backend::Remote { .. } => self.run_tool("mkdir", &["-p", "--", agent_path(dir)?]),
+        }
+    }
+
+    /// Moves a file or directory, replacing a file at `to`.
+    pub fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        match &self.0.backend {
+            Backend::Local => fs::rename(from, to),
+            Backend::Remote { .. } => {
+                self.run_tool("mv", &["-f", "--", agent_path(from)?, agent_path(to)?])
+            }
+        }
+    }
+
+    /// Deletes a file, or a directory (only an empty one unless `recursive`).
+    pub fn remove(&self, path: &Path, recursive: bool) -> io::Result<()> {
+        let dir = matches!(self.kind(path)?, Some(FileKind::Dir));
+        match &self.0.backend {
+            Backend::Local if !dir => fs::remove_file(path),
+            Backend::Local if recursive => fs::remove_dir_all(path),
+            Backend::Local => fs::remove_dir(path),
+            Backend::Remote { .. } => {
+                let path = agent_path(path)?;
+                match (dir, recursive) {
+                    (false, _) => self.run_tool("rm", &["-f", "--", path]),
+                    (true, true) => self.run_tool("rm", &["-rf", "--", path]),
+                    (true, false) => self.run_tool("rmdir", &["--", path]),
+                }
+            }
+        }
+    }
+
+    /// Runs a POSIX tool where a remote project lives; its stderr is the
+    /// error when it fails.
+    fn run_tool(&self, program: &str, args: &[&str]) -> io::Result<()> {
+        let args: Vec<String> = args.iter().map(|&arg| arg.to_owned()).collect();
+        let output = self.run_program(program, &args, &[], None, Duration::from_secs(30))?;
+        if output.code == Some(0) {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(io::Error::other(format!("{program}: {}", stderr.trim())))
+    }
+
     pub fn watch(&self, debounce: Duration) -> io::Result<(WatchHandle, UnboundedReceiver<Batch>)> {
         match &self.0.backend {
             Backend::Local => {
