@@ -30,6 +30,10 @@ python.workspace = true
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 
+[build-dependencies]
+# Same version gpui uses: icon and version info (`build.rs`).
+embed-resource = "3.0"
+
 [target.'cfg(windows)'.dependencies]
 # The version gpui uses (no second copy): startup warm-up (`startup::prewarm`).
 windows = { version = "0.61", features = [

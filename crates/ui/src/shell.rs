@@ -1,14 +1,19 @@
-//! The window: the menu bar with the command bar beside it, project tabs,
+//! The window: the menu bar (on Windows also the title bar, with drag
+//! areas and caption buttons) with the command bar in it, project tabs,
 //! and the active project. Every window's root is a [`Shell`]; a project
 //! tab holds a `Workspace`, or `Connecting` while a remote project opens.
 
-use std::{path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    path::PathBuf,
+    rc::Rc,
+    sync::{Arc, LazyLock},
+};
 
 use gpui::{
     Action, AnyElement, AnyView, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle,
-    Focusable, KeyBinding, KeyDownEvent, MouseButton, PathPromptOptions, PromptLevel, SharedString,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, anchored,
-    deferred, div, prelude::*, px, size,
+    Focusable, Image, ImageFormat, KeyBinding, KeyDownEvent, MouseButton, PathPromptOptions,
+    PromptLevel, SharedString, Subscription, TitlebarOptions, Window, WindowBounds,
+    WindowControlArea, WindowOptions, actions, anchored, deferred, div, img, prelude::*, px, size,
 };
 
 use crate::{
@@ -52,7 +57,17 @@ pub struct OpenRecentProject {
 }
 
 const CONTEXT: &str = "Shell";
-const MENU_BAR_HEIGHT: f32 = 30.;
+/// Windows gets no system title bar: the menu bar takes its place.
+const CUSTOM_TITLE_BAR: bool = cfg!(windows);
+const MENU_BAR_HEIGHT: f32 = 36.;
+
+static APP_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
+    Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        include_bytes!("../assets/next_code-64.png").to_vec(),
+    ))
+});
+
 const MENU_WIDTH: f32 = 280.;
 const RECENT_IN_MENU: usize = 15;
 
@@ -145,6 +160,9 @@ pub struct Shell {
     theme_notice: Option<SharedString>,
     /// Set once the user confirmed discarding unsaved changes on close.
     close_confirmed: bool,
+    /// Windows' icon font for the caption buttons (Segoe Fluent Icons on
+    /// Windows 11, Segoe MDL2 Assets on 10; same code points).
+    caption_font: SharedString,
     _activation: Subscription,
 }
 
@@ -175,11 +193,22 @@ fn tab_title(location: &Location) -> String {
 /// Opens `location` in a new window.
 pub fn open_window(location: Location, preload: Option<Preload>, cx: &mut App) {
     let location = location.absolute();
-    let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+    // 1280×800, but never past 90 % of the screen (the taskbar and the
+    // window frame need room).
+    let screen = cx
+        .primary_display()
+        .map(|display| display.bounds().size)
+        .unwrap_or(size(px(1280.), px(800.)));
+    let window_size = size(
+        px(1280.).min(screen.width * 0.9),
+        px(800.).min(screen.height * 0.88),
+    );
+    let bounds = Bounds::centered(None, window_size, cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
             title: Some(window_title(Some(&location)).into()),
+            appears_transparent: CUSTOM_TITLE_BAR,
             ..Default::default()
         }),
         ..Default::default()
@@ -259,6 +288,16 @@ impl Shell {
             theme: theme::current(),
             theme_notice: theme::problem().map(Into::into),
             close_confirmed: false,
+            caption_font: if window
+                .text_system()
+                .all_font_names()
+                .iter()
+                .any(|name| name == "Segoe Fluent Icons")
+            {
+                "Segoe Fluent Icons".into()
+            } else {
+                "Segoe MDL2 Assets".into()
+            },
             _activation: activation,
         };
         shell.refresh_menus(cx);
@@ -810,12 +849,24 @@ impl Shell {
         let palette_keys =
             commands::key_text(window, &ShowCommandPalette, Some(&self.focus_handle))
                 .unwrap_or_default();
+        // Empty title bar space moves the window (and maximizes it on
+        // double click, as the system title bar would).
+        let drag_area = |id: &'static str| {
+            div()
+                .id(id)
+                .flex_1()
+                .min_w(px(24.))
+                .h_full()
+                .when(CUSTOM_TITLE_BAR, |area| {
+                    area.window_control_area(WindowControlArea::Drag)
+                })
+        };
         div()
             .flex()
             .flex_none()
             .items_center()
             .h(px(MENU_BAR_HEIGHT))
-            .px_1()
+            .pl_2()
             .gap_0p5()
             .bg(theme::panel())
             .border_b_1()
@@ -823,7 +874,11 @@ impl Shell {
             .text_sm()
             // Clicks on the bar keep focus where it is (the window would
             // otherwise take it): menu commands and the palette act there.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // Occluding rather than handling the press leaves drag areas and
+            // caption buttons to the system (gpui hands it unhandled presses).
+            .id("menu-bar")
+            .occlude()
+            .child(img(APP_ICON.clone()).size(px(18.)).flex_none().mr_1p5())
             .children(
                 self.menus
                     .menus
@@ -831,12 +886,14 @@ impl Shell {
                     .enumerate()
                     .map(|(index, menu)| self.render_menu_title(index, menu.label.clone(), cx)),
             )
+            .child(drag_area("title-drag-left"))
             .child(
                 div()
                     .id("command-bar")
-                    .ml_4()
-                    .w(px(380.))
-                    .h(px(22.))
+                    .flex_shrink()
+                    .w(px(440.))
+                    .min_w(px(160.))
+                    .h(px(24.))
                     .px_2()
                     .flex()
                     .items_center()
@@ -855,8 +912,56 @@ impl Shell {
                             this.show_command_palette(&ShowCommandPalette, window, cx)
                         }),
                     )
-                    .child(div().flex_1().child("Search commands"))
+                    .child(div().text_xs().child("⌕"))
+                    .child(div().flex_1().truncate().child("Search commands"))
                     .child(div().text_xs().child(palette_keys)),
+            )
+            .child(drag_area("title-drag-right"))
+            .when(CUSTOM_TITLE_BAR, |bar| {
+                bar.child(self.render_caption_buttons(window))
+            })
+    }
+
+    /// Minimize, maximize/restore and close, drawn like Windows 11's (the
+    /// system acts on them through their window control areas).
+    fn render_caption_buttons(&self, window: &Window) -> impl IntoElement {
+        let button = |id: &'static str, area: WindowControlArea, glyph: &'static str| {
+            div()
+                .id(id)
+                .w(px(46.))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_family(self.caption_font.clone())
+                .text_size(px(10.))
+                .text_color(theme::text())
+                .window_control_area(area)
+                .child(glyph)
+        };
+        div()
+            .flex()
+            .h_full()
+            .flex_none()
+            .child(
+                button("caption-min", WindowControlArea::Min, "\u{E921}")
+                    .hover(|style| style.bg(theme::hover_row())),
+            )
+            .child(
+                button(
+                    "caption-max",
+                    WindowControlArea::Max,
+                    if window.is_maximized() {
+                        "\u{E923}"
+                    } else {
+                        "\u{E922}"
+                    },
+                )
+                .hover(|style| style.bg(theme::hover_row())),
+            )
+            .child(
+                button("caption-close", WindowControlArea::Close, "\u{E8BB}")
+                    .hover(|style| style.bg(theme::error()).text_color(theme::on_accent())),
             )
     }
 

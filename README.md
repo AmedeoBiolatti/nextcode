@@ -188,9 +188,12 @@ revision, and then swapped), and each file opens its diff.
 ## Window, menus and commands
 
 Top to bottom, a window has the menu bar (File, Edit, View, Go, Run, Git,
-Help) with the command bar beside it, the project tabs, and the active
-project. Each project tab is a whole workspace (docks, editor tabs,
-language servers, terminals); closing it asks about unsaved files first.
+Help) with the command bar in it, the project tabs, and the active
+project. On Windows the menu bar is also the title bar: the system one is
+hidden, empty space in the bar moves the window (double click maximizes),
+and minimize/maximize/close sit at its right. Each project tab is a whole
+workspace (docks, editor tabs, language servers, terminals); closing it
+asks about unsaved files first.
 
 - **File > Open Project…** (`Ctrl+O`) picks a folder (a
   `\\wsl.localhost\...` folder opens through WSL) and opens it in a new
