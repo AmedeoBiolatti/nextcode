@@ -1,4 +1,4 @@
-# Draws the app icon: crates/ui/assets/next_code.ico (16-256 px; DIB
+# Draws the app icon ("<N>"): crates/ui/assets/next_code.ico (16-256 px; DIB
 # entries below 256, PNG at 256) and next_code-64.png (title bar).
 #   powershell -ExecutionPolicy Bypass -File scripts\make-icon.ps1
 param([string]$out = "$PSScriptRoot\..\crates\ui\assets\next_code")
@@ -27,24 +27,21 @@ foreach ($s in $sizes) {
     $hb = New-Object System.Drawing.Drawing2D.LinearGradientBrush $hl, ([System.Drawing.Color]::FromArgb(46, 255, 255, 255)), ([System.Drawing.Color]::FromArgb(0, 255, 255, 255)), 90.0
     $g.SetClip($path); $g.FillRectangle($hb, $hl); $g.ResetClip()
   }
-  # Code brackets "</>".
-  $stroke = [Math]::Max(1.5, $s * 0.09)
+  # "<N>" with a slanted N: one zigzag runs from the end of "<"'s lower arm
+  # through its tip, up into the N's top-left, down the N's diagonal, and
+  # on through ">" (merged at the N's bottom-right); the N's two stems are
+  # separate strokes.
+  $stroke = [Math]::Max(1.5, $s * 0.08)
   $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), $stroke
   $pen.StartCap = 'Round'; $pen.EndCap = 'Round'; $pen.LineJoin = 'Round'
-  $yc = $s * 0.5; $dy = $s * 0.17; $dx = $s * 0.15
-  $lx = $s * 0.23; $rx = $s * 0.77
-  $left = [System.Drawing.PointF[]]@(
-    (New-Object System.Drawing.PointF ($lx + $dx), ($yc - $dy)),
-    (New-Object System.Drawing.PointF $lx, $yc),
-    (New-Object System.Drawing.PointF ($lx + $dx), ($yc + $dy)))
-  $right = [System.Drawing.PointF[]]@(
-    (New-Object System.Drawing.PointF ($rx - $dx), ($yc - $dy)),
-    (New-Object System.Drawing.PointF $rx, $yc),
-    (New-Object System.Drawing.PointF ($rx - $dx), ($yc + $dy)))
-  $g.DrawLines($pen, $left); $g.DrawLines($pen, $right)
-  $slash = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(225, 255, 255, 255)), $stroke
-  $slash.StartCap = 'Round'; $slash.EndCap = 'Round'
-  $g.DrawLine($slash, ($s * 0.555), ($yc - $s * 0.22), ($s * 0.445), ($yc + $s * 0.22))
+  function P([double]$x, [double]$y) { New-Object System.Drawing.PointF ($x * $s), ($y * $s) }
+  $tl = P 0.44 0.28; $bl = P 0.37 0.72; $tr = P 0.63 0.28; $br = P 0.56 0.72
+  $lt = P 0.14 0.50; $rt = P 0.86 0.50
+  $lowerEnd = P 0.245 0.585; $upperEnd = P 0.755 0.415
+  $zigzag = [System.Drawing.PointF[]]@($lowerEnd, $lt, $tl, $br, $rt, $upperEnd)
+  $g.DrawLines($pen, $zigzag)
+  $g.DrawLine($pen, $bl, $tl)
+  $g.DrawLine($pen, $br, $tr)
   $ms = New-Object System.IO.MemoryStream
   if ($s -ge 256) {
     $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
