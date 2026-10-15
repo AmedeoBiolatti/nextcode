@@ -136,6 +136,19 @@ pub fn attach_console() {
 #[cfg(not(windows))]
 pub fn attach_console() {}
 
+/// Gives the editor its own taskbar identity. Without one, Windows may
+/// group its windows with the program that started it (a terminal, for
+/// instance), showing that program's icon instead of next_code's.
+#[cfg(windows)]
+pub fn set_app_id() {
+    use windows::{Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID, core::w};
+    // SAFETY: a static string; only fails on out-of-range input.
+    unsafe { SetCurrentProcessExplicitAppUserModelID(w!("next_code.Editor")) }.ok();
+}
+
+#[cfg(not(windows))]
+pub fn set_app_id() {}
+
 /// Warm-up threads started ahead of gpui; what they created stays alive
 /// until the first window is up.
 pub struct Prewarm {

@@ -112,6 +112,7 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    startup::set_app_id();
     // Warm up graphics, and connect to WSL or read git status, while gpui
     // sets up the platform.
     let prewarm = startup::prewarm();
