@@ -30,6 +30,7 @@ mod brackets;
 mod call_hierarchy;
 mod code_actions;
 mod completion;
+mod debug_gutter;
 mod display_map;
 mod editing;
 mod find;
@@ -67,6 +68,10 @@ pub(crate) use code_actions::{
     usable as usable_code_actions,
 };
 pub(crate) use completion::symbol_kind_badge;
+pub use debug_gutter::{
+    CancelBreakpointEdit, ConfirmBreakpointEdit, DebugEvaluator, DebugLine, GutterBreakpoint,
+    GutterMarker, GutterMarkerKind, NextBreakpointField,
+};
 pub use find::{
     CloseFind, Find, FindNext, FindPrevious, FindReplace, ReplaceAll, ReplaceNext,
     SelectAllMatches, ToggleMatchCase, ToggleRegex, ToggleWholeWord,
@@ -279,6 +284,17 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", CancelGoToLine, Some("GoToLine")),
         KeyBinding::new("enter", ConfirmRename, Some("RenameInput > Editor")),
         KeyBinding::new("escape", CancelRename, Some("RenameInput")),
+        KeyBinding::new(
+            "enter",
+            ConfirmBreakpointEdit,
+            Some("BreakpointEditor > Editor"),
+        ),
+        KeyBinding::new(
+            "tab",
+            NextBreakpointField,
+            Some("BreakpointEditor > Editor"),
+        ),
+        KeyBinding::new("escape", CancelBreakpointEdit, Some("BreakpointEditor")),
     ]);
     // Snippet tab stops; before the signature-help and completion keys,
     // which win while those popovers show.
@@ -356,6 +372,29 @@ pub enum EditorEvent {
         server: Arc<RunningServer>,
         command: Option<lsp::types::Command>,
         label: SharedString,
+    },
+    /// A click in the breakpoint column.
+    ToggleBreakpoint {
+        line: usize,
+    },
+    /// The breakpoint editor set the line's breakpoint.
+    SetBreakpoint {
+        line: usize,
+        enabled: bool,
+        condition: Option<String>,
+        hit_condition: Option<String>,
+        log_message: Option<String>,
+    },
+    RemoveBreakpoint {
+        line: usize,
+    },
+    /// Edits moved the breakpoints given with `set_breakpoints` to these
+    /// lines (same order).
+    BreakpointsMoved(Vec<usize>),
+    /// A click on a gutter marker.
+    GutterMarkerClicked {
+        line: usize,
+        kind: GutterMarkerKind,
     },
 }
 
@@ -444,6 +483,8 @@ pub struct Editor {
     format: format::FormatState,
     /// Tab stops of the snippet last inserted, until it is left.
     snippet: Option<snippets::SnippetSession>,
+    /// Breakpoints, run markers, the paused line, hover values.
+    debug: debug_gutter::DebugGutterState,
 }
 
 /// A mouse drag in progress.
@@ -525,6 +566,11 @@ struct EditorLayout {
     em_width: Pixels,
     /// Right edge of the line numbers.
     numbers_right: Pixels,
+    /// Left edges of the breakpoint column, the run-marker column (when
+    /// there are markers) and the lightbulb.
+    breakpoint_left: Pixels,
+    marker_left: Option<Pixels>,
+    bulb_left: Pixels,
     /// Left edge of the fold chevrons' column (it ends at the text).
     fold_left: Pixels,
     /// Screen row of `rows[0]`.
@@ -534,6 +580,8 @@ struct EditorLayout {
     placeholder: ShapedLine,
     /// Chevrons: folded (▸) and foldable (▾).
     chevrons: [ShapedLine; 2],
+    /// ▶ of run markers.
+    run_marker: ShapedLine,
 }
 
 /// One visible screen row.
@@ -684,6 +732,7 @@ impl Editor {
             code_actions: code_actions::CodeActionState::default(),
             format: format::FormatState::default(),
             snippet: None,
+            debug: Default::default(),
         }
     }
 
@@ -1131,6 +1180,7 @@ impl Editor {
         self.shift_semantic_tokens();
         self.map_symbols();
         self.snippet_edited();
+        self.debug_gutter_edited(cx);
         // Folds move with the text (or open when edited inside); edited
         // lines wrap again.
         self.display.edit(&self.buffer, &self.changes);
@@ -1358,7 +1408,9 @@ impl Editor {
     ) {
         self.start_mouse(window);
         if !self.single_line
-            && (self.lightbulb_click(event.position, cx) || self.fold_click(event.position, cx))
+            && (self.debug_gutter_click(event.position, cx)
+                || self.lightbulb_click(event.position, cx)
+                || self.fold_click(event.position, cx))
         {
             return;
         }
@@ -1698,17 +1750,28 @@ impl Editor {
         let em_width = shape("m".into(), &[run(1, style.color)]).width;
         let line_count = self.buffer.line_count();
         let digits = line_count.to_string().len().max(3);
-        // Gutter: the code-action lightbulb, line numbers, then the fold
-        // chevrons' column.
-        let (numbers_right, fold_left, gutter_width) = if self.single_line {
-            (bounds.left(), bounds.left(), px(0.))
-        } else {
-            let bulb = em_width * code_actions::LIGHTBULB_COLUMNS;
-            let numbers = GUTTER_PADDING + bulb + em_width * digits as f32;
-            let fold_left = numbers + GUTTER_PADDING / 2.;
-            let gutter = fold_left + em_width * 1.5 + GUTTER_PADDING / 2.;
-            (bounds.left() + numbers, bounds.left() + fold_left, gutter)
-        };
+        // Gutter: breakpoints (and run markers), the code-action
+        // lightbulb, line numbers, then the fold chevrons' column.
+        let (numbers_right, fold_left, gutter_width, breakpoint_left, marker_left, bulb_left) =
+            if self.single_line {
+                let left = bounds.left();
+                (left, left, px(0.), left, None, left)
+            } else {
+                let (breakpoint_left, marker_left, debug_width) =
+                    self.debug_columns(bounds.left(), em_width);
+                let bulb = em_width * code_actions::LIGHTBULB_COLUMNS;
+                let numbers = debug_width + bulb + GUTTER_PADDING / 2. + em_width * digits as f32;
+                let fold_left = numbers + GUTTER_PADDING / 2.;
+                let gutter = fold_left + em_width * 1.5 + GUTTER_PADDING / 2.;
+                (
+                    bounds.left() + numbers,
+                    bounds.left() + fold_left,
+                    gutter,
+                    breakpoint_left,
+                    marker_left,
+                    bounds.left() + debug_width,
+                )
+            };
         let text_bounds = Bounds::from_corners(
             point(bounds.left() + gutter_width, bounds.top()),
             bounds.bottom_right(),
@@ -1904,11 +1967,15 @@ impl Editor {
             line_height,
             em_width,
             numbers_right,
+            breakpoint_left,
+            marker_left,
+            bulb_left,
             fold_left,
             first_row,
             rows,
             placeholder: glyph("⋯"),
             chevrons: [glyph("▸"), glyph("▾")],
+            run_marker: shape("▶".into(), &[run("▶".len(), theme::run_marker())]),
         });
     }
 
@@ -1956,6 +2023,7 @@ impl Editor {
             }
             if row.number.is_some() {
                 self.paint_lightbulb(layout, row.row.line, top, window);
+                self.paint_debug_gutter(layout, row.row.line, top, window, cx);
             }
         }
 
@@ -1970,6 +2038,7 @@ impl Editor {
                     let shaped = &row.shaped;
                     let (start, end) = (row.row.range.start, row.row.range.end);
                     let last = row.row.last;
+                    self.paint_debug_line(layout, row, top, window);
                     // Backgrounds over the part of `range` on this row.
                     let mut highlight = |range: &Range<usize>, color: Hsla| {
                         if range.start > end || range.end < start || range.is_empty() {
@@ -2610,6 +2679,7 @@ impl Render for Editor {
                     .text_color(theme::text())
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_mouse_down))
+                    .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
@@ -2718,11 +2788,15 @@ impl Render for Editor {
             .on_action(cx.listener(Self::cancel_go_to_line))
             .on_action(cx.listener(Self::confirm_rename))
             .on_action(cx.listener(Self::cancel_rename))
+            .on_action(cx.listener(Self::confirm_breakpoint_edit))
+            .on_action(cx.listener(Self::cancel_breakpoint_edit))
+            .on_action(cx.listener(Self::next_breakpoint_field))
             .children(self.render_breadcrumbs(cx))
             .children(self.render_find_bar(cx))
             .child(div().flex_1().min_h_0().child(editor))
             .children(self.render_go_to_line(cx))
             .children(self.render_rename())
+            .children(self.render_breakpoint_editor(cx))
             .into_any_element()
     }
 }

@@ -88,6 +88,9 @@ impl Workspace {
             PanelId::Python => Some(self.python.clone().into()),
             PanelId::Outline => Some(self.outline.clone().into()),
             PanelId::CallHierarchy => Some(self.call_hierarchy.clone().into()),
+            PanelId::Debug => Some(self.debug.panel.clone().into()),
+            PanelId::DebugConsole => Some(self.debug.console.clone().into()),
+            PanelId::Tests => Some(self.runs.tests.clone().into()),
         }
     }
 
@@ -116,7 +119,7 @@ impl Workspace {
         self.layout_changed(cx);
     }
 
-    fn toggle_panel(&mut self, panel: PanelId, cx: &mut Context<Self>) {
+    pub(super) fn toggle_panel(&mut self, panel: PanelId, cx: &mut Context<Self>) {
         self.layout.toggle_panel(panel);
         self.layout_changed(cx);
     }

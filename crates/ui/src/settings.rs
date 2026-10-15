@@ -18,7 +18,11 @@
 //!     "server": {
 //!     "command": "basedpyright-langserver", "args": ["--stdio"],
 //!     "settings": { "basedpyright": { "analysis": { "typeCheckingMode": "strict" } } }
-//! } } } }
+//! } } } },
+//!   "debug": { "adapters": { "lldb": { "command": "/opt/codelldb/adapter/codelldb" },
+//!     "python": { "command": "python3", "args": ["-m", "debugpy.adapter"] } } },
+//!   "tests": { "discover_on_save": true, "pytest_args": ["-p", "no:randomly"],
+//!     "cargo_test_args": ["--features", "slow-tests"] } }
 //! ```
 
 use std::{
@@ -51,6 +55,8 @@ pub struct Settings {
     /// Format files when saving them with Ctrl+S (see `formatter`).
     pub format_on_save: bool,
     pub languages: HashMap<String, LanguageSettings>,
+    pub debug: DebugSettings,
+    pub tests: TestSettings,
 }
 
 impl Default for Settings {
@@ -64,6 +70,47 @@ impl Default for Settings {
             inlay_hints: true,
             format_on_save: false,
             languages: HashMap::new(),
+            debug: DebugSettings::default(),
+            tests: TestSettings::default(),
+        }
+    }
+}
+
+/// `"debug"`: how debug adapters start.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DebugSettings {
+    /// The adapter command by kind (`"python"`, `"lldb"`), run where the
+    /// project lives instead of the one found automatically.
+    pub adapters: HashMap<String, AdapterCommandSetting>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterCommandSetting {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// `"tests"`: the Tests panel.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestSettings {
+    /// Rediscover tests after saving a test file (debounced).
+    pub discover_on_save: bool,
+    /// Extra pytest arguments for discovery and runs.
+    pub pytest_args: Vec<String>,
+    /// Extra `cargo test` arguments (before `--`) for discovery and runs.
+    pub cargo_test_args: Vec<String>,
+}
+
+impl Default for TestSettings {
+    fn default() -> Self {
+        Self {
+            discover_on_save: true,
+            pytest_args: Vec::new(),
+            cargo_test_args: Vec::new(),
         }
     }
 }

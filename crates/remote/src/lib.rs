@@ -7,6 +7,7 @@ pub mod launch;
 pub mod wsl;
 
 pub use client::{
-    AgentClient, Initialized, REQUEST_TIMEOUT, RunOutput, StreamHandle, Transport, agent_path,
+    AgentClient, Initialized, PipedProcess, REQUEST_TIMEOUT, RunOutput, StreamHandle, Transport,
+    agent_path,
 };
 pub use launch::Connection;

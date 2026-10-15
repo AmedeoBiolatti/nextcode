@@ -48,9 +48,11 @@ use crate::{
     worktree_picker::{WorktreePicker, WorktreePickerEvent},
 };
 
+mod debug;
 mod docks;
 mod edits;
 mod panes;
+mod runs;
 mod session;
 mod symbols;
 #[cfg(test)]
@@ -104,6 +106,8 @@ pub fn bind_keys(cx: &mut App) {
     docks::bind_keys(cx);
     panes::bind_keys(cx);
     symbols::bind_keys(cx);
+    runs::bind_keys(cx);
+    debug::bind_keys(cx);
 }
 
 /// Work for the first window started before gpui (whose platform setup
@@ -214,6 +218,8 @@ pub(crate) enum OfferKind {
     ReopenInContainer { config: String },
     /// `.venv` is out of date with the lock or `pyproject.toml`.
     PythonSync,
+    /// No LLDB debug adapter: download CodeLLDB.
+    DownloadCodeLldb,
 }
 
 impl OfferKind {
@@ -221,6 +227,7 @@ impl OfferKind {
         match self {
             Self::ReopenInContainer { .. } => "Reopen in Container",
             Self::PythonSync => "Sync",
+            Self::DownloadCodeLldb => "Download CodeLLDB",
         }
     }
 }
@@ -237,6 +244,10 @@ pub struct Workspace {
     call_hierarchy: Entity<CallHierarchyPanel>,
     /// Follows the active editor (set while rendering).
     outline: Entity<OutlinePanel>,
+    /// Run configurations, the Tests panel and the configuration picker.
+    runs: runs::Runs,
+    /// Debug sessions, breakpoints, the Debug panel and console.
+    debug: debug::DebugState,
     layout: Layout,
     /// Dock being resized by dragging its handle.
     resizing: Option<DockPosition>,
@@ -391,11 +402,13 @@ impl Workspace {
                 CallHierarchyEvent::Jump(location) => this.jump_to(location, window, cx),
             },
         );
+        let runs = runs::Runs::new(project.clone(), window, cx);
 
         // Workspace key bindings (e.g. Ctrl+P) need focus inside the workspace.
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
         let layout = Layout::load(&project.state_key());
+        let debug = debug::DebugState::new(window, cx);
         let mut notice = settings_error.map(|error| format!("Settings ignored: {error}").into());
         let watcher = match project.watch(Duration::from_millis(150)) {
             Ok((watcher, mut batches)) => {
@@ -479,6 +492,8 @@ impl Workspace {
             python,
             call_hierarchy,
             outline: cx.new(OutlinePanel::new),
+            runs,
+            debug,
             layout,
             resizing: None,
             panel_menu: None,
@@ -545,6 +560,7 @@ impl Workspace {
         if batch.repository || batch.rescan {
             self.reload_history(cx);
         }
+        self.run_files_changed(&batch, cx);
 
         // One view per file: views of a file share its buffer.
         let mut seen = HashSet::new();
@@ -1077,7 +1093,16 @@ impl Workspace {
                         this.sync_views(editor, cx);
                         cx.notify();
                     }
-                    EditorEvent::Saved | EditorEvent::SymbolsChanged => {}
+                    EditorEvent::Saved => {
+                        let path = this
+                            .all_tabs()
+                            .find(|tab| tab.editor() == Some(editor))
+                            .map(|tab| tab.path.clone());
+                        if let Some(path) = path {
+                            this.run_file_saved(&path, cx);
+                        }
+                    }
+                    EditorEvent::SymbolsChanged => {}
                     EditorEvent::ApplyEdit {
                         edit,
                         server,
@@ -1093,6 +1118,15 @@ impl Workspace {
                     ),
                     EditorEvent::Pick(request) => {
                         this.open_pick_request(editor.clone(), request.clone(), window, cx);
+                    }
+                    EditorEvent::ToggleBreakpoint { .. }
+                    | EditorEvent::SetBreakpoint { .. }
+                    | EditorEvent::RemoveBreakpoint { .. }
+                    | EditorEvent::BreakpointsMoved(_) => {
+                        this.on_editor_debug_event(editor, event, cx)
+                    }
+                    EditorEvent::GutterMarkerClicked { line, kind } => {
+                        this.gutter_marker_clicked(editor, *line, *kind, cx)
                     }
                 },
             );
@@ -1112,6 +1146,8 @@ impl Workspace {
                 editor.set_lsp_status(status, cx);
             });
         }
+        self.debug_editor_opened(&editor, path, cx);
+        self.set_test_markers(&editor, path, cx);
         let title = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -1285,61 +1321,12 @@ impl Workspace {
         }
     }
 
-    /// Runs a Python script, file or tests in a new terminal tab with
-    /// `uv run`, where the project lives.
-    fn run_python(&mut self, request: RunRequest, window: &mut Window, cx: &mut Context<Self>) {
-        use python::uv::{Run, run_line};
-        let active = self.active_tab().and_then(|tab| {
-            let editor = tab.editor()?.read(cx);
-            let line = editor.buffer().line_of(editor.cursor());
-            Some((tab.path.clone(), line, editor.text()))
-        });
-        let file = active
-            .as_ref()
-            .map(|(path, _, _)| crate::python_panel::project_relative(&self.project, path));
-        let need_file = || "Open a Python file first".to_owned();
-        let run = match request {
-            RunRequest::Script(name) => Ok((format!("Run {name}"), Run::Script(name))),
-            RunRequest::CurrentFile => file
-                .clone()
-                .map(|file| (format!("Run {file}"), Run::File(file)))
-                .ok_or_else(need_file),
-            RunRequest::Tests => Ok(("Tests".to_owned(), Run::Pytest(String::new()))),
-            RunRequest::TestFile => file
-                .clone()
-                .map(|file| (format!("Test {file}"), Run::Pytest(file)))
-                .ok_or_else(need_file),
-            RunRequest::TestAtCursor => match (&active, &file) {
-                (Some((_, line, text)), Some(file)) => python::test_at(text, *line)
-                    .map(|node| {
-                        (
-                            format!("Test {node}"),
-                            Run::Pytest(format!("{file}::{node}")),
-                        )
-                    })
-                    .ok_or_else(|| "The cursor is not in a test function or class".to_owned()),
-                _ => Err(need_file()),
-            },
-        };
-        match run {
-            Ok((title, run)) => {
-                self.show_panel(PanelId::Terminal, cx);
-                self.terminal.update(cx, |terminal, cx| {
-                    terminal.run_command(&title, &run_line(&run), window, cx)
-                });
-            }
-            Err(message) => {
-                self.notice = Some(message.into());
-                cx.notify();
-            }
-        }
-    }
-
-    fn accept_offer(&mut self, kind: OfferKind, cx: &mut Context<Self>) {
+    fn accept_offer(&mut self, kind: OfferKind, window: &mut Window, cx: &mut Context<Self>) {
         self.withdraw_offer(&kind, cx);
         match kind {
             OfferKind::PythonSync => self.python.update(cx, |python, cx| python.sync(cx)),
             OfferKind::ReopenInContainer { config } => self.reopen_in(config, cx),
+            OfferKind::DownloadCodeLldb => self.download_codelldb(window, cx),
         }
     }
 
@@ -1562,7 +1549,9 @@ impl Workspace {
                     .child(div().flex_1().min_w_0().child(offer.message.clone()))
                     .child(
                         button("offer-accept", offer.kind.action()).on_click(cx.listener(
-                            move |this, _, _, cx| this.accept_offer(accept_kind.clone(), cx),
+                            move |this, _, window, cx| {
+                                this.accept_offer(accept_kind.clone(), window, cx)
+                            },
                         )),
                     )
                     .child(button("offer-dismiss", "Not now").on_click(
@@ -1705,7 +1694,7 @@ impl Render for Workspace {
             .child(self.render_panes(cx));
 
         div()
-            .key_context("Workspace")
+            .key_context(self.workspace_key_context(cx))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close_active))
             .on_action(cx.listener(Self::toggle_file_finder))
@@ -1750,6 +1739,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::move_tab_to_next_pane))
             .on_action(cx.listener(Self::move_tab_to_previous_pane))
             .on_action(cx.listener(Self::close_pane_action))
+            .on_action(cx.listener(Self::run_configuration))
+            .on_action(cx.listener(Self::debug_configuration))
+            .on_action(cx.listener(Self::select_configuration))
+            .on_action(cx.listener(Self::edit_configurations))
+            .on_action(cx.listener(Self::run_all_tests))
+            .on_action(cx.listener(Self::run_failed_tests))
+            .on_action(cx.listener(Self::toggle_tests))
+            .map(|element| self.on_debug_actions(element, cx))
             .on_mouse_move(cx.listener(Self::on_resize_move))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(Self::on_resize_end))
             .relative()
@@ -1780,6 +1777,7 @@ impl Render for Workspace {
                             }),
                     )
                     .children(self.render_offers(cx))
+                    .children(self.render_debug_bar(cx))
                     .child(main)
                     .children(self.render_dock(DockPosition::Bottom, window, cx)),
             )
@@ -1835,5 +1833,6 @@ impl Render for Workspace {
                     .justify_center()
                     .child(picker.clone())
             }))
+            .children(self.render_configuration_picker())
     }
 }

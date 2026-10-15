@@ -260,6 +260,16 @@ ui_colors! {
     /// The code-action lightbulb in the editor gutter (quick fixes use
     /// `warning`).
     lightbulb,
+    /// Breakpoint dots in the editor gutter and the Breakpoints list.
+    breakpoint,
+    /// Background of the line where the debuggee is paused.
+    debug_current_line,
+    /// Background of the line of another selected stack frame.
+    debug_frame_line,
+    /// The gutter arrow at the paused (or selected frame's) line.
+    debug_arrow,
+    /// Run markers (▶) in the editor gutter, e.g. at tests.
+    run_marker,
 }
 
 /// The color of commit graph lane `index`.

@@ -426,10 +426,25 @@ impl Editor {
                 )
             })
             .zip(self.position_params(offset));
-        if !messages.is_empty() || hover_request.is_some() {
+        // While a debug session is paused: the value under the mouse.
+        let debug_value = self
+            .debug
+            .evaluator
+            .clone()
+            .zip(self.hover_expression(&word));
+        if !messages.is_empty() || hover_request.is_some() || debug_value.is_some() {
             self._hover_delay = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(HOVER_DELAY).await;
-                let docs = match hover_request {
+                let value = match debug_value {
+                    Some((evaluate, expression)) => {
+                        match cx.update(|cx| evaluate(expression, cx)) {
+                            Ok(task) => task.await,
+                            Err(_) => None,
+                        }
+                    }
+                    None => None,
+                };
+                let mut docs = match hover_request {
                     Some((server, position)) => server
                         .connection
                         .request::<HoverRequest>(HoverParams {
@@ -443,6 +458,18 @@ impl Editor {
                         .unwrap_or_default(),
                     None => Vec::new(),
                 };
+                if let Some(value) = value {
+                    if !docs.is_empty() {
+                        docs.insert(0, Block::Rule);
+                    }
+                    docs.insert(
+                        0,
+                        Block::Code {
+                            language: None,
+                            text: value,
+                        },
+                    );
+                }
                 this.update(cx, |this, cx| {
                     if (messages.is_empty() && docs.is_empty())
                         || this.hover_word.as_ref() != Some(&word)

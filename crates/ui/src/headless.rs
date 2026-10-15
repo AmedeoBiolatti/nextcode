@@ -58,11 +58,29 @@
 //! | `python_interpreters` | | `[{version, implementation, path}]` (`path` null: downloadable) |
 //! | `python_test_at` | `path`, `line` (0-based) | pytest node suffix (`TestX::test_y`) or `null` |
 //! | `devcontainer_configs` | | `devcontainer.json` paths of the project folder |
+//! | `run_configurations` | `file`?, `line`? (0-based; for `${file}`/`${lineNumber}`) | `{configurations: [{name, source, summary, kind, disabled, notes, command}], problems}`: `.next_code/run.json`, `.vscode/launch.json` and automatic ones; `command` is the terminal line Run types (or `{error}`) |
+//! | `debug_request` | `name`? (default: the first usable), `file`?, `line`? | the `DebugRequest` (`{name, adapter, request, configuration}`) Debug hands to the debugger; cargo configurations are built first |
+//! | `tests_discover` | | `{nodes: [{id, label, kind, tool, parent, depth, children, path, line, run}], roots, errors, results}` (pytest and cargo; `results` holds collection errors) |
+//! | `tests_run` | `ids`? (node ids; default: everything) | discovers, runs, `{results: [{id, in_tree, status, message, output, duration}], roots: [{id, summary}], errors, discovery_errors, output}` |
+//! | `debug_start` | `request`: `{name, adapter: {type: "python" \| "lldb" \| "custom", command?, args?}, request: "launch" \| "attach", configuration}` | `{state: "starting"}`; one session at a time (a running one is stopped); progress comes as `debug_event`s |
+//! | `debug_set_breakpoints` | `path`, `breakpoints`: `[{line (0-based), condition?, hit_condition?, log_message?, enabled?}]` | `null`; replaces the file's breakpoints (sent to a running session; `breakpoints` events report verification) |
+//! | `debug_continue` / `debug_step` / `debug_pause` | `kind`? (`over` \| `into` \| `out`, step) | `null` |
+//! | `debug_stack` | | `{state, reason, thread_id, threads: [{id, name}], frames: [{index, id, name, path, line, column}], selected_frame}` (0-based lines) |
+//! | `debug_select_frame` | `frame` (index) | `null` |
+//! | `debug_variables` | `reference`? (a variable's children), else `frame`? (index) and `scope`? (name; first) | `[{name, value, type, reference}]` for `reference`, else `{scope, scopes, variables}` |
+//! | `debug_evaluate` | `expression`, `context`? (`repl` \| `watch` \| `hover`) | `{result, type, reference}` in the selected frame |
+//! | `debug_output` | | `[{category, text}]` (stdout, stderr, console, important, input, result) |
+//! | `debug_stop` | | `null` once the session ended |
+//! | `debug_download_codelldb` | | `{path}`: CodeLLDB downloaded where the project lives |
 //! | `shutdown` | | stops language servers and exits |
 //!
 //! Events: `progress` (while a dev container opens), `ready` (after
 //! connecting), `files_changed`, `diagnostics`, `server_status`,
-//! `disconnected`, `error` (startup failure, then exit 1).
+//! `disconnected`, `error` (startup failure, then exit 1), `debug_event`
+//! (`type`: `stopped` with `reason`, `thread_id`, `frame`; `running`;
+//! `output` with `category`, `text`; `breakpoints` with `path` and
+//! `[{line, verified, message}]`; `frame_selected`; `terminated` with
+//! `error`, `exit_code`; `adapter_missing` with `message`, `download`).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -103,7 +121,9 @@ use crate::{
     settings::Settings,
 };
 
+mod debug;
 mod edits;
+mod runs;
 
 const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a server must be idle before waited-for diagnostics count as final.
@@ -217,6 +237,9 @@ async fn serve(
     }) {
         stopping.await;
     }
+    if let Ok(stopping) = session.update(cx, |session, cx| session.debug_shutdown(cx)) {
+        stopping.await;
+    }
     cx.update(|cx| cx.quit()).ok();
 }
 
@@ -265,6 +288,7 @@ struct Session {
     _disconnects: Option<Task<()>>,
     /// The last `code_actions` answer, for `apply_code_action`.
     code_actions: Option<(Arc<RunningServer>, Vec<lsp::types::CodeActionOrCommand>)>,
+    debug: debug::HeadlessDebug,
     _subscription: Subscription,
 }
 
@@ -331,6 +355,7 @@ impl Session {
             watch: None,
             _disconnects: disconnects,
             code_actions: None,
+            debug: debug::HeadlessDebug::new(cx),
             _subscription: subscription,
         }
     }
@@ -496,6 +521,10 @@ impl Session {
             "devcontainer_configs" => {
                 self.blocking(id, cx, |project| Ok(json!(project.devcontainer_configs()?)))
             }
+            "run_configurations" | "debug_request" | "tests_discover" | "tests_run" => {
+                self.run_command(id, cmd, &request, cx)
+            }
+            command if command.starts_with("debug_") => self.debug(id, command, &request, cx),
             "shutdown" => {
                 self.out.reply(&id, Ok(Value::Null));
                 return true;

@@ -70,39 +70,6 @@ pub fn python_list() -> Vec<String> {
     args(["python", "list", "--output-format", "json"])
 }
 
-/// What to run with `uv run`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Run {
-    /// A `[project.scripts]` entry point.
-    Script(String),
-    /// A Python file (project-relative or absolute).
-    File(String),
-    /// pytest on a target (`""` for every test, a file, or a node id).
-    Pytest(String),
-}
-
-/// `uv run …`, as one shell line for a terminal (arguments quoted for
-/// POSIX shells, PowerShell and cmd alike: double quotes when needed).
-pub fn run_line(run: &Run) -> String {
-    let quote = |text: &str| {
-        if text.is_empty()
-            || text
-                .chars()
-                .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '&' | '|' | ';' | '$'))
-        {
-            format!("\"{}\"", text.replace('"', "\\\""))
-        } else {
-            text.to_owned()
-        }
-    };
-    match run {
-        Run::Script(name) => format!("uv run {}", quote(name)),
-        Run::File(path) => format!("uv run {}", quote(path)),
-        Run::Pytest(target) if target.is_empty() => "uv run pytest".into(),
-        Run::Pytest(target) => format!("uv run pytest {}", quote(target)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,18 +88,5 @@ mod tests {
             remove("orjson", &DependencyKind::Optional("fast".into())),
             ["remove", "--optional", "fast", "orjson"]
         );
-    }
-
-    #[test]
-    fn run_lines_quote_paths_with_spaces() {
-        assert_eq!(
-            run_line(&Run::File("src/my app.py".into())),
-            "uv run \"src/my app.py\""
-        );
-        assert_eq!(
-            run_line(&Run::Pytest("tests/test_a.py::TestX::test_y".into())),
-            "uv run pytest tests/test_a.py::TestX::test_y"
-        );
-        assert_eq!(run_line(&Run::Pytest(String::new())), "uv run pytest");
     }
 }

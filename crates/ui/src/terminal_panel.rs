@@ -121,6 +121,9 @@ pub struct TerminalView {
     terminal: Terminal,
     profile: &'static str,
     title: SharedString,
+    /// Set by `TerminalPanel::run_command`: the tab keeps this name (shell
+    /// titles don't replace it) and running it again replaces the tab.
+    run_name: Option<SharedString>,
     focus_handle: FocusHandle,
     palette: Palette,
     /// Grid size last sent to the pty.
@@ -174,6 +177,7 @@ impl TerminalView {
             terminal,
             profile,
             title: SharedString::default(),
+            run_name: None,
             focus_handle: cx.focus_handle(),
             palette,
             grid: (0, 0),
@@ -193,7 +197,10 @@ impl TerminalView {
     }
 
     fn tab_title(&self) -> SharedString {
-        let title = self.title.trim();
+        let title = match &self.run_name {
+            Some(name) => name.trim(),
+            None => self.title.trim(),
+        };
         if title.is_empty() {
             return self.profile.into();
         }
@@ -784,8 +791,9 @@ impl TerminalPanel {
         }
     }
 
-    /// Runs `command_line` in a new tab of the default shell, so its output
-    /// stays visible and it can be run again.
+    /// Runs `command_line` in a tab of the default shell named `title`, so
+    /// its output stays visible; running the same title again replaces
+    /// that tab (stopping what still runs there) in place.
     pub fn run_command(
         &mut self,
         title: &str,
@@ -796,13 +804,25 @@ impl TerminalPanel {
         let Some(profile) = profiles(&self.project).into_iter().next() else {
             return;
         };
+        let previous = self.tabs.iter().position(|(view, _)| {
+            view.read(cx)
+                .run_name
+                .as_ref()
+                .is_some_and(|name| name.as_ref() == title)
+        });
         if let Some(view) = self.spawn(&profile, window, cx) {
-            let title: SharedString = title.to_owned().into();
             let line = format!("{command_line}\r");
             view.update(cx, |view, cx| {
-                view.title = title;
+                view.run_name = Some(title.to_owned().into());
                 view.write(line.into_bytes(), cx);
             });
+            if let Some(index) = previous {
+                // Dropping the old view shuts its shell down.
+                drop(self.tabs.remove(index));
+                let tab = self.tabs.pop().expect("just spawned");
+                self.tabs.insert(index, tab);
+                self.active = index;
+            }
         }
     }
 

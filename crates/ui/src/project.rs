@@ -17,7 +17,7 @@ use std::{
 
 use futures::channel::mpsc::UnboundedReceiver;
 use lsp::{Incoming, LanguageServer, Logger};
-use remote::{AgentClient, RunOutput, StreamHandle, agent_path};
+use remote::{AgentClient, PipedProcess, RunOutput, StreamHandle, agent_path};
 use search::{SearchEvent, SearchLimits, SearchQuery};
 use serde::{Deserialize, Serialize};
 use terminal::{Palette, Terminal, TerminalEvent};
@@ -200,6 +200,16 @@ pub enum WatchHandle {
 pub enum SearchHandle {
     Local(#[allow(dead_code)] search::SearchHandle),
     Remote(#[allow(dead_code)] StreamHandle),
+}
+
+/// Ends a local child process when dropped.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
 }
 
 impl Project {
@@ -586,6 +596,51 @@ impl Project {
                 agent_path(&self.0.root)?,
                 logger,
             ),
+        }
+    }
+
+    /// Starts `program` where the project lives, in its root, with piped
+    /// stdio (e.g. a debug adapter); stderr chunks go to `stderr`.
+    pub fn spawn_piped(
+        &self,
+        program: &str,
+        args: &[String],
+        env: &[(String, String)],
+        stderr: impl FnMut(&[u8]) + Send + 'static,
+    ) -> io::Result<PipedProcess> {
+        match &self.0.backend {
+            Backend::Local => {
+                let mut command = Command::new(program);
+                command
+                    .args(args)
+                    .envs(env.iter().map(|(key, value)| (key, value)))
+                    .current_dir(&self.0.root)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                remote::launch::no_window(&mut command);
+                let mut child = command.spawn()?;
+                let stdin = child.stdin.take().expect("piped stdin");
+                let stdout = child.stdout.take().expect("piped stdout");
+                let mut error = child.stderr.take().expect("piped stderr");
+                let mut stderr = stderr;
+                thread::Builder::new()
+                    .name("piped-stderr".into())
+                    .spawn(move || {
+                        let mut buffer = [0; 4096];
+                        while let Ok(read @ 1..) = error.read(&mut buffer) {
+                            stderr(&buffer[..read]);
+                        }
+                    })?;
+                Ok(PipedProcess {
+                    stdout: Box::new(stdout),
+                    stdin: Box::new(stdin),
+                    guard: Box::new(KillOnDrop(child)),
+                })
+            }
+            Backend::Remote { client, .. } => {
+                client.spawn_piped(program, args, agent_path(&self.0.root)?, env, stderr)
+            }
         }
     }
 

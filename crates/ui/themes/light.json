@@ -31,7 +31,12 @@
     "graph_lanes": ["#3574f0", "#067d17", "#871094", "#c27d04", "#00808a", "#d63447"],
     "branch": "#7a7e85",
     "tag": "#9e6a00",
-    "lightbulb": "#3574f0"
+    "lightbulb": "#3574f0",
+    "breakpoint": "#e0303f",
+    "debug_current_line": "#fff1b8",
+    "debug_frame_line": "#dde8f8",
+    "debug_arrow": "#c27d04",
+    "run_marker": "#1f9a35"
   },
   "terminal": {
     "foreground": "#1e1f22",

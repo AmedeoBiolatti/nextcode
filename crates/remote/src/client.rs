@@ -519,6 +519,45 @@ impl AgentClient {
         Ok((server, incoming))
     }
 
+    /// Starts `program` on the agent's machine, in `cwd`, with piped stdio:
+    /// its stdout to read, stdin to write, and stderr chunks passed to
+    /// `stderr`. The output ends (EOF) when the process exits; dropping
+    /// the guard ends the process.
+    pub fn spawn_piped(
+        self: &Arc<Self>,
+        program: &str,
+        args: &[String],
+        cwd: &str,
+        env: &[(String, String)],
+        mut stderr: impl FnMut(&[u8]) + Send + 'static,
+    ) -> io::Result<PipedProcess> {
+        let (stdout_tx, stdout_rx) = std_mpsc::channel();
+        let request = Request::Spawn(SpawnRequest {
+            program: Some(program.into()),
+            args: args.to_vec(),
+            cwd: cwd.into(),
+            env: env.to_vec(),
+            pty: None,
+        });
+        let handle = self.start_stream(request, move |event| match event {
+            Event::Stdout(data) => {
+                stdout_tx.send(data).ok();
+            }
+            Event::Stderr(data) => stderr(&data),
+            Event::Exited { .. } | Event::Watch(_) | Event::Search(_) => {}
+        })?;
+        let handle = Arc::new(handle);
+        Ok(PipedProcess {
+            stdout: Box::new(ChannelReader {
+                chunks: stdout_rx,
+                chunk: Vec::new(),
+                position: 0,
+            }),
+            stdin: Box::new(StreamWriter(handle.clone())),
+            guard: Box::new(CancelOnDrop(handle)),
+        })
+    }
+
     /// Runs `program` in `cwd` on the agent's machine to completion with
     /// `input` on its stdin (then end of file), killing it after `timeout`.
     pub fn run(
@@ -668,6 +707,14 @@ impl Drop for StreamHandle {
     fn drop(&mut self) {
         self.cancel();
     }
+}
+
+/// A process with piped stdio (see [`AgentClient::spawn_piped`]).
+pub struct PipedProcess {
+    pub stdout: Box<dyn Read + Send>,
+    pub stdin: Box<dyn Write + Send>,
+    /// Ends the process when dropped.
+    pub guard: Box<dyn Send>,
 }
 
 /// A process's stdout, as delivered by its stream.

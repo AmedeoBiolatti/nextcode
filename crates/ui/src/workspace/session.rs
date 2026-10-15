@@ -21,7 +21,7 @@ use super::{
     panes::{Pane, PaneId, PaneNode, SplitAxis},
     *,
 };
-use crate::editor::EditorState;
+use crate::{debugger::store::SavedDebugState, editor::EditorState};
 
 /// How long changes settle before the session is written.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
@@ -32,6 +32,9 @@ pub(crate) struct Session {
     /// Index of the active pane in reading order.
     #[serde(default)]
     pub active_pane: usize,
+    /// Breakpoints, exception filter choices and watch expressions.
+    #[serde(default, skip_serializing_if = "SavedDebugState::is_empty")]
+    pub debug: SavedDebugState,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -89,6 +92,7 @@ impl Workspace {
                 .iter()
                 .position(|pane| pane.id == self.active_pane)
                 .unwrap_or_default(),
+            debug: self.saved_debug_state(cx),
         }
     }
 
@@ -154,12 +158,16 @@ impl Workspace {
 
     /// Reopens the saved session, if any, in a workspace with no tabs yet.
     pub(super) fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.restore_session || self.all_tabs().next().is_some() {
+        if !self.restore_session {
             return;
         }
         let Some(session) = Session::load(&self.project.state_key()) else {
             return;
         };
+        self.restore_debug_state(session.debug.clone(), cx);
+        if self.all_tabs().next().is_some() {
+            return;
+        }
         self.panes.clear();
         let tree = self.restore_node(&session.root, window, cx);
         match tree {

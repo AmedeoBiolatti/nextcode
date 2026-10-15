@@ -1321,6 +1321,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "dap"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "parking_lot",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3564,6 +3574,7 @@ name = "next_code"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dap",
  "devcontainer",
  "dirs 7.0.0",
  "embed-resource",
@@ -3578,6 +3589,7 @@ dependencies = [
  "python",
  "regex",
  "remote",
+ "run",
  "search",
  "serde",
  "serde_json",
@@ -4852,6 +4864,17 @@ name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
+name = "run"
+version = "0.1.0"
+dependencies = [
+ "devcontainer",
+ "regex",
+ "roxmltree",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "rust-embed"

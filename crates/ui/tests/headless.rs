@@ -25,9 +25,14 @@ struct Headless {
 
 impl Headless {
     fn start(root: &PathBuf) -> Self {
+        Self::start_with(root, &[])
+    }
+
+    fn start_with(root: &PathBuf, env: &[(&str, &std::path::Path)]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_next_code"))
             .arg("--headless")
             .arg(root)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -884,6 +889,446 @@ fn headless_mode_renames_fixes_and_formats_with_rust_analyzer() {
     } else {
         println!("format skipped: rustfmt is not on PATH");
     }
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `{id: status}` of a `tests_run` reply.
+fn statuses(reply: &Value) -> std::collections::BTreeMap<String, String> {
+    reply["result"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{reply}"))
+        .iter()
+        .map(|row| {
+            (
+                row["id"].as_str().unwrap().to_owned(),
+                row["status"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn result_row<'a>(reply: &'a Value, id: &str) -> &'a Value {
+    reply["result"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} in {reply}"))
+}
+
+#[test]
+fn headless_mode_discovers_runs_and_configures_pytest_tests() {
+    if Command::new("uv").arg("--version").output().is_err() {
+        println!("skipped: uv is not on PATH");
+        return;
+    }
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_pytest_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("tests").join("sub")).unwrap();
+    fs::create_dir_all(root.join(".vscode")).unwrap();
+    fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"demo\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\n\
+         dependencies = []\n\n[dependency-groups]\ndev = [\"pytest\"]\n\n[tool.uv]\npackage = false\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests").join("test_a.py"),
+        "import pytest\n\n\
+         def test_pass():\n    assert 1 + 1 == 2\n\n\
+         def test_fail():\n    assert 1 + 1 == 3, \"math is broken\"\n\n\
+         @pytest.mark.parametrize(\"x,y\", [(1, 2), (3, 7)])\n\
+         def test_double(x, y):\n    assert x * 2 == y\n\n\
+         class TestGroup:\n    def test_inside(self):\n        print(\"inside out\")\n\n\
+         \x20   @pytest.mark.skip(reason=\"not today\")\n    def test_skipped(self):\n        pass\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests").join("sub").join("test_b.py"),
+        "def test_b():\n    pass\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".vscode").join("launch.json"),
+        "{\n  // VS Code's file\n  \"configurations\": [\n    { \"name\": \"Main\", \"type\": \"debugpy\", \
+         \"request\": \"launch\", \"program\": \"${workspaceFolder}/main.py\", \"justMyCode\": false },\n    \
+         { \"name\": \"Web\", \"type\": \"node\", \"request\": \"launch\" },\n  ],\n}\n",
+    )
+    .unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+
+    let discovered = headless.call(json!({ "cmd": "tests_discover" }));
+    let nodes = discovered["result"]["nodes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{discovered}"));
+    let find = |id: &str| {
+        nodes
+            .iter()
+            .find(|node| node["id"] == id)
+            .unwrap_or_else(|| panic!("no {id} in {discovered}"))
+    };
+    assert_eq!(find("tests/test_a.py::test_fail")["line"], 5);
+    assert_eq!(find("tests/test_a.py::test_double")["kind"], "function");
+    assert_eq!(find("tests/test_a.py::test_double[3-7]")["kind"], "test");
+    assert_eq!(find("tests/test_a.py::TestGroup")["kind"], "class");
+    assert_eq!(find("tests/test_a.py::TestGroup::test_inside")["line"], 13);
+    assert_eq!(find("tests/sub")["kind"], "folder");
+
+    let all = headless.call(json!({ "cmd": "tests_run" }));
+    assert_eq!(
+        statuses(&all),
+        [
+            ("tests/sub/test_b.py::test_b", "passed"),
+            ("tests/test_a.py::TestGroup::test_inside", "passed"),
+            ("tests/test_a.py::TestGroup::test_skipped", "skipped"),
+            ("tests/test_a.py::test_double[1-2]", "passed"),
+            ("tests/test_a.py::test_double[3-7]", "failed"),
+            ("tests/test_a.py::test_fail", "failed"),
+            ("tests/test_a.py::test_pass", "passed"),
+        ]
+        .map(|(id, status)| (id.to_owned(), status.to_owned()))
+        .into(),
+        "{all}"
+    );
+    let fail = result_row(&all, "tests/test_a.py::test_fail");
+    assert!(
+        fail["message"].as_str().unwrap().contains("math is broken"),
+        "{fail}"
+    );
+    assert!(
+        fail["output"]
+            .as_str()
+            .unwrap()
+            .contains("assert 1 + 1 == 3"),
+        "{fail}"
+    );
+    let inside = result_row(&all, "tests/test_a.py::TestGroup::test_inside");
+    assert!(
+        inside["output"].as_str().unwrap().contains("inside out"),
+        "{inside}"
+    );
+    assert_eq!(
+        result_row(&all, "tests/test_a.py::TestGroup::test_skipped")["message"],
+        "not today"
+    );
+    assert_eq!(all["result"]["roots"][0]["summary"]["failed"], 2, "{all}");
+
+    let class = headless.call(json!({ "cmd": "tests_run", "ids": ["tests/test_a.py::TestGroup"] }));
+    assert_eq!(statuses(&class).len(), 2, "{class}");
+
+    let configs = headless.call(json!({ "cmd": "run_configurations", "file": "tests/test_a.py" }));
+    let configs = configs["result"]["configurations"].as_array().unwrap();
+    let config = |name: &str| {
+        configs
+            .iter()
+            .find(|config| config["name"] == name)
+            .unwrap()
+    };
+    assert_eq!(config("Main")["source"], "launch_json");
+    assert!(
+        config("Web")["disabled"]
+            .as_str()
+            .unwrap()
+            .contains("`node`")
+    );
+    assert_eq!(config("pytest: All Tests")["command"], "uv run pytest");
+    let current = config("Python: Current File")["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        current.starts_with("uv run python ") && current.contains("test_a.py"),
+        "{current}"
+    );
+
+    let debug = headless.call(json!({ "cmd": "debug_request", "name": "Main" }));
+    let debug = &debug["result"];
+    assert_eq!(debug["adapter"]["type"], "python", "{debug}");
+    assert_eq!(debug["configuration"]["justMyCode"], false);
+    assert!(
+        debug["configuration"]["program"]
+            .as_str()
+            .unwrap()
+            .ends_with("main.py")
+    );
+    let pytest = headless.call(json!({ "cmd": "debug_request", "name": "pytest: All Tests" }));
+    assert_eq!(
+        pytest["result"]["configuration"]["module"], "pytest",
+        "{pytest}"
+    );
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn headless_mode_discovers_and_runs_cargo_tests() {
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_cargo_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("src").join("bin")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n\
+         #[cfg(test)]\nmod tests {\n    use super::*;\n\n\
+         \x20   #[test]\n    fn adds() {\n        assert_eq!(add(1, 2), 3);\n    }\n\n\
+         \x20   #[test]\n    fn fails() {\n        assert_eq!(add(1, 2), 4, \"bad math\");\n    }\n\n\
+         \x20   #[test]\n    #[ignore = \"slow\"]\n    fn ignored() {}\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("bin").join("tool.rs"),
+        "fn main() {\n    println!(\"tool\");\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests").join("it.rs"),
+        "#[test]\nfn integration() {\n    assert_eq!(demo::add(2, 2), 4);\n}\n",
+    )
+    .unwrap();
+    // Its own target dir: the outer `cargo test` holds the workspace's.
+    let target = root.join("target");
+    let mut headless = Headless::start_with(&root, &[("CARGO_TARGET_DIR", &target)]);
+    headless.next(|line| line["event"] == "ready");
+
+    let discovered = headless.call(json!({ "cmd": "tests_discover" }));
+    let nodes = discovered["result"]["nodes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{discovered}"));
+    let adds = nodes
+        .iter()
+        .find(|node| node["id"] == "demo/lib::tests::adds")
+        .unwrap_or_else(|| panic!("{discovered}"));
+    assert_eq!(adds["line"], 9, "{adds}");
+    assert!(adds["path"].as_str().unwrap().ends_with("lib.rs"));
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node["id"] == "demo/test:it::integration")
+    );
+
+    let all = headless.call(json!({ "cmd": "tests_run" }));
+    assert_eq!(
+        statuses(&all),
+        [
+            ("demo/lib::tests::adds", "passed"),
+            ("demo/lib::tests::fails", "failed"),
+            ("demo/lib::tests::ignored", "skipped"),
+            ("demo/test:it::integration", "passed"),
+        ]
+        .map(|(id, status)| (id.to_owned(), status.to_owned()))
+        .into(),
+        "{all}"
+    );
+    let fails = result_row(&all, "demo/lib::tests::fails");
+    assert!(
+        fails["message"].as_str().unwrap().contains("bad math"),
+        "{fails}"
+    );
+    let one = headless.call(json!({ "cmd": "tests_run", "ids": ["demo/lib::tests::adds"] }));
+    assert_eq!(statuses(&one).len(), 1, "{one}");
+
+    let debug = headless.call(json!({ "cmd": "debug_request", "name": "cargo run: tool" }));
+    let debug = &debug["result"];
+    assert_eq!(debug["adapter"]["type"], "lldb", "{debug}");
+    let program = debug["configuration"]["program"].as_str().unwrap();
+    assert!(
+        program.ends_with("tool") || program.ends_with("tool.exe"),
+        "{program}"
+    );
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The next `debug_event` of `kind` (other events stay in the backlog).
+fn debug_event(headless: &mut Headless, kind: &str) -> Value {
+    headless.next(|line| line["event"] == "debug_event" && line["type"] == kind)
+}
+
+#[test]
+fn headless_mode_debugs_python_with_debugpy() {
+    if Command::new("uv").arg("--version").output().is_err() {
+        println!("skipped: uv is not on PATH (debugpy comes through `uv run --with debugpy`)");
+        return;
+    }
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_dap_py_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let main = root.join("main.py");
+    fs::write(
+        &main,
+        "def compute(n):\n    total = 0\n    for i in range(n):\n        total += i\n    return total\n\n\
+         result = compute(4)\nprint(\"result\", result)\n",
+    )
+    .unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let set = headless.call(json!({
+        "cmd": "debug_set_breakpoints", "path": "main.py", "breakpoints": [{ "line": 3 }]
+    }));
+    assert_eq!(set["ok"], true, "{set}");
+    let started = headless.call(json!({ "cmd": "debug_start", "request": {
+        "name": "main.py",
+        "adapter": { "type": "python" },
+        "request": "launch",
+        "configuration": { "program": main.to_string_lossy() }
+    } }));
+    assert_eq!(started["ok"], true, "{started}");
+
+    // Stops in the loop with the frame on line 3 (0-based).
+    let stopped = debug_event(&mut headless, "stopped");
+    assert_eq!(stopped["frame"]["line"], 3, "{stopped}");
+    assert!(
+        stopped["frame"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("main.py")
+    );
+    let verified = debug_event(&mut headless, "breakpoints");
+    assert_eq!(verified["breakpoints"][0]["verified"], true, "{verified}");
+    let stack = headless.call(json!({ "cmd": "debug_stack" }));
+    let frames = stack["result"]["frames"].as_array().unwrap();
+    assert_eq!(frames[0]["name"], "compute", "{stack}");
+    assert_eq!(stack["result"]["state"], "paused");
+
+    let locals = headless.call(json!({ "cmd": "debug_variables" }));
+    let variables = &locals["result"]["variables"];
+    let value = |name: &str| {
+        variables
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|var| var["name"] == name)
+            .map(|var| var["value"].clone())
+    };
+    assert_eq!(value("i"), Some(json!("0")), "{locals}");
+    assert_eq!(value("total"), Some(json!("0")), "{locals}");
+    let evaluated = headless.call(json!({ "cmd": "debug_evaluate", "expression": "n * 100 + i" }));
+    assert_eq!(evaluated["result"]["result"], "400", "{evaluated}");
+
+    // Step over the loop body: back at the `for` (line 2).
+    let step = headless.call(json!({ "cmd": "debug_step", "kind": "over" }));
+    assert_eq!(step["ok"], true, "{step}");
+    let stopped = debug_event(&mut headless, "stopped");
+    assert_eq!(stopped["frame"]["line"], 2, "{stopped}");
+
+    // Without breakpoints the program runs to its end.
+    headless.call(json!({ "cmd": "debug_set_breakpoints", "path": "main.py", "breakpoints": [] }));
+    let resumed = headless.call(json!({ "cmd": "debug_continue" }));
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    let ended = debug_event(&mut headless, "terminated");
+    assert_eq!(ended["error"], Value::Null, "{ended}");
+    let output = headless.call(json!({ "cmd": "debug_output" }));
+    assert!(
+        output["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line["category"] == "stdout" && line["text"] == "result 6"),
+        "{output}"
+    );
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+/// An LLDB adapter: `NEXT_CODE_TEST_LLDB` (the adapter's path, put first on
+/// `PATH`), else `codelldb` or `lldb-dap` on `PATH`.
+fn lldb_adapter() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("NEXT_CODE_TEST_LLDB") {
+        return Some(PathBuf::from(path));
+    }
+    let names: &[&str] = if cfg!(windows) {
+        &["codelldb.exe", "lldb-dap.exe"]
+    } else {
+        &["codelldb", "lldb-dap"]
+    };
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .find(|path| path.is_file())
+}
+
+#[test]
+fn headless_mode_debugs_a_cargo_binary_with_lldb() {
+    let Some(adapter) = lldb_adapter() else {
+        println!("skipped: no codelldb/lldb-dap on PATH and NEXT_CODE_TEST_LLDB is not set");
+        return;
+    };
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_dap_rs_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("main.rs"),
+        "fn main() {\n    let numbers = vec![1, 2, 3];\n    let total: i32 = numbers.iter().sum();\n    \
+         println!(\"total {total}\");\n}\n",
+    )
+    .unwrap();
+    let built = Command::new(env!("CARGO"))
+        .args(["build", "--quiet"])
+        .current_dir(&root)
+        .env_remove("CARGO_TARGET_DIR")
+        .status()
+        .unwrap();
+    assert!(built.success());
+    let program =
+        root.join("target")
+            .join("debug")
+            .join(if cfg!(windows) { "demo.exe" } else { "demo" });
+
+    // The adapter's directory first on PATH, so it is the one found.
+    let mut path = vec![adapter.parent().unwrap().to_path_buf()];
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(path).unwrap();
+    let mut headless = Headless::start_with(&root, &[("PATH", std::path::Path::new(&path))]);
+    headless.next(|line| line["event"] == "ready");
+    headless.call(json!({
+        "cmd": "debug_set_breakpoints", "path": "src/main.rs", "breakpoints": [{ "line": 3 }]
+    }));
+    let started = headless.call(json!({ "cmd": "debug_start", "request": {
+        "name": "demo",
+        "adapter": { "type": "lldb" },
+        "request": "launch",
+        "configuration": { "program": program.to_string_lossy() }
+    } }));
+    assert_eq!(started["ok"], true, "{started}");
+    let stopped = debug_event(&mut headless, "stopped");
+    assert_eq!(stopped["frame"]["line"], 3, "{stopped}");
+    let locals = headless.call(json!({ "cmd": "debug_variables" }));
+    let total = locals["result"]["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|var| var["name"] == "total")
+        .map(|var| var["value"].clone());
+    assert_eq!(total, Some(json!("6")), "{locals}");
+    let stopping = headless.call(json!({ "cmd": "debug_stop" }));
+    assert_eq!(stopping["ok"], true, "{stopping}");
 
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
     assert!(headless.child.wait().unwrap().success());

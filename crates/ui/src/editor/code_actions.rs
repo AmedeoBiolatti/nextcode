@@ -465,10 +465,7 @@ impl Editor {
 
     /// Left edge and width of the lightbulb column (before the numbers).
     pub(super) fn lightbulb_column(layout: &EditorLayout) -> (Pixels, Pixels) {
-        (
-            layout.bounds.left() + GUTTER_PADDING / 2.,
-            layout.em_width * LIGHTBULB_COLUMNS,
-        )
+        (layout.bulb_left, layout.em_width * LIGHTBULB_COLUMNS)
     }
 
     /// A click on the lightbulb opens the menu.

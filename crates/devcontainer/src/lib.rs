@@ -11,7 +11,9 @@
 //! for the same folder is reused rather than duplicated.
 
 mod config;
-mod jsonc;
+/// JSONC (comments, trailing commas), shared with run configurations'
+/// `launch.json`.
+pub mod jsonc;
 
 use std::{collections::BTreeMap, io, time::Duration};
 

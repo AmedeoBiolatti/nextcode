@@ -91,6 +91,8 @@ impl Documents for OpenEditors<'_, '_> {
                 }
             }
         }
+        let debug = self.workspace.debug.store.clone();
+        debug.update(self.cx, |store, cx| store.renamed(from, to, &project, cx));
         self.cx.notify();
     }
 

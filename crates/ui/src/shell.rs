@@ -917,9 +917,95 @@ impl Shell {
                     .child(div().text_xs().child(palette_keys)),
             )
             .child(drag_area("title-drag-right"))
+            .children(self.render_run_selector(cx))
             .when(CUSTOM_TITLE_BAR, |bar| {
                 bar.child(self.render_caption_buttons(window))
             })
+    }
+
+    /// The selected run configuration (click: pick another), Run and
+    /// Debug, for the active project.
+    fn render_run_selector(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let Content::Workspace(workspace) = &self.tabs.get(self.active)?.content else {
+            return None;
+        };
+        let name = workspace.read(cx).selected_configuration();
+        let button = |id: &'static str| {
+            div()
+                .id(id)
+                .h(px(24.))
+                .px_2()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::hover_row()))
+        };
+        let (pick, run, debug) = (workspace.clone(), workspace.clone(), workspace.clone());
+        Some(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_0p5()
+                .mr_2()
+                .child(
+                    button("run-config-selector")
+                        .max_w(px(240.))
+                        .border_1()
+                        .border_color(theme::border())
+                        .text_color(if name.is_some() {
+                            theme::text()
+                        } else {
+                            theme::muted()
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, window, cx| {
+                                cx.stop_propagation();
+                                pick.update(cx, |workspace, cx| {
+                                    workspace.open_configuration_picker(window, cx)
+                                });
+                            }),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(name.unwrap_or_else(|| "Add Configuration…".into())),
+                        )
+                        .child(div().text_xs().text_color(theme::muted()).child("▾")),
+                )
+                .child(
+                    button("run-config-run")
+                        .text_color(theme::run_marker())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, window, cx| {
+                                cx.stop_propagation();
+                                run.update(cx, |workspace, cx| workspace.run_selected(window, cx));
+                            }),
+                        )
+                        .child("▶"),
+                )
+                .child(
+                    button("run-config-debug")
+                        .text_xs()
+                        .text_color(theme::accent_text())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |_, _, window, cx| {
+                                cx.stop_propagation();
+                                debug.update(cx, |workspace, cx| {
+                                    workspace.debug_selected(window, cx)
+                                });
+                            }),
+                        )
+                        .child("Debug"),
+                ),
+        )
     }
 
     /// Minimize, maximize/restore and close, drawn like Windows 11's (the

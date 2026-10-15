@@ -130,11 +130,13 @@ the project lives (Windows, WSL or a dev container):
 - When `.venv` is out of date with `uv.lock`/`pyproject.toml`
   (`uv sync --check`), the editor offers **Sync**. After a sync the
   language server re-reads the interpreter.
-- **Run**: `[project.scripts]` entry points, the current file, all tests,
-  the current file's tests, or the test under the cursor (pytest node id
-  from the enclosing `test_*` function / `Test*` class), each with `uv run`
-  in a new terminal tab. Ctrl+click on a traceback line (`File "…", line N`
-  or pytest's `path:N:`) opens it.
+- **Run**: `[project.scripts]` entry points and the current file run as
+  configurations (`uv run …`) in a terminal tab named after them (running
+  again replaces the tab); all tests, the current file's tests, or the test
+  under the cursor (pytest node id from the enclosing `test_*` function /
+  `Test*` class) run in the **Tests** panel (see *Run configurations and
+  tests*). Ctrl+click on a traceback line (`File "…", line N` or pytest's
+  `path:N:`) opens it.
 
 New terminals activate `.venv` (`VIRTUAL_ENV`/`PATH` locally;
 `. .venv/bin/activate` in WSL and containers).
@@ -147,6 +149,188 @@ editor at their line and column: compiler-style `path:line:column`,
 (`src/lib.rs`). Relative paths are resolved against the project root. OSC 8
 hyperlinks (`ls --hyperlink`, `gcc`, `cargo` with hyperlinks on) open their
 target. A link wrapped over several rows is one link.
+
+## Run configurations and tests
+
+**Run configurations** say what Run and Debug start. They come from:
+
+- `.next_code/run.json` (next_code's own; **Run > Edit Configurations…**
+  creates it with a commented example and the automatic configurations as
+  templates),
+- `.vscode/launch.json` (read for compatibility; comments and trailing
+  commas allowed),
+- automatic ones: *Python: Current File*, *pytest: All Tests* and `uv run
+  <script>` per `[project.scripts]` entry for `pyproject.toml` projects;
+  `cargo run: <bin>` per binary and *cargo test: All Tests* from `cargo
+  metadata` for Rust projects.
+
+Both files have `launch.json`'s shape:
+
+```jsonc
+{
+  "configurations": [
+    // Python: "program" or "module", "args" (array or one string), "python"
+    { "name": "Serve", "type": "python", "module": "app.server", "args": ["--port", "8000"],
+      "cwd": "${workspaceFolder}/src", "env": { "LOG_LEVEL": "debug" }, "justMyCode": false },
+    { "name": "Unit tests", "type": "pytest", "targets": ["tests/unit"], "args": ["-x"] },
+    { "name": "CLI", "type": "uv", "script": "demo-cli", "args": ["--help"] },
+    // cargo: "command" run | test, "package", "bin" | "test" | "example" | "bench" | "lib": true
+    { "name": "Tool", "type": "cargo", "bin": "tool", "features": ["fast"], "cargoArgs": ["--release"],
+      "args": ["--verbose"] },
+    { "name": "Lint", "type": "shell", "command": "make lint" }
+  ]
+}
+```
+
+`launch.json` types: `python`/`debugpy` (launch with `program` or `module`;
+attach, which can only be debugged), `lldb` (CodeLLDB: a `cargo` section
+such as `{"args": ["build", "--bin=tool"], "filter": {...}}`, or `program`;
+attach), `cppdbg`/`cppvsdbg` launches (run directly, debugged with LLDB).
+Other types, `${command:…}`/`${input:…}` variables and invalid entries are
+listed but disabled, with the reason. `preLaunchTask` is not run and
+`envFile` is ignored (the picker says so). Keys a type does not use go to
+the debug adapter unchanged (`justMyCode`, `stopOnEntry`, `pathMappings`…).
+Variables: `${workspaceFolder}`, `${workspaceFolderBasename}`, `${file}`,
+`${relativeFile}`, `${relativeFileDirname}`, `${fileBasename}`,
+`${fileBasenameNoExtension}`, `${fileExtname}`, `${fileDirname}`,
+`${lineNumber}`, `${pathSeparator}`, `${env:NAME}` (local projects only;
+empty in WSL/containers). A relative `cwd` is relative to the project folder.
+
+The selected configuration shows at the right of the title bar (click it to
+pick another, ▶ runs it, *Debug* debugs it) and is remembered per project.
+
+| Command | Keys |
+|---|---|
+| Run (selected configuration, in a terminal tab) | `Ctrl+F5`, `Shift+F10` |
+| Debug (selected configuration) | `Shift+F9`; `F5` when no session is paused |
+| Select Configuration… / Edit Configurations… | Run menu, palette |
+| Run All Tests / Run Failed Tests / Show Tests | Run menu, palette |
+
+Run types the command into a terminal tab named after the configuration,
+where the project lives (PowerShell syntax for local Windows projects, POSIX
+shells otherwise), changing directory and exporting `env` first; running it
+again replaces that tab. Python runs with `uv run python …` in uv projects
+(else the project's interpreter); pytest with `uv run pytest`; Rust with
+`cargo run`/`cargo test`. Debug builds cargo configurations first (`cargo
+build` / `cargo test --no-run` with `--message-format=json`, taking the one
+executable) and hands the request to the debugger: debugpy for Python and
+pytest (`module: pytest`), LLDB for Rust and native programs.
+
+The **Tests** panel (left dock; View > Tests) finds tests when first shown
+and after a test file is saved (`test_*.py`, `*_test.py`, `conftest.py`,
+`.rs`; debounced):
+
+- pytest: `pytest --collect-only -q --continue-on-collection-errors`
+  (through `uv run` or the project's interpreter) for projects with
+  `pyproject.toml`, `pytest.ini`, `setup.cfg`, `tox.ini` or `conftest.py`;
+  folders → files → classes → tests, parametrized cases grouped under their
+  function. Files that fail to import show as errors with pytest's report.
+- cargo: `cargo test --no-run --workspace --tests` then each test binary's
+  `--list --format terse`; packages → targets (`lib`, `bin x`, `test x`) →
+  modules → tests. Doc tests are not listed.
+
+Icons: ○ not run, ◌ running, ✓ passed, ✗ failed, ! error, ⊘ skipped; folders
+show `failed ✗ passed/total`. The filter box matches names and ids. A click
+opens the test's definition; a double click or the row's ▶ runs it (any
+node: folder, file, class, module, target), *Debug* debugs it (pytest under
+debugpy; the cargo test binary under LLDB with `--exact <name>`).
+**Run All**, **Run Failed** and ⟳ (rediscover) are at the top. The details
+area shows the selected test's message, traceback/panic and captured output,
+or the last run's full output. Results come from pytest's JUnit XML report
+(written to a temp file where the project lives and read back) and libtest's
+`test … ok|FAILED|ignored` lines (one `cargo test --no-fail-fast` per
+target). Once tests are discovered (the Tests panel was shown or a test run
+started), editors show a ▶ in the gutter at tests, test classes and
+parametrized functions; clicking it runs that test.
+
+Settings (`settings.json`): `"tests": { "discover_on_save": true,
+"pytest_args": [], "cargo_test_args": [] }` (extra arguments for discovery
+and runs).
+
+## Debugging
+
+Debugging speaks the Debug Adapter Protocol to an adapter started where
+the project lives (on this machine, inside WSL or inside the dev
+container, through the agent like language servers), so paths are the
+project's own.
+
+- **Python**: debugpy. The adapter is `python -m debugpy.adapter` from the
+  project's `.venv` when debugpy is installed there, else an ephemeral uv
+  environment (`uv run --no-project --with debugpy`; the first start
+  downloads debugpy), else a `python3` on `PATH` that has debugpy. The
+  program runs with the project's interpreter (`.venv`, else `python3`);
+  `justMyCode` is on and output goes to the Debug Console unless the
+  configuration says otherwise. Without uv or debugpy a notice says how to
+  get them.
+- **Rust / C / C++**: CodeLLDB (`codelldb` on `PATH`, or downloaded by
+  next_code), else `lldb-dap`. Without either, a banner offers **Download
+  CodeLLDB**: the release for the machine where the project lives (Windows
+  build for local Windows projects, Linux x64/arm64 inside WSL and
+  containers) is fetched with curl/wget and unpacked into next_code's data
+  directory there (`%LOCALAPPDATA%\next_code\adapters`,
+  `~/.local/share/next_code/adapters`); debugging then starts by itself.
+- **Any other adapter** speaking DAP over stdio: a configuration with a
+  custom adapter command.
+
+`settings.json` can name the adapter command:
+`"debug": { "adapters": { "lldb": { "command": "/opt/codelldb/adapter/codelldb" },
+"python": { "command": "python3", "args": ["-m", "debugpy.adapter"] } } }`.
+
+**Starting.** `F5` debugs the selected run configuration (see above; Rust
+configurations are built first), or with no configuration support the
+current Python file (**Debug > Debug Current File**). One session runs at a
+time: starting another (or Restart) stops the running one first.
+
+**Breakpoints.** Click the gutter left of the line numbers, or press `F9` /
+`Ctrl+F8` on the cursor line. Right-click the gutter (or **Debug > Edit
+Breakpoint…**) for a condition, a hit count (the adapter's syntax, e.g.
+`5`, `>= 3`) or a log message (`{expression}` interpolated; a logpoint logs
+instead of stopping), and to disable or remove it. Dots: filled red =
+enabled (verified while a session runs), hollow = disabled or not verified
+by the adapter (the Breakpoints list shows the adapter's reason), a bar
+= conditional, rounded square = logpoint. Breakpoints follow edits (lines
+inserted or deleted above, a line joined into the previous one) and file
+renames, are saved with the project's session (`session.json`, with the
+watch expressions and exception choices), and are sent to the adapter per
+file as they change while a session runs.
+
+**While paused** the line is highlighted with an arrow in the gutter, its
+file opened (stepping into code without a file selects the nearest frame
+that has one). Hovering an identifier shows its value (`self.items` for
+`items` after a dot). The **Debug** panel (right dock, View > Debug) has a
+toolbar and sections:
+
+- **Call Stack**: threads (when several) and frames; click a frame to show
+  its line (highlighted differently), variables and watches.
+- **Variables**: scopes and variables, expanded lazily (expansion is kept
+  across steps); long lists load 100 items at a time (*Load more*);
+  double-click a value to change it when the adapter supports it.
+- **Watch**: expressions re-evaluated at every stop and frame change; type
+  one and press Enter; × removes.
+- **Breakpoints**: exception filters from the adapter (e.g. *Raised
+  Exceptions*, *Uncaught Exceptions*, *C++: on throw*), every breakpoint
+  with a checkbox (enable/disable), click to show it, × to remove, *Remove
+  all*.
+
+The **Debug Console** (bottom dock) shows the program's stdout, stderr (red)
+and the adapter's messages, and evaluates what you type in the selected
+frame (Up/Down for history). A bar above the editors shows the session's
+state with the same toolbar.
+
+| Command | Keys |
+|---|---|
+| Start Debugging / Continue | `F5` |
+| Pause | `F6` |
+| Step Over / Into / Out | `F10` / `F11` / `Shift+F11` |
+| Stop | `Shift+F5` |
+| Restart | `Ctrl+Shift+F5` |
+| Toggle Breakpoint | `F9`, `Ctrl+F8` |
+| Edit Breakpoint…, Enable/Disable All, Remove All | Debug menu, palette |
+
+Limits: no `runInTerminal` (program input from a terminal) and no child
+sessions (`startDebugging`, e.g. debugpy's multiprocess); both are declined
+with a note in the console. No data or function breakpoints, no
+disassembly.
 
 ## Git and multiple projects
 
@@ -560,7 +744,9 @@ before a theme change keep their palette.
   `accent_text`, `on_accent`, `warning`, `error`, `active_row`,
   `hover_row`, `selection`, `cursor`, `diff_added`, `diff_removed`,
   `git_added`, `git_modified`, `git_renamed`, `git_deleted`,
-  `git_conflicted`, `graph_lanes` (a list, cycled), `branch`, `tag`. An
+  `git_conflicted`, `graph_lanes` (a list, cycled), `branch`, `tag`,
+  `lightbulb`, `breakpoint`, `debug_current_line`, `debug_frame_line`,
+  `debug_arrow`, `run_marker`. An
   unknown key is an error naming it; the theme then falls back to `Dark`
   with a notice under the menu bar.
 - `syntax` keys are highlight scopes, most general part first (`keyword`,
@@ -701,7 +887,13 @@ the project lives), `git_status`, `git_diff`, `git_apply_hunk`, `git_stage`,
 `git_worktrees`, `git_worktree_add`, `git_worktree_remove`, `git_log`,
 `git_refs`, `git_changes`, `git_commit_changes`, `python_info`, `python_sync`,
 `python_lock`, `python_add`, `python_remove`, `python_pin`,
-`python_interpreters`, `python_test_at`, `devcontainer_configs`, `shutdown`;
+`python_interpreters`, `python_test_at`, `devcontainer_configs`,
+`run_configurations`, `debug_request`, `tests_discover`, `tests_run`,
+`debug_start` (a debug request), `debug_set_breakpoints`, `debug_continue`,
+`debug_step`, `debug_pause`, `debug_stack`, `debug_select_frame`,
+`debug_variables`, `debug_evaluate`, `debug_output`, `debug_stop`,
+`debug_download_codelldb` (with `debug_event` events: `stopped`, `running`,
+`output`, `breakpoints`, `terminated`, `adapter_missing`), `shutdown`;
 `--devcontainer` opens the folder's container (with `progress` events).
 Parameters and
 results are documented in
@@ -718,5 +910,5 @@ results are documented in
 - **M6** uv projects (Python panel, environments, run/test) and dev containers — *done*
 - **M6.1** window chrome: menu bar, command palette, project tabs, customizable menus — *done*
 - **M7** AI inline completion, chat, agent
-- **M8** debugger (DAP)
+- **M8** debugger (DAP) — *done*
 - **M9** WASM extension API
