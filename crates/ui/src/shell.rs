@@ -1505,6 +1505,8 @@ mod tests {
         cx.simulate_prompt_answer("Discard Changes");
         cx.run_until_parked();
         assert_eq!(tabs(window, cx), (vec!["beta".into()], 0));
+        // Release the folder watchers so the temp dir can go.
+        cx.dispatch_action(window.into(), CloseProject);
         cleanup(root);
     }
 
