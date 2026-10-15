@@ -7,7 +7,17 @@ use crate::project::Location;
 
 const LIMIT: usize = 20;
 
-fn path() -> Option<PathBuf> {
+pub(crate) fn path() -> Option<PathBuf> {
+    // Unit tests open real workspaces: keep them out of the user's list,
+    // and out of each other's (tests run on threads of one process).
+    if cfg!(test) {
+        let thread = format!("{:?}", std::thread::current().id());
+        let thread: String = thread.chars().filter(char::is_ascii_digit).collect();
+        return Some(std::env::temp_dir().join(format!(
+            "next_code-test-recent-{}-{thread}.json",
+            std::process::id()
+        )));
+    }
     Some(
         dirs::data_local_dir()?
             .join("next_code")

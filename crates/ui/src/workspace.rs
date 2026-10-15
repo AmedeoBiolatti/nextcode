@@ -1,4 +1,5 @@
-//! Main window: docks with panels, editor tabs, and close/save confirmation.
+//! A project's content: docks with panels, editor tabs, and the project's
+//! commands. The window around it (menus, project tabs) is `shell::Shell`.
 
 use std::{
     collections::HashSet,
@@ -10,9 +11,8 @@ use std::{
 use futures::StreamExt;
 
 use gpui::{
-    AnyView, App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding,
-    PathPromptOptions, PromptLevel, SharedString, Subscription, Task, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
+    PromptLevel, SharedString, Subscription, Task, Window, actions, div, prelude::*, px, rgb,
 };
 use language::Location;
 use syntax::Language;
@@ -22,19 +22,18 @@ use watcher::{Batch, ChangeKind};
 use crate::{
     branch_picker::{BranchPicker, BranchPickerEvent},
     compare_view::{CompareEvent, CompareView},
-    connecting::{Connecting, PendingConnection},
+    connecting::PendingConnection,
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     editor::{Editor, EditorEvent, ReloadOutcome},
     file_finder::{FileFinder, FileFinderEvent},
     file_tree::{FileTree, OpenFile},
-    git_panel::{GitPanel, GitPanelEvent, PreloadedRepository},
+    git_panel::{GitPanel, GitPanelEvent, PreloadedRepository, SyncAction},
     history_view::{HistoryEvent, HistoryView},
     layout::{DockPosition, Layout, PanelId},
     location_picker::{LocationPicker, LocationPickerEvent},
     lsp_store::{LspStore, LspStoreEvent, ServerStatus},
     problems::{ProblemsEvent, ProblemsPanel},
     project::{self, Project, WatchHandle},
-    project_picker::{ProjectPicker, ProjectPickerEvent},
     python_panel::{PythonPanel, PythonPanelEvent, RunRequest},
     recent,
     revision_picker::{RevisionPicker, RevisionPickerEvent},
@@ -54,10 +53,29 @@ actions!(
         ToggleFileFinder,
         GoBack,
         GoForward,
-        OpenFolder,
-        OpenRecent
+        SaveAll,
+        NewTerminal,
+        ReopenInContainer
     ]
 );
+
+/// Git commands for menus and the command palette.
+pub mod git_commands {
+    gpui::actions!(
+        git,
+        [
+            Branches, Worktrees, History, Compare, Fetch, Pull, Push, Refresh
+        ]
+    );
+}
+
+/// uv project commands for menus and the command palette.
+pub mod python_commands {
+    gpui::actions!(
+        python,
+        [Sync, Lock, RunFile, RunTests, RunTestFile, RunTestAtCursor]
+    );
+}
 
 /// Positions kept for Back/Forward.
 const HISTORY_LIMIT: usize = 100;
@@ -72,8 +90,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-right", GoForward, ctx),
         KeyBinding::new("secondary-alt-left", GoBack, ctx),
         KeyBinding::new("secondary-alt-right", GoForward, ctx),
-        KeyBinding::new("secondary-o", OpenFolder, ctx),
-        KeyBinding::new("secondary-r", OpenRecent, ctx),
     ]);
     docks::bind_keys(cx);
 }
@@ -99,70 +115,6 @@ impl Preload {
             remote => Self::Remote(PendingConnection::start(remote.clone())),
         }
     }
-}
-
-/// Opens `location` in a new window, or brings forward the window that
-/// already shows it. Each window is an independent workspace.
-pub fn open_project(location: project::Location, cx: &mut App) {
-    open_preloaded(location, None, cx);
-}
-
-/// [`open_project`] with work started by [`Preload::start`] for the same
-/// location.
-pub fn open_preloaded(location: project::Location, preload: Option<Preload>, cx: &mut App) {
-    let location = location.absolute();
-    for window in cx.windows() {
-        let shows = if let Some(workspace) = window.downcast::<Workspace>() {
-            workspace
-                .read(cx)
-                .is_ok_and(|workspace| workspace.project.location().opens_same(&location))
-        } else if let Some(connecting) = window.downcast::<Connecting>() {
-            connecting
-                .read(cx)
-                .is_ok_and(|connecting| connecting.location().opens_same(&location))
-        } else {
-            false
-        };
-        if shows {
-            window
-                .update(cx, |_, window, _| window.activate_window())
-                .ok();
-            return;
-        }
-    }
-
-    let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(TitlebarOptions {
-            title: Some(format!("{location} — next_code").into()),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let opened = match (location, preload) {
-        (project::Location::Local(root), preload) => {
-            let git = match preload {
-                Some(Preload::Local(git)) => Some(git),
-                _ => None,
-            };
-            cx.open_window(options, |window, cx| {
-                cx.new(|cx| Workspace::new(Project::local(root), git, window, cx))
-            })
-            .map(drop)
-        }
-        (remote, preload) => {
-            let pending = match preload {
-                Some(Preload::Remote(pending)) => Some(pending),
-                _ => None,
-            };
-            cx.open_window(options, |window, cx| {
-                cx.new(|cx| Connecting::new(remote, pending, window, cx))
-            })
-            .map(drop)
-        }
-    };
-    opened.expect("failed to open window");
 }
 
 /// A remembered cursor position for Back/Forward.
@@ -264,7 +216,6 @@ pub struct Workspace {
     panel_menu: Option<docks::PanelMenu>,
     file_finder: Option<(Entity<FileFinder>, Subscription)>,
     location_picker: Option<(Entity<LocationPicker>, Subscription)>,
-    project_picker: Option<(Entity<ProjectPicker>, Subscription)>,
     revision_picker: Option<(Entity<RevisionPicker>, Subscription)>,
     /// The branch or worktree picker.
     git_modal: Option<(AnyView, Subscription)>,
@@ -278,14 +229,23 @@ pub struct Workspace {
     offers: Vec<Offer>,
     /// Why the WSL agent connection was lost; stays until restart.
     connection_error: Option<SharedString>,
-    /// Set once the user confirmed discarding unsaved changes on window close.
-    close_confirmed: bool,
     /// Files with an open "changed on disk" prompt, so it is asked once.
     reload_prompts: HashSet<PathBuf>,
     _watcher: Option<(WatchHandle, Task<()>)>,
     _disconnects: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// Requests for the window around the workspace.
+pub enum WorkspaceEvent {
+    /// Open another project (in a new project tab).
+    OpenProject(project::Location),
+    /// Show this project another way (inside its dev container): open
+    /// that, and close this one unless it has unsaved edits.
+    ReplaceWith(project::Location),
+}
+
+impl EventEmitter<WorkspaceEvent> for Workspace {}
 
 impl Workspace {
     pub fn new(
@@ -382,13 +342,6 @@ impl Workspace {
             },
         );
 
-        let workspace = cx.weak_entity();
-        window.on_window_should_close(cx, move |window, cx| {
-            workspace
-                .update(cx, |this, cx| this.should_close(window, cx))
-                .unwrap_or(true)
-        });
-
         // Workspace key bindings (e.g. Ctrl+P) need focus inside the workspace.
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
@@ -468,7 +421,6 @@ impl Workspace {
             panel_menu: None,
             file_finder: None,
             location_picker: None,
-            project_picker: None,
             revision_picker: None,
             git_modal: None,
             back: Vec::new(),
@@ -479,7 +431,6 @@ impl Workspace {
             notice,
             offers: Vec::new(),
             connection_error: None,
-            close_confirmed: false,
             reload_prompts: HashSet::new(),
             _watcher: watcher,
             _disconnects: disconnects,
@@ -801,7 +752,7 @@ impl Workspace {
                 WorktreePickerEvent::Open(path) => {
                     this.repository_changed(None, cx);
                     match this.project.location_of(path) {
-                        Some(location) => open_project(location, cx),
+                        Some(location) => cx.emit(WorkspaceEvent::OpenProject(location)),
                         None => {
                             this.notice = Some(
                                 format!(
@@ -1120,7 +1071,8 @@ impl Workspace {
         }
     }
 
-    fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Focuses the active tab (or the workspace when none is open).
+    pub fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
         match self.tabs.get(self.active) {
             Some(tab) => window.focus(&tab.focus_handle(cx)),
             None => window.focus(&self.focus_handle),
@@ -1197,23 +1149,200 @@ impl Workspace {
         }
     }
 
-    fn accept_offer(&mut self, kind: OfferKind, window: &mut Window, cx: &mut Context<Self>) {
+    fn accept_offer(&mut self, kind: OfferKind, cx: &mut Context<Self>) {
         self.withdraw_offer(&kind, cx);
         match kind {
             OfferKind::PythonSync => self.python.update(cx, |python, cx| python.sync(cx)),
-            OfferKind::ReopenInContainer { config } => {
-                let location = project::Location::DevContainer {
-                    folder: Box::new(self.project.location()),
-                    config: Some(config),
-                };
-                let dirty = self.tabs.iter().any(|tab| tab.is_dirty(cx));
-                open_project(location, cx);
-                // Like reopening: this window goes, unless it has edits.
-                if !dirty {
-                    window.remove_window();
-                }
-            }
+            OfferKind::ReopenInContainer { config } => self.reopen_in(config, cx),
         }
+    }
+
+    /// Asks the window to show this folder inside its dev container instead.
+    fn reopen_in(&mut self, config: String, cx: &mut Context<Self>) {
+        self.offers
+            .retain(|offer| !matches!(offer.kind, OfferKind::ReopenInContainer { .. }));
+        cx.emit(WorkspaceEvent::ReplaceWith(
+            project::Location::DevContainer {
+                folder: Box::new(self.project.location()),
+                config: Some(config),
+            },
+        ));
+    }
+
+    fn reopen_in_container(
+        &mut self,
+        _: &ReopenInContainer,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let project::Location::DevContainer { .. } = self.project.location() {
+            self.notice = Some("This project is already open in its dev container".into());
+            return cx.notify();
+        }
+        let project = self.project.clone();
+        cx.spawn(async move |this, cx| {
+            let configs = cx
+                .background_spawn(async move { project.devcontainer_configs() })
+                .await;
+            this.update(cx, |this, cx| match configs {
+                Ok(configs) if !configs.is_empty() => {
+                    this.reopen_in(configs.into_iter().next().unwrap_or_default(), cx)
+                }
+                Ok(_) => {
+                    this.notice = Some(
+                        "This folder has no dev container (.devcontainer/devcontainer.json)".into(),
+                    );
+                    cx.notify();
+                }
+                Err(err) => {
+                    this.notice = Some(format!("Could not look for a dev container: {err}").into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn save_all(&mut self, _: &SaveAll, _: &mut Window, cx: &mut Context<Self>) {
+        let dirty: Vec<Entity<Editor>> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.is_dirty(cx))
+            .filter_map(|tab| tab.editor().cloned())
+            .collect();
+        for editor in dirty {
+            editor.update(cx, |editor, cx| editor.save(cx));
+        }
+    }
+
+    fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_panel(PanelId::Terminal, cx);
+        self.terminal
+            .update(cx, |terminal, cx| terminal.new_terminal(window, cx));
+    }
+
+    /// The project's repository, or a notice saying there is none (yet).
+    fn repository_or_notice(&mut self, cx: &mut Context<Self>) -> Option<git::Repository> {
+        let repository = self.git.read(cx).repository();
+        if repository.is_none() {
+            self.notice = Some("No git repository here (or its status is still loading)".into());
+            cx.notify();
+        }
+        repository
+    }
+
+    fn git_branches(
+        &mut self,
+        _: &git_commands::Branches,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(repository) = self.repository_or_notice(cx) {
+            self.open_branch_picker(repository, None, window, cx);
+        }
+    }
+
+    fn git_worktrees(
+        &mut self,
+        _: &git_commands::Worktrees,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(repository) = self.repository_or_notice(cx) {
+            self.open_worktree_picker(repository, window, cx);
+        }
+    }
+
+    fn git_history(
+        &mut self,
+        _: &git_commands::History,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(repository) = self.repository_or_notice(cx) {
+            self.open_history(repository, window, cx);
+        }
+    }
+
+    fn git_compare(
+        &mut self,
+        _: &git_commands::Compare,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(repository) = self.repository_or_notice(cx) {
+            self.pick_revision(repository, RevisionPurpose::NewCompare, window, cx);
+        }
+    }
+
+    fn git_sync(&mut self, action: SyncAction, cx: &mut Context<Self>) {
+        if self.repository_or_notice(cx).is_some() {
+            self.show_panel(PanelId::Git, cx);
+            self.git.update(cx, |git, cx| git.sync(action, cx));
+        }
+    }
+
+    fn git_fetch(&mut self, _: &git_commands::Fetch, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_sync(SyncAction::Fetch, cx);
+    }
+
+    fn git_pull(&mut self, _: &git_commands::Pull, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_sync(SyncAction::Pull, cx);
+    }
+
+    fn git_push(&mut self, _: &git_commands::Push, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_sync(SyncAction::Push, cx);
+    }
+
+    fn git_refresh(&mut self, _: &git_commands::Refresh, _: &mut Window, cx: &mut Context<Self>) {
+        self.git.update(cx, |git, cx| git.refresh(cx));
+    }
+
+    fn python_sync(&mut self, _: &python_commands::Sync, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_panel(PanelId::Python, cx);
+        self.python.update(cx, |python, cx| python.sync(cx));
+    }
+
+    fn python_lock(&mut self, _: &python_commands::Lock, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_panel(PanelId::Python, cx);
+        self.python.update(cx, |python, cx| python.lock(cx));
+    }
+
+    fn run_file(
+        &mut self,
+        _: &python_commands::RunFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_python(RunRequest::CurrentFile, window, cx);
+    }
+
+    fn run_tests(
+        &mut self,
+        _: &python_commands::RunTests,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_python(RunRequest::Tests, window, cx);
+    }
+
+    fn run_test_file(
+        &mut self,
+        _: &python_commands::RunTestFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_python(RunRequest::TestFile, window, cx);
+    }
+
+    fn run_test_at_cursor(
+        &mut self,
+        _: &python_commands::RunTestAtCursor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_python(RunRequest::TestAtCursor, window, cx);
     }
 
     fn render_offers(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -1247,9 +1376,7 @@ impl Workspace {
                     .child(div().flex_1().min_w_0().child(offer.message.clone()))
                     .child(
                         button("offer-accept", offer.kind.action()).on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.accept_offer(accept_kind.clone(), window, cx)
-                            },
+                            move |this, _, _, cx| this.accept_offer(accept_kind.clone(), cx),
                         )),
                     )
                     .child(button("offer-dismiss", "Not now").on_click(
@@ -1281,59 +1408,6 @@ impl Workspace {
             });
         window.focus(&finder.focus_handle(cx));
         self.file_finder = Some((finder, subscription));
-        cx.notify();
-    }
-
-    /// `Ctrl+O`: picks a folder and opens it in its own window. A
-    /// `\\wsl.localhost\...` folder opens as a WSL project.
-    fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Open Folder".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            let Some(location) = paths
-                .first()
-                .and_then(|path| project::Location::parse(&path.to_string_lossy()))
-            else {
-                return;
-            };
-            this.update(cx, |this, cx| this.open_location(location, cx))
-                .ok();
-        })
-        .detach();
-    }
-
-    /// Opens another project, checking local folders exist first (WSL
-    /// paths are checked by the agent while connecting).
-    fn open_location(&mut self, location: project::Location, cx: &mut Context<Self>) {
-        if let project::Location::Local(root) = &location
-            && !root.is_dir()
-        {
-            self.notice = Some(format!("{} is not a folder", root.display()).into());
-            cx.notify();
-            return;
-        }
-        open_project(location, cx);
-    }
-
-    /// `Ctrl+R`: recent projects, or a typed location.
-    fn open_recent(&mut self, _: &OpenRecent, window: &mut Window, cx: &mut Context<Self>) {
-        let picker = cx.new(ProjectPicker::new);
-        let subscription = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {
-            this.project_picker = None;
-            this.focus_active(window, cx);
-            if let ProjectPickerEvent::Open(location) = event {
-                this.open_location(location.clone(), cx);
-            }
-        });
-        window.focus(&picker.focus_handle(cx));
-        self.project_picker = Some((picker, subscription));
         cx.notify();
     }
 
@@ -1414,31 +1488,9 @@ impl Workspace {
         }
     }
 
-    fn should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let dirty = self.tabs.iter().filter(|tab| tab.is_dirty(cx)).count();
-        if dirty == 0 || self.close_confirmed {
-            return true;
-        }
-        let message = format!("{dirty} file(s) have unsaved changes. Close anyway?");
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &message,
-            None,
-            &["Discard Changes", "Cancel"],
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            this.update_in(cx, |this, window, _| {
-                this.close_confirmed = true;
-                window.remove_window();
-            })
-            .ok();
-        })
-        .detach();
-        false
+    /// Open files with unsaved changes.
+    pub fn dirty_count(&self, cx: &App) -> usize {
+        self.tabs.iter().filter(|tab| tab.is_dirty(cx)).count()
     }
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1512,14 +1564,30 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close_active))
             .on_action(cx.listener(Self::toggle_file_finder))
-            .on_action(cx.listener(Self::open_folder))
-            .on_action(cx.listener(Self::open_recent))
+            .on_action(cx.listener(Self::save_all))
+            .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(Self::reopen_in_container))
+            .on_action(cx.listener(Self::git_branches))
+            .on_action(cx.listener(Self::git_worktrees))
+            .on_action(cx.listener(Self::git_history))
+            .on_action(cx.listener(Self::git_compare))
+            .on_action(cx.listener(Self::git_fetch))
+            .on_action(cx.listener(Self::git_pull))
+            .on_action(cx.listener(Self::git_push))
+            .on_action(cx.listener(Self::git_refresh))
+            .on_action(cx.listener(Self::python_sync))
+            .on_action(cx.listener(Self::python_lock))
+            .on_action(cx.listener(Self::run_file))
+            .on_action(cx.listener(Self::run_tests))
+            .on_action(cx.listener(Self::run_test_file))
+            .on_action(cx.listener(Self::run_test_at_cursor))
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
             .on_action(cx.listener(Self::toggle_files))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::toggle_git))
             .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::toggle_python))
             .on_action(cx.listener(Self::toggle_problems))
             .on_action(cx.listener(Self::toggle_bottom_dock))
             .on_action(cx.listener(Self::save_layout_as_default))
@@ -1573,16 +1641,6 @@ impl Render for Workspace {
                     .child(finder.clone())
             }))
             .children(self.location_picker.as_ref().map(|(picker, _)| {
-                div()
-                    .absolute()
-                    .top(px(72.))
-                    .left_0()
-                    .right_0()
-                    .flex()
-                    .justify_center()
-                    .child(picker.clone())
-            }))
-            .children(self.project_picker.as_ref().map(|(picker, _)| {
                 div()
                     .absolute()
                     .top(px(72.))

@@ -124,7 +124,7 @@ pub struct GitPanel {
 type SectionKey = u8;
 
 #[derive(Debug, Clone, Copy)]
-enum SyncAction {
+pub enum SyncAction {
     Fetch,
     Pull,
     Push,
@@ -187,6 +187,14 @@ impl GitPanel {
 
     pub fn focus(&self, window: &mut Window, cx: &App) {
         window.focus(&self.message.focus_handle(cx));
+    }
+
+    /// The repository, once its status has been read.
+    pub fn repository(&self) -> Option<Repository> {
+        match &self.state {
+            State::Ready { repository, .. } => Some(repository.clone()),
+            _ => None,
+        }
     }
 
     /// Refreshes after [`REFRESH_DEBOUNCE`], coalescing bursts of changes.
@@ -443,7 +451,7 @@ impl GitPanel {
     }
 
     /// Fetch, pull (fast-forward only) or push, off the main thread.
-    fn sync(&mut self, action: SyncAction, cx: &mut Context<Self>) {
+    pub fn sync(&mut self, action: SyncAction, cx: &mut Context<Self>) {
         let State::Ready { status, .. } = &self.state else {
             return;
         };

@@ -1,5 +1,6 @@
-//! Window content while a remote project (WSL, dev container) opens:
-//! progress, then the workspace, or the failure with a Retry button.
+//! A project tab's content while a remote project (WSL, dev container)
+//! opens: progress, then [`ConnectingEvent::Connected`], or the failure
+//! with a Retry button.
 
 use std::io;
 
@@ -7,12 +8,11 @@ use futures::{
     StreamExt,
     channel::{mpsc, oneshot},
 };
-use gpui::{Context, SharedString, Task, Window, div, prelude::*, px, rgb};
+use gpui::{Context, EventEmitter, SharedString, Task, Window, div, prelude::*, px, rgb};
 
 use crate::{
     project::{Location, Project},
     theme,
-    workspace::Workspace,
 };
 
 /// Progress lines kept on screen.
@@ -40,6 +40,12 @@ impl PendingConnection {
     }
 }
 
+pub enum ConnectingEvent {
+    Connected(Project),
+}
+
+impl EventEmitter<ConnectingEvent> for Connecting {}
+
 pub struct Connecting {
     location: Location,
     log: Vec<SharedString>,
@@ -62,11 +68,6 @@ impl Connecting {
         };
         this.connect(pending, window, cx);
         this
-    }
-
-    /// The project this window is opening.
-    pub fn location(&self) -> Location {
-        self.location.clone()
     }
 
     /// Connects, or takes over a connection already under way.
@@ -98,11 +99,8 @@ impl Connecting {
             let result = result
                 .await
                 .unwrap_or_else(|_| Err(io::Error::other("the connection was abandoned")));
-            this.update_in(cx, |this, window, cx| match result {
-                Ok(project) => {
-                    window.set_window_title(&format!("{} — next_code", project.location()));
-                    window.replace_root(cx, |window, cx| Workspace::new(project, None, window, cx));
-                }
+            this.update(cx, |this, cx| match result {
+                Ok(project) => cx.emit(ConnectingEvent::Connected(project)),
                 Err(err) => {
                     this.error = Some(err.to_string().into());
                     cx.notify();

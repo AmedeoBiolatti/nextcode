@@ -734,6 +734,13 @@ impl TerminalPanel {
         }
     }
 
+    /// Starts the default shell in a new tab and focuses it.
+    pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(profile) = profiles(&self.project).into_iter().next() {
+            self.spawn(&profile, window, cx);
+        }
+    }
+
     /// The project's virtualenv (`.venv`) as `(dir, bin dir)`, if any.
     fn venv(&self) -> Option<(PathBuf, PathBuf)> {
         let venv = self.project.resolve(".venv");

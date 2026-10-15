@@ -16,6 +16,7 @@ actions!(
         ToggleSearch,
         ToggleTerminal,
         ToggleGit,
+        TogglePython,
         ToggleProblems,
         ToggleBottomDock,
         SaveLayoutAsDefault,
@@ -173,6 +174,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.toggle_panel(PanelId::Problems, cx);
+    }
+
+    pub(super) fn toggle_python(
+        &mut self,
+        _: &TogglePython,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel(PanelId::Python, cx);
     }
 
     pub(super) fn toggle_bottom_dock(

@@ -113,7 +113,7 @@ Containers are found by the labels VS Code uses (compose ones by project
 and service, named as VS Code names them), so a container VS Code created is
 reused. A stopped one is started; one that no longer starts (e.g. a mount
 from an old session is gone) is recreated. Containers the editor created or
-started are stopped as `shutdownAction` says when its window closes.
+started are stopped as `shutdownAction` says when its project tab closes.
 
 ## Python (uv)
 
@@ -171,7 +171,7 @@ upstream on `origin` (or the only remote). Git never prompts: credentials
 come from your credential helper or SSH agent, and failures are shown.
 
 **Worktrees…** lists the repository's worktrees; choosing one opens it in
-its own window. Typing a branch name adds a worktree for it (creating the
+a project tab. Typing a branch name adds a worktree for it (creating the
 branch if needed) next to the repository as `<repository>-<branch>` and
 opens it; `×` removes one (asks; its branch is kept).
 
@@ -185,10 +185,47 @@ parent, and "Compare with working tree" starts a comparison from it.
 or list; its base and target can be changed (the target may be another
 revision, and then swapped), and each file opens its diff.
 
-Each project opens in its own window: `Ctrl+O` picks a folder (a
-`\\wsl.localhost\...` folder opens through WSL), `Ctrl+R` lists recent
-projects and also accepts a typed location such as `Ubuntu:~/project`.
-Opening a project that already has a window brings that window forward.
+## Window, menus and commands
+
+Top to bottom, a window has the menu bar (File, Edit, View, Go, Run, Git,
+Help) with the command bar beside it, the project tabs, and the active
+project. Each project tab is a whole workspace (docks, editor tabs,
+language servers, terminals); closing it asks about unsaved files first.
+
+- **File > Open Project…** (`Ctrl+O`) picks a folder (a
+  `\\wsl.localhost\...` folder opens through WSL) and opens it in a new
+  tab; **Open Project in New Window…** does the same in its own window.
+- **File > Recent Projects** lists recent projects; **Open Recent…**
+  (`Ctrl+R`) also accepts a typed location such as `Ubuntu:~/project` or
+  `devcontainer:C:\src\app`.
+- Opening a project that is already open (in any window) switches to its
+  tab. `Ctrl+Alt+]` / `Ctrl+Alt+[` cycle the tabs.
+- The command bar (`Ctrl+Shift+P` or `F1`) lists every command available
+  where focus is, with its shortcut; typed words filter it (in any order),
+  `Enter` runs the command where focus was.
+
+Every menu item is a command, the same ones the palette runs. Menus are
+customizable: **File > Customize Menus…** writes the built-in menus to
+`menus.json` in the config dir (`%APPDATA%\next_code` on Windows,
+`~/.config/next_code` on Linux) and opens it; the file then replaces the
+built-in menus, and edits apply when a menu is next opened:
+
+```json
+{ "menus": [
+    { "label": "File", "items": [
+        "app::OpenProject",
+        { "label": "Recent Projects", "list": "recent_projects" },
+        "-",
+        { "command": "editor::Save", "label": "Save File" },
+        { "label": "More", "items": ["app::About"] }
+    ] }
+] }
+```
+
+An item is a command name, `"-"` (separator), a command with its own
+label, a submenu, or a list. Command names are `namespace::Name` (`app`,
+`workspace`, `editor`, `git`, `python`); unknown ones show disabled with a
+notice, and an invalid file falls back to the built-in menus.
 
 ## Headless mode
 
@@ -230,8 +267,9 @@ results are documented in
 - **M2** host agent protocol, WSL projects — *done*
 - **M3** git panel and diff view, multiple workspaces — *done*
 - **M4** git review: commit graph, compare with branches/commits, compact change trees, side-by-side and whole-file diffs — *done*
-- **M5** git operations: branches, worktrees (one window each), fetch/pull/push, amend, hunk staging — *done*
+- **M5** git operations: branches, worktrees, fetch/pull/push, amend, hunk staging — *done*
 - **M6** uv projects (Python panel, environments, run/test) and dev containers — *done*
+- **M6.1** window chrome: menu bar, command palette, project tabs, customizable menus — *done*
 - **M7** AI inline completion, chat, agent
 - **M8** debugger (DAP)
 - **M9** WASM extension API

@@ -4,6 +4,8 @@
 
 mod branch_picker;
 mod change_tree;
+mod command_palette;
+mod commands;
 mod compare_view;
 mod connecting;
 mod diff_view;
@@ -16,6 +18,7 @@ mod history_view;
 mod layout;
 mod location_picker;
 mod lsp_store;
+mod menus;
 mod problems;
 mod project;
 mod project_picker;
@@ -24,6 +27,7 @@ mod recent;
 mod revision_picker;
 mod search_panel;
 mod settings;
+mod shell;
 mod startup;
 mod terminal_panel;
 mod theme;
@@ -116,6 +120,8 @@ fn run() -> anyhow::Result<()> {
     application.run(move |cx: &mut App| {
         startup::mark("gpui ready");
         editor::bind_keys(cx);
+        shell::bind_keys(cx);
+        command_palette::bind_keys(cx);
         workspace::bind_keys(cx);
         file_finder::bind_keys(cx);
         location_picker::bind_keys(cx);
@@ -127,7 +133,7 @@ fn run() -> anyhow::Result<()> {
             }
         })
         .detach();
-        workspace::open_preloaded(location, Some(preload), cx);
+        shell::open_window(location, Some(preload), cx);
         // The window's renderer exists now.
         prewarm.finish();
         startup::mark("window opened");

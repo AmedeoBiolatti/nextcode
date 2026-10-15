@@ -275,6 +275,10 @@ impl PythonPanel {
         self.run("uv sync", python::uv::sync(), true, cx);
     }
 
+    pub fn lock(&mut self, cx: &mut Context<Self>) {
+        self.run("uv lock", python::uv::lock(false), false, cx);
+    }
+
     fn add(&mut self, _: &editor::Newline, _: &mut Window, cx: &mut Context<Self>) {
         let requirement = self.add_input.read(cx).text().trim().to_owned();
         if requirement.is_empty() {
@@ -449,9 +453,8 @@ impl PythonPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.sync(cx))),
             )
             .child(
-                Self::button("py-lock", "Lock").on_click(cx.listener(|this, _, _, cx| {
-                    this.run("uv lock", python::uv::lock(false), false, cx)
-                })),
+                Self::button("py-lock", "Lock")
+                    .on_click(cx.listener(|this, _, _, cx| this.lock(cx))),
             )
             .child(
                 Self::button("py-upgrade", "Upgrade all").on_click(cx.listener(
