@@ -27,21 +27,19 @@ foreach ($s in $sizes) {
     $hb = New-Object System.Drawing.Drawing2D.LinearGradientBrush $hl, ([System.Drawing.Color]::FromArgb(46, 255, 255, 255)), ([System.Drawing.Color]::FromArgb(0, 255, 255, 255)), 90.0
     $g.SetClip($path); $g.FillRectangle($hb, $hl); $g.ResetClip()
   }
-  # "<N>" with a slanted N: one zigzag runs from the end of "<"'s lower arm
-  # through its tip, up into the N's top-left, down the N's diagonal, and
-  # on through ">" (merged at the N's bottom-right); the N's two stems are
-  # separate strokes.
+  # "<N>" with a slanted N, drawn as one stroke: the free end of "<"'s
+  # upper arm, its tip, its lower arm into the N's bottom-left, up the N,
+  # down its diagonal, up again to the top-right, which is ">"'s upper
+  # arm, then ">"'s tip and its free lower arm.
   $stroke = [Math]::Max(1.5, $s * 0.08)
   $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), $stroke
   $pen.StartCap = 'Round'; $pen.EndCap = 'Round'; $pen.LineJoin = 'Round'
   function P([double]$x, [double]$y) { New-Object System.Drawing.PointF ($x * $s), ($y * $s) }
   $tl = P 0.44 0.28; $bl = P 0.37 0.72; $tr = P 0.63 0.28; $br = P 0.56 0.72
   $lt = P 0.14 0.50; $rt = P 0.86 0.50
-  $lowerEnd = P 0.245 0.585; $upperEnd = P 0.755 0.415
-  $zigzag = [System.Drawing.PointF[]]@($lowerEnd, $lt, $tl, $br, $rt, $upperEnd)
-  $g.DrawLines($pen, $zigzag)
-  $g.DrawLine($pen, $bl, $tl)
-  $g.DrawLine($pen, $br, $tr)
+  $upperEnd = P 0.245 0.415; $lowerEnd = P 0.755 0.585
+  $stroke_points = [System.Drawing.PointF[]]@($upperEnd, $lt, $bl, $tl, $br, $tr, $rt, $lowerEnd)
+  $g.DrawLines($pen, $stroke_points)
   $ms = New-Object System.IO.MemoryStream
   if ($s -ge 256) {
     $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
