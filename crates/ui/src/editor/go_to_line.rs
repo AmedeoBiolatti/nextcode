@@ -73,6 +73,7 @@ impl Editor {
             }
         };
         self.selections = SelectionSet::single(Selection::cursor(offset));
+        self.reveal_selections();
         self.completion = None;
         self.center_cursor = true;
         cx.notify();

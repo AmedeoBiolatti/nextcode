@@ -9,7 +9,8 @@
 //!   "semantic_highlighting": true,
 //!   "auto_close_brackets": true,
 //!   "restore_session": true,
-//!   "languages": { "python": { "server": {
+//!   "word_wrap": false,
+//!   "languages": { "markdown": { "word_wrap": true }, "python": { "server": {
 //!     "command": "basedpyright-langserver", "args": ["--stdio"],
 //!     "settings": { "basedpyright": { "analysis": { "typeCheckingMode": "strict" } } }
 //! } } } }
@@ -35,6 +36,8 @@ pub struct Settings {
     pub auto_close_brackets: bool,
     /// Reopen a project's editor tabs and splits where they were left.
     pub restore_session: bool,
+    /// Wrap long lines at the editor's width (Alt+Z toggles per editor).
+    pub word_wrap: bool,
     pub languages: HashMap<String, LanguageSettings>,
 }
 
@@ -45,6 +48,7 @@ impl Default for Settings {
             semantic_highlighting: true,
             auto_close_brackets: true,
             restore_session: true,
+            word_wrap: false,
             languages: HashMap::new(),
         }
     }
@@ -54,6 +58,18 @@ impl Default for Settings {
 #[serde(default, deny_unknown_fields)]
 pub struct LanguageSettings {
     pub server: ServerOverrides,
+    /// Overrides `word_wrap` for the language (Markdown wraps by default).
+    pub word_wrap: Option<bool>,
+}
+
+impl Settings {
+    /// Whether editors of `language` (`None`: plain text) start wrapped.
+    pub fn word_wrap(&self, language: Option<Language>) -> bool {
+        let configured = language
+            .and_then(|language| self.languages.get(language.id()))
+            .and_then(|settings| settings.word_wrap);
+        configured.unwrap_or(self.word_wrap || language == Some(Language::Markdown))
+    }
 }
 
 /// User overrides; unset fields keep the built-in default.
@@ -244,6 +260,15 @@ mod tests {
         let off: Settings =
             serde_json::from_value(json!({ "semantic_highlighting": false })).unwrap();
         assert!(!off.semantic_highlighting);
+        assert!(!settings.word_wrap(Some(Language::Python)));
+        assert!(settings.word_wrap(Some(Language::Markdown)));
+        let wrapped: Settings = serde_json::from_value(json!({
+            "word_wrap": true,
+            "languages": { "python": { "word_wrap": false } }
+        }))
+        .unwrap();
+        assert!(wrapped.word_wrap(None));
+        assert!(!wrapped.word_wrap(Some(Language::Python)));
     }
 
     #[test]

@@ -44,7 +44,7 @@ use gpui::{App, Application};
 
 use crate::project::Location;
 
-const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code --automation [--port PORT] [--width PX] [--height PX] -- [PROJECT_DIR]\n\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).";
+const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code --automation [--port PORT] [--width PX] [--height PX] [--state-dir DIR] -- [PROJECT_DIR]\n\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).";
 
 /// Reads the command line: a local directory (default: the current one), a
 /// `\\wsl.localhost\<distro>\...` path, or `--wsl <distro> <linux path>`,

@@ -24,6 +24,10 @@ pub(super) struct Selection {
     pub head: usize,
     /// Column (in chars) that vertical motion tries to keep.
     pub goal: Option<usize>,
+    /// A head at a wrap position is drawn at the end of the upper row
+    /// (after End, or a click past a row's end) instead of at the start of
+    /// the next one.
+    pub at_row_end: bool,
 }
 
 impl Selection {
@@ -36,6 +40,7 @@ impl Selection {
             anchor,
             head,
             goal: None,
+            at_row_end: false,
         }
     }
 
@@ -70,6 +75,7 @@ impl Selection {
             anchor,
             head,
             goal: self.goal,
+            at_row_end: self.at_row_end && head == self.head,
         }
     }
 }
@@ -182,13 +188,13 @@ impl SelectionSet {
         self.map(|s| Selection {
             anchor: clamp(s.anchor),
             head: clamp(s.head),
-            goal: s.goal,
+            ..*s
         })
     }
 }
 
-/// What a tab restores: selections and scroll position. Columns are in
-/// chars; positions past the end are clamped on restore.
+/// What a tab restores: selections, scroll position and folds. Columns are
+/// in chars; positions past the end are clamped on restore.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditorState {
     pub selections: Vec<SelectionState>,
@@ -198,6 +204,9 @@ pub struct EditorState {
     /// First visible line.
     #[serde(default)]
     pub scroll_line: usize,
+    /// Folded regions as `(header line, last hidden line)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folds: Vec<(usize, usize)>,
 }
 
 /// A selection as 0-based `(line, column)` pairs.
@@ -240,9 +249,10 @@ impl Editor {
     }
 
     /// Replaces the selections without editing; closes what depended on the
-    /// old cursor position.
+    /// old cursor position and opens folds a cursor moved into.
     pub(super) fn set_selections(&mut self, selections: SelectionSet, cx: &mut Context<Self>) {
         self.selections = selections;
+        self.reveal_selections();
         self.autoscroll = true;
         self.auto_closed.clear();
         self.update_completion_menu(cx);
@@ -269,9 +279,11 @@ impl Editor {
                 })
                 .collect(),
             primary: self.selections.primary_index(),
-            scroll_line: self
-                .pending_scroll_line
-                .unwrap_or((self.scroll.y / line_height).round() as usize),
+            scroll_line: self.pending_scroll_line.unwrap_or_else(|| {
+                let row = (self.scroll.y / line_height).round() as usize;
+                self.display.row_line(row)
+            }),
+            folds: self.folded_lines(),
         }
     }
 
@@ -286,6 +298,8 @@ impl Editor {
             let primary = state.primary.min(items.len() - 1);
             self.selections = SelectionSet::new(items, primary);
         }
+        self.restore_folds(&state.folds);
+        self.reveal_selections();
         self.pending_scroll_line = Some(state.scroll_line.min(self.buffer.line_count() - 1));
         self.autoscroll = false;
         self.center_cursor = false;
@@ -416,11 +430,12 @@ impl Editor {
         let goal = primary
             .goal
             .unwrap_or_else(|| self.buffer.column(primary.head));
-        let line = self.buffer.line_of(primary.head) as isize + lines;
-        if line < 0 || line as usize >= self.buffer.line_count() {
+        let line = self.buffer.line_of(primary.head);
+        // Lines hidden in folds are skipped.
+        let Some(line) = self.display.shown_line(line, lines > 0) else {
             return;
-        }
-        let offset = self.buffer.offset_at(line as usize, goal);
+        };
+        let offset = self.buffer.offset_at(line, goal);
         let selections = self.selections.with(Selection {
             goal: Some(goal),
             ..Selection::cursor(offset)
@@ -472,7 +487,9 @@ impl Editor {
         let mut items = Vec::new();
         let mut primary = 0;
         for line in top..=bottom {
-            if line != head.0 && line != anchor.0 && line_chars(line) < min_column {
+            if line != head.0 && line != anchor.0 && line_chars(line) < min_column
+                || self.display.is_hidden(line)
+            {
                 continue;
             }
             if line == head.0 {

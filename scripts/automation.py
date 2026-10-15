@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--port', type=int, default=0)
     parser.add_argument('--width', type=int, default=1440)
     parser.add_argument('--height', type=int, default=900)
+    parser.add_argument('--state-dir', help='data dir kept across sessions (default: private)')
     parser.add_argument('project', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.project[:1] == ['--']:
@@ -126,9 +127,13 @@ def main():
             run(['xauth', '-f', authority, 'add', env['DISPLAY'], '.', cookie])
             env.pop('WAYLAND_DISPLAY', None)
             env['WINIT_UNIX_BACKEND'] = 'x11'
-            # Keep automated edits to preferences separate from the user's.
+            # Keep automated edits to preferences, recent projects and the
+            # per-project session separate from the user's. `--state-dir`
+            # keeps the data (sessions, recents) across automation runs.
             env['XDG_CONFIG_HOME'] = os.path.join(directory, 'config')
             env['XDG_CACHE_HOME'] = os.path.join(directory, 'cache')
+            env['XDG_DATA_HOME'] = (os.path.abspath(args.state_dir) if args.state_dir
+                                    else os.path.join(directory, 'data'))
             # Nothing the editor opens may reach the user's desktop: without
             # a session bus the desktop portal is unreachable, and the
             # fallbacks (`powershell.exe` on WSL, `xdg-open`, `gio`) are

@@ -25,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::SystemTime,
 };
@@ -240,6 +240,8 @@ ui_colors! {
     find_match_active,
     /// The bracket pair at the cursor.
     bracket_match,
+    /// Background of the `⋯` shown after a folded line.
+    fold_placeholder,
     /// Diff line backgrounds.
     diff_added,
     diff_removed,
@@ -596,6 +598,17 @@ static LOADED: Mutex<Option<Loaded>> = Mutex::new(None);
 static SEMANTIC_HIGHLIGHTING: AtomicBool = AtomicBool::new(true);
 /// `"auto_close_brackets"` from `settings.json` as of the last refresh.
 static AUTO_CLOSE_BRACKETS: AtomicBool = AtomicBool::new(true);
+/// `"word_wrap"` per language as of the last refresh: bit 0 for plain
+/// text, bit `i + 1` for `Language::ALL[i]`.
+static WORD_WRAP: LazyLock<AtomicU32> =
+    LazyLock::new(|| AtomicU32::new(word_wrap_mask(&crate::settings::Settings::default())));
+
+fn word_wrap_mask(settings: &crate::settings::Settings) -> u32 {
+    let languages = Language::ALL.iter().enumerate();
+    languages.fold(settings.word_wrap(None) as u32, |mask, (i, &language)| {
+        mask | (settings.word_wrap(Some(language)) as u32) << (i + 1)
+    })
+}
 
 /// Whether editors layer language-server semantic tokens over syntax
 /// highlighting; follows `settings.json` like the theme.
@@ -606,6 +619,17 @@ pub fn semantic_highlighting() -> bool {
 /// Whether typing an opening bracket or quote inserts its closer.
 pub fn auto_close_brackets() -> bool {
     AUTO_CLOSE_BRACKETS.load(Ordering::Relaxed)
+}
+
+/// Whether editors of `language` (`None`: plain text) start wrapped.
+pub fn word_wrap(language: Option<Language>) -> bool {
+    let bit = language.map_or(0, |language| {
+        1 + Language::ALL
+            .iter()
+            .position(|&known| known == language)
+            .unwrap_or(0)
+    });
+    WORD_WRAP.load(Ordering::Relaxed) & (1 << bit) != 0
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -635,6 +659,7 @@ pub fn refresh(cx: &mut App) {
             let problem = problem.map(|problem| format!("Settings ignored: {problem}"));
             SEMANTIC_HIGHLIGHTING.store(settings.semantic_highlighting, Ordering::Relaxed);
             AUTO_CLOSE_BRACKETS.store(settings.auto_close_brackets, Ordering::Relaxed);
+            WORD_WRAP.store(word_wrap_mask(&settings), Ordering::Relaxed);
             (settings.theme, problem)
         }
         None => (None, None),

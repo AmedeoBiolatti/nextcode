@@ -310,6 +310,35 @@ Regular expressions use Rust's `regex` syntax (`^`/`$` match at lines);
 replacements expand `$1`, `${name}`. Without regex the replacement is
 literal.
 
+**Word wrap.** `Alt+Z` (View > Word Wrap) wraps long lines at the editor's
+width for that editor; `"word_wrap": true` in `settings.json` makes it the
+default, and `"languages": { "<id>": { "word_wrap": … } }` overrides it per
+language (Markdown wraps by default). Rows break after spaces (long words
+break anywhere, East Asian wide characters count two columns), continuation
+rows keep the line's indentation, and the line number shows on the first
+row only. Up/Down move by rows; `Home`/`End` go to the row's start/end
+first, then the line's. There is no horizontal scrolling while wrapping.
+Shift+Alt+drag column selections count buffer columns, so they take the
+same characters of every line.
+
+**Folding.** Foldable regions come from the syntax tree: bracketed blocks,
+objects, arrays and argument lists (the closing line stays visible),
+multi-line comments, Python blocks (from the `def`/`class`/`if` line),
+HTML/JSX elements, Markdown sections and code fences, TOML tables; YAML,
+shell, SQL, Dockerfiles and plain text fold by indentation. Chevrons appear
+in the gutter while the mouse is over it (folded lines always show `▸`);
+click one to fold or unfold. A folded line ends with `⋯`, which unfolds on
+click. Folds belong to the editor pane, follow edits, and open when an
+edit, a cursor, a jump or a find match lands inside; motions step over them.
+Folds are saved with the session.
+
+| Folding | Keys |
+|---|---|
+| Fold / unfold at the cursor | `Ctrl+Shift+[` / `Ctrl+Shift+]` |
+| Toggle fold at the cursor | `Ctrl+K Ctrl+L` |
+| Fold / unfold recursively | `Ctrl+K Ctrl+[` / `Ctrl+K Ctrl+]` |
+| Fold all / unfold all | `Ctrl+K Ctrl+0` / `Ctrl+K Ctrl+J` |
+
 ## Split editor and session restore
 
 The editor area splits into panes (VS Code's editor groups), each with its
@@ -426,7 +455,7 @@ change.
 
 ### UI automation (Linux / WSL)
 
-`next_code --automation [--port 0] [--width 1440] [--height 900] -- PROJECT_DIR`
+`next_code --automation [--port 0] [--width 1440] [--height 900] [--state-dir DIR] -- PROJECT_DIR`
 starts the normal GUI on a private Xvfb display, without a visible desktop or
 terminal window. An agent or supervisor launches this process and reads its
 single `ready` JSON line containing a loopback HTTP URL and bearer token.
@@ -486,10 +515,13 @@ Frame completion tracking and structured action discovery are not exposed by
 this backend yet; commands can be selected through the normal command palette.
 
 The server binds only to loopback and requires its random session token. The
-display requires an X authority cookie and disables TCP connections. Settings
-and caches are isolated for each session; project files are real and UI actions
-have their usual effects. The implementation is embedded in the executable from
-`scripts/automation.py`, so distributing a separate script is unnecessary.
+display requires an X authority cookie and disables TCP connections. Settings,
+caches and data (recent projects, each project's saved layout and session)
+are private to each session; `--state-dir DIR` keeps the data in `DIR` across
+sessions instead, e.g. to check session restore. Project files are real and
+UI actions have their usual effects. The implementation is embedded in the
+executable from `scripts/automation.py`, so distributing a separate script is
+unnecessary.
 Its API uses platform input and pixels and contains no panel-specific logic;
 new UI features are available without updating the automation backend.
 

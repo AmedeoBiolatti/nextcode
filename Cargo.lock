@@ -3585,6 +3585,7 @@ dependencies = [
  "syntax",
  "terminal",
  "text",
+ "unicode-width",
  "watcher",
  "windows 0.61.3",
  "windows-sys 0.61.2",

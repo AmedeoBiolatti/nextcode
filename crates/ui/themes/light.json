@@ -18,6 +18,7 @@
     "find_match": "#fce8a6",
     "find_match_active": "#f0a03070",
     "bracket_match": "#bfe3e0",
+    "fold_placeholder": "#e2e4e8",
     "diff_added": "#dff0e1",
     "diff_removed": "#fae1e3",
     "git_added": "#067d17",

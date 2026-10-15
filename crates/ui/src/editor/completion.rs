@@ -359,14 +359,10 @@ impl Editor {
     ) -> Option<impl IntoElement + use<>> {
         let menu = self.completion.as_ref()?;
         let layout = self.layout.as_ref()?;
-        let line = self.buffer.line_of(menu.word_start);
-        let shaped = layout.lines.get(line.checked_sub(layout.first_line)?)?;
+        let (word_x, line_top) = self.screen_position(menu.word_start)?;
         let bounds = layout.bounds;
-        let word_x = layout.text_bounds.left() - self.scroll.x
-            + shaped.x_for_index(menu.word_start - self.buffer.line_start(line));
         // Align the label column (after the kind badge) with the word.
         let left = (word_x - bounds.left() - px(30.)).max(px(0.));
-        let line_top = layout.line_height * line as f32 - self.scroll.y;
         let below = line_top < bounds.size.height * 0.6;
         let rows = menu.candidates.len().min(MAX_ROWS);
 

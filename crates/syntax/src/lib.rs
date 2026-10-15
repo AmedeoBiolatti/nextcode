@@ -168,6 +168,12 @@ impl Language {
         }
     }
 
+    /// Whether folding follows indentation instead of the syntax tree
+    /// (languages whose blocks have no bracketed or indented-body nodes).
+    pub fn folds_by_indentation(self) -> bool {
+        matches!(self, Self::Bash | Self::Dockerfile | Self::Sql | Self::Yaml)
+    }
+
     fn config(self) -> &'static LanguageConfig {
         macro_rules! config {
             ($language:ident) => {{
@@ -647,6 +653,95 @@ impl Syntax {
         }
         Some(None)
     }
+
+    /// Foldable line ranges `(header, last hidden line)` intersecting
+    /// `lines`, sorted by header line, the largest per header line. Only
+    /// nodes intersecting `lines` are visited.
+    ///
+    /// Foldable: bracketed nodes (`{}`, `[]`, `()`, whose closing line
+    /// stays shown when the closer starts it), multi-line comments, Python
+    /// blocks (from the line of their `:`), HTML and JSX elements,
+    /// Markdown sections and fenced code, TOML tables.
+    pub fn fold_ranges(&self, lines: Range<usize>) -> Vec<(usize, usize)> {
+        let Some(tree) = &self.tree else {
+            return Vec::new();
+        };
+        let mut ranges = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        let mut cursor = tree.walk();
+        while let Some(node) = stack.pop() {
+            if node.end_position().row < lines.start {
+                continue;
+            }
+            // Checked before the start: a Python block's header is the line
+            // before it.
+            if let Some((header, last)) = self.fold_range(node)
+                && header < lines.end
+                && last >= lines.start
+            {
+                ranges.push((header, last));
+            }
+            if node.start_position().row < lines.end {
+                stack.extend(node.children(&mut cursor));
+            }
+        }
+        ranges.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        ranges.dedup_by_key(|range| range.0);
+        ranges
+    }
+
+    fn fold_range(&self, node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
+        let start = node.start_position().row;
+        let end_position = node.end_position();
+        // A node ending at a line start (its line break included) ends on
+        // the line before.
+        let end = if end_position.column == 0 {
+            end_position.row.saturating_sub(1)
+        } else {
+            end_position.row
+        };
+        // (A one-line Python block still folds under its header line.)
+        if end <= start && node.kind() != "block" {
+            return None;
+        }
+        // The closing line stays shown when the closer starts it.
+        let closing_kept = |last: tree_sitter::Node<'_>| match last.prev_sibling() {
+            Some(previous) if previous.end_position().row < last.start_position().row => end - 1,
+            _ => end,
+        };
+        let kind = node.kind();
+        let range = match (self.language, kind) {
+            (Language::Python, "block") => {
+                let header = node
+                    .prev_sibling()
+                    .map_or(start, |colon| colon.start_position().row);
+                (header, end)
+            }
+            (Language::Html, "element" | "script_element" | "style_element")
+            | (Language::JavaScript | Language::Tsx, "jsx_element") => {
+                (start, closing_kept(node.child(node.child_count() - 1)?))
+            }
+            (Language::Markdown, "section" | "fenced_code_block")
+            | (Language::Toml, "table" | "table_array_element") => (start, end),
+            _ if kind.contains("comment") => (start, end),
+            _ => {
+                let count = node.child_count();
+                let first = node.child(0)?;
+                let last = node.child(count.checked_sub(1)?)?;
+                let closer = match first.kind() {
+                    "{" => "}",
+                    "[" => "]",
+                    "(" => ")",
+                    _ => return None,
+                };
+                if count < 2 || last.kind() != closer || last.is_missing() {
+                    return None;
+                }
+                (start, closing_kept(last))
+            }
+        };
+        (range.1 > range.0).then_some(range)
+    }
 }
 
 fn point(point: text::Point) -> Point {
@@ -1123,5 +1218,74 @@ mod tests {
             "inside a string"
         );
         assert_eq!(syntax.bracket_partner(at("fn", 0)), None);
+    }
+
+    fn folds(language: Language, source: &str) -> Vec<(usize, usize)> {
+        let buffer = Buffer::new(source);
+        Syntax::new(language, &buffer).fold_ranges(0..buffer.line_count())
+    }
+
+    #[test]
+    fn python_folds_def_and_class_bodies_from_the_colon_line() {
+        let source = "\
+class A:
+    def f(self):
+        x = 1
+        return x
+
+    def g(
+        self,
+    ):
+        pass
+        pass
+y = 2
+";
+        assert_eq!(
+            folds(Language::Python, source),
+            // class body, f body, g's parameters (`)` line kept), g body.
+            [(0, 9), (1, 3), (5, 6), (7, 9)]
+        );
+        // Asked for the `def f` line only: its body starts on the next line.
+        let buffer = Buffer::new(source);
+        let syntax = Syntax::new(Language::Python, &buffer);
+        assert_eq!(syntax.fold_ranges(1..2), [(0, 9), (1, 3)]);
+        assert_eq!(
+            folds(Language::Python, "def f():\n    pass\nx = 1\n"),
+            [(0, 1)]
+        );
+    }
+
+    #[test]
+    fn rust_folds_fn_and_impl_blocks_keeping_the_closing_line() {
+        let source = "\
+impl A {
+    fn f() {
+        g();
+    }
+    /* one
+       two */
+}
+fn h() { 1 }
+";
+        assert_eq!(folds(Language::Rust, source), [(0, 5), (1, 2), (4, 5)]);
+    }
+
+    #[test]
+    fn json_folds_objects_and_arrays() {
+        let source = "{\n  \"a\": {\n    \"b\": [\n      1,\n      2\n    ]\n  }\n}\n";
+        assert_eq!(folds(Language::Json, source), [(0, 6), (1, 5), (2, 4)]);
+        let buffer = Buffer::new(source);
+        let syntax = Syntax::new(Language::Json, &buffer);
+        // Only ranges touching the requested lines.
+        assert_eq!(syntax.fold_ranges(4..5), [(0, 6), (1, 5), (2, 4)]);
+        assert_eq!(syntax.fold_ranges(7..8), []);
+    }
+
+    #[test]
+    fn markup_folds_elements_and_sections() {
+        let html = "<div>\n  <p>a</p>\n  <p>b</p>\n</div>\n";
+        assert_eq!(folds(Language::Html, html), [(0, 2)]);
+        let markdown = "# A\n\ntext\n\n## B\n\nmore\n";
+        assert_eq!(folds(Language::Markdown, markdown), [(0, 6), (4, 6)]);
     }
 }

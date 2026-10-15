@@ -5,8 +5,8 @@ use std::{ops::Range, sync::Arc, time::Duration};
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
-    FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, KeyBinding, KeyContext,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    FontStyle, FontWeight, Global, GlobalElementId, Hsla, InspectorElementId, KeyBinding,
+    KeyContext, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     ScrollWheelEvent, ShapedLine, SharedString, StrikethroughStyle, Style, Task, TextRun,
     UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative,
     size,
@@ -28,8 +28,10 @@ use crate::{
 
 mod brackets;
 mod completion;
+mod display_map;
 mod editing;
 mod find;
+mod folds;
 mod go_to_line;
 mod lines;
 mod navigation;
@@ -38,6 +40,7 @@ pub(crate) mod semantic;
 #[cfg(test)]
 mod tests;
 
+use display_map::{DisplayMap, DisplayRow};
 use editing::{HistoryEntry, SelectionEdit};
 use find::FindBar;
 use go_to_line::GoToLineInput;
@@ -49,6 +52,7 @@ pub use find::{
     CloseFind, Find, FindNext, FindPrevious, FindReplace, ReplaceAll, ReplaceNext,
     SelectAllMatches, ToggleMatchCase, ToggleRegex, ToggleWholeWord,
 };
+pub use folds::{Fold, FoldAll, FoldRecursively, ToggleFold, Unfold, UnfoldAll, UnfoldRecursively};
 pub use go_to_line::{CancelGoToLine, ConfirmGoToLine, GoToLine};
 pub use lines::{
     CopyLineDown, CopyLineUp, DeleteLine, Indent, InsertLineAbove, InsertLineBelow, MoveLineDown,
@@ -105,6 +109,7 @@ actions!(
         SelectNextCompletion,
         ConfirmCompletion,
         CloseCompletions,
+        ToggleWordWrap,
     ]
 );
 
@@ -197,6 +202,17 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-|", JumpToBracket, ctx),
         KeyBinding::new("shift-alt-a", ToggleBlockComment, ctx),
         KeyBinding::new("secondary-shift-\\", JumpToBracket, ctx),
+        // Word wrap and folding (VS Code).
+        KeyBinding::new("alt-z", ToggleWordWrap, ctx),
+        KeyBinding::new("secondary-{", Fold, ctx),
+        KeyBinding::new("secondary-}", Unfold, ctx),
+        KeyBinding::new("secondary-shift-[", Fold, ctx),
+        KeyBinding::new("secondary-shift-]", Unfold, ctx),
+        KeyBinding::new("secondary-k secondary-l", ToggleFold, ctx),
+        KeyBinding::new("secondary-k secondary-0", FoldAll, ctx),
+        KeyBinding::new("secondary-k secondary-j", UnfoldAll, ctx),
+        KeyBinding::new("secondary-k secondary-[", FoldRecursively, ctx),
+        KeyBinding::new("secondary-k secondary-]", UnfoldRecursively, ctx),
     ]);
     // Find bar: from its inputs and from the text while it is open. Bound
     // after the plain editor keys so they win in the inputs.
@@ -280,6 +296,18 @@ pub struct Editor {
     autoscroll: bool,
     drag: Option<Drag>,
     layout: Option<EditorLayout>,
+    /// Screen rows: word wrap and folds of this view.
+    display: DisplayMap,
+    /// Alt+Z's choice (mirrors [`WordWrapOverride`]); `None` follows
+    /// `"word_wrap"`.
+    word_wrap: Option<bool>,
+    /// Wrap at this many columns instead of the view's width.
+    #[cfg(test)]
+    wrap_columns: Option<usize>,
+    /// Foldable regions of the last gutter drawn: version, lines, regions.
+    fold_cache: Option<(u64, Range<usize>, Vec<folds::Region>)>,
+    /// The mouse is over the gutter: fold chevrons show.
+    gutter_hovered: bool,
     error: Option<SharedString>,
     /// Where the buffer's file lives; `None` for input fields.
     project: Option<Project>,
@@ -364,7 +392,8 @@ struct EditorDiagnostic {
 
 /// Popover shown when the mouse rests on text: diagnostics and hover docs.
 struct HoverPopover {
-    line: usize,
+    /// Screen row of the hovered word.
+    row: usize,
     x: Pixels,
     messages: Vec<(Severity, SharedString)>,
     docs: Vec<language::markdown::Block>,
@@ -385,15 +414,77 @@ pub struct ServerDocument(LspDocument);
 struct EditorLayout {
     bounds: Bounds<Pixels>,
     text_bounds: Bounds<Pixels>,
-    gutter_width: Pixels,
     line_height: Pixels,
     em_width: Pixels,
-    first_line: usize,
-    lines: Vec<ShapedLine>,
-    line_numbers: Vec<ShapedLine>,
-    /// Most severe diagnostic per visible line.
-    gutter_marks: Vec<Option<Severity>>,
+    /// Right edge of the line numbers.
+    numbers_right: Pixels,
+    /// Left edge of the fold chevrons' column (it ends at the text).
+    fold_left: Pixels,
+    /// Screen row of `rows[0]`.
+    first_row: usize,
+    rows: Vec<RowLayout>,
+    /// `⋯` after folded lines.
+    placeholder: ShapedLine,
+    /// Chevrons: folded (▸) and foldable (▾).
+    chevrons: [ShapedLine; 2],
 }
+
+/// One visible screen row.
+struct RowLayout {
+    row: DisplayRow,
+    shaped: ShapedLine,
+    /// Space before the text (continuation indent).
+    indent: Pixels,
+    /// The line number, on a line's first row.
+    number: Option<ShapedLine>,
+    /// Most severe diagnostic of the line, on its first row.
+    mark: Option<Severity>,
+    /// Chevron on a line's first row: `Some(true)` folded, `Some(false)`
+    /// foldable.
+    chevron: Option<bool>,
+    /// On the last row of a folded line: the fold's start (its `⋯`).
+    folded: Option<usize>,
+}
+
+impl EditorLayout {
+    /// The screen row at window `y` (rows above the view count as 0).
+    fn row_at(&self, y: Pixels, scroll_y: Pixels) -> usize {
+        ((y - self.text_bounds.top() + scroll_y) / self.line_height).max(0.) as usize
+    }
+
+    /// The laid-out row at window `y`, with its index in `rows`.
+    fn row_layout_at(&self, y: Pixels, scroll_y: Pixels) -> Option<(usize, &RowLayout)> {
+        let index = self.row_at(y, scroll_y).checked_sub(self.first_row)?;
+        self.rows.get(index).map(|row| (index, row))
+    }
+
+    /// Window y of the top of `rows[index]`.
+    fn row_top(&self, index: usize, scroll_y: Pixels) -> Pixels {
+        self.text_bounds.top() + self.line_height * (self.first_row + index) as f32 - scroll_y
+    }
+
+    /// Window x where `row`'s text starts.
+    fn text_left(&self, row: &RowLayout, scroll_x: Pixels) -> Pixels {
+        self.text_bounds.left() - scroll_x + row.indent
+    }
+
+    /// The `⋯` box after `rows[index]`'s text.
+    fn placeholder_bounds(&self, index: usize, scroll: Point<Pixels>) -> Bounds<Pixels> {
+        let row = &self.rows[index];
+        let left = self.text_left(row, scroll.x) + row.shaped.width + self.em_width / 2.;
+        let top = self.row_top(index, scroll.y);
+        Bounds::new(
+            point(left, top + px(2.)),
+            size(
+                self.placeholder.width + self.em_width,
+                self.line_height - px(4.),
+            ),
+        )
+    }
+}
+
+/// Narrowest wrap width, in columns.
+const MIN_WRAP_COLUMNS: usize = 16;
 
 /// Lines read to detect the indentation style.
 const INDENT_SAMPLE_LINES: usize = 2000;
@@ -409,6 +500,12 @@ impl Editor {
         let indent = IndentStyle::detect(sample.iter().map(String::as_str), language);
         Self {
             focus_handle: cx.focus_handle(),
+            display: DisplayMap::new(&buffer),
+            word_wrap: None,
+            #[cfg(test)]
+            wrap_columns: None,
+            fold_cache: None,
+            gutter_hovered: false,
             buffer,
             selections: SelectionSet::single(Selection::cursor(0)),
             history: Vec::new(),
@@ -449,6 +546,25 @@ impl Editor {
 
     pub fn language(&self) -> Option<Language> {
         self.syntax.as_ref().map(Syntax::language)
+    }
+
+    /// Whether lines wrap at the view's width: Alt+Z's choice, else
+    /// `"word_wrap"` for the language.
+    pub fn wraps(&self) -> bool {
+        !self.single_line
+            && self
+                .word_wrap
+                .unwrap_or_else(|| theme::word_wrap(self.language()))
+    }
+
+    /// Like VS Code, for every editor (also those opened later) until the
+    /// editor exits; `"word_wrap"` in settings.json is left as it is.
+    fn toggle_word_wrap(&mut self, _: &ToggleWordWrap, _: &mut Window, cx: &mut Context<Self>) {
+        let wrap = !self.wraps();
+        cx.set_global(WordWrapOverride(wrap));
+        self.word_wrap = Some(wrap);
+        self.autoscroll = true;
+        cx.refresh_windows();
     }
 
     pub fn set_lsp_status(
@@ -677,19 +793,28 @@ impl Editor {
     }
 
     /// Moves every selection's head to `target`'s offset (with its goal
-    /// column); without `select` the selection collapses there.
+    /// column and row-end affinity); without `select` the selection
+    /// collapses there.
     fn move_selections(
         &mut self,
         select: bool,
-        target: impl Fn(&Self, &Selection) -> (usize, Option<usize>),
+        target: impl Fn(&Self, &Selection) -> (usize, Option<usize>, bool),
         cx: &mut Context<Self>,
     ) {
         let selections = self.selections.map(|s| {
-            let (head, goal) = target(self, s);
+            let (target, goal, at_row_end) = target(self, s);
+            // Motions step over folded text instead of opening it.
+            let bias = if target > s.head {
+                Bias::Right
+            } else {
+                Bias::Left
+            };
+            let head = self.display.clip(&self.buffer, target, bias);
             Selection {
                 anchor: if select { s.anchor } else { head },
                 head,
                 goal,
+                at_row_end: at_row_end && head == target,
             }
         });
         self.set_selections(selections, cx);
@@ -701,24 +826,26 @@ impl Editor {
         target: impl Fn(&Self, &Selection) -> usize,
         cx: &mut Context<Self>,
     ) {
-        self.move_selections(select, |editor, s| (target(editor, s), None), cx);
+        self.move_selections(select, |editor, s| (target(editor, s), None, false), cx);
     }
 
-    fn vertical(&mut self, lines: isize, select: bool, cx: &mut Context<Self>) {
+    /// Moves by screen rows, keeping the goal column (in screen columns).
+    fn vertical(&mut self, rows: isize, select: bool, cx: &mut Context<Self>) {
         self.move_selections(
             select,
             |editor, s| {
-                let buffer = &editor.buffer;
-                let goal = s.goal.unwrap_or_else(|| buffer.column(s.head));
-                let line = buffer.line_of(s.head) as isize + lines;
-                let offset = if line < 0 {
-                    0
-                } else if line as usize >= buffer.line_count() {
-                    buffer.len()
+                let (buffer, display) = (&editor.buffer, &editor.display);
+                let (row, column) = display.point(buffer, s.head, s.at_row_end);
+                let goal = s.goal.unwrap_or(column);
+                let target = row as isize + rows;
+                let (offset, at_row_end) = if target < 0 {
+                    (0, false)
+                } else if target as usize >= display.row_count() {
+                    display.offset_at(buffer, display.row_count() - 1, usize::MAX)
                 } else {
-                    buffer.offset_at(line as usize, goal)
+                    display.offset_at(buffer, target as usize, goal)
                 };
-                (offset, Some(goal))
+                (offset, Some(goal), at_row_end)
             },
             cx,
         );
@@ -740,8 +867,13 @@ impl Editor {
         }
     }
 
-    /// First non-blank column of the line, or the line start if already there.
+    /// The start of a wrapped row, then the first non-blank column of the
+    /// line, then the line start.
     fn home_target(&self, s: &Selection) -> usize {
+        let (_, row) = self.display.row_of(&self.buffer, s.head, s.at_row_end);
+        if !row.first && s.head != row.range.start {
+            return row.range.start;
+        }
         let line = self.buffer.line_of(s.head);
         let start = self.buffer.line_start(line);
         let text = self.buffer.line_text(line);
@@ -749,11 +881,19 @@ impl Editor {
         if s.head == indented { start } else { indented }
     }
 
-    fn end_target(&self, s: &Selection) -> usize {
-        self.buffer.line_end(self.buffer.line_of(s.head))
+    /// The end of a wrapped row (drawn there, not at the next row's start),
+    /// then the end of the line.
+    fn end_target(&self, s: &Selection) -> (usize, Option<usize>, bool) {
+        let (_, row) = self.display.row_of(&self.buffer, s.head, s.at_row_end);
+        if !row.last && s.head != row.range.end {
+            (row.range.end, None, true)
+        } else {
+            (self.buffer.line_end(row.line), None, false)
+        }
     }
 
-    fn page_lines(&self) -> isize {
+    /// Screen rows in a page.
+    fn page_rows(&self) -> isize {
         self.layout.as_ref().map_or(20, |layout| {
             (layout.text_bounds.size.height / layout.line_height)
                 .floor()
@@ -787,6 +927,7 @@ impl Editor {
                     anchor: map(s.anchor, if s.is_empty() { Bias::Right } else { anchor }),
                     head: map(s.head, if s.is_empty() { Bias::Right } else { head }),
                     goal: s.goal,
+                    at_row_end: false,
                 }
             })
             .clamped(&self.buffer);
@@ -827,6 +968,10 @@ impl Editor {
             });
         }
         self.shift_semantic_tokens();
+        // Folds move with the text (or open when edited inside); edited
+        // lines wrap again.
+        self.display.edit(&self.buffer, &self.changes);
+        self.reveal_selections();
         if edited {
             self.hover = None;
             self.hover_word = None;
@@ -934,7 +1079,7 @@ impl Editor {
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.horizontal(false, Self::end_target, cx);
+        self.move_selections(false, Self::end_target, cx);
     }
 
     fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
@@ -942,7 +1087,7 @@ impl Editor {
     }
 
     fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.horizontal(true, Self::end_target, cx);
+        self.move_selections(true, Self::end_target, cx);
     }
 
     fn doc_start(&mut self, _: &DocStart, _: &mut Window, cx: &mut Context<Self>) {
@@ -962,11 +1107,11 @@ impl Editor {
     }
 
     fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.vertical(-self.page_lines(), false, cx);
+        self.vertical(-self.page_rows(), false, cx);
     }
 
     fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.vertical(self.page_lines(), false, cx);
+        self.vertical(self.page_rows(), false, cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -978,35 +1123,48 @@ impl Editor {
     }
 
     fn offset_for_position(&self, position: Point<Pixels>) -> usize {
+        self.cursor_for_position(position).0
+    }
+
+    /// The cursor nearest `position`: its offset and whether it sits at the
+    /// end of a wrapped row (a click past the row's end).
+    fn cursor_for_position(&self, position: Point<Pixels>) -> (usize, bool) {
         let Some(layout) = &self.layout else {
-            return self.primary().head;
+            let primary = self.primary();
+            return (primary.head, primary.at_row_end);
         };
-        let row = (position.y - layout.text_bounds.top() + self.scroll.y) / layout.line_height;
-        let line = (row.max(0.) as usize).min(self.buffer.line_count() - 1);
         let x = position.x - layout.text_bounds.left() + self.scroll.x;
-        let line_start = self.buffer.line_start(line);
-        match line
-            .checked_sub(layout.first_line)
-            .and_then(|i| layout.lines.get(i))
-        {
-            Some(shaped) => line_start + shaped.closest_index_for_x(x),
-            None => self
-                .buffer
-                .offset_at(line, (x / layout.em_width).round().max(0.) as usize),
+        match layout.row_layout_at(position.y, self.scroll.y) {
+            Some((_, row)) => {
+                let offset = row.row.range.start + row.shaped.closest_index_for_x(x - row.indent);
+                let offset = offset.min(row.row.range.end);
+                (offset, row.row.wraps_at(offset))
+            }
+            // Dragged past the visible rows.
+            None => self.display.offset_at(
+                &self.buffer,
+                layout.row_at(position.y, self.scroll.y),
+                (x / layout.em_width).round().max(0.) as usize,
+            ),
         }
     }
 
     /// Line and char column under `position`, counting columns past the
-    /// line end (column selections keep them).
+    /// line end (column selections keep them). Wrapped lines count buffer
+    /// columns, so a column selection takes the same chars of each line.
     fn line_column_at(&self, position: Point<Pixels>) -> (usize, usize) {
-        let Some(layout) = &self.layout else {
-            let head = self.primary().head;
-            return (self.buffer.line_of(head), self.buffer.column(head));
-        };
-        let row = (position.y - layout.text_bounds.top() + self.scroll.y) / layout.line_height;
-        let line = (row.max(0.) as usize).min(self.buffer.line_count() - 1);
-        let x = position.x - layout.text_bounds.left() + self.scroll.x;
-        (line, (x / layout.em_width).round().max(0.) as usize)
+        let offset = self.offset_for_position(position);
+        let line = self.buffer.line_of(offset);
+        let mut column = self.buffer.column(offset);
+        if let Some(layout) = &self.layout
+            && offset == self.buffer.line_end(line)
+            && let Some((_, row)) = layout.row_layout_at(position.y, self.scroll.y)
+            && row.row.last
+        {
+            let x = position.x - layout.text_left(row, self.scroll.x) - row.shaped.width;
+            column += (x / layout.em_width).round().max(0.) as usize;
+        }
+        (line, column)
     }
 
     fn start_mouse(&mut self, window: &mut Window) {
@@ -1031,7 +1189,14 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.start_mouse(window);
-        let offset = self.offset_for_position(event.position);
+        if !self.single_line && self.fold_click(event.position, cx) {
+            return;
+        }
+        let (offset, at_row_end) = self.cursor_for_position(event.position);
+        let cursor = Selection {
+            at_row_end,
+            ..Selection::cursor(offset)
+        };
         let modifiers = event.modifiers;
         let multi = !self.single_line;
         if multi && modifiers.alt && modifiers.shift {
@@ -1058,13 +1223,13 @@ impl Editor {
                     self.set_selections(selections, cx);
                 }
                 _ => {
-                    let selections = self.selections.with(Selection::cursor(offset));
+                    let selections = self.selections.with(cursor);
                     self.set_selections(selections, cx);
                     self.drag = Some(Drag::Select);
                 }
             }
         } else if modifiers.secondary() {
-            self.set_selections(SelectionSet::single(Selection::cursor(offset)), cx);
+            self.set_selections(SelectionSet::single(cursor), cx);
             self.request_definition(offset, cx);
         } else {
             let anchor = if modifiers.shift {
@@ -1072,7 +1237,8 @@ impl Editor {
             } else {
                 offset
             };
-            self.set_selections(SelectionSet::single(Selection::new(anchor, offset)), cx);
+            let selection = Selection { anchor, ..cursor };
+            self.set_selections(SelectionSet::single(selection), cx);
             self.drag = Some(Drag::Select);
         }
     }
@@ -1098,11 +1264,12 @@ impl Editor {
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         match self.drag {
             Some(Drag::Select) => {
-                let offset = self.offset_for_position(event.position);
+                let (head, at_row_end) = self.cursor_for_position(event.position);
                 let primary = self.primary();
-                let selections = self
-                    .selections
-                    .with_primary(Selection::new(primary.anchor, offset));
+                let selections = self.selections.with_primary(Selection {
+                    at_row_end,
+                    ..Selection::new(primary.anchor, head)
+                });
                 self.set_selections(selections, cx);
             }
             Some(Drag::Column { line, column }) => {
@@ -1110,25 +1277,85 @@ impl Editor {
                 let selections = self.column_selection((line, column), head);
                 self.set_selections(selections, cx);
             }
-            None => self.update_hover(event.position, cx),
+            None => {
+                let over_gutter = self.layout.as_ref().is_some_and(|layout| {
+                    layout.bounds.contains(&event.position)
+                        && event.position.x < layout.text_bounds.left()
+                });
+                if over_gutter != self.gutter_hovered {
+                    self.gutter_hovered = over_gutter;
+                    cx.notify();
+                }
+                self.update_hover(event.position, cx)
+            }
         }
     }
 
-    /// Line and offset of the character under `position`, if it is over text.
+    /// A click on a fold chevron or a `⋯` placeholder: folds or unfolds.
+    fn fold_click(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(layout) = &self.layout else {
+            return false;
+        };
+        let Some((index, row)) = layout.row_layout_at(position.y, self.scroll.y) else {
+            return false;
+        };
+        let line = row.row.line;
+        if (layout.fold_left..layout.text_bounds.left()).contains(&position.x) && row.row.first {
+            let foldable = row.chevron.is_some()
+                || self
+                    .fold_regions(line..line + 1)
+                    .iter()
+                    .any(|&(header, _)| header == line);
+            if foldable {
+                self.toggle_fold_at(line, cx);
+                return true;
+            }
+        }
+        if let Some(start) = row.folded
+            && layout
+                .placeholder_bounds(index, self.scroll)
+                .contains(&position)
+        {
+            self.unfold_at(start, cx);
+            return true;
+        }
+        false
+    }
+
+    /// Screen row and offset of the character under `position`, if it is
+    /// over text.
     fn character_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
         let layout = self.layout.as_ref()?;
         if !layout.text_bounds.contains(&position) {
             return None;
         }
-        let row = (position.y - layout.text_bounds.top() + self.scroll.y) / layout.line_height;
-        let line = row.max(0.) as usize;
-        let shaped = layout.lines.get(line.checked_sub(layout.first_line)?)?;
-        let x = position.x - layout.text_bounds.left() + self.scroll.x;
-        let index = shaped.index_for_x(x)?;
-        Some((line, self.buffer.line_start(line) + index))
+        let (index, row) = layout.row_layout_at(position.y, self.scroll.y)?;
+        let index_in_row = row
+            .shaped
+            .index_for_x(position.x - layout.text_left(row, self.scroll.x))?;
+        Some((layout.first_row + index, row.row.range.start + index_in_row))
+    }
+
+    /// Where `offset` is drawn, if its row is laid out: window x and the
+    /// row's top relative to the text area.
+    fn screen_position(&self, offset: usize) -> Option<(Pixels, Pixels)> {
+        let layout = self.layout.as_ref()?;
+        let index = layout
+            .rows
+            .iter()
+            .position(|row| row.row.shows(offset, false))?;
+        let row = &layout.rows[index];
+        let x = layout.text_left(row, self.scroll.x)
+            + row.shaped.x_for_index(offset - row.row.range.start);
+        let top = layout.line_height * (layout.first_row + index) as f32 - self.scroll.y;
+        Some((x, top))
     }
 
     fn clear_hover(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if !hovered && self.gutter_hovered {
+            self.gutter_hovered = false;
+            cx.notify();
+        }
         if !hovered && (self.hover.is_some() || self._hover_delay.is_some()) {
             self.hover = None;
             self.hover_word = None;
@@ -1250,7 +1477,18 @@ impl Editor {
         cx.notify();
     }
 
-    /// Shapes the visible lines and resolves scrolling for `bounds`.
+    /// Columns rows wrap at for a text area `width` wide.
+    fn wrap_columns(&self, width: Pixels, em_width: Pixels) -> usize {
+        #[cfg(test)]
+        if let Some(columns) = self.wrap_columns {
+            return columns;
+        }
+        ((width - em_width) / em_width)
+            .floor()
+            .max(MIN_WRAP_COLUMNS as f32) as usize
+    }
+
+    /// Shapes the visible rows and resolves scrolling for `bounds`.
     fn layout(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {
         let style = window.text_style();
         let font = style.font();
@@ -1272,10 +1510,14 @@ impl Editor {
         let em_width = shape("m".into(), &[run(1, style.color)]).width;
         let line_count = self.buffer.line_count();
         let digits = line_count.to_string().len().max(3);
-        let gutter_width = if self.single_line {
-            px(0.)
+        // Gutter: line numbers, then the fold chevrons' column.
+        let (numbers_right, fold_left, gutter_width) = if self.single_line {
+            (bounds.left(), bounds.left(), px(0.))
         } else {
-            em_width * digits as f32 + GUTTER_PADDING * 2.
+            let numbers = GUTTER_PADDING + em_width * digits as f32;
+            let fold_left = numbers + GUTTER_PADDING / 2.;
+            let gutter = fold_left + em_width * 1.5 + GUTTER_PADDING / 2.;
+            (bounds.left() + numbers, bounds.left() + fold_left, gutter)
         };
         let text_bounds = Bounds::from_corners(
             point(bounds.left() + gutter_width, bounds.top()),
@@ -1283,31 +1525,54 @@ impl Editor {
         );
         let viewport = text_bounds.size;
 
-        let primary_head = self.primary().head;
-        let cursor_line = self.buffer.line_of(primary_head);
+        // Rows wrap at the view's width, so nothing scrolls sideways then.
+        let columns = self
+            .wraps()
+            .then(|| self.wrap_columns(viewport.width, em_width));
+        self.display.set_wrap(&self.buffer, columns);
+        if columns.is_some() {
+            self.scroll.x = px(0.);
+        }
+
+        let primary = self.primary();
+        let (primary_head, primary_at_row_end) = (primary.head, primary.at_row_end);
+        let (cursor_row, _) = self
+            .display
+            .point(&self.buffer, primary_head, primary_at_row_end);
         if let Some(line) = self.pending_scroll_line.take() {
-            self.scroll.y = line_height * line as f32;
+            self.scroll.y = line_height * self.display.line_row(line) as f32;
             self.autoscroll = false;
         }
         if self.center_cursor {
             self.center_cursor = false;
             self.autoscroll = false;
-            self.scroll.y = line_height * cursor_line as f32 - viewport.height / 2.;
+            self.scroll.y = line_height * cursor_row as f32 - viewport.height / 2.;
         }
         if self.autoscroll {
-            let top = line_height * cursor_line as f32;
+            let top = line_height * cursor_row as f32;
             if top < self.scroll.y {
                 self.scroll.y = top;
             } else if top + line_height > self.scroll.y + viewport.height {
                 self.scroll.y = top + line_height - viewport.height;
             }
         }
-        let max_scroll_y = line_height * line_count.saturating_sub(1) as f32;
+        let max_scroll_y = line_height * self.display.row_count().saturating_sub(1) as f32;
         self.scroll.y = self.scroll.y.min(max_scroll_y).max(px(0.));
 
-        let first_line = (self.scroll.y / line_height).floor() as usize;
-        let last_line =
-            (first_line + (viewport.height / line_height).ceil() as usize + 1).min(line_count);
+        let first_row = (self.scroll.y / line_height).floor() as usize;
+        let visible_rows = (viewport.height / line_height).ceil() as usize + 1;
+        let display_rows = self.display.rows(&self.buffer, first_row, visible_rows);
+
+        // Chevrons: folded lines always, foldable ones while the mouse is
+        // over the gutter (VS Code).
+        let foldable: Vec<usize> = match (display_rows.first(), display_rows.last()) {
+            (Some(first), Some(last)) if self.gutter_hovered && !self.single_line => {
+                let lines = first.line..last.line + 1;
+                let regions = self.cached_fold_regions(lines);
+                regions.iter().map(|&(header, _)| header).collect()
+            }
+            _ => Vec::new(),
+        };
         let text_color = theme::text();
         let muted = theme::muted();
         let theme = theme::current();
@@ -1317,21 +1582,25 @@ impl Editor {
             .and_then(|doc| doc.server.semantic_legend.as_ref());
         let styler = semantic::Styler::new(&theme, self.language(), legend);
         let base_run = run(0, text_color);
-        let visible = self.buffer.line_start(first_line)
-            ..self
-                .buffer
-                .line_end(last_line.saturating_sub(1).max(first_line));
-        let spans = self
-            .syntax
-            .as_ref()
-            .map(|syntax| syntax.highlights(&self.buffer, visible))
-            .unwrap_or_default();
+        // Highlighted per run of consecutive shown lines: folded text is
+        // never highlighted.
+        let mut spans = Vec::new();
+        if let Some(syntax) = &self.syntax {
+            let mut rest = display_rows.as_slice();
+            while let Some(first) = rest.first() {
+                let consecutive = rest
+                    .windows(2)
+                    .take_while(|pair| pair[1].line <= pair[0].line + 1)
+                    .count();
+                let end = rest[consecutive].range.end;
+                spans.extend(syntax.highlights(&self.buffer, first.range.start..end));
+                rest = &rest[consecutive + 1..];
+            }
+        }
 
-        let mut lines = Vec::with_capacity(last_line - first_line);
-        let mut line_numbers = Vec::with_capacity(last_line - first_line);
+        let mut rows = Vec::with_capacity(display_rows.len());
         let mut cuts = Vec::new();
-        let mut gutter_marks = Vec::with_capacity(last_line - first_line);
-        let mut line_diagnostics: Vec<&EditorDiagnostic> = Vec::new();
+        let mut diagnostics: Vec<&EditorDiagnostic> = Vec::new();
         let mut cursor_lines: Vec<usize> = self
             .selections
             .all()
@@ -1339,63 +1608,78 @@ impl Editor {
             .map(|s| self.buffer.line_of(s.head))
             .collect();
         cursor_lines.dedup();
-        for line in first_line..last_line {
-            let start = self.buffer.line_start(line);
+        for row in display_rows {
+            let range = row.range.clone();
             // Tabs render as one space for now; byte offsets stay aligned.
-            let text = self.buffer.line_text(line).replace('\t', " ");
-            let range = start..start + text.len();
+            let text = self.buffer.slice(range.clone()).replace('\t', " ");
             let first_span = spans.partition_point(|span| span.range.end <= range.start);
-            let line_spans = &spans[first_span..];
-            let line_spans =
-                &line_spans[..line_spans.partition_point(|span| span.range.start < range.end)];
+            let row_spans = &spans[first_span..];
+            let row_spans =
+                &row_spans[..row_spans.partition_point(|span| span.range.start < range.end)];
             let highlights = LineHighlights {
-                spans: line_spans,
+                spans: row_spans,
                 tokens: semantic::overlapping(&self.semantic.tokens, range.clone()),
             };
-            line_diagnostics.clear();
-            let candidates = self
-                .diagnostics
-                .partition_point(|d| d.range.start < range.end.max(range.start + 1));
-            line_diagnostics.extend(
-                self.diagnostics[..candidates]
-                    .iter()
-                    .filter(|d| d.range.end > range.start || d.range.start == range.start),
-            );
-            gutter_marks.push(
-                line_diagnostics
-                    .iter()
-                    .map(|d| d.severity)
-                    .filter(|&severity| severity < Severity::Hint)
-                    .min(),
-            );
+            diagnostics_in(&self.diagnostics, &range, &mut diagnostics);
             let runs = line_runs(
                 range,
                 &highlights,
                 &styler,
                 self.marked.as_ref(),
-                &line_diagnostics,
+                &diagnostics,
                 &base_run,
                 &mut cuts,
             );
-            lines.push(shape(text, &runs));
+            let shaped = shape(text, &runs);
 
-            if !self.single_line {
+            let line = row.line;
+            let gutter = row.first && !self.single_line;
+            let folded_header = self.display.is_folded_header(&self.buffer, line);
+            let number = gutter.then(|| {
                 let number = (line + 1).to_string();
                 let color = if cursor_lines.binary_search(&line).is_ok() {
                     text_color
                 } else {
                     muted
                 };
-                line_numbers.push(shape(number.clone(), &[run(number.len(), color)]));
-            }
+                shape(number.clone(), &[run(number.len(), color)])
+            });
+            let mark = if gutter {
+                let line_range = self.buffer.line_start(line)..self.buffer.line_end(line);
+                diagnostics_in(&self.diagnostics, &line_range, &mut diagnostics);
+                diagnostics
+                    .iter()
+                    .map(|d| d.severity)
+                    .filter(|&severity| severity < Severity::Hint)
+                    .min()
+            } else {
+                None
+            };
+            let chevron = if !gutter {
+                None
+            } else if folded_header {
+                Some(true)
+            } else {
+                foldable.binary_search(&line).is_ok().then_some(false)
+            };
+            rows.push(RowLayout {
+                indent: em_width * row.indent as f32,
+                folded: (row.last && folded_header).then(|| self.buffer.line_end(line)),
+                row,
+                shaped,
+                number,
+                mark,
+                chevron,
+            });
         }
 
         if self.autoscroll
-            && let Some(shaped) = cursor_line
-                .checked_sub(first_line)
-                .and_then(|i| lines.get(i))
+            && columns.is_none()
+            && let Some(row) = rows
+                .iter()
+                .find(|row| row.row.shows(primary_head, primary_at_row_end))
         {
-            let x = shaped.x_for_index(primary_head - self.buffer.line_start(cursor_line));
+            let x = row.shaped.x_for_index(primary_head - row.row.range.start);
             let margin = em_width * 2.;
             if x < self.scroll.x {
                 self.scroll.x = (x - margin).max(px(0.));
@@ -1405,16 +1689,18 @@ impl Editor {
         }
         self.autoscroll = false;
 
+        let glyph = |glyph: &str| shape(glyph.into(), &[run(glyph.len(), muted)]);
         self.layout = Some(EditorLayout {
             bounds,
             text_bounds,
-            gutter_width,
             line_height,
             em_width,
-            first_line,
-            lines,
-            line_numbers,
-            gutter_marks,
+            numbers_right,
+            fold_left,
+            first_row,
+            rows,
+            placeholder: glyph("⋯"),
+            chevrons: [glyph("▸"), glyph("▾")],
         });
     }
 
@@ -1428,8 +1714,6 @@ impl Editor {
             return;
         };
         let line_height = layout.line_height;
-        let line_top = |line: usize| bounds.top() + line_height * line as f32 - self.scroll.y;
-        let text_left = layout.text_bounds.left() - self.scroll.x;
         let selections = self.selections.all();
         let focused = self.focus_handle.is_focused(window);
         let (matches, active_match) = match &self.find {
@@ -1441,20 +1725,13 @@ impl Editor {
             .flat_map(|(a, b)| [a..a + 1, b..b + 1])
             .collect();
 
-        for (i, number) in layout.line_numbers.iter().enumerate() {
-            let x = bounds.left() + layout.gutter_width - GUTTER_PADDING - number.width;
-            number
-                .paint(
-                    point(x, line_top(layout.first_line + i)),
-                    line_height,
-                    window,
-                    cx,
-                )
-                .ok();
-        }
-        for (i, mark) in layout.gutter_marks.iter().enumerate() {
-            if let Some(severity) = mark {
-                let top = line_top(layout.first_line + i);
+        for (i, row) in layout.rows.iter().enumerate() {
+            let top = layout.row_top(i, self.scroll.y);
+            if let Some(number) = &row.number {
+                let origin = point(layout.numbers_right - number.width, top);
+                number.paint(origin, line_height, window, cx).ok();
+            }
+            if let Some(severity) = row.mark {
                 window.paint_quad(fill(
                     Bounds::new(
                         point(bounds.left() + px(3.), top + px(3.)),
@@ -1463,6 +1740,12 @@ impl Editor {
                     severity.color(),
                 ));
             }
+            if let Some(folded) = row.chevron {
+                let chevron = &layout.chevrons[if folded { 0 } else { 1 }];
+                let column = layout.text_bounds.left() - layout.fold_left;
+                let x = layout.fold_left + (column - chevron.width) / 2.;
+                chevron.paint(point(x, top), line_height, window, cx).ok();
+            }
         }
 
         window.with_content_mask(
@@ -1470,19 +1753,24 @@ impl Editor {
                 bounds: layout.text_bounds,
             }),
             |window| {
-                for (i, shaped) in layout.lines.iter().enumerate() {
-                    let line = layout.first_line + i;
-                    let top = line_top(line);
-                    let start = self.buffer.line_start(line);
-                    let end = self.buffer.line_end(line);
-                    // Backgrounds over the part of `range` on this line.
+                for (i, row) in layout.rows.iter().enumerate() {
+                    let top = layout.row_top(i, self.scroll.y);
+                    let text_left = layout.text_left(row, self.scroll.x);
+                    let shaped = &row.shaped;
+                    let (start, end) = (row.row.range.start, row.row.range.end);
+                    let last = row.row.last;
+                    // Backgrounds over the part of `range` on this row.
                     let mut highlight = |range: &Range<usize>, color: Hsla| {
                         if range.start > end || range.end < start || range.is_empty() {
                             return;
                         }
+                        // A row that continues below ends where the next starts.
+                        if !last && range.start == end {
+                            return;
+                        }
                         let x0 = shaped.x_for_index(range.start.max(start) - start);
                         let mut x1 = shaped.x_for_index(range.end.min(end) - start);
-                        if range.end > end {
+                        if range.end > end && last {
                             // Show the selected line break.
                             x1 += layout.em_width / 2.;
                         }
@@ -1499,8 +1787,8 @@ impl Editor {
                         highlight(m, theme::find_match());
                     }
                     let first = selections.partition_point(|s| s.end() < start);
-                    let on_line = || selections[first..].iter().take_while(|s| s.start() <= end);
-                    for s in on_line() {
+                    let on_row = || selections[first..].iter().take_while(|s| s.start() <= end);
+                    for s in on_row() {
                         highlight(&s.range(), theme::selection());
                     }
                     if let Some(active) = active_match.and_then(|i| matches.get(i)) {
@@ -1514,8 +1802,32 @@ impl Editor {
                         .paint(point(text_left, top), line_height, window, cx)
                         .ok();
 
+                    if let Some(fold_start) = row.folded {
+                        let placeholder = layout.placeholder_bounds(i, self.scroll);
+                        let fold_end = self
+                            .display
+                            .folds()
+                            .iter()
+                            .find(|fold| fold.start == fold_start)
+                            .map_or(fold_start, |fold| fold.end);
+                        let selected = selections
+                            .iter()
+                            .any(|s| s.start() <= fold_start && fold_end <= s.end());
+                        let background = if selected {
+                            theme::selection()
+                        } else {
+                            theme::fold_placeholder()
+                        };
+                        window.paint_quad(fill(placeholder, background).corner_radii(px(3.)));
+                        let origin = point(placeholder.left() + layout.em_width / 2., top);
+                        layout
+                            .placeholder
+                            .paint(origin, line_height, window, cx)
+                            .ok();
+                    }
+
                     if focused {
-                        for s in on_line().filter(|s| (start..=end).contains(&s.head)) {
+                        for s in on_row().filter(|s| row.row.shows(s.head, s.at_row_end)) {
                             let x = text_left + shaped.x_for_index(s.head - start);
                             window.paint_quad(fill(
                                 Bounds::from_corners(
@@ -1534,6 +1846,23 @@ impl Editor {
 
 fn lsp_position(point: text::Point) -> lsp::types::Position {
     lsp::types::Position::new(point.row as u32, point.column as u32)
+}
+
+/// Diagnostics touching `range` (an empty one at its start counts), in
+/// `out`.
+fn diagnostics_in<'a>(
+    diagnostics: &'a [EditorDiagnostic],
+    range: &Range<usize>,
+    out: &mut Vec<&'a EditorDiagnostic>,
+) {
+    out.clear();
+    let candidates =
+        diagnostics.partition_point(|d| d.range.start < range.end.max(range.start + 1));
+    out.extend(
+        diagnostics[..candidates]
+            .iter()
+            .filter(|d| d.range.end > range.start || d.range.start == range.start),
+    );
 }
 
 /// What highlights one line: tree-sitter spans and semantic tokens
@@ -1742,18 +2071,18 @@ impl EntityInputHandler for Editor {
         let layout = self.layout.as_ref()?;
         let start = self.buffer.offset_from_utf16(range_utf16.start);
         let end = self.buffer.offset_from_utf16(range_utf16.end);
-        let line = self.buffer.line_of(start);
-        let shaped = layout.lines.get(line.checked_sub(layout.first_line)?)?;
-        let line_start = self.buffer.line_start(line);
-        let end = end.min(self.buffer.line_end(line));
-        let left = layout.text_bounds.left() - self.scroll.x;
-        let top = layout.text_bounds.top() + layout.line_height * line as f32 - self.scroll.y;
+        let index = layout
+            .rows
+            .iter()
+            .position(|row| row.row.shows(start, false))?;
+        let row = &layout.rows[index];
+        let end = end.min(row.row.range.end);
+        let left = layout.text_left(row, self.scroll.x);
+        let top = layout.row_top(index, self.scroll.y);
+        let x = |offset: usize| left + row.shaped.x_for_index(offset - row.row.range.start);
         Some(Bounds::from_corners(
-            point(left + shaped.x_for_index(start - line_start), top),
-            point(
-                left + shaped.x_for_index(end - line_start),
-                top + layout.line_height,
-            ),
+            point(x(start), top),
+            point(x(end), top + layout.line_height),
         ))
     }
 
@@ -1843,10 +2172,21 @@ impl Focusable for Editor {
         self.focus_handle.clone()
     }
 }
+/// Alt+Z's choice for all editors of the app.
+struct WordWrapOverride(bool);
+
+impl Global for WordWrapOverride {}
+
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // `settings.json` may have toggled semantic highlighting.
         self.sync_semantic_setting(cx);
+        // Alt+Z in another editor.
+        if let Some(&WordWrapOverride(wrap)) = cx.try_global::<WordWrapOverride>()
+            && self.word_wrap != Some(wrap)
+        {
+            self.word_wrap = Some(wrap);
+        }
         if self.find_open() {
             self.refresh_find(cx);
         }
@@ -1953,6 +2293,14 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::toggle_block_comment))
                     .on_action(cx.listener(Self::jump_to_bracket))
                     .on_action(cx.listener(Self::go_to_line_action))
+                    .on_action(cx.listener(Self::toggle_word_wrap))
+                    .on_action(cx.listener(Self::fold))
+                    .on_action(cx.listener(Self::unfold))
+                    .on_action(cx.listener(Self::toggle_fold))
+                    .on_action(cx.listener(Self::fold_all))
+                    .on_action(cx.listener(Self::unfold_all))
+                    .on_action(cx.listener(Self::fold_recursively))
+                    .on_action(cx.listener(Self::unfold_recursively))
             })
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy))
@@ -2001,6 +2349,7 @@ impl Render for Editor {
                     div()
                         .flex()
                         .justify_between()
+                        .gap_4()
                         .px_3()
                         .py_1()
                         .border_t_1()
@@ -2008,19 +2357,31 @@ impl Render for Editor {
                         .bg(theme::panel())
                         .text_xs()
                         .text_color(theme::muted())
-                        .child(div().text_color(message_color).child(message))
+                        .whitespace_nowrap()
+                        // In a narrow pane the path and the language-server
+                        // status share the shrinking (both start at their
+                        // natural width) before the position gives way.
+                        .child(
+                            div()
+                                .flex_auto()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(message_color)
+                                .child(message),
+                        )
                         .child(
                             div()
                                 .flex()
                                 .gap_4()
+                                .min_w_0()
                                 .children(
                                     self.lsp_status.clone().map(|(status, color)| {
-                                        div().text_color(color()).child(status)
+                                        div().min_w_0().truncate().text_color(color()).child(status)
                                     }),
                                 )
-                                .child(format!(
+                                .child(div().flex_none().child(format!(
                                     "{selection_count}Ln {line}, Col {column}   {indent}   {line_ending}   UTF-8   {language}"
-                                ))
+                                )))
                                 .when(errors + warnings > 0, |row| {
                                     row.child(
                                         div()

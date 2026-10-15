@@ -47,6 +47,7 @@ impl Editor {
             .buffer
             .offset_of(self.buffer.point(offset), Encoding::Utf8);
         self.selections = SelectionSet::single(Selection::cursor(offset));
+        self.reveal_selections();
         self.auto_closed.clear();
         self.completion = None;
         self.center_cursor = true;
@@ -211,7 +212,7 @@ impl Editor {
     /// After the mouse rests on a word, shows its diagnostics and the
     /// server's hover documentation.
     pub(super) fn update_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some((line, offset)) = self.character_at(position) else {
+        let Some((row, offset)) = self.character_at(position) else {
             if self.hover_word.take().is_some() {
                 self.hover = None;
                 self._hover_delay = None;
@@ -274,7 +275,7 @@ impl Editor {
                         return;
                     }
                     this.hover = Some(HoverPopover {
-                        line,
+                        row,
                         x: position.x,
                         messages,
                         docs,
@@ -295,7 +296,7 @@ impl Editor {
         let hover = self.hover.as_ref()?;
         let layout = self.layout.as_ref()?;
         let bounds = layout.bounds;
-        let line_top = layout.line_height * hover.line as f32 - self.scroll.y;
+        let line_top = layout.line_height * hover.row as f32 - self.scroll.y;
         let below = line_top < bounds.size.height * 0.6;
         let diagnostics = hover.messages.iter().map(|(severity, message)| {
             div()

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{TestAppContext, WindowHandle};
+use gpui::{Modifiers, TestAppContext, WindowHandle};
 
 use super::{selections::SelectionState, *};
 
@@ -465,4 +465,274 @@ fn state_round_trips_selections_and_scroll(cx: &mut TestAppContext) {
         e.restore_state(&serde_json::from_str(&json).unwrap(), cx)
     });
     assert_eq!(state(other, cx), "one\n«two»\nth|ree");
+}
+
+/// Wraps the editor at `columns` from its next layout on.
+fn wrap_at(window: WindowHandle<Editor>, columns: usize, cx: &mut TestAppContext) {
+    update(window, cx, |e, _, cx| {
+        e.word_wrap = Some(true);
+        e.wrap_columns = Some(columns);
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+fn row_count(window: WindowHandle<Editor>, cx: &mut TestAppContext) -> usize {
+    window.read_with(cx, |e, _| e.display.row_count()).unwrap()
+}
+
+#[gpui::test]
+fn alt_z_wraps_every_editor_also_new_ones(cx: &mut TestAppContext) {
+    let text = "    al|pha beta gamma delta\nxy";
+    let first = editor("a.txt", text, cx);
+    let second = editor("b.txt", text, cx);
+    for window in [first, second] {
+        update(window, cx, |e, _, cx| {
+            e.wrap_columns = Some(16);
+            cx.notify();
+        });
+    }
+    cx.run_until_parked();
+    assert_eq!(row_count(second, cx), 2, "no wrap by default");
+    update(first, cx, |e, w, cx| {
+        e.toggle_word_wrap(&ToggleWordWrap, w, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(row_count(second, cx), 3, "the other editor wraps too");
+    let later = editor("c.txt", text, cx);
+    update(later, cx, |e, _, cx| {
+        e.wrap_columns = Some(16);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(row_count(later, cx), 3, "and so does one opened later");
+    update(later, cx, |e, w, cx| {
+        e.toggle_word_wrap(&ToggleWordWrap, w, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(row_count(first, cx), 2);
+}
+
+#[gpui::test]
+fn vertical_motion_and_home_end_follow_wrapped_rows(cx: &mut TestAppContext) {
+    // Rows: "    alpha beta ", "    gamma delta" (continuation indented), "xy".
+    let window = editor("a.txt", "    al|pha beta gamma delta\nxy", cx);
+    wrap_at(window, 16, cx);
+    assert_eq!(row_count(window, cx), 3);
+    update(window, cx, |e, w, cx| e.down(&Down, w, cx));
+    assert_eq!(state(window, cx), "    alpha beta ga|mma delta\nxy");
+    update(window, cx, |e, w, cx| e.down(&Down, w, cx));
+    assert_eq!(state(window, cx), "    alpha beta gamma delta\nxy|");
+    update(window, cx, |e, w, cx| e.up(&Up, w, cx));
+    assert_eq!(
+        state(window, cx),
+        "    alpha beta ga|mma delta\nxy",
+        "the goal column survives the short line"
+    );
+    update(window, cx, |e, w, cx| e.up(&Up, w, cx));
+    assert_eq!(state(window, cx), "    al|pha beta gamma delta\nxy");
+    // End: the row's end first (drawn there), then the line's.
+    update(window, cx, |e, w, cx| e.end(&End, w, cx));
+    assert_eq!(state(window, cx), "    alpha beta |gamma delta\nxy");
+    assert_eq!(cursor_point(window, cx), (0, 15));
+    update(window, cx, |e, w, cx| e.end(&End, w, cx));
+    assert_eq!(state(window, cx), "    alpha beta gamma delta|\nxy");
+    // Home: the row's start first, then the line's indentation.
+    update(window, cx, |e, w, cx| e.home(&Home, w, cx));
+    assert_eq!(state(window, cx), "    alpha beta |gamma delta\nxy");
+    assert_eq!(cursor_point(window, cx), (1, 4));
+    update(window, cx, |e, w, cx| e.home(&Home, w, cx));
+    assert_eq!(state(window, cx), "    |alpha beta gamma delta\nxy");
+    // Toggling wrap off brings back one row per line.
+    update(window, cx, |e, w, cx| {
+        e.toggle_word_wrap(&ToggleWordWrap, w, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(row_count(window, cx), 2);
+}
+
+/// Screen row and column of the primary cursor.
+fn cursor_point(window: WindowHandle<Editor>, cx: &mut TestAppContext) -> (usize, usize) {
+    window
+        .read_with(cx, |e, _| {
+            let s = e.primary();
+            e.display.point(&e.buffer, s.head, s.at_row_end)
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn end_of_a_wrapped_row_stays_on_that_row(cx: &mut TestAppContext) {
+    // Rows: "    alpha beta ", "    gamma delta", "xy".
+    let window = editor("a.txt", "    al|pha beta gamma delta\nxy", cx);
+    wrap_at(window, 16, cx);
+    update(window, cx, |e, w, cx| e.end(&End, w, cx));
+    assert_eq!(
+        cursor_point(window, cx),
+        (0, 15),
+        "after the row's last char"
+    );
+    // Home from there goes to the first row's indentation.
+    update(window, cx, |e, w, cx| e.home(&Home, w, cx));
+    assert_eq!(state(window, cx), "    |alpha beta gamma delta\nxy");
+    // Shift+End selects the whole row.
+    update(window, cx, |e, w, cx| e.select_end(&SelectEnd, w, cx));
+    assert_eq!(state(window, cx), "    «alpha beta »gamma delta\nxy");
+    assert_eq!(cursor_point(window, cx), (0, 15));
+    // Up/Down keep the row end's screen column.
+    update(window, cx, |e, _, cx| e.set_cursor(6, cx));
+    update(window, cx, |e, w, cx| e.end(&End, w, cx));
+    update(window, cx, |e, w, cx| e.down(&Down, w, cx));
+    assert_eq!(state(window, cx), "    alpha beta gamma delta|\nxy");
+    update(window, cx, |e, w, cx| e.up(&Up, w, cx));
+    assert_eq!(state(window, cx), "    alpha beta |gamma delta\nxy");
+    assert_eq!(cursor_point(window, cx), (0, 15));
+    // Typing inserts at the wrap position; the cursor follows the char.
+    type_text(window, "X", cx);
+    assert_eq!(state(window, cx), "    alpha beta X|gamma delta\nxy");
+    assert_eq!(cursor_point(window, cx), (1, 5), "after the X");
+}
+
+#[gpui::test]
+fn clicking_past_a_wrapped_row_end_stays_on_that_row(cx: &mut TestAppContext) {
+    let window = editor("a.txt", "    al|pha beta gamma delta\nxy", cx);
+    wrap_at(window, 16, cx);
+    let click = |e: &mut Editor, row: usize, w: &mut Window, cx: &mut Context<Editor>| {
+        let layout = e.layout.as_ref().expect("laid out");
+        let y = layout.text_bounds.top() + layout.line_height * (row as f32 + 0.5);
+        let position = point(layout.text_bounds.right() - px(4.), y);
+        let event = MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        e.on_mouse_down(&event, w, cx);
+        e.on_mouse_up(
+            &MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            },
+            w,
+            cx,
+        );
+    };
+    update(window, cx, |e, w, cx| click(e, 0, w, cx));
+    assert_eq!(state(window, cx), "    alpha beta |gamma delta\nxy");
+    assert_eq!(cursor_point(window, cx), (0, 15), "drawn at the row's end");
+    update(window, cx, |e, w, cx| click(e, 1, w, cx));
+    assert_eq!(state(window, cx), "    alpha beta gamma delta|\nxy");
+    assert_eq!(cursor_point(window, cx), (1, 15));
+    // End on the clicked row end goes on to the line end.
+    update(window, cx, |e, w, cx| click(e, 0, w, cx));
+    update(window, cx, |e, w, cx| e.end(&End, w, cx));
+    assert_eq!(state(window, cx), "    alpha beta gamma delta|\nxy");
+}
+
+#[gpui::test]
+fn motion_steps_over_folds(cx: &mut TestAppContext) {
+    let window = editor("a.py", "de|f f():\n    x = 1\n    y = 2\nz = 3", cx);
+    update(window, cx, |e, w, cx| e.fold(&Fold, w, cx));
+    assert_eq!(row_count(window, cx), 2);
+    update(window, cx, |e, w, cx| e.down(&Down, w, cx));
+    assert_eq!(state(window, cx), "def f():\n    x = 1\n    y = 2\nz |= 3");
+    update(window, cx, |e, w, cx| e.up(&Up, w, cx));
+    assert_eq!(state(window, cx), "de|f f():\n    x = 1\n    y = 2\nz = 3");
+    update(window, cx, |e, w, cx| e.end(&End, w, cx));
+    update(window, cx, |e, w, cx| e.right(&Right, w, cx));
+    assert_eq!(state(window, cx), "def f():\n    x = 1\n    y = 2\n|z = 3");
+    update(window, cx, |e, w, cx| e.left(&Left, w, cx));
+    assert_eq!(state(window, cx), "def f():|\n    x = 1\n    y = 2\nz = 3");
+    assert_eq!(row_count(window, cx), 2, "still folded");
+    // A cursor placed inside (a jump, a search…) opens the fold.
+    update(window, cx, |e, _, cx| e.set_cursor(12, cx));
+    assert_eq!(row_count(window, cx), 4);
+}
+
+#[gpui::test]
+fn fold_all_unfold_and_recursive_folding(cx: &mut TestAppContext) {
+    let text =
+        "|impl A {\n    fn f() {\n        g();\n    }\n    fn h() {\n        i();\n    }\n}\n";
+    let window = editor("a.rs", text, cx);
+    assert_eq!(row_count(window, cx), 9);
+    update(window, cx, |e, w, cx| e.fold_all(&FoldAll, w, cx));
+    assert_eq!(
+        row_count(window, cx),
+        3,
+        "the impl header, its closer, the last line"
+    );
+    // Unfolding the outer fold leaves the inner ones folded.
+    update(window, cx, |e, w, cx| e.unfold(&Unfold, w, cx));
+    assert_eq!(row_count(window, cx), 7);
+    update(window, cx, |e, w, cx| e.unfold_all(&UnfoldAll, w, cx));
+    assert_eq!(row_count(window, cx), 9);
+    update(window, cx, |e, w, cx| {
+        e.fold_recursively(&FoldRecursively, w, cx)
+    });
+    let folds = window.read_with(cx, |e, _| e.folded_lines()).unwrap();
+    assert_eq!(folds, [(0, 6), (1, 2), (4, 5)]);
+    update(window, cx, |e, w, cx| {
+        e.unfold_recursively(&UnfoldRecursively, w, cx)
+    });
+    assert_eq!(row_count(window, cx), 9);
+    // Fold at a cursor inside picks the innermost region.
+    update(window, cx, |e, _, cx| {
+        e.set_cursor(text.find("g()").unwrap() - 1, cx)
+    });
+    update(window, cx, |e, w, cx| e.fold(&Fold, w, cx));
+    let folds = window.read_with(cx, |e, _| e.folded_lines()).unwrap();
+    assert_eq!(folds, [(1, 2)]);
+    assert_eq!(
+        state(window, cx),
+        "impl A {\n    fn f() {|\n        g();\n    }\n    fn h() {\n        i();\n    }\n}\n",
+        "the cursor left the folded text"
+    );
+}
+
+#[gpui::test]
+fn folds_follow_edits_and_open_when_edited_inside(cx: &mut TestAppContext) {
+    let window = editor("a.py", "x = 0\nde|f f():\n    return 1\n", cx);
+    update(window, cx, |e, w, cx| e.fold(&Fold, w, cx));
+    update(window, cx, |e, w, cx| e.doc_start(&DocStart, w, cx));
+    update(window, cx, |e, w, cx| e.newline(&Newline, w, cx));
+    let folds = window.read_with(cx, |e, _| e.folded_lines()).unwrap();
+    assert_eq!(folds, [(2, 3)], "moved down with the text");
+    update(window, cx, |e, w, cx| e.undo(&Undo, w, cx));
+    let folds = window.read_with(cx, |e, _| e.folded_lines()).unwrap();
+    assert_eq!(folds, [(1, 2)]);
+    // An edit of the hidden text (e.g. from another pane) opens the fold.
+    update(window, cx, |e, _, cx| {
+        let at = e.text().find('1').unwrap();
+        e.commit(
+            vec![(at..at + 1, "2".into())],
+            |_| SelectionSet::single(Selection::cursor(0)),
+            cx,
+        );
+    });
+    let folds = window.read_with(cx, |e, _| e.folded_lines()).unwrap();
+    assert!(folds.is_empty());
+}
+
+#[gpui::test]
+fn find_opens_folds_around_matches(cx: &mut TestAppContext) {
+    let window = editor("a.py", "de|f f():\n    secret = 1\nz = 2\n", cx);
+    update(window, cx, |e, w, cx| e.fold(&Fold, w, cx));
+    assert_eq!(row_count(window, cx), 3);
+    assert_eq!(find(window, "secret", cx), 1);
+    assert_eq!(row_count(window, cx), 4);
+    assert_eq!(state(window, cx), "def f():\n    «secret» = 1\nz = 2\n");
+}
+
+#[gpui::test]
+fn state_round_trips_folds(cx: &mut TestAppContext) {
+    let window = editor("a.py", "de|f f():\n    x = 1\nz = 2\n", cx);
+    update(window, cx, |e, w, cx| e.fold(&Fold, w, cx));
+    let saved = window.read_with(cx, |e, _| e.state()).unwrap();
+    assert_eq!(saved.folds, [(0, 1)]);
+    let other = editor("a.py", "def f():\n    x = 1\nz = 2\n|", cx);
+    update(other, cx, |e, _, cx| e.restore_state(&saved, cx));
+    assert_eq!(row_count(other, cx), 3);
 }

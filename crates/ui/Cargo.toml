@@ -21,6 +21,7 @@ serde_json.workspace = true
 syntax.workspace = true
 terminal.workspace = true
 text.workspace = true
+unicode-width.workspace = true
 watcher.workspace = true
 remote.workspace = true
 worktree.workspace = true

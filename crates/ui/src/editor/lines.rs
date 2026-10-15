@@ -180,6 +180,7 @@ impl Editor {
                 anchor: map(s.anchor, anchor_is_start),
                 head: map(s.head, !anchor_is_start),
                 goal: None,
+                at_row_end: false,
             }
         })
     }
@@ -200,6 +201,7 @@ impl Editor {
                 anchor: s.anchor.saturating_add_signed(shift),
                 head: s.head.saturating_add_signed(shift),
                 goal: s.goal,
+                at_row_end: false,
             }
         })
     }
