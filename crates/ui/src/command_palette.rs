@@ -181,6 +181,7 @@ impl Render for CommandPalette {
                             let selected = row == this.selected;
                             div()
                                 .id(row)
+                                .w_full()
                                 .h(px(ROW_HEIGHT))
                                 .px_3()
                                 .flex()

@@ -58,8 +58,9 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-o", OpenProject, ctx),
         KeyBinding::new("secondary-r", OpenRecent, ctx),
-        KeyBinding::new("secondary-shift-p", ShowCommandPalette, ctx),
+        // The last binding is the one shown.
         KeyBinding::new("f1", ShowCommandPalette, ctx),
+        KeyBinding::new("secondary-shift-p", ShowCommandPalette, ctx),
         // JetBrains' next/previous project window.
         KeyBinding::new("ctrl-alt-]", NextProject, ctx),
         KeyBinding::new("ctrl-alt-[", PreviousProject, ctx),
@@ -929,21 +930,21 @@ impl Shell {
                             .when(open, |row| row.bg(rgb(theme::ACTIVE_ROW)))
                             .on_hover(hover)
                             .child(div().text_color(rgb(theme::MUTED)).child("›"))
+                            // Already inside the menu's deferred layer, which
+                            // gpui does not nest; placed past the parent's
+                            // rows so none paints over it.
                             .when(open, |row| {
                                 row.child(
                                     div()
                                         .absolute()
                                         .top(px(-4.))
-                                        .left(px(MENU_WIDTH - 12.))
-                                        .child(
-                                            deferred(anchored().child(self.render_rows(
-                                                rows,
-                                                depth + 1,
-                                                &path[1..],
-                                                cx,
-                                            )))
-                                            .with_priority(depth + 2),
-                                        ),
+                                        .left(px(MENU_WIDTH - 8.))
+                                        .child(anchored().child(self.render_rows(
+                                            rows,
+                                            depth + 1,
+                                            &path[1..],
+                                            cx,
+                                        ))),
                                 )
                             })
                             .into_any_element()
@@ -1145,7 +1146,8 @@ fn resolve(items: &[Item], focus: &FocusHandle, window: &mut Window, cx: &mut Ap
                     .into_iter()
                     .take(RECENT_IN_MENU)
                     .map(|location| Row::Command {
-                        label: location.to_string().into(),
+                        // Paths share long prefixes: the name comes first.
+                        label: format!("{}  —  {location}", tab_title(&location)).into(),
                         action: Some(Box::new(OpenRecentProject { location })),
                         keys: None,
                     })
