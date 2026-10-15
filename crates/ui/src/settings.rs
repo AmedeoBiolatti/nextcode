@@ -22,7 +22,8 @@
 //!   "debug": { "adapters": { "lldb": { "command": "/opt/codelldb/adapter/codelldb" },
 //!     "python": { "command": "python3", "args": ["-m", "debugpy.adapter"] } } },
 //!   "tests": { "discover_on_save": true, "pytest_args": ["-p", "no:randomly"],
-//!     "cargo_test_args": ["--features", "slow-tests"] } }
+//!     "cargo_test_args": ["--features", "slow-tests"] },
+//!   "ports": { "auto_forward": true } }
 //! ```
 
 use std::{
@@ -57,6 +58,7 @@ pub struct Settings {
     pub languages: HashMap<String, LanguageSettings>,
     pub debug: DebugSettings,
     pub tests: TestSettings,
+    pub ports: PortSettings,
 }
 
 impl Default for Settings {
@@ -72,6 +74,7 @@ impl Default for Settings {
             languages: HashMap::new(),
             debug: DebugSettings::default(),
             tests: TestSettings::default(),
+            ports: PortSettings::default(),
         }
     }
 }
@@ -112,6 +115,21 @@ impl Default for TestSettings {
             pytest_args: Vec::new(),
             cargo_test_args: Vec::new(),
         }
+    }
+}
+
+/// `"ports"`: port forwarding for WSL and dev container projects.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PortSettings {
+    /// Forward ports that start listening where the project lives (in a
+    /// container also those already listening when it opens).
+    pub auto_forward: bool,
+}
+
+impl Default for PortSettings {
+    fn default() -> Self {
+        Self { auto_forward: true }
     }
 }
 

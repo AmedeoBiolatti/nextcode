@@ -22,6 +22,7 @@ mod location_picker;
 mod lsp_store;
 mod menus;
 mod outline_panel;
+mod ports;
 mod problems;
 mod project;
 mod project_picker;
@@ -153,6 +154,7 @@ fn run() -> anyhow::Result<()> {
         project_picker::bind_keys(cx);
         theme_picker::bind_keys(cx);
         terminal_panel::bind_keys(cx);
+        ports::panel::bind_keys(cx);
         theme::refresh(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {

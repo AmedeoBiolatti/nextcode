@@ -32,6 +32,8 @@ const LABELS: &[(&str, &str)] = &[
     ("workspace::ToggleTerminal", "Terminal Panel"),
     ("workspace::ToggleGit", "Git Panel"),
     ("workspace::ToggleProblems", "Problems Panel"),
+    ("workspace::TogglePorts", "Ports Panel"),
+    ("ports::ForwardPort", "Forward a Port…"),
     ("workspace::ToggleCallHierarchy", "Call Hierarchy Panel"),
     ("workspace::ToggleOutline", "Outline Panel"),
     ("workspace::TogglePython", "Python Panel"),
@@ -189,6 +191,8 @@ const HIDDEN: &[&str] = &[
     "debugger::NextConsoleInput",
     "debugger::ConfirmSetVariable",
     "debugger::CancelSetVariable",
+    "ports::ConfirmInput",
+    "ports::CancelInput",
     "app::OpenRecentProject",
 ];
 

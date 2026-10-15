@@ -35,6 +35,7 @@ use crate::{
     location_picker::{LocationPicker, LocationPickerEvent},
     lsp_store::{LspStore, LspStoreEvent, ServerStatus},
     outline_panel::OutlinePanel,
+    ports::{Ports, PortsEvent, panel::PortsPanel},
     problems::{ProblemsEvent, ProblemsPanel},
     project::{self, Project, WatchHandle},
     python_panel::{PythonPanel, PythonPanelEvent, RunRequest},
@@ -220,6 +221,8 @@ pub(crate) enum OfferKind {
     PythonSync,
     /// No LLDB debug adapter: download CodeLLDB.
     DownloadCodeLldb,
+    /// A forwarded port's application listens: open it in the browser.
+    PortAvailable { port: u16, url: String },
 }
 
 impl OfferKind {
@@ -228,6 +231,7 @@ impl OfferKind {
             Self::ReopenInContainer { .. } => "Reopen in Container",
             Self::PythonSync => "Sync",
             Self::DownloadCodeLldb => "Download CodeLLDB",
+            Self::PortAvailable { .. } => "Open in Browser",
         }
     }
 }
@@ -237,6 +241,9 @@ pub struct Workspace {
     project: Project,
     file_tree: Entity<FileTree>,
     problems: Entity<ProblemsPanel>,
+    /// Forwarded ports (WSL and container projects); the panel holds the
+    /// model.
+    ports_panel: Entity<PortsPanel>,
     terminal: Entity<TerminalPanel>,
     search: Entity<SearchPanel>,
     git: Entity<GitPanel>,
@@ -318,6 +325,11 @@ impl Workspace {
 
         let (settings, settings_error) = Settings::load();
         let restore_session = settings.restore_session;
+        let ports = cx.new(|cx| Ports::new(project.clone(), &settings.ports, cx));
+        let ports_subscription = cx.subscribe(&ports, |this, _, event, cx| {
+            this.on_ports_event(event, cx);
+        });
+        let ports_panel = cx.new(|cx| PortsPanel::new(ports.clone(), cx));
         let lsp_store = cx.new(|_| LspStore::new(project.clone(), Arc::new(settings)));
         let lsp_subscription = cx.subscribe(&lsp_store, |this, _, event, cx| {
             this.on_lsp_event(event, cx);
@@ -486,6 +498,7 @@ impl Workspace {
             project,
             file_tree,
             problems,
+            ports_panel,
             terminal,
             search,
             git,
@@ -529,7 +542,51 @@ impl Workspace {
                 terminal_subscription,
                 release_subscription,
                 quit_subscription,
+                ports_subscription,
             ],
+        }
+    }
+
+    /// Tells the user about forwarded applications (`onAutoForward`).
+    fn on_ports_event(&mut self, event: &PortsEvent, cx: &mut Context<Self>) {
+        match event {
+            PortsEvent::Available {
+                port,
+                url,
+                label,
+                action,
+            } => match action {
+                devcontainer::ports::OnAutoForward::OpenBrowser => cx.open_url(url),
+                devcontainer::ports::OnAutoForward::Notify => {
+                    let what = match label {
+                        Some(label) => format!("Your application ({label})"),
+                        None => "Your application".to_owned(),
+                    };
+                    let local = url.rsplit(':').next().unwrap_or_default();
+                    let message = if local == port.to_string() {
+                        format!("{what} running on port {port} is available.")
+                    } else {
+                        format!("{what} running on port {port} is available at localhost:{local}.")
+                    };
+                    self.offer(
+                        OfferKind::PortAvailable {
+                            port: *port,
+                            url: url.clone(),
+                        },
+                        &message,
+                        cx,
+                    );
+                }
+                _ => {}
+            },
+            PortsEvent::Released { target } if target.host.is_none() => {
+                let port = target.port;
+                self.offers.retain(|offer| {
+                    !matches!(&offer.kind, OfferKind::PortAvailable { port: p, .. } if *p == port)
+                });
+                cx.notify();
+            }
+            _ => {}
         }
     }
 
@@ -1327,6 +1384,7 @@ impl Workspace {
             OfferKind::PythonSync => self.python.update(cx, |python, cx| python.sync(cx)),
             OfferKind::ReopenInContainer { config } => self.reopen_in(config, cx),
             OfferKind::DownloadCodeLldb => self.download_codelldb(window, cx),
+            OfferKind::PortAvailable { url, .. } => cx.open_url(&url),
         }
     }
 
@@ -1723,6 +1781,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_python))
             .on_action(cx.listener(Self::toggle_problems))
+            .on_action(cx.listener(Self::toggle_ports))
+            .on_action(cx.listener(Self::forward_port))
             .on_action(cx.listener(Self::toggle_call_hierarchy))
             .on_action(cx.listener(Self::toggle_outline))
             .on_action(cx.listener(Self::go_to_workspace_symbol))

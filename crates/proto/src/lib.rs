@@ -19,9 +19,22 @@
 //!
 //! Every request has a client-chosen id and gets exactly one
 //! [`AgentMessage::Response`]. Streaming requests ([`Request::Watch`],
-//! [`Request::Search`], [`Request::Spawn`]) then send [`AgentMessage::Event`]s
-//! with the same id until a final event ([`Event::is_final`]) or until the
-//! client sends [`ClientMessage::Cancel`].
+//! [`Request::Search`], [`Request::Spawn`], [`Request::Tunnel`]) then send
+//! [`AgentMessage::Event`]s with the same id until a final event
+//! ([`Event::is_final`]) or until the client sends [`ClientMessage::Cancel`].
+//!
+//! # Tunnels
+//!
+//! [`Request::Tunnel`] opens a TCP connection from the agent's machine (port
+//! forwarding). Bytes flow as [`ClientMessage::Input`] (client → target) and
+//! [`Event::TunnelData`] (target → client), each direction under a credit
+//! window of [`TUNNEL_WINDOW`] bytes: a sender may have at most that many
+//! bytes unacknowledged, and the receiver grants more as it delivers them
+//! ([`ClientMessage::Credit`], [`Event::TunnelCredit`]). So a fast transfer
+//! never queues more than the window per tunnel, and the shared connection
+//! keeps serving other requests (no head-of-line blocking: neither side's
+//! reader ever waits for a slow socket). [`ClientMessage::CloseInput`] and
+//! [`Event::TunnelEof`] are half-closes; [`Event::TunnelClosed`] is final.
 //!
 //! Shutdown is closing the agent's stdin: the agent stops its watchers and
 //! searches, terminates the processes it started, and exits.
@@ -34,7 +47,11 @@ pub use watcher::Batch;
 pub use worktree::{DirEntry, FileKind};
 
 /// Bumped on every incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
+
+/// Bytes a tunnel's sender may have in flight in each direction before the
+/// receiver grants more (see the crate docs).
+pub const TUNNEL_WINDOW: u32 = 1024 * 1024;
 
 pub const BANNER_PREFIX: &str = "NEXT_CODE_AGENT";
 
@@ -80,7 +97,7 @@ pub enum ClientMessage {
     Cancel {
         id: RequestId,
     },
-    /// Bytes for a spawned process's stdin or pty.
+    /// Bytes for a spawned process's stdin or pty, or for a tunnel's target.
     Input {
         id: RequestId,
         data: Vec<u8>,
@@ -90,9 +107,16 @@ pub enum ClientMessage {
         id: RequestId,
         size: PtySize,
     },
-    /// Closes a spawned process's stdin (end of input); it keeps running.
+    /// Closes a spawned process's stdin (end of input; it keeps running), or
+    /// a tunnel's sending direction (the target reads end of file).
     CloseInput {
         id: RequestId,
+    },
+    /// The client delivered this many bytes of a tunnel's data: the agent
+    /// may send as many more.
+    Credit {
+        id: RequestId,
+        bytes: u32,
     },
 }
 
@@ -141,6 +165,31 @@ pub enum Request {
     },
     /// Streams output events; the final one is [`Event::Exited`].
     Spawn(SpawnRequest),
+    /// Connects to `host:port` from the agent's machine and relays bytes
+    /// both ways (see the crate docs); answers once connected. `localhost`
+    /// and loopback addresses try both 127.0.0.1 and ::1, so servers bound
+    /// to either family are reached. Streams [`Event::TunnelData`],
+    /// [`Event::TunnelCredit`] and [`Event::TunnelEof`]; the final event is
+    /// [`Event::TunnelClosed`].
+    Tunnel {
+        host: String,
+        port: u16,
+    },
+    /// TCP sockets listening on the agent's machine ([`Response::Ports`];
+    /// empty where `/proc/net/tcp` does not exist).
+    ListeningPorts,
+}
+
+/// A listening TCP socket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListeningPort {
+    /// The bound address (`0.0.0.0`, `::`, `127.0.0.1`, …).
+    pub address: std::net::IpAddr,
+    pub port: u16,
+    /// The owning process, when the agent may read its file descriptors.
+    pub pid: Option<u32>,
+    /// The owning process's command line.
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +221,7 @@ pub enum Response {
     Contents(Vec<u8>),
     Kind(Option<FileKind>),
     Path(Option<String>),
+    Ports(Vec<ListeningPort>),
     /// The request succeeded and has nothing to return; for streaming
     /// requests, the stream started.
     Done,
@@ -200,6 +250,17 @@ pub enum Event {
     Exited {
         code: Option<i32>,
     },
+    /// Bytes the tunnel's target sent.
+    TunnelData(Vec<u8>),
+    /// The agent wrote this many of the client's bytes to the target: the
+    /// client may send as many more.
+    TunnelCredit(u32),
+    /// The target ended its output (half-close); the client may still send.
+    TunnelEof,
+    /// The tunnel is closed, after all its data; `error` when it broke.
+    TunnelClosed {
+        error: Option<String>,
+    },
 }
 
 impl Event {
@@ -207,7 +268,9 @@ impl Event {
     pub fn is_final(&self) -> bool {
         matches!(
             self,
-            Self::Exited { .. } | Self::Search(SearchEvent::Done { .. })
+            Self::Exited { .. }
+                | Self::Search(SearchEvent::Done { .. })
+                | Self::TunnelClosed { .. }
         )
     }
 }
@@ -353,6 +416,17 @@ mod tests {
                     rows: 40,
                 },
             },
+            ClientMessage::Request {
+                id: 3,
+                request: Request::Tunnel {
+                    host: "db".into(),
+                    port: 5432,
+                },
+            },
+            ClientMessage::Credit {
+                id: 3,
+                bytes: TUNNEL_WINDOW,
+            },
         ];
         let mut wire = Vec::new();
         for message in &messages {
@@ -369,7 +443,9 @@ mod tests {
 
         let truncated = &wire[..wire.len() - 1];
         let mut reader = truncated;
-        read_frame::<ClientMessage>(&mut reader).unwrap();
+        for _ in 1..messages.len() {
+            read_frame::<ClientMessage>(&mut reader).unwrap();
+        }
         let err = read_frame::<ClientMessage>(&mut reader).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }

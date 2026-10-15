@@ -14,10 +14,12 @@ mod config;
 /// JSONC (comments, trailing commas), shared with run configurations'
 /// `launch.json`.
 pub mod jsonc;
+pub mod ports;
 
 use std::{collections::BTreeMap, io, time::Duration};
 
 pub use config::{Build, Config, Kind, Lifecycle, Mount, ShutdownAction};
+pub use ports::PortsConfig;
 
 /// Quick docker calls (`ps`, `inspect`, `start`).
 const SHORT: Duration = Duration::from_secs(120);
@@ -251,6 +253,8 @@ pub struct Started {
     /// stops it when done, following `shutdownAction`).
     pub started: bool,
     pub shutdown: Shutdown,
+    /// `forwardPorts`, `portsAttributes`, `otherPortsAttributes`.
+    pub ports: PortsConfig,
 }
 
 /// Docker's answer, or an error with its output.
@@ -730,6 +734,7 @@ pub fn up(
         remote_env,
         started,
         shutdown,
+        ports: config.ports(),
     };
     if created {
         for (what, command) in [

@@ -165,6 +165,7 @@ impl Default for MenuBar {
                         plain("workspace::ToggleGit"),
                         plain("workspace::TogglePython"),
                         plain("workspace::ToggleProblems"),
+                        labeled("workspace::TogglePorts", "Ports"),
                         labeled("workspace::ToggleTests", "Tests"),
                         labeled("workspace::ToggleCallHierarchy", "Call Hierarchy"),
                         labeled("workspace::ToggleOutline", "Outline"),
@@ -256,6 +257,7 @@ impl Default for MenuBar {
                         plain("python::Lock"),
                         separator(),
                         plain("workspace::NewTerminal"),
+                        plain("ports::ForwardPort"),
                     ],
                 ),
                 menu(

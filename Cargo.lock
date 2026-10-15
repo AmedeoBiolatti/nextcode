@@ -1359,6 +1359,7 @@ dependencies = [
 name = "devcontainer"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
 ]
@@ -3584,6 +3585,7 @@ dependencies = [
  "ignore",
  "language",
  "lsp",
+ "next_code_agent",
  "nucleo-matcher",
  "parking_lot",
  "python",

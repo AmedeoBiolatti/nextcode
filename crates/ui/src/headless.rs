@@ -72,6 +72,9 @@
 //! | `debug_output` | | `[{category, text}]` (stdout, stderr, console, important, input, result) |
 //! | `debug_stop` | | `null` once the session ended |
 //! | `debug_download_codelldb` | | `{path}`: CodeLLDB downloaded where the project lives |
+//! | `ports_list` | | `{available, listening: [{port, addresses, pid, command}], forwarded: [{port, host, local_port, address, url, origin, label, connections, process}], error}` after a fresh scan (`origin`: `auto` \| `user` \| `dev_container`; `available` false for local projects) |
+//! | `ports_forward` | `port` (number or `"host:port"`), `host`?, `local_port`? (required when given; default: the same port, else the next free one) | `{local_port, url}`; a user port, saved for the project |
+//! | `ports_stop` | `port`, `host`? | `null`; an automatically forwarded port stays unforwarded while it keeps listening |
 //! | `shutdown` | | stops language servers and exits |
 //!
 //! Events: `progress` (while a dev container opens), `ready` (after
@@ -80,8 +83,11 @@
 //! (`type`: `stopped` with `reason`, `thread_id`, `frame`; `running`;
 //! `output` with `category`, `text`; `breakpoints` with `path` and
 //! `[{line, verified, message}]`; `frame_selected`; `terminated` with
-//! `error`, `exit_code`; `adapter_missing` with `message`, `download`).
-
+//! `error`, `exit_code`; `adapter_missing` with `message`, `download`),
+//! `port_forwarded` (`port`, `host`, `local_port`, `origin`; also automatic
+//! and `forwardPorts` ones), `port_released` (`port`, `host`),
+//! `port_available` (`port`, `url`, `label`, `action`: what the GUI does
+//! as `onAutoForward` says: `notify`, `openBrowser`, `silent`).
 use std::{
     collections::{HashMap, HashSet},
     io::{self, BufRead, Write},
@@ -123,6 +129,7 @@ use crate::{
 
 mod debug;
 mod edits;
+mod ports;
 mod runs;
 
 const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -289,7 +296,10 @@ struct Session {
     /// The last `code_actions` answer, for `apply_code_action`.
     code_actions: Option<(Arc<RunningServer>, Vec<lsp::types::CodeActionOrCommand>)>,
     debug: debug::HeadlessDebug,
+    /// Forwarded ports (WSL and container projects).
+    ports: Entity<crate::ports::Ports>,
     _subscription: Subscription,
+    _ports_subscription: Subscription,
 }
 
 fn param_str<'a>(request: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -334,6 +344,10 @@ impl Session {
                 json!({ "message": format!("Settings ignored: {error}") }),
             );
         }
+        let ports = cx.new(|cx| crate::ports::Ports::new(project.clone(), &settings.ports, cx));
+        let ports_subscription = cx.subscribe(&ports, |this, _, event, _| {
+            this.on_ports_event(event);
+        });
         let store = cx.new(|_| LspStore::new(project.clone(), Arc::new(settings)));
         let subscription = cx.subscribe(&store, |this, store, event, cx| {
             this.on_lsp_event(&store, event, cx)
@@ -356,7 +370,9 @@ impl Session {
             _disconnects: disconnects,
             code_actions: None,
             debug: debug::HeadlessDebug::new(cx),
+            ports,
             _subscription: subscription,
+            _ports_subscription: ports_subscription,
         }
     }
 
@@ -525,6 +541,7 @@ impl Session {
                 self.run_command(id, cmd, &request, cx)
             }
             command if command.starts_with("debug_") => self.debug(id, command, &request, cx),
+            command if command.starts_with("ports_") => self.ports(id, command, &request, cx),
             "shutdown" => {
                 self.out.reply(&id, Ok(Value::Null));
                 return true;

@@ -14,6 +14,7 @@ pub enum PanelId {
     Python,
     Terminal,
     Problems,
+    Ports,
     Outline,
     CallHierarchy,
     Debug,
@@ -22,13 +23,14 @@ pub enum PanelId {
 }
 
 impl PanelId {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Files,
         Self::Search,
         Self::Git,
         Self::Python,
         Self::Terminal,
         Self::Problems,
+        Self::Ports,
         Self::Outline,
         Self::CallHierarchy,
         Self::Debug,
@@ -44,6 +46,7 @@ impl PanelId {
             Self::Python => "Python",
             Self::Terminal => "Terminal",
             Self::Problems => "Problems",
+            Self::Ports => "Ports",
             Self::Outline => "Outline",
             Self::CallHierarchy => "Call Hierarchy",
             Self::Debug => "Debug",
@@ -58,9 +61,11 @@ impl PanelId {
                 DockPosition::Left
             }
             Self::Outline | Self::Debug => DockPosition::Right,
-            Self::Terminal | Self::Problems | Self::CallHierarchy | Self::DebugConsole => {
-                DockPosition::Bottom
-            }
+            Self::Terminal
+            | Self::Problems
+            | Self::Ports
+            | Self::CallHierarchy
+            | Self::DebugConsole => DockPosition::Bottom,
         }
     }
 }
@@ -143,6 +148,7 @@ impl Default for Layout {
                 panels: vec![
                     PanelId::Terminal,
                     PanelId::Problems,
+                    PanelId::Ports,
                     PanelId::CallHierarchy,
                     PanelId::DebugConsole,
                 ],
@@ -379,6 +385,7 @@ mod tests {
                 PanelId::Search,
                 PanelId::Terminal,
                 PanelId::Problems,
+                PanelId::Ports,
                 PanelId::CallHierarchy,
                 PanelId::DebugConsole
             ]
@@ -400,6 +407,7 @@ mod tests {
             [
                 PanelId::Problems,
                 PanelId::Terminal,
+                PanelId::Ports,
                 PanelId::CallHierarchy,
                 PanelId::DebugConsole
             ]
@@ -409,6 +417,7 @@ mod tests {
             layout.bottom.panels,
             [
                 PanelId::Terminal,
+                PanelId::Ports,
                 PanelId::CallHierarchy,
                 PanelId::DebugConsole,
                 PanelId::Problems

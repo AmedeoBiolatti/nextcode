@@ -21,6 +21,7 @@ actions!(
         ToggleGit,
         TogglePython,
         ToggleProblems,
+        TogglePorts,
         ToggleCallHierarchy,
         ToggleOutline,
         ToggleBottomDock,
@@ -82,6 +83,7 @@ impl Workspace {
         match panel {
             PanelId::Files => Some(self.file_tree.clone().into()),
             PanelId::Problems => Some(self.problems.clone().into()),
+            PanelId::Ports => Some(self.ports_panel.clone().into()),
             PanelId::Terminal => Some(self.terminal.clone().into()),
             PanelId::Search => Some(self.search.clone().into()),
             PanelId::Git => Some(self.git.clone().into()),
@@ -186,6 +188,22 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.toggle_panel(PanelId::Problems, cx);
+    }
+
+    pub(super) fn toggle_ports(&mut self, _: &TogglePorts, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_panel(PanelId::Ports, cx);
+    }
+
+    /// Forward a Port…: shows the Ports panel with its input focused.
+    pub(super) fn forward_port(
+        &mut self,
+        _: &crate::ports::panel::ForwardPort,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(PanelId::Ports, cx);
+        self.ports_panel
+            .update(cx, |panel, cx| panel.start_forward(window, cx));
     }
 
     pub(super) fn toggle_python(

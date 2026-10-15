@@ -4,6 +4,7 @@
 use std::{
     collections::HashMap,
     io::{self, BufRead, BufReader, Read, Write},
+    net::{Shutdown, TcpStream},
     path::Path,
     process::Child,
     sync::{
@@ -17,10 +18,11 @@ use std::{
 
 use futures::channel::mpsc as async_mpsc;
 use lsp::{Incoming, LanguageServer, LogKind, Logger};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use proto::{
-    AgentMessage, Banner, Batch, ClientMessage, DirEntry, Event, FileKind, PROTOCOL_VERSION,
-    PtySize, Request, RequestId, Response, SearchEvent, SearchLimits, SearchQuery, SpawnRequest,
+    AgentMessage, Banner, Batch, ClientMessage, DirEntry, Event, FileKind, ListeningPort,
+    PROTOCOL_VERSION, PtySize, Request, RequestId, Response, SearchEvent, SearchLimits,
+    SearchQuery, SpawnRequest, TUNNEL_WINDOW,
 };
 use terminal::{Palette, PtyOutput, RemotePty, Terminal, TerminalEvent};
 
@@ -433,6 +435,140 @@ impl AgentClient {
         }
     }
 
+    /// TCP sockets listening on the agent's machine.
+    pub fn listening_ports(&self) -> io::Result<Vec<ListeningPort>> {
+        match self.request(Request::ListeningPorts)? {
+            Response::Ports(ports) => Ok(ports),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Connects to `host:port` from the agent's machine (blocking until it
+    /// connected or failed) and relays that connection to `local` on
+    /// threads, both ways with half-closes, under the protocol's credit
+    /// windows. `closed` is called once both directions ended, with the
+    /// error if the tunnel broke. Dropping the handle closes the tunnel.
+    pub fn tunnel(
+        self: &Arc<Self>,
+        host: &str,
+        port: u16,
+        local: TcpStream,
+        closed: impl FnOnce(Option<String>) + Send + 'static,
+    ) -> io::Result<TunnelHandle> {
+        enum Down {
+            Data(Vec<u8>),
+            Eof,
+            Closed(Option<String>),
+        }
+        let credit = Arc::new(Credit::new());
+        let (down_tx, down_rx) = std_mpsc::channel();
+        let granted = credit.clone();
+        let request = Request::Tunnel {
+            host: host.to_owned(),
+            port,
+        };
+        let handle = Arc::new(self.start_stream(request, move |event| match event {
+            Event::TunnelData(data) => {
+                down_tx.send(Down::Data(data)).ok();
+            }
+            Event::TunnelEof => {
+                down_tx.send(Down::Eof).ok();
+            }
+            Event::TunnelCredit(bytes) => granted.grant(bytes),
+            Event::TunnelClosed { error } => {
+                down_tx.send(Down::Closed(error)).ok();
+            }
+            _ => {}
+        })?);
+        local.set_nodelay(true).ok();
+        // One handle shared by both threads (`&TcpStream` reads and writes),
+        // never `try_clone`d: on Windows a duplicated socket can consider
+        // itself unconnected, and its half-close is then lost.
+        local.set_read_timeout(WAKE)?;
+        let local = Arc::new(local);
+        let closing = Arc::new(AtomicBool::new(false));
+
+        let uplink = {
+            let (handle, credit, local) = (handle.clone(), credit.clone(), local.clone());
+            let closing = closing.clone();
+            thread::Builder::new()
+                .name("tunnel-up".into())
+                .spawn(move || {
+                    let mut buffer = vec![0; 64 * 1024];
+                    while let Some(allowed) = credit.wait() {
+                        match (&*local).read(&mut buffer[..allowed]) {
+                            Ok(0) => {
+                                handle.close_input().ok();
+                                return;
+                            }
+                            Ok(n) => {
+                                credit.spend(n);
+                                if handle.input(buffer[..n].to_vec()).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                            // `WAKE`: check whether the tunnel closed.
+                            Err(err) if is_wake(&err) && !closing.load(Ordering::Acquire) => {}
+                            Err(_) => {
+                                handle.cancel();
+                                return;
+                            }
+                        }
+                    }
+                })?
+        };
+        let client = self.clone();
+        let (down_handle, down_local) = (handle.clone(), local.clone());
+        thread::Builder::new()
+            .name("tunnel-down".into())
+            .spawn(move || {
+                let handle = down_handle;
+                let mut broken = false;
+                let error = loop {
+                    match down_rx.recv() {
+                        Ok(Down::Data(data)) => {
+                            // After a failed write, data is dropped until the
+                            // agent confirms the close.
+                            if broken {
+                                continue;
+                            }
+                            if (&*down_local).write_all(&data).is_err() {
+                                broken = true;
+                                handle.cancel();
+                            } else {
+                                handle.credit(data.len() as u32).ok();
+                            }
+                        }
+                        Ok(Down::Eof) => {
+                            if !broken && down_local.shutdown(Shutdown::Write).is_err() {
+                                broken = true;
+                                handle.cancel();
+                            }
+                        }
+                        Ok(Down::Closed(error)) => break error,
+                        // The agent disconnected.
+                        Err(_) => {
+                            break Some(
+                                client
+                                    .disconnect_reason()
+                                    .unwrap_or_else(|| "the agent disconnected".into()),
+                            );
+                        }
+                    }
+                };
+                down_local.shutdown(Shutdown::Both).ok();
+                credit.close();
+                uplink.join().ok();
+                closed(error);
+            })?;
+        Ok(TunnelHandle {
+            stream: handle,
+            local,
+            closing,
+        })
+    }
+
     /// Watches `root`; batches arrive until the handle is dropped.
     pub fn watch(
         self: &Arc<Self>,
@@ -504,7 +640,7 @@ impl AgentClient {
                     }
                 }
             }
-            Event::Exited { .. } | Event::Watch(_) | Event::Search(_) => {}
+            _ => {}
         })?;
         let reader = ChannelReader {
             chunks: stdout_rx,
@@ -544,7 +680,7 @@ impl AgentClient {
                 stdout_tx.send(data).ok();
             }
             Event::Stderr(data) => stderr(&data),
-            Event::Exited { .. } | Event::Watch(_) | Event::Search(_) => {}
+            _ => {}
         })?;
         let handle = Arc::new(handle);
         Ok(PipedProcess {
@@ -598,7 +734,7 @@ impl AgentClient {
                     output.code = code;
                     return Ok(output);
                 }
-                Ok(Event::Watch(_) | Event::Search(_)) => {}
+                Ok(_) => {}
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {
                     drop(handle);
                     return Err(io::Error::new(
@@ -640,7 +776,7 @@ impl AgentClient {
             Event::Exited { code } => {
                 output_tx.send(PtyOutput::Exited(code)).ok();
             }
-            Event::Watch(_) | Event::Search(_) => {}
+            _ => {}
         })?;
         Terminal::attach(
             columns,
@@ -696,6 +832,13 @@ impl StreamHandle {
     pub fn close_input(&self) -> io::Result<()> {
         self.client.send(&ClientMessage::CloseInput { id: self.id })
     }
+
+    /// Lets a tunnel's agent send `bytes` more.
+    fn credit(&self, bytes: u32) -> io::Result<()> {
+        self.client
+            .send(&ClientMessage::Credit { id: self.id, bytes })
+    }
+
     pub fn cancel(&self) {
         self.client
             .send(&ClientMessage::Cancel { id: self.id })
@@ -706,6 +849,94 @@ impl StreamHandle {
 impl Drop for StreamHandle {
     fn drop(&mut self) {
         self.cancel();
+    }
+}
+
+/// A running tunnel (see [`AgentClient::tunnel`]); dropping it closes the
+/// connection both ways.
+pub struct TunnelHandle {
+    stream: Arc<StreamHandle>,
+    local: Arc<TcpStream>,
+    /// Tells relay threads woken by [`WAKE`] to stop.
+    closing: Arc<AtomicBool>,
+}
+
+impl TunnelHandle {
+    pub fn close(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.stream.cancel();
+        self.local.shutdown(Shutdown::Both).ok();
+    }
+}
+
+impl Drop for TunnelHandle {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// How often the uplink thread, blocked reading the local socket, wakes to
+/// see whether its tunnel closed. Windows does not wake a blocked `recv` on
+/// `shutdown` (Linux does), so an idle application would keep a stopped
+/// tunnel's threads alive and its `closed` callback (the forwarder's
+/// connection count) pending. A timed-out `recv` consumed nothing.
+const WAKE: Option<Duration> = if cfg!(windows) {
+    Some(Duration::from_millis(200))
+} else {
+    None
+};
+
+/// A socket timeout (from [`WAKE`]).
+fn is_wake(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// How many bytes a tunnel's client may still send; `None` once closed.
+struct Credit {
+    bytes: Mutex<Option<u64>>,
+    changed: Condvar,
+}
+
+impl Credit {
+    fn new() -> Self {
+        Self {
+            bytes: Mutex::new(Some(u64::from(TUNNEL_WINDOW))),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Waits for credit; the most to send next (64 KiB at most), `None`
+    /// once closed.
+    fn wait(&self) -> Option<usize> {
+        let mut bytes = self.bytes.lock();
+        loop {
+            match *bytes {
+                None => return None,
+                Some(0) => self.changed.wait(&mut bytes),
+                Some(n) => return Some(n.min(64 * 1024) as usize),
+            }
+        }
+    }
+
+    fn spend(&self, n: usize) {
+        if let Some(bytes) = &mut *self.bytes.lock() {
+            *bytes = bytes.saturating_sub(n as u64);
+        }
+    }
+
+    fn grant(&self, n: u32) {
+        if let Some(bytes) = &mut *self.bytes.lock() {
+            *bytes += u64::from(n);
+            self.changed.notify_all();
+        }
+    }
+
+    fn close(&self) {
+        *self.bytes.lock() = None;
+        self.changed.notify_all();
     }
 }
 

@@ -24,14 +24,19 @@ struct Headless {
 }
 
 impl Headless {
-    fn start(root: &PathBuf) -> Self {
+    fn start(root: &std::path::Path) -> Self {
         Self::start_with(root, &[])
     }
 
-    fn start_with(root: &PathBuf, env: &[(&str, &std::path::Path)]) -> Self {
+    fn start_with(root: &std::path::Path, env: &[(&str, &std::path::Path)]) -> Self {
+        Self::launch(&[root.as_os_str()], env)
+    }
+
+    /// `next_code --headless <args>`.
+    fn launch(args: &[&std::ffi::OsStr], env: &[(&str, &std::path::Path)]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_next_code"))
             .arg("--headless")
-            .arg(root)
+            .args(args)
             .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1332,5 +1337,185 @@ fn headless_mode_debugs_a_cargo_binary_with_lldb() {
 
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
     assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Removes the dev containers created for `folder` (by VS Code's label).
+struct DevContainers(String);
+
+impl Drop for DevContainers {
+    fn drop(&mut self) {
+        let label = format!("label=devcontainer.local_folder={}", self.0);
+        let Ok(output) = Command::new("docker")
+            .args(["ps", "-aq", "--filter", &label])
+            .output()
+        else {
+            return;
+        };
+        for id in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+            Command::new("docker").args(["rm", "-f", id]).output().ok();
+        }
+    }
+}
+
+/// A plain HTTP GET through `localhost:port`; the whole response.
+fn http_get(port: u16) -> String {
+    use std::io::Read;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+/// Port forwarding against a real dev container: `forwardPorts` on
+/// connect, auto-forwarding of a server started inside, HTTP through the
+/// local port, manual forward/stop, release when the server exits.
+#[test]
+#[ignore = "needs Docker (python:3.12-slim) and a built Linux agent (NEXT_CODE_WSL_AGENT)"]
+fn headless_mode_forwards_dev_container_ports() {
+    let root = std::env::temp_dir().join(format!("next_code_ports_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join(".devcontainer")).unwrap();
+    fs::write(root.join("hello.txt"), "hello\n").unwrap();
+    fs::write(
+        root.join(".devcontainer/devcontainer.json"),
+        r#"{ "image": "python:3.12-slim",
+             "forwardPorts": [9100],
+             "portsAttributes": { "8000": { "label": "Web" }, "8001": { "onAutoForward": "silent" } } }"#,
+    )
+    .unwrap();
+    let root = root.canonicalize().unwrap();
+    let containers = DevContainers(root.to_string_lossy().into_owned());
+    let state = root.join(".state");
+    let mut headless = Headless::launch(
+        &["--devcontainer".as_ref(), root.as_os_str()],
+        &[("XDG_DATA_HOME", &state)],
+    );
+    let ready = headless.next(|line| matches!(line["event"].as_str(), Some("ready" | "error")));
+    assert_eq!(ready["event"], "ready", "{ready}");
+
+    // `forwardPorts`, with nothing listening yet.
+    let configured =
+        headless.next(|line| line["event"] == "port_forwarded" && line["port"] == 9100);
+    assert_eq!(configured["origin"], "dev_container", "{configured}");
+
+    let started = headless.call(json!({ "cmd": "exec", "command":
+        "setsid python3 -m http.server 8000 >/tmp/http8000.log 2>&1 </dev/null & \
+         setsid python3 -m http.server 8001 >/tmp/http8001.log 2>&1 </dev/null & echo $! >/tmp/http8001.pid" }));
+    assert_eq!(started["result"]["code"], 0, "{started}");
+
+    let auto = headless.next(|line| line["event"] == "port_forwarded" && line["port"] == 8000);
+    assert_eq!(auto["origin"], "auto", "{auto}");
+    let local = auto["local_port"].as_u64().unwrap() as u16;
+    let available = headless.next(|line| line["event"] == "port_available" && line["port"] == 8000);
+    assert_eq!(available["action"], "notify", "{available}");
+    assert_eq!(available["label"], "Web", "{available}");
+    assert_eq!(available["url"], format!("http://localhost:{local}"));
+    let silent = headless.next(|line| line["event"] == "port_available" && line["port"] == 8001);
+    assert_eq!(silent["action"], "silent", "{silent}");
+
+    let page = http_get(local);
+    assert!(page.starts_with("HTTP/1.0 200"), "{page}");
+    assert!(page.contains("hello.txt"), "{page}");
+
+    let list = headless.call(json!({ "cmd": "ports_list" }));
+    let result = &list["result"];
+    assert_eq!(result["available"], true, "{list}");
+    let listening = result["listening"].as_array().unwrap();
+    let server = listening
+        .iter()
+        .find(|l| l["port"] == 8000)
+        .expect("8000 listens");
+    assert!(
+        server["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("http.server 8000"),
+        "{server}"
+    );
+    let forwarded = result["forwarded"].as_array().unwrap();
+    let web = forwarded
+        .iter()
+        .find(|f| f["port"] == 8000)
+        .expect("8000 forwarded");
+    assert_eq!(web["label"], "Web");
+    assert_eq!(web["local_port"], local);
+    assert!(
+        forwarded
+            .iter()
+            .any(|f| f["port"] == 9100 && f["origin"] == "dev_container")
+    );
+
+    // A user port, by hand, then stopped.
+    let manual = headless.call(json!({ "cmd": "ports_forward", "port": 9200 }));
+    let manual_port = manual["result"]["local_port"].as_u64().expect("local port") as u16;
+    assert!(std::net::TcpStream::connect(("127.0.0.1", manual_port)).is_ok());
+    let stop = headless.call(json!({ "cmd": "ports_stop", "port": 9200 }));
+    assert_eq!(stop["ok"], true, "{stop}");
+    // One that stays, to be restored on reopen.
+    let kept = headless.call(json!({ "cmd": "ports_forward", "port": "localhost:9201" }));
+    assert!(kept["result"]["local_port"].is_u64(), "{kept}");
+
+    // Stopping the automatic port closes its listener; it is not
+    // forwarded again while the server keeps listening.
+    let stop = headless.call(json!({ "cmd": "ports_stop", "port": 8000 }));
+    assert_eq!(stop["ok"], true, "{stop}");
+    headless.next(|line| line["event"] == "port_released" && line["port"] == 8000);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", local)).is_ok() {
+        assert!(Instant::now() < deadline, "localhost:{local} still accepts");
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_secs(3));
+    let list = headless.call(json!({ "cmd": "ports_list" }));
+    assert!(
+        !list["result"]["forwarded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["port"] == 8000),
+        "{list}"
+    );
+
+    // A server that exits releases its automatic port.
+    let killed =
+        headless.call(json!({ "cmd": "exec", "command": "kill $(cat /tmp/http8001.pid)" }));
+    assert_eq!(killed["result"]["code"], 0, "{killed}");
+    headless.next(|line| line["event"] == "port_released" && line["port"] == 8001);
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+
+    // Reopened (once the detached `docker stop` of the first session is
+    // done): the user port is forwarded again.
+    let label = format!("label=devcontainer.local_folder={}", root.to_string_lossy());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        let running = Command::new("docker")
+            .args(["ps", "-q", "--filter", &label])
+            .output()
+            .unwrap();
+        if running.stdout.trim_ascii().is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let mut headless = Headless::launch(
+        &["--devcontainer".as_ref(), root.as_os_str()],
+        &[("XDG_DATA_HOME", &state)],
+    );
+    let restored = headless.next(|line| line["event"] == "port_forwarded" && line["port"] == 9201);
+    assert_eq!(restored["origin"], "user", "{restored}");
+    let stop = headless.call(json!({ "cmd": "ports_stop", "port": 9201 }));
+    assert_eq!(stop["ok"], true, "{stop}");
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    drop(containers);
     fs::remove_dir_all(&root).ok();
 }

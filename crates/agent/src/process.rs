@@ -17,6 +17,7 @@ use crate::EventSink;
 /// How long a cancelled process may take to exit before it is killed.
 pub(crate) const GRACE: Duration = Duration::from_secs(2);
 
+/// A stream the client writes to: a process, or a TCP tunnel.
 pub(crate) trait Process: Send + Sync {
     fn write(&self, data: Vec<u8>);
     /// Ends the input: a piped process then reads end of file.
@@ -25,6 +26,8 @@ pub(crate) trait Process: Send + Sync {
     /// Asks the process to end (closes its input), killing it after [`GRACE`].
     fn terminate(&self);
     fn kill(&self);
+    /// The client delivered this many bytes (tunnels' flow control).
+    fn credit(&self, _bytes: u32) {}
 }
 
 pub(crate) fn spawn(request: SpawnRequest, sink: EventSink) -> io::Result<Arc<dyn Process>> {

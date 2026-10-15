@@ -115,6 +115,43 @@ reused. A stopped one is started; one that no longer starts (e.g. a mount
 from an old session is gone) is recreated. Containers the editor created or
 started are stopped as `shutdownAction` says when its project tab closes.
 
+## Port forwarding (dev containers and WSL)
+
+Like VS Code's Ports view: a server running where the project lives is
+reachable on `localhost` here. The **Ports** panel (bottom dock, View >
+Ports; Run > Forward a Port…) lists forwarded ports: Port (with its
+`portsAttributes` label), Forwarded Address (`localhost:NNNN`, click to open
+it in the browser), Running Process, Origin (Auto Forwarded, User Forwarded,
+devcontainer.json) and open connections, with Open, Copy (the local
+address), Port… (change the local port) and Stop.
+
+- **Forward a Port…** takes `8000` or `host:port` (`db:5432`: the agent
+  connects to host `db`, e.g. another compose service). User ports are
+  saved per project and forwarded again on reopen.
+- **Automatic**: the agent's listening TCP sockets (`/proc/net/tcp{,6}`)
+  are polled every 2 s; new ones are forwarded and announced ("Your
+  application running on port 8000 is available." with Open in Browser). In
+  a container, ports already listening when it opens count too; in WSL only
+  ports that start listening afterwards (the distro's services, which WSL
+  forwards itself, are left alone). An automatically forwarded port is
+  released when its server stops; one the user stopped is not forwarded
+  again while it keeps listening. The editor's own debug adapters are
+  skipped. Settings: `"ports": { "auto_forward": false }` turns it off.
+- **devcontainer.json**: `forwardPorts` (numbers, `"8000"` or
+  `"host:port"`) are forwarded on connect, even before anything listens;
+  `portsAttributes` (keys: a port, a range `"8000-8010"`, `"host:port"`, or
+  a regular expression matched against the process command line) give
+  `label`, `protocol` (`http`/`https`, for the browser URL),
+  `onAutoForward` (`notify` (default), `openBrowser`, `openBrowserOnce`,
+  `openPreview` (opens the browser), `silent`, `ignore`) and
+  `requireLocalPort`; `otherPortsAttributes` applies to ports no key
+  matches. `elevateIfNeeded` is ignored.
+- The local port is the same number on 127.0.0.1 if it is free, else the
+  next free one (WSL's own localhost forwarding may hold the same number).
+  Each local connection becomes a tunnel through the agent connection
+  (protocol 4), so nothing listens inside the container.
+- Limits: TCP only (no UDP); local projects have nothing to forward.
+
 ## Python (uv)
 
 The **Python** panel (left dock) reads `pyproject.toml` and `uv.lock`:
@@ -893,7 +930,9 @@ the project lives), `git_status`, `git_diff`, `git_apply_hunk`, `git_stage`,
 `debug_step`, `debug_pause`, `debug_stack`, `debug_select_frame`,
 `debug_variables`, `debug_evaluate`, `debug_output`, `debug_stop`,
 `debug_download_codelldb` (with `debug_event` events: `stopped`, `running`,
-`output`, `breakpoints`, `terminated`, `adapter_missing`), `shutdown`;
+`output`, `breakpoints`, `terminated`, `adapter_missing`), `ports_list`,
+`ports_forward`, `ports_stop` (with `port_forwarded`, `port_released`,
+`port_available` events), `shutdown`;
 `--devcontainer` opens the folder's container (with `progress` events).
 Parameters and
 results are documented in

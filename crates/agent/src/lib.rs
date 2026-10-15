@@ -1,11 +1,14 @@
 //! `next_code_agent`: serves the [`proto`] protocol on a byte stream and runs
-//! the requested project operations (files, watching, search, processes) on
-//! the machine it runs on. The editor starts it inside a WSL distro and talks
-//! to it over the process's stdin/stdout.
+//! the requested project operations (files, watching, search, processes,
+//! TCP tunnels for port forwarding) on the machine it runs on. The editor
+//! starts it inside a WSL distro or dev container and talks to it over the
+//! process's stdin/stdout.
 
+mod ports;
 mod process;
 #[cfg(target_os = "linux")]
 mod pty;
+mod tunnel;
 
 use std::{
     collections::HashMap,
@@ -98,6 +101,7 @@ enum Stream {
     Watch(#[allow(dead_code)] watcher::ProjectWatcher),
     /// Dropping the handle cancels the search.
     Search(#[allow(dead_code)] search::SearchHandle),
+    /// A process or a tunnel.
     Process(Arc<dyn Process>),
 }
 
@@ -146,7 +150,7 @@ impl EventSink {
 fn is_streaming(request: &Request) -> bool {
     matches!(
         request,
-        Request::Watch { .. } | Request::Search { .. } | Request::Spawn(_)
+        Request::Watch { .. } | Request::Search { .. } | Request::Spawn(_) | Request::Tunnel { .. }
     )
 }
 
@@ -225,6 +229,11 @@ impl Agent {
             ClientMessage::Resize { id, size } => {
                 if let Some(process) = self.process(id) {
                     process.resize(size);
+                }
+            }
+            ClientMessage::Credit { id, bytes } => {
+                if let Some(process) = self.process(id) {
+                    process.credit(bytes);
                 }
             }
             ClientMessage::CloseInput { id } => {
@@ -336,6 +345,12 @@ impl Agent {
                 self.install(id, Stream::Process(process));
                 Ok(Response::Done)
             }
+            Request::Tunnel { host, port } => {
+                let tunnel = tunnel::open(&host, port, self.sink(id))?;
+                self.install(id, Stream::Process(tunnel));
+                Ok(Response::Done)
+            }
+            Request::ListeningPorts => Ok(Response::Ports(ports::listening())),
         }
     }
 

@@ -169,6 +169,8 @@ struct ContainerHost {
     /// Set when the editor created or started the container: it is stopped
     /// (as `shutdownAction` says) when the project is closed.
     stop: Option<Vec<String>>,
+    /// The configuration's port forwarding settings.
+    ports: devcontainer::PortsConfig,
 }
 
 impl Drop for ContainerHost {
@@ -305,6 +307,7 @@ impl Project {
                 .started
                 .then(|| devcontainer::stop_args(&started.shutdown))
                 .flatten(),
+            ports: started.ports.clone(),
         };
         let connection = remote::container::connect(&target, &started.workspace_folder)?;
         Ok(Self(Arc::new(Inner {
@@ -395,6 +398,36 @@ impl Project {
 
     pub fn is_remote(&self) -> bool {
         matches!(self.0.backend, Backend::Remote { .. })
+    }
+
+    /// The agent serving a WSL or container project.
+    pub fn agent(&self) -> Option<Arc<AgentClient>> {
+        match &self.0.backend {
+            Backend::Local => None,
+            Backend::Remote { client, .. } => Some(client.clone()),
+        }
+    }
+
+    pub fn in_container(&self) -> bool {
+        matches!(
+            self.0.backend,
+            Backend::Remote {
+                host: RemoteHost::Container(_),
+                ..
+            }
+        )
+    }
+
+    /// `forwardPorts` and port attributes of the dev container (none for
+    /// other projects).
+    pub fn ports_config(&self) -> devcontainer::PortsConfig {
+        match &self.0.backend {
+            Backend::Remote {
+                host: RemoteHost::Container(container),
+                ..
+            } => container.ports.clone(),
+            _ => devcontainer::PortsConfig::default(),
+        }
     }
 
     /// Receives why the agent disconnected; `None` for local projects.

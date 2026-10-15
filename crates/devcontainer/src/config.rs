@@ -1,12 +1,15 @@
 //! `devcontainer.json`: the parts of the spec this editor implements.
-//! Unknown properties (editor customizations, ports, …) are ignored.
+//! Unknown properties (editor customizations, …) are ignored.
 
 use std::{collections::BTreeMap, io};
 
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::jsonc;
+use crate::{
+    jsonc,
+    ports::{self, ForwardPort, PortAttributes, PortPattern, PortsConfig},
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +55,12 @@ pub struct Config {
     /// Dev Container Features are not installed; their names are reported.
     #[serde(default)]
     pub features: BTreeMap<String, Value>,
+    /// Container ports forwarded when the editor connects.
+    #[serde(default, deserialize_with = "ports::forward_ports")]
+    pub forward_ports: Vec<ForwardPort>,
+    #[serde(default, deserialize_with = "ports::ports_attributes")]
+    pub ports_attributes: Vec<(PortPattern, PortAttributes)>,
+    pub other_ports_attributes: Option<PortAttributes>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -174,6 +183,15 @@ pub enum Kind<'a> {
 }
 
 impl Config {
+    /// `forwardPorts`, `portsAttributes` and `otherPortsAttributes`.
+    pub fn ports(&self) -> PortsConfig {
+        PortsConfig {
+            forward: self.forward_ports.clone(),
+            attributes: self.ports_attributes.clone(),
+            other: self.other_ports_attributes.clone(),
+        }
+    }
+
     pub fn parse(text: &str) -> io::Result<Self> {
         serde_json::from_str(&jsonc::to_json(text)).map_err(|err| {
             io::Error::new(
