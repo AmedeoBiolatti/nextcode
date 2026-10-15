@@ -34,6 +34,19 @@ const LABELS: &[(&str, &str)] = &[
     ("workspace::ResetLayout", "Reset Layout"),
     ("workspace::NewTerminal", "New Terminal"),
     ("workspace::ReopenInContainer", "Reopen in Dev Container"),
+    ("workspace::SplitRight", "Split Editor Right"),
+    ("workspace::SplitDown", "Split Editor Down"),
+    ("workspace::FocusFirstPane", "Focus First Editor Pane"),
+    ("workspace::FocusSecondPane", "Focus Second Editor Pane"),
+    ("workspace::FocusThirdPane", "Focus Third Editor Pane"),
+    ("workspace::FocusNextPane", "Focus Next Editor Pane"),
+    ("workspace::FocusPreviousPane", "Focus Previous Editor Pane"),
+    ("workspace::MoveTabToNextPane", "Move Tab to Next Pane"),
+    (
+        "workspace::MoveTabToPreviousPane",
+        "Move Tab to Previous Pane",
+    ),
+    ("workspace::ClosePane", "Close Editor Pane"),
     ("git::Branches", "Branches…"),
     ("git::Worktrees", "Worktrees…"),
     ("git::History", "History"),
@@ -54,6 +67,17 @@ const LABELS: &[(&str, &str)] = &[
     ("editor::NextDiagnostic", "Next Problem"),
     ("editor::PrevDiagnostic", "Previous Problem"),
     ("editor::ShowCompletions", "Show Completions"),
+    ("editor::SelectNextOccurrence", "Add Next Occurrence"),
+    ("editor::Indent", "Indent Lines"),
+    ("editor::Outdent", "Outdent Lines"),
+    ("editor::JumpToBracket", "Go to Matching Bracket"),
+    ("editor::GoToLine", "Go to Line…"),
+    ("editor::Find", "Find…"),
+    ("editor::FindReplace", "Replace…"),
+    ("editor::ReplaceNext", "Replace"),
+    ("editor::ToggleMatchCase", "Find: Toggle Match Case"),
+    ("editor::ToggleWholeWord", "Find: Toggle Whole Word"),
+    ("editor::ToggleRegex", "Find: Toggle Regular Expression"),
 ];
 
 /// Namespaces of modal pickers: their actions only mean something inside.
@@ -99,6 +123,10 @@ const HIDDEN: &[&str] = &[
     "editor::SelectNextCompletion",
     "editor::ConfirmCompletion",
     "editor::CloseCompletions",
+    "editor::CollapseSelections",
+    "editor::CloseFind",
+    "editor::ConfirmGoToLine",
+    "editor::CancelGoToLine",
     "app::OpenRecentProject",
 ];
 

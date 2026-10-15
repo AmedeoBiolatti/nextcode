@@ -34,8 +34,9 @@ impl Editor {
         cx.notify();
     }
 
+    /// The primary cursor.
     pub fn cursor(&self) -> usize {
-        self.head
+        self.primary().head
     }
 
     /// Moves the cursor to `offset` (clamped to a character boundary) and
@@ -45,9 +46,8 @@ impl Editor {
         let offset = self
             .buffer
             .offset_of(self.buffer.point(offset), Encoding::Utf8);
-        self.anchor = offset;
-        self.head = offset;
-        self.goal_column = None;
+        self.selections = SelectionSet::single(Selection::cursor(offset));
+        self.auto_closed.clear();
         self.completion = None;
         self.center_cursor = true;
         cx.notify();
@@ -77,7 +77,7 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.request_definition(self.head, cx);
+        self.request_definition(self.primary().head, cx);
     }
 
     pub(super) fn request_definition(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -146,7 +146,7 @@ impl Editor {
         ) {
             return self.show_notice("The language server cannot find references", cx);
         }
-        let Some(position) = self.position_params(self.head) else {
+        let Some(position) = self.position_params(self.primary().head) else {
             return;
         };
         let params = ReferenceParams {

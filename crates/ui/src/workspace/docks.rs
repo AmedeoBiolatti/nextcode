@@ -47,7 +47,7 @@ const HANDLE_SIZE: f32 = 5.;
 pub(super) struct DraggedPanel(PanelId);
 
 /// What follows the mouse while a tab is dragged.
-struct DragPreview(SharedString);
+pub(super) struct DragPreview(pub(super) SharedString);
 
 impl Render for DragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -221,6 +221,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(split) = self.pane_resize {
+            return self.resize_split(split, event.position, cx);
+        }
         let Some(position) = self.resizing else {
             return;
         };
@@ -243,6 +246,10 @@ impl Workspace {
     ) {
         if self.resizing.take().is_some() {
             self.layout_changed(cx);
+        }
+        if self.pane_resize.take().is_some() {
+            self.schedule_session_save(cx);
+            cx.notify();
         }
     }
 

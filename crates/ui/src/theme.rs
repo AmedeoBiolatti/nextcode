@@ -234,6 +234,12 @@ ui_colors! {
     /// Selected text and search matches.
     selection,
     cursor,
+    /// Find matches in the editor; the current one is painted over the
+    /// selection, so it should be translucent.
+    find_match,
+    find_match_active,
+    /// The bracket pair at the cursor.
+    bracket_match,
     /// Diff line backgrounds.
     diff_added,
     diff_removed,
@@ -588,11 +594,18 @@ static LOADED: Mutex<Option<Loaded>> = Mutex::new(None);
 
 /// `"semantic_highlighting"` from `settings.json` as of the last refresh.
 static SEMANTIC_HIGHLIGHTING: AtomicBool = AtomicBool::new(true);
+/// `"auto_close_brackets"` from `settings.json` as of the last refresh.
+static AUTO_CLOSE_BRACKETS: AtomicBool = AtomicBool::new(true);
 
 /// Whether editors layer language-server semantic tokens over syntax
 /// highlighting; follows `settings.json` like the theme.
 pub fn semantic_highlighting() -> bool {
     SEMANTIC_HIGHLIGHTING.load(Ordering::Relaxed)
+}
+
+/// Whether typing an opening bracket or quote inserts its closer.
+pub fn auto_close_brackets() -> bool {
+    AUTO_CLOSE_BRACKETS.load(Ordering::Relaxed)
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -621,6 +634,7 @@ pub fn refresh(cx: &mut App) {
             let (settings, problem) = Settings::load_from(path);
             let problem = problem.map(|problem| format!("Settings ignored: {problem}"));
             SEMANTIC_HIGHLIGHTING.store(settings.semantic_highlighting, Ordering::Relaxed);
+            AUTO_CLOSE_BRACKETS.store(settings.auto_close_brackets, Ordering::Relaxed);
             (settings.theme, problem)
         }
         None => (None, None),

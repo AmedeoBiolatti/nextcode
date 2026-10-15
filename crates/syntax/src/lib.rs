@@ -133,6 +133,41 @@ impl Language {
         }
     }
 
+    /// Line comment token, if the language has one (`#`, `//`, `--`).
+    pub fn line_comment(self) -> Option<&'static str> {
+        match self {
+            Self::Bash | Self::Dockerfile | Self::Python | Self::Toml | Self::Yaml => Some("#"),
+            Self::C
+            | Self::Cpp
+            | Self::Go
+            | Self::JavaScript
+            | Self::Json
+            | Self::Rust
+            | Self::Tsx
+            | Self::TypeScript => Some("//"),
+            Self::Sql => Some("--"),
+            Self::Css | Self::Html | Self::Markdown => None,
+        }
+    }
+
+    /// Block comment delimiters, if the language has them.
+    pub fn block_comment(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::C
+            | Self::Cpp
+            | Self::Css
+            | Self::Go
+            | Self::JavaScript
+            | Self::Json
+            | Self::Rust
+            | Self::Sql
+            | Self::Tsx
+            | Self::TypeScript => Some(("/*", "*/")),
+            Self::Html | Self::Markdown => Some(("<!--", "-->")),
+            Self::Bash | Self::Dockerfile | Self::Python | Self::Toml | Self::Yaml => None,
+        }
+    }
+
     fn config(self) -> &'static LanguageConfig {
         macro_rules! config {
             ($language:ident) => {{
@@ -561,6 +596,56 @@ impl Syntax {
             }
         }
         spans
+    }
+
+    /// The bracket matching the `(`, `)`, `[`, `]`, `{` or `}` token at
+    /// `offset`, found among the token's siblings in the tree. `None` when
+    /// the character there is no bracket token (e.g. inside a string or
+    /// comment, or prose); `Some(None)` when the token has no partner.
+    pub fn bracket_partner(&self, offset: usize) -> Option<Option<usize>> {
+        let tree = self.tree.as_ref()?;
+        let node = tree
+            .root_node()
+            .descendant_for_byte_range(offset, offset + 1)?;
+        let (open, close, forward) = match node.kind() {
+            "(" => ("(", ")", true),
+            "[" => ("[", "]", true),
+            "{" => ("{", "}", true),
+            ")" => ("(", ")", false),
+            "]" => ("[", "]", false),
+            "}" => ("{", "}", false),
+            _ => return None,
+        };
+        if node.is_named() || node.start_byte() != offset || node.end_byte() != offset + 1 {
+            return None;
+        }
+        let (same, other) = if forward {
+            (open, close)
+        } else {
+            (close, open)
+        };
+        fn step(node: tree_sitter::Node<'_>, forward: bool) -> Option<tree_sitter::Node<'_>> {
+            if forward {
+                node.next_sibling()
+            } else {
+                node.prev_sibling()
+            }
+        }
+        let mut depth = 0usize;
+        let mut sibling = step(node, forward);
+        while let Some(candidate) = sibling {
+            let kind = candidate.kind();
+            if kind == same && !candidate.is_missing() {
+                depth += 1;
+            } else if kind == other {
+                if depth == 0 {
+                    return Some((!candidate.is_missing()).then(|| candidate.start_byte()));
+                }
+                depth -= 1;
+            }
+            sibling = step(candidate, forward);
+        }
+        Some(None)
     }
 }
 
@@ -996,5 +1081,47 @@ mod tests {
             fresh.tree.as_ref().unwrap().root_node().to_sexp()
         );
         assert_eq!(highlighted(&syntax, &buffer), highlighted(&fresh, &buffer));
+    }
+
+    #[test]
+    fn every_language_has_a_comment_syntax() {
+        for language in Language::ALL {
+            assert!(
+                language.line_comment().is_some() || language.block_comment().is_some(),
+                "{} has no comments",
+                language.name()
+            );
+        }
+        assert_eq!(Language::Python.line_comment(), Some("#"));
+        assert_eq!(Language::Sql.line_comment(), Some("--"));
+        assert_eq!(Language::Html.block_comment(), Some(("<!--", "-->")));
+    }
+
+    #[test]
+    fn bracket_partners_come_from_the_tree_and_skip_strings() {
+        let source = "fn f(a: [u8; 2]) { g(\"(\", (1)); }";
+        let buffer = Buffer::new(source);
+        let syntax = Syntax::new(Language::Rust, &buffer);
+        let at = |pattern: &str, nth: usize| source.match_indices(pattern).nth(nth).unwrap().0;
+        // `f(` ↔ the `)` before ` {`.
+        assert_eq!(syntax.bracket_partner(at("(", 0)), Some(Some(at(")", 0))));
+        assert_eq!(syntax.bracket_partner(at(")", 0)), Some(Some(at("(", 0))));
+        assert_eq!(syntax.bracket_partner(at("[", 0)), Some(Some(at("]", 0))));
+        assert_eq!(syntax.bracket_partner(at("{", 0)), Some(Some(at("}", 0))));
+        // `g(` skips the `(` inside the string and the nested `(1)`.
+        assert_eq!(
+            syntax.bracket_partner(at("g(", 0) + 1),
+            Some(Some(at(")", 2)))
+        );
+        assert_eq!(
+            syntax.bracket_partner(at(")", 2)),
+            Some(Some(at("g(", 0) + 1))
+        );
+        assert_eq!(
+            syntax.bracket_partner(at("\"(", 0) + 1),
+            None,
+            "inside a string"
+        );
+        assert_eq!(syntax.bracket_partner(at("fn", 0)), None);
     }
 }

@@ -46,6 +46,12 @@ use crate::{
 };
 
 mod docks;
+mod panes;
+mod session;
+#[cfg(test)]
+mod tests;
+
+use panes::{Pane, PaneId, PaneNode};
 
 actions!(
     workspace,
@@ -86,13 +92,12 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-w", CloseTab, ctx),
         KeyBinding::new("secondary-p", ToggleFileFinder, ctx),
-        // VS Code and JetBrains defaults.
+        // VS Code defaults (Ctrl+Alt+Left/Right move tabs between panes).
         KeyBinding::new("alt-left", GoBack, ctx),
         KeyBinding::new("alt-right", GoForward, ctx),
-        KeyBinding::new("secondary-alt-left", GoBack, ctx),
-        KeyBinding::new("secondary-alt-right", GoForward, ctx),
     ]);
     docks::bind_keys(cx);
+    panes::bind_keys(cx);
 }
 
 /// Work for the first window started before gpui (whose platform setup
@@ -144,6 +149,9 @@ struct Tab {
     /// The edited file, the file a diff is about, or the project root.
     path: PathBuf,
     title: SharedString,
+    /// The view of its file that holds the language server document (one
+    /// per file, following focus between panes).
+    lsp_owner: bool,
     _subscription: Subscription,
 }
 
@@ -170,6 +178,15 @@ impl Tab {
             TabContent::Diff(diff) => diff.clone().into(),
             TabContent::History(view) => view.clone().into(),
             TabContent::Compare(view) => view.clone().into(),
+        }
+    }
+
+    fn entity_id(&self) -> gpui::EntityId {
+        match &self.content {
+            TabContent::Editor(editor) => editor.entity_id(),
+            TabContent::Diff(diff) => diff.entity_id(),
+            TabContent::History(view) => view.entity_id(),
+            TabContent::Compare(view) => view.entity_id(),
         }
     }
 
@@ -223,8 +240,18 @@ pub struct Workspace {
     back: Vec<NavEntry>,
     forward: Vec<NavEntry>,
     lsp_store: Entity<LspStore>,
-    tabs: Vec<Tab>,
-    active: usize,
+    /// Editor panes in reading order (never empty); see `panes`.
+    panes: Vec<Pane>,
+    pane_tree: PaneNode,
+    active_pane: PaneId,
+    /// Source of pane and split ids.
+    next_id: usize,
+    /// Split whose handle is being dragged.
+    pane_resize: Option<usize>,
+    /// `restore_session` from settings.json.
+    restore_session: bool,
+    /// Pending debounced session write.
+    session_save: Option<Task<()>>,
     notice: Option<SharedString>,
     /// Suggestions with buttons, above the editor.
     offers: Vec<Offer>,
@@ -268,6 +295,7 @@ impl Workspace {
         );
 
         let (settings, settings_error) = Settings::load();
+        let restore_session = settings.restore_session;
         let lsp_store = cx.new(|_| LspStore::new(project.clone(), Arc::new(settings)));
         let lsp_subscription = cx.subscribe(&lsp_store, |this, _, event, cx| {
             this.on_lsp_event(event, cx);
@@ -409,7 +437,18 @@ impl Workspace {
         })
         .detach();
         recent::record(&project.location());
+        // The session is written when the project closes (its tab or
+        // window, or the app quits) and restored once the workspace exists.
+        let release_subscription = cx.on_release(|this, cx| {
+            this.save_session(cx).ok();
+        });
+        let quit_subscription = cx.on_app_quit(|this, cx| {
+            this.save_session(cx).ok();
+            async {}
+        });
+        cx.defer_in(window, |this, window, cx| this.restore_session(window, cx));
         crate::startup::mark("workspace built");
+        let first_pane = PaneId(1);
         Self {
             focus_handle,
             project,
@@ -429,8 +468,13 @@ impl Workspace {
             back: Vec::new(),
             forward: Vec::new(),
             lsp_store,
-            tabs: Vec::new(),
-            active: 0,
+            panes: vec![Pane::new(first_pane)],
+            pane_tree: PaneNode::Leaf(first_pane),
+            active_pane: first_pane,
+            next_id: first_pane.0,
+            pane_resize: None,
+            restore_session,
+            session_save: None,
             notice,
             offers: Vec::new(),
             connection_error: None,
@@ -445,6 +489,8 @@ impl Workspace {
                 git_subscription,
                 python_subscription,
                 terminal_subscription,
+                release_subscription,
+                quit_subscription,
             ],
         }
     }
@@ -477,9 +523,11 @@ impl Workspace {
             self.reload_history(cx);
         }
 
+        // One view per file: views of a file share its buffer.
+        let mut seen = HashSet::new();
         let affected: Vec<(Entity<Editor>, PathBuf, bool)> = self
-            .tabs
-            .iter()
+            .all_tabs()
+            .filter(|tab| tab.editor().is_some() && seen.insert(tab.path.clone()))
             .filter_map(|tab| {
                 let editor = tab.editor()?.clone();
                 let event = batch.events.iter().find(|event| event.path == tab.path);
@@ -519,15 +567,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let path = self.project.repository_path(&repository, source.path());
-        let existing = self.tabs.iter().position(|tab| match &tab.content {
+        let existing = self.find_tab(|tab| match &tab.content {
             TabContent::Diff(diff) => *diff.read(cx).source() == source,
             _ => false,
         });
-        if let Some(index) = existing {
-            if let TabContent::Diff(diff) = &self.tabs[index].content {
+        if let Some((pane, index)) = existing {
+            if let Some(TabContent::Diff(diff)) = self.tab_content(pane, index) {
                 diff.update(cx, |diff, cx| diff.reload(cx));
             }
-            return self.activate(index, window, cx);
+            return self.activate(pane, index, window, cx);
         }
         let project = self.project.clone();
         let view = cx.new(|cx| DiffView::new(project, repository, source, cx));
@@ -562,13 +610,31 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.tabs.push(Tab {
+        let pane = self.active_pane;
+        let Some(tabs) = self.pane_mut(pane).map(|pane| &mut pane.tabs) else {
+            return;
+        };
+        tabs.push(Tab {
             content,
             path,
             title,
+            lsp_owner: false,
             _subscription: subscription,
         });
-        self.activate(self.tabs.len() - 1, window, cx);
+        let index = tabs.len() - 1;
+        self.activate(pane, index, window, cx);
+    }
+
+    /// The first tab (in pane order) matching `predicate`.
+    fn find_tab(&self, predicate: impl Fn(&Tab) -> bool) -> Option<(PaneId, usize)> {
+        self.panes.iter().find_map(|pane| {
+            let index = pane.tabs.iter().position(&predicate)?;
+            Some((pane.id, index))
+        })
+    }
+
+    fn tab_content(&self, pane: PaneId, index: usize) -> Option<&TabContent> {
+        Some(&self.pane(pane)?.tabs.get(index)?.content)
     }
 
     /// Opens (or activates) the commit history tab.
@@ -578,12 +644,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| matches!(tab.content, TabContent::History(_)))
+        if let Some((pane, index)) =
+            self.find_tab(|tab| matches!(tab.content, TabContent::History(_)))
         {
-            return self.activate(index, window, cx);
+            return self.activate(pane, index, window, cx);
         }
         let view = cx.new(|cx| HistoryView::new(repository, cx));
         let subscription =
@@ -622,15 +686,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let existing = self.tabs.iter().position(|tab| match &tab.content {
+        let existing = self.find_tab(|tab| match &tab.content {
             TabContent::Compare(view) => view.read(cx).sides() == (&base, &target),
             _ => false,
         });
-        if let Some(index) = existing {
-            if let TabContent::Compare(view) = &self.tabs[index].content {
+        if let Some((pane, index)) = existing {
+            if let Some(TabContent::Compare(view)) = self.tab_content(pane, index) {
                 view.update(cx, |view, cx| view.reload(cx));
             }
-            return self.activate(index, window, cx);
+            return self.activate(pane, index, window, cx);
         }
         let view = cx.new(|cx| CompareView::new(repository, base, target, cx));
         let subscription =
@@ -651,10 +715,14 @@ impl Workspace {
                     cx,
                 ),
                 CompareEvent::TitleChanged => {
-                    if let Some(tab) = this.tabs.iter_mut().find(|tab| match &tab.content {
-                        TabContent::Compare(compare) => compare == view,
-                        _ => false,
-                    }) {
+                    let tab =
+                        this.panes.iter_mut().flat_map(|pane| &mut pane.tabs).find(
+                            |tab| match &tab.content {
+                                TabContent::Compare(compare) => compare == view,
+                                _ => false,
+                            },
+                        );
+                    if let Some(tab) = tab {
                         tab.title = view.read(cx).title();
                     }
                     cx.notify();
@@ -794,7 +862,7 @@ impl Workspace {
     /// Recomputes open diffs and comparisons after the repository or the
     /// working tree changed.
     fn reload_diffs(&mut self, cx: &mut Context<Self>) {
-        for tab in &self.tabs {
+        for tab in self.all_tabs() {
             match &tab.content {
                 TabContent::Diff(diff) => diff.update(cx, |diff, cx| diff.reload(cx)),
                 TabContent::Compare(view) => view.update(cx, |view, cx| view.reload(cx)),
@@ -805,7 +873,7 @@ impl Workspace {
 
     /// Re-reads history tabs after commits, checkouts or ref changes.
     fn reload_history(&mut self, cx: &mut Context<Self>) {
-        for tab in &self.tabs {
+        for tab in self.all_tabs() {
             if let TabContent::History(view) = &tab.content {
                 view.update(cx, |view, cx| view.reload(cx));
             }
@@ -853,49 +921,52 @@ impl Workspace {
                 else {
                     return;
                 };
-                for editor in self.editors_for(language, cx) {
+                for editor in self.editors_for(language, true, cx) {
                     editor.update(cx, |editor, cx| editor.attach_server(server.clone(), cx));
                 }
             }
             &LspStoreEvent::ServerStopped(language) => {
-                for editor in self.editors_for(language, cx) {
+                for editor in self.editors_for(language, true, cx) {
                     editor.update(cx, |editor, _| editor.detach_server(false));
                 }
             }
             &LspStoreEvent::StatusChanged(language) => {
                 let status = self.lsp_status(language, cx);
-                for editor in self.editors_for(language, cx) {
+                for editor in self.editors_for(language, false, cx) {
                     editor.update(cx, |editor, cx| editor.set_lsp_status(status.clone(), cx));
                 }
             }
             LspStoreEvent::DiagnosticsUpdated(path) => self.refresh_diagnostics(path, cx),
             &LspStoreEvent::SemanticTokensRefresh(language) => {
-                for editor in self.editors_for(language, cx) {
+                for editor in self.editors_for(language, true, cx) {
                     editor.update(cx, |editor, cx| editor.refresh_semantic_tokens(cx));
                 }
             }
         }
     }
 
+    /// Gives every view of `path` the server's diagnostics.
     fn refresh_diagnostics(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(editor) = self.editor_tab(path).and_then(Tab::editor) else {
+        let editors: Vec<Entity<Editor>> = self
+            .all_tabs()
+            .filter(|tab| tab.path == path)
+            .filter_map(Tab::editor)
+            .cloned()
+            .collect();
+        if editors.is_empty() {
             return;
-        };
-        let store = self.lsp_store.read(cx);
-        let diagnostics = store.diagnostics(path).to_vec();
-        editor.update(cx, |editor, cx| editor.set_diagnostics(&diagnostics, cx));
+        }
+        let diagnostics = self.lsp_store.read(cx).diagnostics(path).to_vec();
+        for editor in editors {
+            editor.update(cx, |editor, cx| editor.set_diagnostics(&diagnostics, cx));
+        }
     }
 
-    /// The editor tab of `path`, if open.
-    fn editor_tab(&self, path: &Path) -> Option<&Tab> {
-        self.tabs
-            .iter()
-            .find(|tab| tab.path == path && tab.editor().is_some())
-    }
-
-    fn editors_for(&self, language: Language, cx: &App) -> Vec<Entity<Editor>> {
-        self.tabs
-            .iter()
+    /// Editors of `language`; with `owners`, only the view of each file that
+    /// holds (or would hold) its server document.
+    fn editors_for(&self, language: Language, owners: bool, cx: &App) -> Vec<Entity<Editor>> {
+        self.all_tabs()
+            .filter(|tab| tab.lsp_owner || !owners)
             .filter_map(Tab::editor)
             .filter(|editor| editor.read(cx).language() == Some(language))
             .cloned()
@@ -925,36 +996,66 @@ impl Workspace {
         })
     }
 
+    /// Opens (or activates) `path` in the active pane.
     pub fn open(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.path == path && tab.editor().is_some())
-        {
-            self.activate(index, window, cx);
-            return;
+        self.open_editor(path, window, cx);
+    }
+
+    /// Opens (or activates) `path` in the active pane and returns its
+    /// editor. A file open in another pane gets a second view of the same
+    /// buffer there.
+    fn open_editor(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Editor>> {
+        let pane = self.active_pane;
+        if let Some(index) = self.active_pane().editor_index(path) {
+            self.activate(pane, index, window, cx);
+            return self.active_tab().and_then(Tab::editor).cloned();
         }
-        let buffer = match self.project.read_text(path) {
-            Ok(text) => Buffer::with_path(&text, path.to_path_buf()),
-            Err(err) => {
-                self.notice = Some(format!("Cannot open {}: {err}", path.display()).into());
-                cx.notify();
-                return;
-            }
+        let existing = self
+            .all_tabs()
+            .filter(|tab| tab.path == path)
+            .find_map(Tab::editor)
+            .cloned();
+        let buffer = match &existing {
+            Some(editor) => editor.read(cx).buffer().link(),
+            None => match self.project.read_text(path) {
+                Ok(text) => Buffer::with_path(&text, path.to_path_buf()),
+                Err(err) => {
+                    self.notice = Some(format!("Cannot open {}: {err}", path.display()).into());
+                    cx.notify();
+                    return None;
+                }
+            },
         };
         let project = self.project.clone();
         let editor = cx.new(|cx| Editor::for_file(buffer, project, cx));
         let subscription =
-            cx.subscribe_in(&editor, window, |this, _, event, window, cx| match event {
-                EditorEvent::Navigate { locations, title } => {
-                    this.navigate(locations.clone(), title.clone(), window, cx);
-                }
-                EditorEvent::DirtyChanged | EditorEvent::Edited => cx.notify(),
-            });
+            cx.subscribe_in(
+                &editor,
+                window,
+                |this, editor, event, window, cx| match event {
+                    EditorEvent::Navigate { locations, title } => {
+                        this.navigate(locations.clone(), title.clone(), window, cx);
+                    }
+                    EditorEvent::DirtyChanged | EditorEvent::Edited => {
+                        this.sync_views(editor, cx);
+                        cx.notify();
+                    }
+                    EditorEvent::Saved => {}
+                },
+            );
         if let Some(language) = editor.read(cx).language() {
-            let server = self
-                .lsp_store
-                .update(cx, |store, cx| store.server(language, cx));
+            // A second view gets the server document when it takes focus.
+            let server = match existing {
+                Some(_) => None,
+                None => self
+                    .lsp_store
+                    .update(cx, |store, cx| store.server(language, cx)),
+            };
             let status = self.lsp_status(language, cx);
             editor.update(cx, |editor, cx| {
                 if let Some(server) = server {
@@ -968,23 +1069,63 @@ impl Workspace {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
             .into();
-        self.tabs.push(Tab {
-            content: TabContent::Editor(editor),
+        let tabs = &mut self.pane_mut(pane)?.tabs;
+        tabs.push(Tab {
+            content: TabContent::Editor(editor.clone()),
             path: path.to_path_buf(),
             title,
+            lsp_owner: existing.is_none(),
             _subscription: subscription,
         });
+        let index = tabs.len() - 1;
         self.refresh_diagnostics(path, cx);
-        self.activate(self.tabs.len() - 1, window, cx);
+        self.activate(pane, index, window, cx);
+        Some(editor)
     }
 
-    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.active = index;
-        self.notice = None;
-        let tab = &self.tabs[index];
+    /// Brings the other views of `source`'s file up to date with its edits.
+    fn sync_views(&mut self, source: &Entity<Editor>, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .all_tabs()
+            .find(|tab| tab.editor() == Some(source))
+            .map(|tab| tab.path.clone())
+        else {
+            return;
+        };
+        let others: Vec<Entity<Editor>> = self
+            .all_tabs()
+            .filter(|tab| tab.path == path)
+            .filter_map(Tab::editor)
+            .filter(|editor| *editor != source)
+            .cloned()
+            .collect();
+        for other in others {
+            other.update(cx, |editor, cx| editor.sync_buffer(cx));
+        }
+    }
+
+    /// Shows tab `index` of `pane` and focuses it.
+    fn activate(
+        &mut self,
+        pane: PaneId,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.pane_mut(pane).and_then(|target| {
+            let tab = target.tabs.get(index)?;
+            target.active = index;
+            Some(tab)
+        }) else {
+            return;
+        };
         window.focus(&tab.focus_handle(cx));
-        self.file_tree
-            .update(cx, |tree, cx| tree.select(&tab.path, cx));
+        let path = tab.path.clone();
+        self.active_pane = pane;
+        self.notice = None;
+        self.file_tree.update(cx, |tree, cx| tree.select(&path, cx));
+        self.claim_server(pane, index, cx);
+        self.schedule_session_save(cx);
         cx.notify();
     }
 
@@ -1025,19 +1166,8 @@ impl Workspace {
         }
     }
 
-    /// Opens (or activates) `path` and returns its editor.
-    fn open_editor(
-        &mut self,
-        path: &Path,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<Editor>> {
-        self.open(path, window, cx);
-        self.editor_tab(path).and_then(Tab::editor).cloned()
-    }
-
     fn current_position(&self, cx: &App) -> Option<NavEntry> {
-        let tab = self.tabs.get(self.active)?;
+        let tab = self.active_tab()?;
         Some(NavEntry {
             path: tab.path.clone(),
             offset: tab.editor()?.read(cx).cursor(),
@@ -1081,7 +1211,7 @@ impl Workspace {
 
     /// Focuses the active tab (or the workspace when none is open).
     pub fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.tabs.get(self.active) {
+        match self.active_tab() {
             Some(tab) => window.focus(&tab.focus_handle(cx)),
             None => window.focus(&self.focus_handle),
         }
@@ -1111,7 +1241,7 @@ impl Workspace {
     /// `uv run`, where the project lives.
     fn run_python(&mut self, request: RunRequest, window: &mut Window, cx: &mut Context<Self>) {
         use python::uv::{Run, run_line};
-        let active = self.tabs.get(self.active).and_then(|tab| {
+        let active = self.active_tab().and_then(|tab| {
             let editor = tab.editor()?.read(cx);
             let line = editor.buffer().line_of(editor.cursor());
             Some((tab.path.clone(), line, editor.text()))
@@ -1213,10 +1343,10 @@ impl Workspace {
     }
 
     fn save_all(&mut self, _: &SaveAll, _: &mut Window, cx: &mut Context<Self>) {
+        // Once per file, through the view holding its server document.
         let dirty: Vec<Entity<Editor>> = self
-            .tabs
-            .iter()
-            .filter(|tab| tab.is_dirty(cx))
+            .all_tabs()
+            .filter(|tab| tab.lsp_owner && tab.is_dirty(cx))
             .filter_map(|tab| tab.editor().cloned())
             .collect();
         for editor in dirty {
@@ -1421,7 +1551,7 @@ impl Workspace {
 
     fn dismiss_file_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.file_finder = None;
-        match self.tabs.get(self.active) {
+        match self.active_tab() {
             Some(tab) => window.focus(&tab.focus_handle(cx)),
             None => window.focus(&self.focus_handle),
         }
@@ -1429,22 +1559,34 @@ impl Workspace {
     }
 
     fn close_active(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.close_tab(self.active, window, cx);
+        self.sync_active_pane(window, cx);
+        let pane = self.active_pane();
+        if !pane.tabs.is_empty() {
+            self.close_tab(pane.id, pane.active, window, cx);
         }
     }
 
-    /// Closes a tab, asking to save first if it has unsaved changes.
-    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.tabs[index]
-            .editor()
-            .filter(|editor| editor.read(cx).buffer().is_dirty())
-            .cloned()
-        else {
-            self.remove_tab(index, window, cx);
+    /// Closes a tab, asking to save first if its unsaved changes would be
+    /// lost (no other pane shows the file).
+    fn close_tab(
+        &mut self,
+        pane: PaneId,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.pane(pane).and_then(|pane| pane.tabs.get(index)) else {
             return;
         };
-        let message = format!("Save changes to {}?", self.tabs[index].title);
+        let Some(editor) = tab
+            .editor()
+            .filter(|_| tab.is_dirty(cx) && !self.has_other_view(tab))
+            .cloned()
+        else {
+            self.remove_tab(pane, index, window, cx);
+            return;
+        };
+        let message = format!("Save changes to {}?", tab.title);
         let answer = window.prompt(
             PromptLevel::Warning,
             &message,
@@ -1462,14 +1604,9 @@ impl Workspace {
                     1 => true,
                     _ => false,
                 };
-                // The tab list may have changed while the prompt was open.
-                if close
-                    && let Some(index) = this
-                        .tabs
-                        .iter()
-                        .position(|tab| tab.editor() == Some(&editor))
-                {
-                    this.remove_tab(index, window, cx);
+                // The tabs may have changed while the prompt was open.
+                if close && let Some((pane, index)) = this.find_view(editor.entity_id()) {
+                    this.remove_tab(pane, index, window, cx);
                 }
             })
             .ok();
@@ -1477,77 +1614,11 @@ impl Workspace {
         .detach();
     }
 
-    fn remove_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let tab = self.tabs.remove(index);
-        if let Some(editor) = tab.editor() {
-            editor.update(cx, |editor, _| editor.detach_server(true));
-        }
-        if self.tabs.is_empty() {
-            self.active = 0;
-            window.focus(&self.focus_handle);
-            cx.notify();
-        } else {
-            let next = if self.active > index {
-                self.active - 1
-            } else {
-                self.active
-            };
-            self.activate(next.min(self.tabs.len() - 1), window, cx);
-        }
-    }
-
-    /// Open files with unsaved changes.
+    /// Open files with unsaved changes (a file open in two panes counts once).
     pub fn dirty_count(&self, cx: &App) -> usize {
-        self.tabs.iter().filter(|tab| tab.is_dirty(cx)).count()
-    }
-
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .h(px(34.))
-            .bg(theme::panel())
-            .border_b_1()
-            .border_color(theme::border())
-            .text_sm()
-            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                let active = index == self.active;
-                let dirty = tab.is_dirty(cx);
-                div()
-                    .id(("tab", index))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .border_r_1()
-                    .border_color(theme::border())
-                    .cursor_pointer()
-                    .text_color(if active {
-                        theme::text()
-                    } else {
-                        theme::muted()
-                    })
-                    .when(active, |tab| {
-                        tab.bg(theme::background())
-                            .border_b_2()
-                            .border_color(theme::accent())
-                    })
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
-                    )
-                    .child(tab.title.clone())
-                    .child(
-                        div()
-                            .id(("close", index))
-                            .w(px(14.))
-                            .text_color(theme::muted())
-                            .hover(|style| style.text_color(theme::text()))
-                            .child(if dirty { "●" } else { "×" })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(index, window, cx);
-                            })),
-                    )
-            }))
+        self.all_tabs()
+            .filter(|tab| tab.lsp_owner && tab.is_dirty(cx))
+            .count()
     }
 }
 
@@ -1560,16 +1631,11 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::startup::mark_once("first workspace render");
-        let main = match self.tabs.get(self.active) {
-            Some(tab) => div().flex_1().min_h_0().child(tab.view()),
-            None => div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme::muted())
-                .child("Open a file from the project tree, or press Ctrl+P"),
-        };
+        let main = div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .child(self.render_panes(cx));
 
         div()
             .key_context("Workspace")
@@ -1604,6 +1670,16 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_bottom_dock))
             .on_action(cx.listener(Self::save_layout_as_default))
             .on_action(cx.listener(Self::reset_layout))
+            .on_action(cx.listener(Self::split_right))
+            .on_action(cx.listener(Self::split_down))
+            .on_action(cx.listener(Self::focus_next_pane))
+            .on_action(cx.listener(Self::focus_previous_pane))
+            .on_action(cx.listener(Self::focus_first_pane))
+            .on_action(cx.listener(Self::focus_second_pane))
+            .on_action(cx.listener(Self::focus_third_pane))
+            .on_action(cx.listener(Self::move_tab_to_next_pane))
+            .on_action(cx.listener(Self::move_tab_to_previous_pane))
+            .on_action(cx.listener(Self::close_pane_action))
             .on_mouse_move(cx.listener(Self::on_resize_move))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(Self::on_resize_end))
             .relative()
@@ -1619,9 +1695,6 @@ impl Render for Workspace {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .when(!self.tabs.is_empty(), |column| {
-                        column.child(self.render_tabs(cx))
-                    })
                     .children(
                         self.connection_error
                             .iter()

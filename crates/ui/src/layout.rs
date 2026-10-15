@@ -282,19 +282,37 @@ fn global_layout_path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("next_code").join("layout.json"))
 }
 
-/// Per-project state lives outside the project so it never shows up in git.
 fn project_layout_path(project_key: &str) -> Option<PathBuf> {
+    Some(project_state_dir(project_key)?.join("layout.json"))
+}
+
+/// Where per-project state (layout, session) lives: outside the project so
+/// it never shows up in git, in the local data dir
+/// (`next_code/projects/<key>`, the key with non-alphanumerics as `_`).
+pub(crate) fn project_state_dir(project_key: &str) -> Option<PathBuf> {
     let key: String = project_key
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    Some(
-        dirs::data_local_dir()?
-            .join("next_code")
-            .join("projects")
-            .join(key)
-            .join("layout.json"),
-    )
+    Some(state_root()?.join("projects").join(key))
+}
+
+#[cfg(not(test))]
+fn state_root() -> Option<PathBuf> {
+    Some(dirs::data_local_dir()?.join("next_code"))
+}
+
+/// Unit tests open real workspaces: their state stays out of the user's,
+/// and out of each other's (tests run on threads of one process). Tests
+/// remove it when they end.
+#[cfg(test)]
+pub(crate) fn state_root() -> Option<PathBuf> {
+    let thread = format!("{:?}", std::thread::current().id());
+    let thread: String = thread.chars().filter(char::is_ascii_digit).collect();
+    Some(std::env::temp_dir().join(format!(
+        "next_code-test-state-{}-{thread}",
+        std::process::id()
+    )))
 }
 
 #[cfg(test)]

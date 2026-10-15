@@ -7,6 +7,8 @@
 //! ```json
 //! { "theme": "Light",
 //!   "semantic_highlighting": true,
+//!   "auto_close_brackets": true,
+//!   "restore_session": true,
 //!   "languages": { "python": { "server": {
 //!     "command": "basedpyright-langserver", "args": ["--stdio"],
 //!     "settings": { "basedpyright": { "analysis": { "typeCheckingMode": "strict" } } }
@@ -29,6 +31,10 @@ pub struct Settings {
     pub theme: Option<String>,
     /// Layer language servers' semantic tokens over syntax highlighting.
     pub semantic_highlighting: bool,
+    /// Typing an opening bracket or quote inserts its closer.
+    pub auto_close_brackets: bool,
+    /// Reopen a project's editor tabs and splits where they were left.
+    pub restore_session: bool,
     pub languages: HashMap<String, LanguageSettings>,
 }
 
@@ -37,6 +43,8 @@ impl Default for Settings {
         Self {
             theme: None,
             semantic_highlighting: true,
+            auto_close_brackets: true,
+            restore_session: true,
             languages: HashMap::new(),
         }
     }

@@ -8,6 +8,7 @@
 use std::{
     ops::Range,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use ropey::Rope;
@@ -18,6 +19,39 @@ struct Edit {
     offset: usize,
     old: String,
     new: String,
+}
+
+/// One undo step: edits in the order they were applied (back to front).
+#[derive(Debug, Clone)]
+struct Transaction {
+    /// Unique per buffer; kept when later typing coalesces into it.
+    id: u64,
+    edits: Vec<Edit>,
+}
+
+impl Transaction {
+    /// Whether `edits` (sorted, pure insertions) continue typing at the end
+    /// of each of this transaction's insertions; same count, no line breaks.
+    fn continues_with(&self, edits: &[(Range<usize>, String)]) -> bool {
+        if self.edits.len() != edits.len()
+            || edits
+                .iter()
+                .any(|(range, text)| !range.is_empty() || text.contains('\n'))
+        {
+            return false;
+        }
+        // Stored back to front; final positions shift by earlier insertions.
+        let mut shift = 0;
+        self.edits
+            .iter()
+            .rev()
+            .zip(edits)
+            .all(|(last, (range, _))| {
+                let end = last.offset + shift + last.new.len();
+                shift += last.new.len();
+                last.old.is_empty() && !last.new.contains('\n') && range.start == end
+            })
+    }
 }
 
 /// Row and column of an offset; the column unit depends on the [`Encoding`].
@@ -90,36 +124,142 @@ impl Change {
     }
 }
 
+/// A document's text as seen by one view. [`Buffer::link`] makes more views
+/// of the same document (one file shown in two editors): they share the
+/// text, undo history and saved state; each keeps its own snapshot and
+/// change list, and picks up edits made through other views with
+/// [`Buffer::sync`].
 pub struct Buffer {
+    /// This view's snapshot (cheap to clone: ropes share their nodes).
     rope: Rope,
     path: Option<PathBuf>,
-    /// Undo steps; each is one or more edits in the order they were applied.
-    undo: Vec<Vec<Edit>>,
-    redo: Vec<Vec<Edit>>,
-    /// Undo-stack depth matching the file on disk; `None` if that state is unreachable.
-    saved_at: Option<usize>,
     line_ending: &'static str,
     /// Changes not yet consumed by `drain_changes`.
     changes: Vec<Change>,
+    document: Arc<Mutex<Document>>,
+    view: usize,
+}
+
+/// What the views of one document share.
+struct Document {
+    /// The latest text.
+    rope: Rope,
+    line_ending: &'static str,
+    /// Undo steps, oldest first.
+    undo: Vec<Transaction>,
+    redo: Vec<Transaction>,
+    next_transaction: u64,
+    /// Undo-stack depth matching the file on disk; `None` if that state is unreachable.
+    saved_at: Option<usize>,
+    /// Per view: changes made through other views it has not synced yet.
+    views: Vec<(usize, Vec<Change>)>,
+    next_view: usize,
+}
+
+fn lock(document: &Mutex<Document>) -> MutexGuard<'_, Document> {
+    document.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Buffer {
     pub fn new(text: &str) -> Self {
-        let line_ending = match text.find('\n') {
-            Some(i) if text[..i].ends_with('\r') => "\r\n",
-            _ => "\n",
-        };
+        let line_ending = line_ending_of(text);
+        let rope = Rope::from_str(text);
         Self {
-            rope: Rope::from_str(text),
+            rope: rope.clone(),
             path: None,
-            undo: Vec::new(),
-            redo: Vec::new(),
-            saved_at: Some(0),
             line_ending,
             changes: Vec::new(),
+            document: Arc::new(Mutex::new(Document {
+                rope,
+                line_ending,
+                undo: Vec::new(),
+                redo: Vec::new(),
+                next_transaction: 0,
+                saved_at: Some(0),
+                views: vec![(0, Vec::new())],
+                next_view: 1,
+            })),
+            view: 0,
         }
     }
 
+    /// Another view of this document, with the latest text and no pending
+    /// changes.
+    pub fn link(&self) -> Self {
+        let mut document = lock(&self.document);
+        let view = document.next_view;
+        document.next_view += 1;
+        document.views.push((view, Vec::new()));
+        Self {
+            rope: document.rope.clone(),
+            path: self.path.clone(),
+            line_ending: document.line_ending,
+            changes: Vec::new(),
+            document: Arc::clone(&self.document),
+            view,
+        }
+    }
+
+    /// Whether `other` is a view of the same document.
+    pub fn is_linked_to(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.document, &other.document)
+    }
+
+    /// Takes in edits made through other views: updates the text and queues
+    /// their changes for `drain_changes`. Returns whether there were any.
+    /// Offsets this view computed before must be mapped through them.
+    pub fn sync(&mut self) -> bool {
+        let document = Arc::clone(&self.document);
+        let mut document = lock(&document);
+        self.sync_locked(&mut document)
+    }
+
+    fn sync_locked(&mut self, document: &mut Document) -> bool {
+        let Some((_, pending)) = document.views.iter_mut().find(|(id, _)| *id == self.view) else {
+            return false;
+        };
+        if pending.is_empty() {
+            return false;
+        }
+        self.changes.append(pending);
+        self.rope = document.rope.clone();
+        self.line_ending = document.line_ending;
+        true
+    }
+
+    /// Shares this view's changes from `first` on (just made) with the
+    /// other views.
+    fn publish(&self, document: &mut Document, first: usize) {
+        document.rope = self.rope.clone();
+        document.line_ending = self.line_ending;
+        let new = &self.changes[first..];
+        if new.is_empty() {
+            return;
+        }
+        for (view, pending) in &mut document.views {
+            if *view != self.view {
+                pending.extend_from_slice(new);
+            }
+        }
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        lock(&self.document)
+            .views
+            .retain(|(view, _)| *view != self.view);
+    }
+}
+
+fn line_ending_of(text: &str) -> &'static str {
+    match text.find('\n') {
+        Some(i) if text[..i].ends_with('\r') => "\r\n",
+        _ => "\n",
+    }
+}
+
+impl Buffer {
     /// Line ending used by the file's first line break (`"\n"` if none).
     pub fn line_ending(&self) -> &'static str {
         self.line_ending
@@ -139,11 +279,13 @@ impl Buffer {
 
     /// Records that the current text is what the file now contains.
     pub fn mark_saved(&mut self) {
-        self.saved_at = Some(self.undo.len());
+        let mut document = lock(&self.document);
+        document.saved_at = Some(document.undo.len());
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.saved_at != Some(self.undo.len())
+        let document = lock(&self.document);
+        document.saved_at != Some(document.undo.len())
     }
 
     pub fn len(&self) -> usize {
@@ -365,49 +507,31 @@ impl Buffer {
     /// Replaces `range` with `text` and records it for undo.
     /// Consecutive single-line insertions coalesce into one undo step.
     pub fn edit(&mut self, range: Range<usize>, text: &str) {
-        if range.is_empty() && text.is_empty() {
-            return;
-        }
-        let old = self.slice(range.clone());
-        self.replace(range.clone(), text);
-        self.redo.clear();
-        if self.saved_at.is_some_and(|saved| saved > self.undo.len()) {
-            self.saved_at = None;
-        }
-
-        if old.is_empty()
-            && !text.contains('\n')
-            && Some(self.undo.len()) != self.saved_at
-            && let Some([last]) = self.undo.last_mut().map(Vec::as_mut_slice)
-            && last.old.is_empty()
-            && !last.new.contains('\n')
-            && last.offset + last.new.len() == range.start
-        {
-            last.new.push_str(text);
-            return;
-        }
-        self.undo.push(vec![Edit {
-            offset: range.start,
-            old,
-            new: text.to_owned(),
-        }]);
+        self.edit_batch(vec![(range, text.to_owned())])
+            .expect("a single edit cannot overlap");
     }
 
     /// Replaces the whole text with what is now on disk, as one undo step,
     /// and marks the buffer saved. Returns `false` if nothing differed.
     pub fn reload(&mut self, text: &str) -> bool {
+        let document = Arc::clone(&self.document);
+        let mut document = lock(&document);
+        self.sync_locked(&mut document);
         if self.rope == text {
-            self.saved_at = Some(self.undo.len());
+            document.saved_at = Some(document.undo.len());
             return false;
         }
-        self.edit(0..self.len(), text);
-        self.saved_at = Some(self.undo.len());
-        self.line_ending = Self::new(text).line_ending;
+        self.line_ending = line_ending_of(text);
+        let range = 0..self.len();
+        self.edit_locked(&mut document, vec![(range, text.to_owned())]);
+        document.saved_at = Some(document.undo.len());
         true
     }
 
     /// Applies several edits as one undo step. Ranges refer to the current
     /// text and must not overlap; inserts at the same offset keep their order.
+    /// Single-line insertions at the end of each of the previous step's
+    /// insertions (typing, also at several cursors) coalesce into that step.
     pub fn edit_batch(
         &mut self,
         mut edits: Vec<(Range<usize>, String)>,
@@ -420,56 +544,111 @@ impl Buffer {
         if edits.is_empty() {
             return Ok(());
         }
-        // Back to front, so earlier ranges stay valid.
-        let mut transaction = Vec::with_capacity(edits.len());
-        for (range, text) in edits.into_iter().rev() {
-            let old = self.slice(range.clone());
-            self.replace(range.clone(), &text);
-            transaction.push(Edit {
-                offset: range.start,
-                old,
-                new: text,
-            });
-        }
-        self.redo.clear();
-        if self.saved_at.is_some_and(|saved| saved > self.undo.len()) {
-            self.saved_at = None;
-        }
-        self.undo.push(transaction);
+        let document = Arc::clone(&self.document);
+        let mut document = lock(&document);
+        self.sync_locked(&mut document);
+        self.edit_locked(&mut document, edits);
         Ok(())
     }
 
-    /// Reverts the last undo step; returns the restored range of its
-    /// last-in-text edit (where the cursor belongs).
+    /// `edit_batch` for sorted, non-overlapping, non-empty `edits`.
+    fn edit_locked(&mut self, document: &mut Document, edits: Vec<(Range<usize>, String)>) {
+        let first = self.changes.len();
+        document.redo.clear();
+        if document
+            .saved_at
+            .is_some_and(|saved| saved > document.undo.len())
+        {
+            document.saved_at = None;
+        }
+        let coalesce = Some(document.undo.len()) != document.saved_at
+            && document
+                .undo
+                .last()
+                .is_some_and(|last| last.continues_with(&edits));
+        if coalesce {
+            // Back to front, so earlier ranges stay valid.
+            for (range, text) in edits.iter().rev() {
+                self.replace(range.clone(), text);
+            }
+            let last = document.undo.last_mut().expect("checked above");
+            // The transaction is stored back to front too.
+            for ((_, text), edit) in edits.iter().zip(last.edits.iter_mut().rev()) {
+                edit.new.push_str(text);
+            }
+        } else {
+            let mut transaction = Vec::with_capacity(edits.len());
+            for (range, text) in edits.into_iter().rev() {
+                let old = self.slice(range.clone());
+                self.replace(range.clone(), &text);
+                transaction.push(Edit {
+                    offset: range.start,
+                    old,
+                    new: text,
+                });
+            }
+            document.next_transaction += 1;
+            let id = document.next_transaction;
+            document.undo.push(Transaction {
+                id,
+                edits: transaction,
+            });
+        }
+        self.publish(document, first);
+    }
+
+    /// Id of the step `undo` would revert next (the latest edit, or the
+    /// step just redone); unchanged while typing coalesces into it. Shared
+    /// by all views of the document.
+    pub fn transaction_id(&self) -> Option<u64> {
+        lock(&self.document)
+            .undo
+            .last()
+            .map(|transaction| transaction.id)
+    }
+
+    /// Reverts the last undo step (made through any view); returns the
+    /// restored range of its last-in-text edit (where the cursor belongs).
     pub fn undo(&mut self) -> Option<Range<usize>> {
-        let transaction = self.undo.pop()?;
-        for edit in transaction.iter().rev() {
+        let document = Arc::clone(&self.document);
+        let mut document = lock(&document);
+        self.sync_locked(&mut document);
+        let transaction = document.undo.pop()?;
+        let first_change = self.changes.len();
+        for edit in transaction.edits.iter().rev() {
             self.replace(edit.offset..edit.offset + edit.new.len(), &edit.old);
         }
         // Edits apply back to front, so the first one is last in the text and,
         // being reverted last, its offset is already final.
-        let first = &transaction[0];
+        let first = &transaction.edits[0];
         let restored = first.offset..first.offset + first.old.len();
-        self.redo.push(transaction);
+        document.redo.push(transaction);
+        self.publish(&mut document, first_change);
         Some(restored)
     }
 
     /// Reapplies the last undone step; returns the reinserted range of its
     /// last-in-text edit.
     pub fn redo(&mut self) -> Option<Range<usize>> {
-        let transaction = self.redo.pop()?;
-        for edit in &transaction {
+        let document = Arc::clone(&self.document);
+        let mut document = lock(&document);
+        self.sync_locked(&mut document);
+        let transaction = document.redo.pop()?;
+        let first_change = self.changes.len();
+        let edits = &transaction.edits;
+        for edit in edits {
             self.replace(edit.offset..edit.offset + edit.old.len(), &edit.new);
         }
-        let first = &transaction[0];
+        let first = &edits[0];
         // Later edits sit earlier in the text and shift the first one.
-        let shift: isize = transaction[1..]
+        let shift: isize = edits[1..]
             .iter()
             .map(|edit| edit.new.len() as isize - edit.old.len() as isize)
             .sum();
         let inserted = first.offset.saturating_add_signed(shift)
             ..first.offset.saturating_add_signed(shift) + first.new.len();
-        self.undo.push(transaction);
+        document.undo.push(transaction);
+        self.publish(&mut document, first_change);
         Some(inserted)
     }
 
@@ -735,7 +914,7 @@ mod tests {
     fn new_edit_after_undo_past_save_point_stays_dirty() {
         let mut buffer = Buffer::new("");
         buffer.edit(0..0, "a");
-        buffer.saved_at = Some(1); // as if saved here
+        buffer.mark_saved(); // saved here
         buffer.undo();
         buffer.edit(0..0, "b");
         assert!(buffer.is_dirty());
@@ -744,5 +923,72 @@ mod tests {
             buffer.is_dirty(),
             "save point was discarded with the redo stack"
         );
+    }
+
+    #[test]
+    fn typing_at_several_cursors_coalesces_and_keeps_the_transaction_id() {
+        let mut buffer = Buffer::new("x\ny\n");
+        assert_eq!(buffer.transaction_id(), None);
+        buffer
+            .edit_batch(vec![(1..1, "a".into()), (3..3, "a".into())])
+            .unwrap();
+        let id = buffer.transaction_id();
+        // Both cursors moved past their "a": 2 and 5.
+        buffer
+            .edit_batch(vec![(2..2, "b".into()), (5..5, "b".into())])
+            .unwrap();
+        assert_eq!(buffer.slice(0..buffer.len()), "xab\nyab\n");
+        assert_eq!(buffer.transaction_id(), id);
+        // Elsewhere starts a new step.
+        buffer
+            .edit_batch(vec![(0..0, "c".into()), (4..4, "c".into())])
+            .unwrap();
+        assert_ne!(buffer.transaction_id(), id);
+        buffer.undo();
+        assert_eq!(buffer.transaction_id(), id);
+        buffer.undo();
+        assert_eq!(buffer.slice(0..buffer.len()), "x\ny\n");
+        buffer.redo();
+        assert_eq!(buffer.slice(0..buffer.len()), "xab\nyab\n");
+        assert_eq!(buffer.transaction_id(), id);
+    }
+
+    #[test]
+    fn linked_views_share_text_history_and_saved_state() {
+        let mut left = Buffer::with_path("one\n", PathBuf::from("a.txt"));
+        left.drain_changes();
+        let mut right = left.link();
+        assert!(right.is_linked_to(&left));
+        assert_eq!(right.path(), Some(Path::new("a.txt")));
+
+        left.edit(3..3, " two");
+        assert!(right.is_dirty(), "dirty is per document");
+        // The other view keeps its snapshot until it syncs.
+        assert_eq!(right.slice(0..right.len()), "one\n");
+        assert!(right.sync());
+        assert_eq!(right.slice(0..right.len()), "one two\n");
+        let changes: Vec<Change> = right.drain_changes().collect();
+        assert_eq!(
+            (changes[0].start, changes[0].old_end, changes[0].new_end),
+            (3, 3, 7)
+        );
+        assert!(!right.sync(), "nothing new");
+
+        // Undo from the other view reverts the shared step.
+        right.undo();
+        assert_eq!(right.slice(0..right.len()), "one\n");
+        assert!(!right.is_dirty());
+        assert!(left.sync());
+        assert_eq!(left.slice(0..left.len()), "one\n");
+        left.redo();
+        right.sync();
+        right.mark_saved();
+        assert!(!left.is_dirty());
+
+        // A view that goes away stops collecting changes.
+        drop(right);
+        left.edit(0..0, "x");
+        assert_eq!(lock(&left.document).views.len(), 1);
+        assert!(!left.is_linked_to(&Buffer::new("")));
     }
 }

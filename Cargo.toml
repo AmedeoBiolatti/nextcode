@@ -31,6 +31,8 @@ parking_lot = "0.12"
 percent-encoding = "2"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 proto = { path = "crates/proto" }
+# Already in the tree via grep-regex: find/replace in the editor.
+regex = "1"
 remote = { path = "crates/remote" }
 # LF-only line indexing; CR before LF is handled by `text::Buffer`.
 ropey = { version = "1.6", default-features = false, features = ["simd"] }

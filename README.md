@@ -196,8 +196,8 @@ revision, and then swapped), and each file opens its diff.
 
 ## Window, menus and commands
 
-Top to bottom, a window has the menu bar (File, Edit, View, Go, Run, Git,
-Help) with the command bar in it, the project tabs, and the active
+Top to bottom, a window has the menu bar (File, Edit, Selection, View, Go,
+Run, Git, Help) with the command bar in it, the project tabs, and the active
 project. On Windows the menu bar is also the title bar: the system one is
 hidden, empty space in the bar moves the window (double click maximizes),
 and minimize/maximize/close sit at its right. Each project tab is a whole
@@ -238,6 +238,111 @@ An item is a command name, `"-"` (separator), a command with its own
 label, a submenu, or a list. Command names are `namespace::Name` (`app`,
 `workspace`, `editor`, `git`, `python`); unknown ones show disabled with a
 notice, and an invalid file falls back to the built-in menus.
+
+## Editing
+
+Shortcuts follow VS Code (JetBrains where VS Code has none); the menus and
+the command bar show each command's keys.
+
+**Multiple cursors.** Every edit, motion, deletion, copy/cut/paste and
+undo works at every cursor; selections that overlap (or a cursor touching
+one) merge. Pasting N lines into N cursors puts one line at each. Undo
+restores the cursors of the undone edit.
+
+| Command | Keys |
+|---|---|
+| Add / remove a cursor | `Alt+click` |
+| Column selection | `Shift+Alt+drag` or middle-drag |
+| Add Next Occurrence (first: select the word) | `Ctrl+D` |
+| Select All Occurrences | `Ctrl+Shift+L` |
+| Add Cursor Above / Below | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` |
+| Back to one cursor | `Escape` |
+
+Occurrences started from a cursor on a word match whole words; started from a
+selection they match the text anywhere. Both are case-sensitive.
+
+**Lines, comments, indentation.** All work on every selection.
+
+| Command | Keys |
+|---|---|
+| Move Line Up / Down | `Alt+Up` / `Alt+Down` |
+| Copy Line Up / Down | `Shift+Alt+Up` / `Shift+Alt+Down` |
+| Delete Line | `Ctrl+Shift+K` |
+| Insert Line Below / Above | `Ctrl+Enter` / `Ctrl+Shift+Enter` |
+| Toggle Line Comment (block comment in HTML, CSS, Markdown) | `Ctrl+/` |
+| Toggle Block Comment | `Shift+Alt+A` or `Ctrl+Shift+/` |
+| Indent / Outdent Lines | `Tab` on a multi-line selection, `Ctrl+]` / `Shift+Tab`, `Ctrl+[` |
+| Go to Matching Bracket | `Ctrl+Shift+\` |
+| Go to Line (`line` or `line:column`, previews while typing, `Escape` returns) | `Ctrl+G` |
+
+Line comments go at the smallest indentation of the selected lines and are
+removed only when every non-blank line is commented. The indentation style
+(tabs or N spaces) is detected from the file; files without indentation get
+4 spaces (2 for JSON, YAML, JavaScript, TypeScript, HTML, CSS). The status
+bar shows it.
+
+**Typing helpers.** Typing `(`, `[`, `{`, `"`, `'` (and `` ` `` in
+JavaScript/TypeScript, Go, shell, SQL, Markdown; no `'` in Rust or
+Markdown) inserts the closer; quotes don't pair right after a letter,
+digit or backslash, and nothing pairs before a word. Typing the closer
+steps over an inserted one, Backspace between an empty pair deletes both,
+and an opener typed over a selection wraps it. `"auto_close_brackets":
+false` in `settings.json` turns all of this off. Enter keeps the line's
+indentation, adds a level after `{`, `(`, `[` (and Python's `:`), and puts
+the closer of `{|}` on its own line. The bracket pair at the cursor is
+highlighted (from the syntax tree; brackets in strings and comments don't
+match).
+
+**Find and replace.** `Ctrl+F` opens the find bar above the text, seeded
+with the selection or the word at the cursor; `Ctrl+H` also shows the
+replace field. Matches are highlighted, the current one stands out, and the
+bar shows `n of m` (updated as the text changes).
+
+| In the find bar | Keys |
+|---|---|
+| Next / previous match | `Enter` / `Shift+Enter`, `F3` / `Shift+F3` |
+| Match case / whole word / regular expression | `Alt+C` / `Alt+W` / `Alt+R` |
+| Select all matches as cursors | `Alt+Enter` |
+| Replace (in the replace field) / Replace All | `Enter` / `Ctrl+Alt+Enter` |
+| Close and return to the text | `Escape` |
+
+Regular expressions use Rust's `regex` syntax (`^`/`$` match at lines);
+replacements expand `$1`, `${name}`. Without regex the replacement is
+literal.
+
+## Split editor and session restore
+
+The editor area splits into panes (VS Code's editor groups), each with its
+own tabs and active tab. A file open in two panes is two views of one
+buffer: edits, undo and the unsaved marker are shared, and closing one view
+of an edited file does not ask (closing the last one does). Files opened
+from the tree, the finder, search, Problems, the terminal, diffs or Back /
+Forward (`Alt+Left` / `Alt+Right`) go to the active pane (the one last
+clicked or focused).
+
+| Command (View menu, palette) | Shortcut |
+|---|---|
+| Split Editor Right (the active file, at the same position) | `Ctrl+\` |
+| Split Editor Down | `Ctrl+K Ctrl+\` |
+| Focus First / Second / Third Editor Pane (one past the last splits right) | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` |
+| Focus Next / Previous Editor Pane | `Ctrl+K Ctrl+Right` / `Ctrl+K Ctrl+Left` |
+| Move Tab to Next / Previous Pane (splits one off at the edge) | `Ctrl+Alt+Right` / `Ctrl+Alt+Left` |
+| Close Editor Pane (asks once about unsaved files) | `Ctrl+K W` |
+
+Tabs can be dragged onto another pane's tab bar (before a tab or at the
+end), into a pane's middle, or onto its left/right/top/bottom quarter to
+split it there. The bar between panes resizes them. Closing a pane's last
+tab removes the pane. Middle click closes a tab.
+
+Each project remembers its editor tabs per pane, the active tab and pane,
+the splits and their sizes, and every editor's selections and scroll, and
+reopens them the next time the project opens (local, WSL and container
+projects alike). Files that no longer exist are skipped; diff, history and
+comparison tabs are not kept. The state is `session.json` next to the
+project's saved layout, in `%LOCALAPPDATA%\next_code\projects\<key>\` on
+Windows or `~/.local/share/next_code/projects/<key>/` on Linux (the key is
+the project's location with other characters than letters and digits as
+`_`). `"restore_session": false` in `settings.json` turns it off.
 
 ## Themes and highlighting
 

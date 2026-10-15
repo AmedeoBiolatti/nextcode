@@ -1483,11 +1483,15 @@ impl Render for Shell {
 mod tests {
     use super::*;
 
-    /// Removes a test's folders and its recent-projects file.
+    /// Removes a test's folders, its recent-projects file and its project
+    /// state (sessions saved when workspaces close).
     fn cleanup(root: PathBuf) {
         std::fs::remove_dir_all(root).ok();
         if let Some(recent) = recent::path() {
             std::fs::remove_file(recent).ok();
+        }
+        if let Some(state) = crate::layout::state_root() {
+            std::fs::remove_dir_all(state).ok();
         }
     }
 

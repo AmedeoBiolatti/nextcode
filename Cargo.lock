@@ -3576,6 +3576,7 @@ dependencies = [
  "nucleo-matcher",
  "parking_lot",
  "python",
+ "regex",
  "remote",
  "search",
  "serde",

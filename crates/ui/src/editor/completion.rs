@@ -70,7 +70,7 @@ impl Editor {
         let Some(server) = self.server() else {
             return;
         };
-        let Some(position) = self.position_params(self.head) else {
+        let Some(position) = self.position_params(self.primary().head) else {
             return;
         };
         let trigger_kind = if trigger.is_some() {
@@ -91,7 +91,7 @@ impl Editor {
         };
         self.completion_generation += 1;
         let generation = self.completion_generation;
-        let requested_at = self.head;
+        let requested_at = self.primary().head;
         let request = server.connection.request::<Completion>(params);
         self._completion_task = Some(cx.spawn(async move |this, cx| {
             let response = request.await;
@@ -104,9 +104,10 @@ impl Editor {
                     Ok(Some(CompletionResponse::List(list))) => (list.items, list.is_incomplete),
                     Ok(None) | Err(_) => return,
                 };
-                let word_start = complete::word_start(&this.buffer, this.head);
-                let same_line = this.buffer.line_of(this.head) == this.buffer.line_of(requested_at);
-                if items.is_empty() || !same_line || this.head < word_start.min(requested_at) {
+                let head = this.primary().head;
+                let word_start = complete::word_start(&this.buffer, head);
+                let same_line = this.buffer.line_of(head) == this.buffer.line_of(requested_at);
+                if items.is_empty() || !same_line || head < word_start.min(requested_at) {
                     return;
                 }
                 this.completion = Some(CompletionMenu {
@@ -130,12 +131,13 @@ impl Editor {
         let Some(menu) = &self.completion else {
             return;
         };
-        let still_in_word = self.anchor == self.head
-            && self.head >= menu.word_start
-            && self.buffer.line_of(self.head) == self.buffer.line_of(menu.word_start)
+        let primary = self.primary();
+        let still_in_word = primary.is_empty()
+            && primary.head >= menu.word_start
+            && self.buffer.line_of(primary.head) == self.buffer.line_of(menu.word_start)
             && self
                 .buffer
-                .slice(menu.word_start..self.head)
+                .slice(menu.word_start..primary.head)
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '_');
         if !still_in_word {
@@ -151,7 +153,9 @@ impl Editor {
         let Some(menu) = &mut self.completion else {
             return;
         };
-        let query = self.buffer.slice(menu.word_start..self.head);
+        let query = self
+            .buffer
+            .slice(menu.word_start..self.selections.primary().head);
         menu.candidates = complete::filter(&menu.items, &query);
         // Nothing left, or the only match is exactly what was typed.
         let exhausted = menu.candidates.is_empty()
@@ -311,17 +315,37 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         // The cursor may have moved off the word while resolving.
-        if self.head < word_start
-            || self.buffer.line_of(self.head) != self.buffer.line_of(word_start)
-        {
+        let head = self.primary().head;
+        if head < word_start || self.buffer.line_of(head) != self.buffer.line_of(word_start) {
             return;
         }
+        let accepted = complete::accept(&self.buffer, item, word_start, head, encoding);
+        // Accepted at the primary cursor; other cursors keep their text.
+        let mut edits = accepted.edits;
+        edits.sort_by_key(|(range, _)| range.start);
+        let cursor = accepted.cursor;
+        let primary = self.selections.primary_index();
+        let others: Vec<Selection> = self.selections.all().to_vec();
+        let mapped: Vec<Selection> = others
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if i == primary {
+                    Selection::cursor(cursor)
+                } else {
+                    Selection::new(
+                        lines::map_through(&edits, s.anchor, Bias::Right),
+                        lines::map_through(&edits, s.head, Bias::Right),
+                    )
+                }
+            })
+            .collect();
+        let transaction = self.buffer.transaction_id();
+        let before = self.selections.clone();
         let was_dirty = self.buffer.is_dirty();
-        let accepted = complete::accept(&self.buffer, item, word_start, self.head, encoding);
-        if self.buffer.edit_batch(accepted.edits).is_ok() {
-            self.anchor = accepted.cursor;
-            self.head = accepted.cursor;
-            self.goal_column = None;
+        if self.buffer.edit_batch(edits).is_ok() {
+            self.selections = SelectionSet::new(mapped, primary).clamped(&self.buffer);
+            self.record_history(transaction, before);
             self.autoscroll = true;
             self.finish_change(was_dirty, cx);
             // Accepting must not reopen the menu on the inserted word.
