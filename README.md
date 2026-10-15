@@ -10,13 +10,13 @@ Native, AI-first IDE written in Rust on [gpui](https://crates.io/crates/gpui).
 | `crates/syntax` | Incremental tree-sitter parsing and highlight spans for Bash, C, C++, CSS, Dockerfile, Go, HTML, JavaScript, JSON, Markdown, Python, Rust, SQL, TOML, TypeScript/TSX, YAML |
 | `crates/search` | Gitignore-aware project text search with regex, globs and streaming results |
 | `crates/watcher` | Debounced project file watching with `.gitignore` filtering |
-| `crates/terminal` | Shell process and terminal emulation, local or attached to a remote pty |
+| `crates/terminal` | Shell process and terminal emulation, local or attached to a remote pty; links (URLs, file locations, OSC 8) in its output |
 | `crates/worktree` | Project file operations shared by the editor and the agent: listing, ignore rules, tool lookup |
 | `crates/proto` | Versioned editor ↔ agent wire protocol (framing, requests, events) |
 | `crates/agent` | `next_code_agent`: headless Linux process serving files, watching, search, language servers and shells |
 | `crates/remote` | Agent client and the bootstraps that install and start it in WSL or a container (`docker exec`) |
 | `crates/devcontainer` | `devcontainer.json` (JSONC) and bringing dev containers up with the docker CLI |
-| `crates/python` | `pyproject.toml` / `uv.lock`, uv command lines, pytest node ids and traceback locations |
+| `crates/python` | `pyproject.toml` / `uv.lock`, uv command lines, pytest node ids |
 | `crates/git` | Git through its CLI: porcelain v2 status, stage/unstage/discard/commit, hunk patches, branches, worktrees, fetch/pull/push, history, diffs |
 | `crates/ui` | `next_code` binary: editor, docks, LSP, terminal, search, problems, git and Python panels, diffs, fuzzy file finder (`Ctrl+P`) |
 
@@ -138,6 +138,15 @@ the project lives (Windows, WSL or a dev container):
 
 New terminals activate `.venv` (`VIRTUAL_ENV`/`PATH` locally;
 `. .venv/bin/activate` in WSL and containers).
+
+Links in terminal output are underlined under the mouse; Ctrl+click opens
+them (the pointer turns into a hand while Ctrl is held). URLs (`http`,
+`https`, `file`, `ftp`) open in the browser; file locations open in the
+editor at their line and column: compiler-style `path:line:column`,
+`path:line`, Python's `File "path", line N`, and paths with a separator
+(`src/lib.rs`). Relative paths are resolved against the project root. OSC 8
+hyperlinks (`ls --hyperlink`, `gcc`, `cargo` with hyperlinks on) open their
+target. A link wrapped over several rows is one link.
 
 ## Git and multiple projects
 
@@ -357,6 +366,12 @@ immediately.
 When the GUI panics, the message and a backtrace are appended to
 `next_code/crash.log` in the local data dir (`%LOCALAPPDATA%` on Windows,
 `~/.local/share` on Linux); without a console there is otherwise no trace.
+
+Nothing the editor opens leaves the session: there is no D-Bus session bus
+(so no desktop portal), and `xdg-open`, `gio`, `wslview` and the
+`powershell.exe` launch used on WSL are stand-ins that only record the target.
+`{"cmd":"opened"}` returns the URLs and files the editor asked to open, in
+order.
 
 Requests execute serially. Input acknowledgements mean the platform operation
 finished, not that asynchronous application work or a rendered frame completed.

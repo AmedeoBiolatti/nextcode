@@ -1,6 +1,6 @@
 //! Python projects managed with uv: `pyproject.toml` and `uv.lock`, the
-//! `uv` command lines the editor runs, and helpers for running tests
-//! (pytest node ids, traceback locations).
+//! `uv` command lines the editor runs, and pytest node ids for running
+//! tests.
 
 mod pytest;
 pub mod uv;
@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, io};
 
 use serde::Deserialize;
 
-pub use pytest::{test_at, traceback_location};
+pub use pytest::test_at;
 
 /// A PEP 508 requirement, split into the parts the editor shows.
 #[derive(Debug, Clone, PartialEq, Eq)]

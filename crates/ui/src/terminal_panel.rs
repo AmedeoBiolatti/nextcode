@@ -5,14 +5,17 @@ use std::path::PathBuf;
 
 use futures::StreamExt;
 use gpui::{
-    App, BorderStyle, Bounds, ClipboardItem, Context, Element, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId,
-    KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    NoAction, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString, Size, StrikethroughStyle,
-    Style, Subscription, Task, TextRun, UnderlineStyle, Window, div, fill, outline, point,
-    prelude::*, px, relative, rgb, size,
+    App, BorderStyle, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hsla,
+    InspectorElementId, KeyBinding, KeyDownEvent, LayoutId, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NoAction, Pixels, Point, ScrollWheelEvent,
+    ShapedLine, SharedString, Size, StrikethroughStyle, Style, Subscription, Task, TextRun,
+    UnderlineStyle, Window, div, fill, outline, point, prelude::*, px, relative, rgb, size,
 };
-use terminal::{Key, Modifiers, Palette, Rgb, Snapshot, Terminal, TerminalEvent, TerminalOptions};
+use terminal::{
+    Key, LinkTarget, Modifiers, Palette, Rgb, ScreenLink, Snapshot, Terminal, TerminalEvent,
+    TerminalOptions,
+};
 use worktree::FileKind;
 
 use crate::{project::Project, theme};
@@ -96,11 +99,12 @@ fn to_hsla(color: Rgb) -> Hsla {
 pub enum TerminalViewEvent {
     TitleChanged,
     Exited,
-    /// Ctrl+click on a line naming a file and line (a Python traceback, a
-    /// pytest failure): the path as printed and its 1-based line.
+    /// Ctrl+click on a file location (compiler output, a traceback, a
+    /// pytest failure): the path as printed, 1-based line and column.
     OpenLocation {
         path: String,
-        line: usize,
+        line: Option<u32>,
+        column: Option<u32>,
     },
 }
 
@@ -133,6 +137,12 @@ pub struct TerminalView {
     selecting: bool,
     /// Fractional scroll-wheel lines not yet applied.
     scroll_remainder: f32,
+    /// The cell under the mouse, and whether Ctrl is held.
+    hover: Option<CellPoint>,
+    ctrl: bool,
+    /// The link under the mouse in the last frame (underlined; Ctrl+click
+    /// opens it).
+    link: Option<ScreenLink>,
     _events: Task<()>,
 }
 
@@ -175,6 +185,9 @@ impl TerminalView {
             selection: None,
             selecting: false,
             scroll_remainder: 0.,
+            hover: None,
+            ctrl: false,
+            link: None,
             _events: task,
         }
     }
@@ -349,20 +362,11 @@ impl TerminalView {
     ) {
         window.focus(&self.focus_handle);
         let cell = self.cell_at(event.position);
-        if event.modifiers.control {
-            let snapshot = self.terminal.snapshot();
-            if cell.row < snapshot.rows {
-                let text: String = snapshot
-                    .row(cell.row)
-                    .iter()
-                    .filter(|cell| !cell.spacer)
-                    .map(|cell| cell.c)
-                    .collect();
-                if let Some((path, line)) = python::traceback_location(&text) {
-                    cx.emit(TerminalViewEvent::OpenLocation { path, line });
-                    return;
-                }
-            }
+        if event.modifiers.control
+            && let Some(link) = self.terminal.snapshot().link_at(cell.row, cell.column)
+        {
+            self.open_link(link.target, cx);
+            return;
         }
         self.selection = Some((cell, cell));
         self.selecting = true;
@@ -370,11 +374,46 @@ impl TerminalView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let cell = self.cell_at(event.position);
         if self.selecting
             && let Some((anchor, _)) = self.selection
         {
-            self.selection = Some((anchor, self.cell_at(event.position)));
+            self.selection = Some((anchor, cell));
             cx.notify();
+        }
+        if self.hover != Some(cell) || self.ctrl != event.modifiers.control {
+            self.hover = Some(cell);
+            self.ctrl = event.modifiers.control;
+            cx.notify();
+        }
+    }
+
+    fn on_hover(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if !hovered && self.hover.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ctrl != event.modifiers.control {
+            self.ctrl = event.modifiers.control;
+            cx.notify();
+        }
+    }
+
+    /// Opens what Ctrl+click hit: URLs in the browser, file locations in
+    /// the editor.
+    fn open_link(&mut self, target: LinkTarget, cx: &mut Context<Self>) {
+        match target {
+            LinkTarget::Url(url) => cx.open_url(&url),
+            LinkTarget::File { path, line, column } => {
+                cx.emit(TerminalViewEvent::OpenLocation { path, line, column })
+            }
         }
     }
 
@@ -445,6 +484,10 @@ impl TerminalView {
         self.app_cursor = snapshot.app_cursor;
         self.bracketed_paste = snapshot.bracketed_paste;
         self.alt_screen = snapshot.alt_screen;
+        // Text moves under a resting mouse too: find the link every frame.
+        self.link = self
+            .hover
+            .and_then(|cell| snapshot.link_at(cell.row, cell.column));
         let background = self.palette.background;
 
         let mut lines = Vec::with_capacity(snapshot.rows);
@@ -484,7 +527,12 @@ impl TerminalView {
                     font,
                     color,
                     background_color: None,
-                    underline: cell.underline.then_some(UnderlineStyle {
+                    underline: (cell.underline
+                        || self
+                            .link
+                            .as_ref()
+                            .is_some_and(|link| link.contains(row, column)))
+                    .then_some(UnderlineStyle {
                         color: Some(color),
                         thickness: px(1.),
                         wavy: false,
@@ -583,6 +631,11 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_hover(cx.listener(Self::on_hover))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
+            .when(self.ctrl && self.link.is_some(), |terminal| {
+                terminal.cursor(CursorStyle::PointingHand)
+            })
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
@@ -685,8 +738,12 @@ impl Element for TerminalElement {
 }
 
 pub enum TerminalPanelEvent {
-    /// Open a file at a 0-based line (Ctrl+click in a terminal).
-    OpenFile { path: PathBuf, line: usize },
+    /// Open a file, at a 0-based line and column when known (Ctrl+click
+    /// in a terminal).
+    OpenFile {
+        path: PathBuf,
+        position: Option<(usize, usize)>,
+    },
 }
 
 impl EventEmitter<TerminalPanelEvent> for TerminalPanel {}
@@ -835,12 +892,15 @@ impl TerminalPanel {
                         this.close(index, window, cx);
                     }
                 }
-                TerminalViewEvent::OpenLocation { path, line } => {
+                TerminalViewEvent::OpenLocation { path, line, column } => {
                     let path = this.project.path(path);
-                    cx.emit(TerminalPanelEvent::OpenFile {
-                        path,
-                        line: line.saturating_sub(1),
+                    let position = line.map(|line| {
+                        (
+                            (line as usize).saturating_sub(1),
+                            column.map_or(0, |column| (column as usize).saturating_sub(1)),
+                        )
                     });
+                    cx.emit(TerminalPanelEvent::OpenFile { path, position });
                 }
             });
         self.started = true;

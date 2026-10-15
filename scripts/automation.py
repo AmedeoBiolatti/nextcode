@@ -10,6 +10,7 @@ import json
 import os
 import secrets
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -17,6 +18,12 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+def write_script(path, body):
+    with open(path, 'w') as script:
+        script.write('#!/bin/sh\n' + body)
+    os.chmod(path, 0o755)
 
 
 def main():
@@ -122,6 +129,26 @@ def main():
             # Keep automated edits to preferences separate from the user's.
             env['XDG_CONFIG_HOME'] = os.path.join(directory, 'config')
             env['XDG_CACHE_HOME'] = os.path.join(directory, 'cache')
+            # Nothing the editor opens may reach the user's desktop: without
+            # a session bus the desktop portal is unreachable, and the
+            # fallbacks (`powershell.exe` on WSL, `xdg-open`, `gio`) are
+            # stand-ins that record the target for the `opened` command.
+            env.pop('DBUS_SESSION_BUS_ADDRESS', None)
+            opened_log = os.path.join(directory, 'opened.log')
+            open(opened_log, 'w').close()
+            shims = os.path.join(directory, 'bin')
+            os.mkdir(shims)
+            record = f'printf "%s\\n" "$target" >> {shlex.quote(opened_log)}'
+            for name in ('xdg-open', 'gio', 'wslview', 'sensible-browser', 'x-www-browser'):
+                write_script(os.path.join(shims, name),
+                             f'target="$1"; [ "$1" = open ] && target="$2"\n{record}\n')
+            real_powershell = shutil.which('powershell.exe', path=env.get('PATH'))
+            write_script(os.path.join(shims, 'powershell.exe'),
+                         'if [ -n "$OPEN_RS_TARGET" ]; then target="$OPEN_RS_TARGET"; '
+                         f'{record}; exit 0; fi\n'
+                         + (f'exec {shlex.quote(real_powershell)} "$@"\n' if real_powershell else 'exit 127\n'))
+            env['PATH'] = shims + os.pathsep + env.get('PATH', '')
+            env['BROWSER'] = os.path.join(shims, 'xdg-open')
             app = spawn([args.binary, *args.project], stdout=sys.stderr)
             deadline = time.monotonic() + 60
             window = None
@@ -150,7 +177,7 @@ def main():
                             'height': args.height, 'coordinates': 'display pixels',
                             'commands': ['info', 'key_down', 'key_up', 'key', 'text',
                                          'mouse_move', 'mouse_down', 'mouse_up', 'click',
-                                         'scroll', 'screenshot', 'wait', 'shutdown']}
+                                         'scroll', 'screenshot', 'wait', 'opened', 'shutdown']}
                 if cmd in ('key_down', 'key_up', 'key'):
                     verb = {'key_down': 'keydown', 'key_up': 'keyup', 'key': 'key'}[cmd]
                     run(['xdotool', verb, '--', string(request, 'key')])
@@ -185,6 +212,10 @@ def main():
                             'width': args.width, 'height': args.height}
                 elif cmd == 'wait':
                     time.sleep(int(number(request, 'ms', 0, 10000)) / 1000)
+                elif cmd == 'opened':
+                    # URLs and files the editor asked the desktop to open.
+                    with open(opened_log) as log:
+                        return log.read().splitlines()
                 elif cmd == 'shutdown':
                     threading.Thread(target=server.shutdown, daemon=True).start()
                 else:

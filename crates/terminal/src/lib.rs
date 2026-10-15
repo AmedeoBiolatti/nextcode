@@ -4,11 +4,13 @@
 //! visible screen.
 
 mod keys;
+mod links;
 
 use std::{
     borrow::Cow,
     collections::HashMap,
     io,
+    ops::Range,
     path::PathBuf,
     sync::{
         Arc, OnceLock,
@@ -30,6 +32,7 @@ use alacritty_terminal::{
 };
 use futures::channel::mpsc;
 pub use keys::{Key, Modifiers, encode_key, encode_paste};
+pub use links::{Link, LinkTarget, find_links};
 use parking_lot::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +248,26 @@ pub struct Snapshot {
     pub app_cursor: bool,
     pub bracketed_paste: bool,
     pub alt_screen: bool,
+    /// Per row: the line continues on the next row (soft wrap).
+    pub wrapped: Vec<bool>,
+    /// OSC 8 hyperlinks by cell index (`row * columns + column`), sorted.
+    pub hyperlinks: Vec<(usize, Arc<str>)>,
+}
+
+/// A link on screen: the cells it covers (per row, a range of columns)
+/// and what it opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenLink {
+    pub cells: Vec<(usize, Range<usize>)>,
+    pub target: LinkTarget,
+}
+
+impl ScreenLink {
+    pub fn contains(&self, row: usize, column: usize) -> bool {
+        self.cells
+            .iter()
+            .any(|(at, columns)| *at == row && columns.contains(&column))
+    }
 }
 
 impl Snapshot {
@@ -266,6 +289,86 @@ impl Snapshot {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn hyperlink(&self, index: usize) -> Option<&Arc<str>> {
+        self.hyperlinks
+            .binary_search_by_key(&index, |(at, _)| *at)
+            .ok()
+            .map(|found| &self.hyperlinks[found].1)
+    }
+
+    /// The link at a cell: an OSC 8 hyperlink, else a URL or file location
+    /// in the text of its (soft-wrapped) line.
+    pub fn link_at(&self, row: usize, column: usize) -> Option<ScreenLink> {
+        if row >= self.rows || column >= self.columns {
+            return None;
+        }
+        let mut first = row;
+        while first > 0 && self.wrapped.get(first - 1) == Some(&true) {
+            first -= 1;
+        }
+        let mut last = row;
+        while last + 1 < self.rows && self.wrapped.get(last) == Some(&true) {
+            last += 1;
+        }
+        // The line's characters and the cell each came from.
+        let mut text = String::new();
+        let mut positions: Vec<(usize, usize)> = Vec::new();
+        for at in first..=last {
+            for (col, cell) in self.row(at).iter().enumerate() {
+                if !cell.spacer {
+                    text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                    positions.push((at, col));
+                }
+            }
+        }
+        let hovered = positions
+            .iter()
+            .position(|&(at, col)| at == row && col == column)
+            // The second half of a wide character belongs to the first.
+            .or_else(|| {
+                positions
+                    .iter()
+                    .position(|&(at, col)| at == row && col + 1 == column)
+            })?;
+        let to_screen = |range: Range<usize>| {
+            let mut cells: Vec<(usize, Range<usize>)> = Vec::new();
+            for &(at, col) in &positions[range] {
+                let width = if self.row(at)[col].wide { 2 } else { 1 };
+                match cells.last_mut() {
+                    Some((last_row, columns)) if *last_row == at && columns.end == col => {
+                        columns.end = col + width;
+                    }
+                    _ => cells.push((at, col..col + width)),
+                }
+            }
+            cells
+        };
+
+        let index_of = |(at, col): (usize, usize)| at * self.columns + col;
+        if let Some(uri) = self.hyperlink(index_of(positions[hovered])) {
+            let same = |i: usize| self.hyperlink(index_of(positions[i])) == Some(uri);
+            let mut start = hovered;
+            while start > 0 && same(start - 1) {
+                start -= 1;
+            }
+            let mut end = hovered + 1;
+            while end < positions.len() && same(end) {
+                end += 1;
+            }
+            return Some(ScreenLink {
+                cells: to_screen(start..end),
+                target: LinkTarget::Url(uri.to_string()),
+            });
+        }
+        links::find_links(&text)
+            .into_iter()
+            .find(|link| link.range.contains(&hovered))
+            .map(|link| ScreenLink {
+                cells: to_screen(link.range),
+                target: link.target,
+            })
     }
 }
 
@@ -513,6 +616,8 @@ impl Terminal {
             spacer: false,
         };
         let mut cells = vec![blank; columns * rows];
+        let mut wrapped = vec![false; rows];
+        let mut hyperlinks: Vec<(usize, Arc<str>)> = Vec::new();
         let offset = content.display_offset as i32;
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + offset;
@@ -534,7 +639,19 @@ impl Terminal {
             if flags.contains(Flags::HIDDEN) {
                 fg = bg;
             }
-            cells[row as usize * columns + column] = SnapshotCell {
+            let index = row as usize * columns + column;
+            if column + 1 == columns && flags.contains(Flags::WRAPLINE) {
+                wrapped[row as usize] = true;
+            }
+            if let Some(link) = cell.hyperlink() {
+                // One allocation per link, not per cell.
+                let uri = match hyperlinks.last() {
+                    Some((_, last)) if **last == *link.uri() => last.clone(),
+                    _ => Arc::from(link.uri()),
+                };
+                hyperlinks.push((index, uri));
+            }
+            cells[index] = SnapshotCell {
                 c: cell.c,
                 fg,
                 bg,
@@ -565,6 +682,8 @@ impl Terminal {
             app_cursor: mode.contains(TermMode::APP_CURSOR),
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
             alt_screen: mode.contains(TermMode::ALT_SCREEN),
+            wrapped,
+            hyperlinks,
         }
     }
 }
@@ -724,5 +843,57 @@ mod tests {
             palette.indexed(NamedColor::Background as usize),
             palette.background
         );
+    }
+}
+
+#[cfg(test)]
+mod screen_links {
+    use super::*;
+
+    struct Sink;
+    impl RemotePty for Sink {
+        fn write(&self, _: Vec<u8>) {}
+        fn resize(&self, _: u16, _: u16) {}
+        fn close(&self) {}
+    }
+
+    /// A 20-column screen once it shows `last` (the end of `output`).
+    fn screen(output: &[u8], last: &str) -> Snapshot {
+        let (tx, rx) = std_mpsc::channel();
+        let (terminal, _events) =
+            Terminal::attach(20, 4, 10, Palette::default(), Arc::new(Sink), rx).unwrap();
+        tx.send(PtyOutput::Data(output.to_vec())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let snapshot = terminal.snapshot();
+            if snapshot.text().contains(last) || std::time::Instant::now() > deadline {
+                return snapshot;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_url_wrapped_over_rows_is_one_link() {
+        // "see " + a 28-character URL: 16 columns on row 0, 12 on row 1.
+        let snapshot = screen(b"see https://example.com/abcdefgh done", "done");
+        let url = LinkTarget::Url("https://example.com/abcdefgh".into());
+        let from_first = snapshot.link_at(0, 10).unwrap();
+        assert_eq!(from_first.target, url);
+        assert_eq!(from_first.cells, [(0, 4..20), (1, 0..12)]);
+        assert_eq!(snapshot.link_at(1, 3), Some(from_first));
+        assert_eq!(snapshot.link_at(1, 14), None, "`done` is not part of it");
+    }
+
+    #[test]
+    fn osc8_hyperlinks_open_their_target_not_their_text() {
+        let snapshot = screen(
+            b"\x1b]8;;https://docs.rs/\x1b\\the docs\x1b]8;;\x1b\\ end",
+            "end",
+        );
+        let link = snapshot.link_at(0, 5).unwrap();
+        assert_eq!(link.target, LinkTarget::Url("https://docs.rs/".into()));
+        assert_eq!(link.cells, [(0, 0..8)]);
+        assert_eq!(snapshot.link_at(0, 10), None);
     }
 }

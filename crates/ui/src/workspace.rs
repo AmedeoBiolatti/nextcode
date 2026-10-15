@@ -316,11 +316,13 @@ impl Workspace {
             &terminal,
             window,
             |this, _, event: &TerminalPanelEvent, window, cx| match event {
-                TerminalPanelEvent::OpenFile { path, line } => {
+                TerminalPanelEvent::OpenFile { path, position } => {
                     this.record_position(cx);
                     this.forward.clear();
-                    if let Some(editor) = this.open_editor(path, window, cx) {
-                        editor.update(cx, |editor, cx| editor.go_to_line(*line, 0, cx));
+                    if let Some(editor) = this.open_editor(path, window, cx)
+                        && let Some((line, column)) = *position
+                    {
+                        editor.update(cx, |editor, cx| editor.go_to_line(line, column, cx));
                     }
                 }
             },

@@ -69,33 +69,6 @@ pub fn test_at(source: &str, line: usize) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("::"))
 }
 
-/// The file and 1-based line a traceback line points to: Python's
-/// `File "path", line N` and pytest's `path:N: message`.
-pub fn traceback_location(line: &str) -> Option<(String, usize)> {
-    if let Some(start) = line.find("File \"") {
-        let rest = &line[start + 6..];
-        let (path, rest) = rest.split_once('"')?;
-        let number = rest
-            .trim_start_matches(',')
-            .trim_start()
-            .strip_prefix("line ")?;
-        let digits: String = number.chars().take_while(char::is_ascii_digit).collect();
-        return Some((path.to_owned(), digits.parse().ok()?));
-    }
-    // `tests/test_a.py:12: AssertionError` (also `C:\x\a.py:12:`).
-    let text = line.trim();
-    let py = text.find(".py:")?;
-    let path = &text[..py + 3];
-    let digits: String = text[py + 4..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    if digits.is_empty() || path.contains(char::is_whitespace) && !path.contains(['/', '\\']) {
-        return None;
-    }
-    Some((path.to_owned(), digits.parse().ok()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,22 +103,5 @@ async def test_async():
         assert_eq!(test_at(SOURCE, 16).as_deref(), Some("test_async"));
         assert_eq!(test_at(SOURCE, 3), None);
         assert_eq!(test_at(SOURCE, 0), None);
-    }
-
-    #[test]
-    fn traceback_lines_point_to_files() {
-        assert_eq!(
-            traceback_location(r#"  File "/w/app/main.py", line 12, in <module>"#),
-            Some(("/w/app/main.py".into(), 12))
-        );
-        assert_eq!(
-            traceback_location("tests/test_a.py:7: AssertionError"),
-            Some(("tests/test_a.py".into(), 7))
-        );
-        assert_eq!(
-            traceback_location(r"C:\src\p\test_a.py:3: in test_x"),
-            Some((r"C:\src\p\test_a.py".into(), 3))
-        );
-        assert_eq!(traceback_location("collected 3 items"), None);
     }
 }
