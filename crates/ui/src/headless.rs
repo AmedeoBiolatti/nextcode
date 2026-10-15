@@ -23,6 +23,7 @@
 //! | `close` | `path` | `null` |
 //! | `diagnostics` | `path`?, `wait_ms`? | `[{path, diagnostics}]` (raw LSP); `wait_ms` waits until the server published for `path` and stayed idle 1 s |
 //! | `definition` | `path`, `line`, `character` (LSP position) | `[{path, range}]` |
+//! | `semantic_tokens` | `path` (open) | `[{line, start, end, text, scope, modifiers}]`: the server's tokens as the editor decodes them; `start`/`end` are UTF-8 byte columns, `scope` is the highlight scope (`null`: modifiers only) |
 //! | `exec` | `command`, `timeout_ms`? | `{code, stdout, stderr}`; runs in the project root where it lives |
 //! | `git_status` | | `{root, prefix, branch, unborn, upstream, ahead, behind, entries: [{path, orig_path, staged, unstaged}]}` |
 //! | `git_stage` / `git_unstage` / `git_discard` | `paths` (repository-relative) | `null`; discarding deletes untracked files |
@@ -69,7 +70,8 @@ use lsp::types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, GotoDefinitionParams, Position, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
-    VersionedTextDocumentIdentifier, notification, request::GotoDefinition,
+    VersionedTextDocumentIdentifier, notification,
+    request::{GotoDefinition, SemanticTokensFullRequest},
 };
 use parking_lot::Mutex;
 use search::{SearchEvent, SearchLimits, SearchQuery};
@@ -81,6 +83,7 @@ use worktree::FileKind;
 
 use crate::{
     diff_view::DiffSource,
+    editor::semantic,
     lsp_store::{LspStore, LspStoreEvent, RunningServer, ServerStatus},
     project::{Location, Project, WatchHandle},
     settings::Settings,
@@ -322,7 +325,7 @@ impl Session {
                     }
                 }
             }
-            LspStoreEvent::ServerStopped(_) => {}
+            LspStoreEvent::ServerStopped(_) | LspStoreEvent::SemanticTokensRefresh(_) => {}
         }
     }
 
@@ -412,6 +415,7 @@ impl Session {
             },
             "diagnostics" => self.diagnostics(id, &request, cx),
             "definition" => self.definition(id, &request, cx),
+            "semantic_tokens" => self.semantic_tokens(id, &request, cx),
             "exec" => match param_str(&request, "command") {
                 Ok(command) => {
                     let command = command.to_owned();
@@ -1125,6 +1129,73 @@ impl Session {
                     .map(|location| json!({ "path": path_json(&location.path), "range": location.range }))
                     .collect();
                 json!(locations)
+            });
+            out.reply(&id, result);
+        })
+        .detach();
+    }
+
+    fn semantic_tokens(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
+        let path = match param_str(request, "path") {
+            Ok(path) => self.project.path(path),
+            Err(err) => return self.out.reply(&id, Err(err)),
+        };
+        let Some(document) = self.documents.get(&path) else {
+            return self.out.reply(
+                &id,
+                Err(format!("{} is not open; send `open` first", path.display())),
+            );
+        };
+        let params = semantic::params(document.uri.clone());
+        let buffer = text::Buffer::new(&document.text);
+        let Some(server) = self.running(document.language, cx) else {
+            return self
+                .out
+                .reply(&id, Err("the language server is not running".into()));
+        };
+        if server.semantic_legend.is_none() {
+            return self.out.reply(
+                &id,
+                Err("the language server does not serve semantic tokens".into()),
+            );
+        }
+        let out = self.out.clone();
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
+            let mut attempts = 0;
+            let response = loop {
+                let result = server
+                    .connection
+                    .request::<SemanticTokensFullRequest>(params.clone())
+                    .await;
+                match result {
+                    Err(lsp::Error::Response { code: -32801, .. }) if attempts < 10 => {
+                        attempts += 1;
+                        executor.timer(Duration::from_millis(500)).await;
+                    }
+                    other => break other,
+                }
+            };
+            let Some(legend) = &server.semantic_legend else {
+                return;
+            };
+            let result = response.map_err(|err| err.to_string()).map(|response| {
+                let data = semantic::response_data(response);
+                let tokens: Vec<Value> = semantic::decode(&data, legend, &buffer, server.encoding)
+                    .into_iter()
+                    .map(|token| {
+                        let start = buffer.point(token.range.start);
+                        json!({
+                            "line": start.row,
+                            "start": start.column,
+                            "end": start.column + token.range.len(),
+                            "text": buffer.slice(token.range.clone()),
+                            "scope": token.highlight.map(|highlight| highlight.scope()),
+                            "modifiers": legend.modifier_names(token.modifiers).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                json!(tokens)
             });
             out.reply(&id, result);
         })

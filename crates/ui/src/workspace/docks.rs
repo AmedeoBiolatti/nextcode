@@ -55,11 +55,11 @@ impl Render for DragPreview {
             .px_2()
             .py_1()
             .text_sm()
-            .bg(rgb(theme::ACTIVE_ROW))
+            .bg(theme::active_row())
             .border_1()
-            .border_color(rgb(theme::ACCENT))
+            .border_color(theme::accent())
             .rounded_md()
-            .text_color(rgb(theme::TEXT))
+            .text_color(theme::text())
             .child(self.0.clone())
     }
 }
@@ -270,7 +270,7 @@ impl Workspace {
             .flex()
             .items_center()
             .border_b_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .children(dock.panels.iter().enumerate().map(|(index, &panel)| {
                 self.render_panel_tab(position, index, panel, dock.active == Some(panel), cx)
             }))
@@ -279,7 +279,7 @@ impl Workspace {
                 div()
                     .flex_1()
                     .h_full()
-                    .drag_over::<DraggedPanel>(|style, _, _, _| style.bg(rgb(theme::HOVER_ROW)))
+                    .drag_over::<DraggedPanel>(|style, _, _, _| style.bg(theme::hover_row()))
                     .on_drop(cx.listener(move |this, dragged: &DraggedPanel, _, cx| {
                         this.move_panel(dragged.0, position, None, cx);
                     })),
@@ -288,8 +288,8 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("collapse-{}", position.label())))
                     .px_2()
-                    .text_color(rgb(theme::MUTED))
-                    .hover(|style| style.text_color(rgb(theme::TEXT)))
+                    .text_color(theme::muted())
+                    .hover(|style| style.text_color(theme::text()))
                     .cursor_pointer()
                     .child("–")
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -304,7 +304,7 @@ impl Workspace {
                     div()
                         .p_3()
                         .text_sm()
-                        .text_color(rgb(theme::MUTED))
+                        .text_color(theme::muted())
                         .child("This panel is not available yet.")
                         .into_any_element(),
                 ),
@@ -315,9 +315,9 @@ impl Workspace {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .drag_over::<DraggedPanel>(|style, _, _, _| {
-                style.border_1().border_color(rgb(theme::ACCENT))
+                style.border_1().border_color(theme::accent())
             })
             .on_drop(cx.listener(move |this, dragged: &DraggedPanel, _, cx| {
                 this.move_panel(dragged.0, position, None, cx);
@@ -358,11 +358,13 @@ impl Workspace {
             .items_center()
             .text_sm()
             .cursor_pointer()
-            .text_color(rgb(if active { theme::TEXT } else { theme::MUTED }))
-            .when(active, |tab| {
-                tab.border_b_2().border_color(rgb(theme::ACCENT))
+            .text_color(if active {
+                theme::text()
+            } else {
+                theme::muted()
             })
-            .hover(|style| style.text_color(rgb(theme::TEXT)))
+            .when(active, |tab| tab.border_b_2().border_color(theme::accent()))
+            .hover(|style| style.text_color(theme::text()))
             .child(panel.title())
             .on_click(cx.listener(move |this, _, _, cx| this.show_panel(panel, cx)))
             .on_mouse_down(
@@ -380,7 +382,7 @@ impl Workspace {
             })
             // Dropping on a tab inserts before it.
             .drag_over::<DraggedPanel>(|style, _, _, _| {
-                style.border_l_2().border_color(rgb(theme::ACCENT))
+                style.border_l_2().border_color(theme::accent())
             })
             .on_drop(cx.listener(move |this, dragged: &DraggedPanel, _, cx| {
                 this.move_panel(dragged.0, position, Some(index), cx);
@@ -403,9 +405,9 @@ impl Workspace {
                 .py(px(2.))
                 .rounded_sm()
                 .text_xs()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(theme::HOVER_ROW)).text_color(rgb(theme::TEXT)))
+                .hover(|style| style.bg(theme::hover_row()).text_color(theme::text()))
                 .child(label)
                 .on_click(cx.listener(move |this, _, _, cx| this.show_panel(panel, cx)))
                 .on_mouse_down(
@@ -424,9 +426,9 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_1()
-            .bg(rgb(theme::PANEL))
-            .border_color(rgb(theme::BORDER))
-            .drag_over::<DraggedPanel>(|style, _, _, _| style.bg(rgb(theme::ACTIVE_ROW)))
+            .bg(theme::panel())
+            .border_color(theme::border())
+            .drag_over::<DraggedPanel>(|style, _, _, _| style.bg(theme::active_row()))
             .on_drop(cx.listener(move |this, dragged: &DraggedPanel, _, cx| {
                 this.move_panel(dragged.0, position, None, cx);
             }))
@@ -458,8 +460,12 @@ impl Workspace {
         let active = self.resizing == Some(position);
         let handle = div()
             .flex_none()
-            .bg(rgb(if active { theme::ACCENT } else { theme::BORDER }))
-            .hover(|style| style.bg(rgb(theme::ACCENT)))
+            .bg(if active {
+                theme::accent()
+            } else {
+                theme::border()
+            })
+            .hover(|style| style.bg(theme::accent()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -495,7 +501,7 @@ impl Workspace {
                 .py_1()
                 .rounded_sm()
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(theme::ACTIVE_ROW)))
+                .hover(|style| style.bg(theme::active_row()))
                 .child(label)
         };
         let moves = DockPosition::ALL
@@ -520,10 +526,10 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .text_sm()
-                    .text_color(rgb(theme::TEXT))
-                    .bg(rgb(theme::PANEL))
+                    .text_color(theme::text())
+                    .bg(theme::panel())
                     .border_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .rounded_md()
                     .shadow_lg()
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -531,7 +537,7 @@ impl Workspace {
                         cx.notify();
                     }))
                     .children(moves)
-                    .child(div().my_1().h(px(1.)).bg(rgb(theme::BORDER)))
+                    .child(div().my_1().h(px(1.)).bg(theme::border()))
                     .child(
                         item("save-default".into(), "Save layout as default".into()).on_click(
                             cx.listener(|this, _, window, cx| {

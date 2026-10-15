@@ -4,11 +4,12 @@ use std::{ops::Range, sync::Arc, time::Duration};
 
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, InspectorElementId, KeyBinding, KeyContext, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, ShapedLine,
-    SharedString, StrikethroughStyle, Style, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
-    actions, div, fill, point, prelude::*, px, relative, rgb, size,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
+    FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, KeyBinding, KeyContext,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollWheelEvent, ShapedLine, SharedString, StrikethroughStyle, Style, Task, TextRun,
+    UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative,
+    size,
 };
 use lsp::types::{
     DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -19,10 +20,15 @@ use lsp::types::{
 use syntax::{HighlightSpan, Language, Syntax};
 use text::{Bias, Buffer, Change, Encoding};
 
-use crate::{lsp_store::RunningServer, project::Project, theme};
+use crate::{
+    lsp_store::RunningServer,
+    project::Project,
+    theme::{self, SyntaxStyle},
+};
 
 mod completion;
 mod navigation;
+pub(crate) mod semantic;
 
 pub use navigation::{FindReferences, GoToDefinition};
 
@@ -191,11 +197,12 @@ pub struct Editor {
     single_line: bool,
     lsp: Option<LspDocument>,
     /// Language-server status shown in the status bar, with its color.
-    lsp_status: Option<(SharedString, u32)>,
+    lsp_status: Option<(SharedString, fn() -> Hsla)>,
     /// Scratch space for changes drained from the buffer.
     changes: Vec<Change>,
     /// Sorted by start; kept in sync with edits until the server republishes.
     diagnostics: Vec<EditorDiagnostic>,
+    semantic: semantic::SemanticState,
     hover: Option<HoverPopover>,
     _hover_delay: Option<Task<()>>,
     /// Word the hover popover shows, or is waiting to show, information for.
@@ -222,12 +229,12 @@ pub enum Severity {
 }
 
 impl Severity {
-    fn color(self) -> u32 {
+    fn color(self) -> Hsla {
         match self {
-            Self::Error => theme::ERROR,
-            Self::Warning => theme::WARNING,
-            Self::Information => theme::ACCENT_TEXT,
-            Self::Hint => theme::MUTED,
+            Self::Error => theme::error(),
+            Self::Warning => theme::warning(),
+            Self::Information => theme::accent_text(),
+            Self::Hint => theme::muted(),
         }
     }
 
@@ -307,6 +314,7 @@ impl Editor {
             lsp_status: None,
             changes: Vec::new(),
             diagnostics: Vec::new(),
+            semantic: semantic::SemanticState::new(),
             hover: None,
             _hover_delay: None,
             hover_word: None,
@@ -324,13 +332,18 @@ impl Editor {
         self.syntax.as_ref().map(Syntax::language)
     }
 
-    pub fn set_lsp_status(&mut self, status: Option<(SharedString, u32)>, cx: &mut Context<Self>) {
+    pub fn set_lsp_status(
+        &mut self,
+        status: Option<(SharedString, fn() -> Hsla)>,
+        cx: &mut Context<Self>,
+    ) {
         self.lsp_status = status;
         cx.notify();
     }
 
-    /// Opens this document on `server` (no-op if already open there).
-    pub fn attach_server(&mut self, server: Arc<RunningServer>) {
+    /// Opens this document on `server` (no-op if already open there) and
+    /// asks for its semantic tokens.
+    pub fn attach_server(&mut self, server: Arc<RunningServer>, cx: &mut Context<Self>) {
         if self
             .lsp
             .as_ref()
@@ -359,10 +372,12 @@ impl Editor {
             uri,
             version: 1,
         });
+        self.refresh_semantic_tokens(cx);
     }
 
     /// Forgets the server; `close` also tells it the document closed.
     pub fn detach_server(&mut self, close: bool) {
+        self.clear_semantic_tokens();
         if let Some(doc) = self.lsp.take()
             && close
             && !doc.server.connection.has_exited()
@@ -376,10 +391,10 @@ impl Editor {
     }
 
     /// Sends the drained `changes` to the server: one incremental edit when
-    /// possible, otherwise the full text.
-    fn sync_changes(&mut self) {
+    /// possible, otherwise the full text. Returns whether it sent them.
+    fn sync_changes(&mut self) -> bool {
         let Some(doc) = &mut self.lsp else {
-            return;
+            return false;
         };
         let server = &doc.server;
         let content_changes =
@@ -404,7 +419,7 @@ impl Editor {
                     text: self.buffer.slice(0..self.buffer.len()),
                 }]
             } else {
-                return;
+                return false;
             };
         doc.version += 1;
         server
@@ -413,6 +428,7 @@ impl Editor {
                 text_document: VersionedTextDocumentIdentifier::new(doc.uri.clone(), doc.version),
                 content_changes,
             });
+        true
     }
 
     pub fn single_line(cx: &mut Context<Self>) -> Self {
@@ -498,6 +514,8 @@ impl Editor {
                             text: doc.server.save_includes_text.then(|| self.text()),
                         });
                 }
+                // A saved `settings.json` or theme file applies at once.
+                theme::refresh(cx);
                 true
             }
             Err(err) => {
@@ -631,6 +649,7 @@ impl Editor {
                 diagnostic.range = start..end;
             }
         }
+        self.shift_semantic_tokens();
         if edited {
             self.hover = None;
             self.hover_word = None;
@@ -645,8 +664,8 @@ impl Editor {
             }
             syntax.reparse(&self.buffer);
         }
-        if edited {
-            self.sync_changes();
+        if edited && self.sync_changes() {
+            self.semantic_tokens_edited(cx);
         }
         if edited {
             cx.emit(EditorEvent::Edited);
@@ -1097,8 +1116,14 @@ impl Editor {
         let first_line = (self.scroll.y / line_height).floor() as usize;
         let last_line =
             (first_line + (viewport.height / line_height).ceil() as usize + 1).min(line_count);
-        let text_color = rgb(theme::TEXT).into();
-        let muted = rgb(theme::MUTED).into();
+        let text_color = theme::text();
+        let muted = theme::muted();
+        let theme = theme::current();
+        let legend = self
+            .lsp
+            .as_ref()
+            .and_then(|doc| doc.server.semantic_legend.as_ref());
+        let styler = semantic::Styler::new(&theme, self.language(), legend);
         let base_run = run(0, text_color);
         let visible = self.buffer.line_start(first_line)
             ..self
@@ -1124,6 +1149,10 @@ impl Editor {
             let line_spans = &spans[first_span..];
             let line_spans =
                 &line_spans[..line_spans.partition_point(|span| span.range.start < range.end)];
+            let highlights = LineHighlights {
+                spans: line_spans,
+                tokens: semantic::overlapping(&self.semantic.tokens, range.clone()),
+            };
             line_diagnostics.clear();
             let candidates = self
                 .diagnostics
@@ -1142,7 +1171,8 @@ impl Editor {
             );
             let runs = line_runs(
                 range,
-                line_spans,
+                &highlights,
+                &styler,
                 self.marked.as_ref(),
                 &line_diagnostics,
                 &base_run,
@@ -1219,7 +1249,7 @@ impl Editor {
                         point(bounds.left() + px(3.), top + px(3.)),
                         size(px(3.), line_height - px(6.)),
                     ),
-                    rgb(severity.color()),
+                    severity.color(),
                 ));
             }
         }
@@ -1247,7 +1277,7 @@ impl Editor {
                                 point(text_left + x0, top),
                                 point(text_left + x1, top + line_height),
                             ),
-                            rgb(theme::SELECTION),
+                            theme::selection(),
                         ));
                     }
 
@@ -1262,7 +1292,7 @@ impl Editor {
                                 point(x, top),
                                 point(x + px(2.), top + line_height),
                             ),
-                            rgb(theme::CURSOR),
+                            theme::cursor(),
                         ));
                     }
                 }
@@ -1275,12 +1305,20 @@ fn lsp_position(point: text::Point) -> lsp::types::Position {
     lsp::types::Position::new(point.row as u32, point.column as u32)
 }
 
-/// Text runs for one line: syntax colors from `spans`, wavy underlines from
-/// `diagnostics`, IME composition underlined. `cuts` is scratch space reused
-/// across lines.
+/// What highlights one line: tree-sitter spans and semantic tokens
+/// overlapping it.
+struct LineHighlights<'a> {
+    spans: &'a [HighlightSpan],
+    tokens: &'a [semantic::SemanticToken],
+}
+
+/// Text runs for one line: syntax styles from `highlights` (resolved by
+/// `styler`), wavy underlines from `diagnostics`, IME composition
+/// underlined. `cuts` is scratch space reused across lines.
 fn line_runs(
     line: Range<usize>,
-    spans: &[HighlightSpan],
+    highlights: &LineHighlights,
+    styler: &semantic::Styler,
     marked: Option<&Range<usize>>,
     diagnostics: &[&EditorDiagnostic],
     base: &TextRun,
@@ -1289,8 +1327,11 @@ fn line_runs(
     let clamp = |offset: usize| offset.clamp(line.start, line.end);
     cuts.clear();
     cuts.extend([line.start, line.end]);
-    for span in spans {
+    for span in highlights.spans {
         cuts.extend([clamp(span.range.start), clamp(span.range.end)]);
+    }
+    for token in highlights.tokens {
+        cuts.extend([clamp(token.range.start), clamp(token.range.end)]);
     }
     for diagnostic in diagnostics {
         cuts.extend([clamp(diagnostic.range.start), clamp(diagnostic.range.end)]);
@@ -1305,44 +1346,71 @@ fn line_runs(
         .map(|cut| {
             let start = cut[0];
             let covering = || diagnostics.iter().filter(move |d| d.range.contains(&start));
+            let syntax = highlights
+                .spans
+                .iter()
+                .find(|span| span.range.contains(&start))
+                .map(|span| span.highlight);
+            let token = highlights
+                .tokens
+                .iter()
+                .find(|token| token.range.contains(&start));
+            let style = styler.style(syntax, token);
             let color = if covering().any(|d| d.unnecessary) {
-                rgb(theme::MUTED).into()
+                theme::muted()
             } else {
-                spans
-                    .iter()
-                    .find(|span| span.range.contains(&start))
-                    .map_or(base.color, |span| {
-                        rgb(theme::highlight_color(span.highlight)).into()
-                    })
+                style.color.unwrap_or(base.color)
+            };
+            let plain_underline = UnderlineStyle {
+                color: Some(color),
+                thickness: px(1.),
+                wavy: false,
             };
             let underline = match marked.filter(|marked| marked.contains(&start)) {
-                Some(_) => Some(UnderlineStyle {
-                    color: Some(color),
-                    thickness: px(1.),
-                    wavy: false,
-                }),
+                Some(_) => Some(plain_underline),
                 None => covering()
                     .map(|d| d.severity)
                     .filter(|&severity| severity < Severity::Hint)
                     .min()
                     .map(|severity| UnderlineStyle {
-                        color: Some(rgb(severity.color()).into()),
+                        color: Some(severity.color()),
                         thickness: px(1.),
                         wavy: true,
-                    }),
+                    })
+                    .or((style.underline == Some(true)).then_some(plain_underline)),
             };
-            let strikethrough = covering()
-                .any(|d| d.deprecated)
-                .then(|| StrikethroughStyle {
-                    color: Some(color),
-                    thickness: px(1.),
-                });
+            let strikethrough = (covering().any(|d| d.deprecated)
+                || style.strikethrough == Some(true))
+            .then_some(StrikethroughStyle {
+                color: Some(color),
+                thickness: px(1.),
+            });
+            let bold = style.bold == Some(true);
+            let italic = style.italic == Some(true);
+            let font = if bold || italic {
+                Font {
+                    weight: if bold {
+                        FontWeight::BOLD
+                    } else {
+                        base.font.weight
+                    },
+                    style: if italic {
+                        FontStyle::Italic
+                    } else {
+                        base.font.style
+                    },
+                    ..base.font.clone()
+                }
+            } else {
+                base.font.clone()
+            };
             TextRun {
                 len: cut[1] - start,
+                font,
                 color,
+                background_color: style.background,
                 underline,
                 strikethrough,
-                ..base.clone()
             }
         })
         .collect()
@@ -1538,6 +1606,8 @@ impl Focusable for Editor {
 }
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // `settings.json` may have toggled semantic highlighting.
+        self.sync_semantic_setting(cx);
         // A modal (finder, picker) took focus: don't leave a popover over it.
         let focused = self.focus_handle.contains_focused(window, cx);
         let line = self.buffer.line_of(self.head) + 1;
@@ -1552,14 +1622,14 @@ impl Render for Editor {
             "LF"
         };
         let (message, message_color) = match (&self.error, &self.notice) {
-            (Some(error), _) => (error.clone(), theme::ERROR),
-            (None, Some(notice)) => (notice.clone(), theme::TEXT),
+            (Some(error), _) => (error.clone(), theme::error()),
+            (None, Some(notice)) => (notice.clone(), theme::text()),
             (None, None) => (
                 self.buffer
                     .path()
                     .map(|path| path.display().to_string().into())
                     .unwrap_or_default(),
-                theme::MUTED,
+                theme::muted(),
             ),
         };
         let count = |severity| {
@@ -1583,7 +1653,7 @@ impl Render for Editor {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::BACKGROUND))
+            .bg(theme::background())
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::delete_word_left))
@@ -1641,7 +1711,7 @@ impl Render for Editor {
                     .font_family(theme::MONO_FONT)
                     .text_size(px(theme::EDITOR_FONT_SIZE))
                     .line_height(px(theme::EDITOR_LINE_HEIGHT))
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(theme::text())
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1662,18 +1732,20 @@ impl Render for Editor {
                         .px_3()
                         .py_1()
                         .border_t_1()
-                        .border_color(rgb(theme::BORDER))
-                        .bg(rgb(theme::PANEL))
+                        .border_color(theme::border())
+                        .bg(theme::panel())
                         .text_xs()
-                        .text_color(rgb(theme::MUTED))
-                        .child(div().text_color(rgb(message_color)).child(message))
+                        .text_color(theme::muted())
+                        .child(div().text_color(message_color).child(message))
                         .child(
                             div()
                                 .flex()
                                 .gap_4()
-                                .children(self.lsp_status.clone().map(|(status, color)| {
-                                    div().text_color(rgb(color)).child(status)
-                                }))
+                                .children(
+                                    self.lsp_status.clone().map(|(status, color)| {
+                                        div().text_color(color()).child(status)
+                                    }),
+                                )
                                 .child(format!(
                                     "Ln {line}, Col {column}   {line_ending}   UTF-8   {language}"
                                 ))
@@ -1684,12 +1756,12 @@ impl Render for Editor {
                                             .gap_2()
                                             .child(
                                                 div()
-                                                    .text_color(rgb(theme::ERROR))
+                                                    .text_color(theme::error())
                                                     .child(format!("✕ {errors}")),
                                             )
                                             .child(
                                                 div()
-                                                    .text_color(rgb(theme::WARNING))
+                                                    .text_color(theme::warning())
                                                     .child(format!("⚠ {warnings}")),
                                             ),
                                     )

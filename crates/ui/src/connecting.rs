@@ -8,7 +8,7 @@ use futures::{
     StreamExt,
     channel::{mpsc, oneshot},
 };
-use gpui::{Context, EventEmitter, SharedString, Task, Window, div, prelude::*, px, rgb};
+use gpui::{Context, EventEmitter, SharedString, Task, Window, div, prelude::*, px};
 
 use crate::{
     project::{Location, Project},
@@ -131,13 +131,13 @@ impl Render for Connecting {
             .justify_center()
             .gap_3()
             .p_8()
-            .bg(rgb(theme::BACKGROUND))
-            .text_color(rgb(theme::TEXT))
+            .bg(theme::background())
+            .text_color(theme::text())
             .child(div().text_lg().child(self.heading()))
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(self.location.to_string()),
             )
             .when(!self.log.is_empty(), |this| {
@@ -146,10 +146,10 @@ impl Render for Connecting {
                         .w(px(720.))
                         .p_2()
                         .rounded_md()
-                        .bg(rgb(theme::PANEL))
+                        .bg(theme::panel())
                         .font_family(theme::MONO_FONT)
                         .text_xs()
-                        .text_color(rgb(theme::MUTED))
+                        .text_color(theme::muted())
                         .children(
                             self.log
                                 .iter()
@@ -161,7 +161,7 @@ impl Render for Connecting {
                 div()
                     .max_w(px(720.))
                     .text_sm()
-                    .text_color(rgb(theme::ERROR))
+                    .text_color(theme::error())
                     .child(error)
             }))
             .children(self.error.is_some().then(|| {
@@ -170,8 +170,8 @@ impl Render for Connecting {
                     .px_4()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(theme::ACCENT))
-                    .text_color(rgb(0xffffff))
+                    .bg(theme::accent())
+                    .text_color(theme::on_accent())
                     .cursor_pointer()
                     .child("Retry")
                     .on_click(cx.listener(|this, _, window, cx| this.connect(None, window, cx)))

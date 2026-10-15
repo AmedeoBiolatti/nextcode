@@ -4,7 +4,7 @@
 use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton,
     ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, actions, div,
-    prelude::*, px, rgb, uniform_list,
+    prelude::*, px, uniform_list,
 };
 
 use crate::{
@@ -167,7 +167,7 @@ impl Render for CommandPalette {
                 .px_3()
                 .flex()
                 .items_center()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("No matching commands")
                 .into_any_element()
         } else {
@@ -188,30 +188,30 @@ impl Render for CommandPalette {
                                 .items_center()
                                 .gap_2()
                                 .cursor_pointer()
-                                .when(selected, |row| row.bg(rgb(theme::ACTIVE_ROW)))
+                                .when(selected, |row| row.bg(theme::active_row()))
                                 .when(!selected, |row| {
-                                    row.hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                                    row.hover(|style| style.bg(theme::hover_row()))
                                 })
                                 .on_click(cx.listener(move |this, _, _, cx| this.run(row, cx)))
                                 .child(
                                     div()
-                                        .text_color(rgb(theme::MUTED))
+                                        .text_color(theme::muted())
                                         .child(format!("{}:", command.category)),
                                 )
                                 .child(
                                     div()
                                         .flex_1()
                                         .truncate()
-                                        .text_color(rgb(theme::TEXT))
+                                        .text_color(theme::text())
                                         .child(command.label.clone()),
                                 )
                                 .children(command.keys.clone().map(|keys| {
                                     div()
                                         .px_1()
                                         .rounded_sm()
-                                        .bg(rgb(theme::BACKGROUND))
+                                        .bg(theme::background())
                                         .text_xs()
-                                        .text_color(rgb(theme::MUTED))
+                                        .text_color(theme::muted())
                                         .child(keys)
                                 }))
                         })
@@ -234,9 +234,9 @@ impl Render for CommandPalette {
             .w(px(640.))
             .flex()
             .flex_col()
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .rounded_md()
             .shadow_lg()
             .text_sm()
@@ -246,7 +246,7 @@ impl Render for CommandPalette {
                     .px_3()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .child(self.query.clone()),
             )
             .child(list)

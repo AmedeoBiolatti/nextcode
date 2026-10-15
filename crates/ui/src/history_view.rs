@@ -11,7 +11,7 @@ use std::{
 use git::{Commit, FileChange, GraphRow, Repository, Side};
 use gpui::{
     App, Bounds, Context, EventEmitter, FocusHandle, Focusable, Hsla, PathBuilder, SharedString,
-    Task, UniformListScrollHandle, Window, canvas, div, fill, point, prelude::*, px, rgb, size,
+    Task, UniformListScrollHandle, Window, canvas, div, fill, point, prelude::*, px, size,
     uniform_list,
 };
 
@@ -28,7 +28,6 @@ const LANE_WIDTH: f32 = 14.;
 const MAX_LANES: usize = 16;
 const LIMIT: usize = 2000;
 const DETAILS_HEIGHT: f32 = 280.;
-const LANE_COLORS: [u32; 6] = [0x56a8f5, 0x6aab73, 0xc77dbb, 0xe0a458, 0x2aacb8, 0xf75464];
 
 pub enum HistoryEvent {
     OpenDiff {
@@ -68,10 +67,6 @@ pub struct HistoryView {
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
     _load: Task<()>,
-}
-
-fn lane_color(lane: usize) -> Hsla {
-    rgb(LANE_COLORS[lane % LANE_COLORS.len()]).into()
 }
 
 /// "3 hours ago", "2 days ago", …
@@ -114,14 +109,14 @@ fn graph_cell(row: &GraphRow) -> impl IntoElement {
                 }
             };
             for &(from, to) in &row.top {
-                line((from, top), (to, middle), lane_color(from));
+                line((from, top), (to, middle), theme::graph_lane(from));
             }
             for &(from, to) in &row.bottom {
-                line((from, middle), (to, bottom), lane_color(to));
+                line((from, middle), (to, bottom), theme::graph_lane(to));
             }
             if row.column < MAX_LANES {
                 let node = Bounds::centered_at(point(x(row.column), middle), size(px(8.), px(8.)));
-                window.paint_quad(fill(node, lane_color(row.column)).corner_radii(px(4.)));
+                window.paint_quad(fill(node, theme::graph_lane(row.column)).corner_radii(px(4.)));
             }
         },
     )
@@ -276,19 +271,19 @@ impl HistoryView {
         let selected = self.selected.as_ref().is_some_and(|s| s.commit == index);
         let refs = commit.refs.iter().map(|name| {
             let (label, color) = if let Some(branch) = name.strip_prefix("HEAD -> ") {
-                (branch.to_owned(), theme::ACCENT)
+                (branch.to_owned(), theme::accent())
             } else if let Some(tag) = name.strip_prefix("tag: ") {
-                (tag.to_owned(), 0x8a6d1f)
+                (tag.to_owned(), theme::tag())
             } else {
-                (name.clone(), theme::BORDER)
+                (name.clone(), theme::branch())
             };
             div()
                 .flex_none()
                 .px_1()
                 .rounded_sm()
                 .text_xs()
-                .bg(rgb(color))
-                .text_color(rgb(0xffffff))
+                .bg(color)
+                .text_color(theme::on_accent())
                 .child(label)
         });
         div()
@@ -301,9 +296,9 @@ impl HistoryView {
             .gap_2()
             .text_sm()
             .cursor_pointer()
-            .when(selected, |row| row.bg(rgb(theme::ACTIVE_ROW)))
+            .when(selected, |row| row.bg(theme::active_row()))
             .when(!selected, |row| {
-                row.hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                row.hover(|style| style.bg(theme::hover_row()))
             })
             .on_click(cx.listener(move |this, _, _, cx| this.select(index, cx)))
             .child(graph_cell(&self.graph[index]))
@@ -313,7 +308,7 @@ impl HistoryView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(theme::text())
                     .child(commit.subject.clone()),
             )
             .child(
@@ -322,7 +317,7 @@ impl HistoryView {
                     .w(px(140.))
                     .truncate()
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(commit.author.clone()),
             )
             .child(
@@ -330,7 +325,7 @@ impl HistoryView {
                     .flex_none()
                     .w(px(96.))
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(relative_time(commit.time)),
             )
             .child(
@@ -339,7 +334,7 @@ impl HistoryView {
                     .w(px(64.))
                     .font_family(theme::MONO_FONT)
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(commit.short_id().to_owned()),
             )
             .into_any_element()
@@ -360,7 +355,7 @@ impl HistoryView {
             None => div()
                 .p_2()
                 .text_sm()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("Loading…")
                 .into_any_element(),
             Some(changes) => {
@@ -394,7 +389,7 @@ impl HistoryView {
                 .flex_none()
                 .flex()
                 .border_t_1()
-                .border_color(rgb(theme::BORDER))
+                .border_color(theme::border())
                 .child(
                     div()
                         .w(px(360.))
@@ -404,37 +399,37 @@ impl HistoryView {
                         .flex_col()
                         .gap_1()
                         .border_r_1()
-                        .border_color(rgb(theme::BORDER))
+                        .border_color(theme::border())
                         .text_sm()
                         .child(
                             div()
-                                .text_color(rgb(theme::TEXT))
+                                .text_color(theme::text())
                                 .child(commit.subject.clone()),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(theme::MUTED))
+                                .text_color(theme::muted())
                                 .child(format!("{} <{}>", commit.author, commit.email)),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(theme::MUTED))
+                                .text_color(theme::muted())
                                 .child(relative_time(commit.time)),
                         )
                         .child(
                             div()
                                 .font_family(theme::MONO_FONT)
                                 .text_xs()
-                                .text_color(rgb(theme::MUTED))
+                                .text_color(theme::muted())
                                 .child(commit.id.clone()),
                         )
                         .when(!parents.is_empty(), |details| {
                             details.child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(theme::MUTED))
+                                    .text_color(theme::muted())
                                     .child(format!("parents: {parents}")),
                             )
                         })
@@ -447,9 +442,9 @@ impl HistoryView {
                                 .w_auto()
                                 .rounded_sm()
                                 .border_1()
-                                .border_color(rgb(theme::BORDER))
+                                .border_color(theme::border())
                                 .cursor_pointer()
-                                .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                                .hover(|style| style.bg(theme::hover_row()))
                                 .child("Compare with working tree")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.emit(HistoryEvent::Compare {
@@ -466,9 +461,9 @@ impl HistoryView {
                                 .py_px()
                                 .rounded_sm()
                                 .border_1()
-                                .border_color(rgb(theme::BORDER))
+                                .border_color(theme::border())
                                 .cursor_pointer()
-                                .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                                .hover(|style| style.bg(theme::hover_row()))
                                 .child("Create branch here…")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.emit(HistoryEvent::CreateBranch {
@@ -504,9 +499,9 @@ impl Render for HistoryView {
             .py_px()
             .rounded_sm()
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+            .hover(|style| style.bg(theme::hover_row()))
             .child(if self.all_branches {
                 "All branches"
             } else {
@@ -520,13 +515,13 @@ impl Render for HistoryView {
             Some(error) => div()
                 .p_3()
                 .text_sm()
-                .text_color(rgb(theme::ERROR))
+                .text_color(theme::error())
                 .child(error.clone())
                 .into_any_element(),
             None if !self.loading && self.commits.is_empty() => div()
                 .p_3()
                 .text_sm()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("No commits yet.")
                 .into_any_element(),
             None => uniform_list(
@@ -545,8 +540,8 @@ impl Render for HistoryView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::BACKGROUND))
-            .text_color(rgb(theme::TEXT))
+            .bg(theme::background())
+            .text_color(theme::text())
             .child(
                 div()
                     .px_3()
@@ -555,7 +550,7 @@ impl Render for HistoryView {
                     .items_center()
                     .gap_2()
                     .border_b_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .text_sm()
                     .child(toggle)
                     .child(
@@ -563,13 +558,13 @@ impl Render for HistoryView {
                             .id("history-refresh")
                             .px_2()
                             .cursor_pointer()
-                            .text_color(rgb(theme::MUTED))
-                            .hover(|style| style.text_color(rgb(theme::TEXT)))
+                            .text_color(theme::muted())
+                            .hover(|style| style.text_color(theme::text()))
                             .child("⟳")
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     )
                     .child(div().flex_1())
-                    .child(div().text_xs().text_color(rgb(theme::MUTED)).child(status)),
+                    .child(div().text_xs().text_color(theme::muted()).child(status)),
             )
             .child(div().flex_1().min_h_0().flex().flex_col().child(list))
             .children(self.render_details(cx))

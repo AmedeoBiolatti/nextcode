@@ -14,6 +14,8 @@ const LABELS: &[(&str, &str)] = &[
     ("app::ShowCommandPalette", "Command Palette…"),
     ("app::CustomizeMenus", "Customize Menus…"),
     ("app::OpenSettings", "Open Settings"),
+    ("app::SelectTheme", "Select Theme…"),
+    ("app::CustomizeTheme", "Customize Theme…"),
     ("app::Quit", "Exit"),
     ("app::About", "About next_code"),
     ("workspace::CloseTab", "Close Tab"),
@@ -60,6 +62,7 @@ const HIDDEN_NAMESPACES: &[&str] = &[
     "location_picker",
     "project_picker",
     "command_palette",
+    "theme_picker",
 ];
 
 /// Building blocks of typing and list navigation, not commands.

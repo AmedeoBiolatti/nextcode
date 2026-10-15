@@ -1,6 +1,6 @@
 //! `next_code --headless` end to end on a local project: the JSON-lines
-//! contract scripts rely on (language servers are left out: they depend on
-//! the machine).
+//! contract scripts rely on. Language servers depend on the machine: tests
+//! that need one are skipped when it is not on PATH.
 
 use std::{
     fs,
@@ -9,7 +9,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
@@ -415,4 +415,83 @@ fn headless_mode_reads_python_projects_and_dev_container_configs() {
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
     assert!(headless.child.wait().unwrap().success());
     fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn headless_mode_decodes_rust_analyzer_semantic_tokens() {
+    if Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("skipped: rust-analyzer is not on PATH");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("next_code_headless_rs_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("main.rs"),
+        "struct Point {\n    x: i32,\n}\n\n\
+         fn shift(point: Point, by: i32) -> i32 {\n    let mut total = point.x;\n    total += by;\n    total\n}\n\n\
+         fn main() {\n    let p = Point { x: 1 };\n    println!(\"{}\", shift(p, 2));\n}\n",
+    )
+    .unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let open =
+        headless.call(json!({ "cmd": "open", "path": "src/main.rs", "timeout_ms": 120_000 }));
+    assert_eq!(open["ok"], true, "{open}");
+
+    let token = |tokens: &[Value], line: u64, text: &str| {
+        tokens
+            .iter()
+            .find(|token| token["line"] == line && token["text"] == text)
+            .cloned()
+    };
+    let has_mutable = |token: &Option<Value>| {
+        token.as_ref().is_some_and(|token| {
+            token["modifiers"]
+                .as_array()
+                .is_some_and(|modifiers| modifiers.contains(&json!("mutable")))
+        })
+    };
+    // Until rust-analyzer has loaded the crate, its tokens lack semantics.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let tokens = loop {
+        let reply = headless.call(json!({ "cmd": "semantic_tokens", "path": "src/main.rs" }));
+        assert_eq!(reply["ok"], true, "{reply}");
+        let tokens = reply["result"].as_array().unwrap().clone();
+        let ready = token(&tokens, 4, "by").is_some_and(|t| t["scope"] == "variable.parameter")
+            && token(&tokens, 0, "Point").is_some_and(|t| t["scope"] == "type.struct")
+            && has_mutable(&token(&tokens, 5, "total"));
+        if ready || Instant::now() >= deadline {
+            break tokens;
+        }
+        thread::sleep(Duration::from_secs(1));
+    };
+    let excerpt: Vec<&Value> = tokens
+        .iter()
+        .filter(|token| token["line"].as_u64().is_some_and(|line| line <= 5))
+        .collect();
+    println!("semantic_tokens (lines 0-5): {}", json!(excerpt));
+
+    let by = token(&tokens, 4, "by").expect("token for `by`");
+    assert_eq!(by["scope"], "variable.parameter", "{by}");
+    assert_eq!((&by["start"], &by["end"]), (&json!(23), &json!(25)), "{by}");
+    let point = token(&tokens, 0, "Point").expect("token for `Point`");
+    assert_eq!(point["scope"], "type.struct", "{point}");
+    let total = token(&tokens, 5, "total");
+    assert!(has_mutable(&total), "{total:?}");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
 }

@@ -31,6 +31,7 @@ mod shell;
 mod startup;
 mod terminal_panel;
 mod theme;
+mod theme_picker;
 mod workspace;
 mod worktree_picker;
 
@@ -126,7 +127,9 @@ fn run() -> anyhow::Result<()> {
         file_finder::bind_keys(cx);
         location_picker::bind_keys(cx);
         project_picker::bind_keys(cx);
+        theme_picker::bind_keys(cx);
         terminal_panel::bind_keys(cx);
+        theme::refresh(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();

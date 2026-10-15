@@ -11,8 +11,9 @@ use std::{
 use futures::StreamExt;
 
 use gpui::{
-    AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    PromptLevel, SharedString, Subscription, Task, Window, actions, div, prelude::*, px, rgb,
+    AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
+    KeyBinding, PromptLevel, SharedString, Subscription, Task, Window, actions, div, prelude::*,
+    px,
 };
 use language::Location;
 use syntax::Language;
@@ -851,7 +852,7 @@ impl Workspace {
                     return;
                 };
                 for editor in self.editors_for(language, cx) {
-                    editor.update(cx, |editor, _| editor.attach_server(server.clone()));
+                    editor.update(cx, |editor, cx| editor.attach_server(server.clone(), cx));
                 }
             }
             &LspStoreEvent::ServerStopped(language) => {
@@ -866,6 +867,11 @@ impl Workspace {
                 }
             }
             LspStoreEvent::DiagnosticsUpdated(path) => self.refresh_diagnostics(path, cx),
+            &LspStoreEvent::SemanticTokensRefresh(language) => {
+                for editor in self.editors_for(language, cx) {
+                    editor.update(cx, |editor, cx| editor.refresh_semantic_tokens(cx));
+                }
+            }
         }
     }
 
@@ -895,13 +901,13 @@ impl Workspace {
     }
 
     /// Status-bar text and color for `language`'s server.
-    fn lsp_status(&self, language: Language, cx: &App) -> Option<(SharedString, u32)> {
+    fn lsp_status(&self, language: Language, cx: &App) -> Option<(SharedString, fn() -> Hsla)> {
         let (name, status) = self.lsp_store.read(cx).status(language)?;
         Some(match status {
-            ServerStatus::Starting => (format!("{name}: starting…").into(), theme::MUTED),
-            ServerStatus::Ready => (name, theme::MUTED),
-            ServerStatus::Busy(work) => (format!("{name}: {work}").into(), theme::MUTED),
-            ServerStatus::Disabled => (format!("{name}: disabled").into(), theme::MUTED),
+            ServerStatus::Starting => (format!("{name}: starting…").into(), theme::muted),
+            ServerStatus::Ready => (name, theme::muted),
+            ServerStatus::Busy(work) => (format!("{name}: {work}").into(), theme::muted),
+            ServerStatus::Disabled => (format!("{name}: disabled").into(), theme::muted),
             ServerStatus::NotFound {
                 command,
                 install_hint,
@@ -911,9 +917,9 @@ impl Workspace {
                     None => format!("{command} not found"),
                 }
                 .into(),
-                theme::ERROR,
+                theme::error,
             ),
-            ServerStatus::Failed(error) => (format!("{name}: {error}").into(), theme::ERROR),
+            ServerStatus::Failed(error) => (format!("{name}: {error}").into(), theme::error),
         })
     }
 
@@ -950,7 +956,7 @@ impl Workspace {
             let status = self.lsp_status(language, cx);
             editor.update(cx, |editor, cx| {
                 if let Some(server) = server {
-                    editor.attach_server(server);
+                    editor.attach_server(server, cx);
                 }
                 editor.set_lsp_status(status, cx);
             });
@@ -1356,10 +1362,10 @@ impl Workspace {
                         .px_2()
                         .rounded_sm()
                         .border_1()
-                        .border_color(rgb(theme::BORDER))
+                        .border_color(theme::border())
                         .text_xs()
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                        .hover(|style| style.bg(theme::hover_row()))
                         .child(label)
                 };
                 let (accept_kind, dismiss_kind) = (offer.kind.clone(), offer.kind.clone());
@@ -1369,9 +1375,9 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .bg(rgb(theme::PANEL))
+                    .bg(theme::panel())
                     .border_b_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .text_sm()
                     .child(div().flex_1().min_w_0().child(offer.message.clone()))
                     .child(
@@ -1497,9 +1503,9 @@ impl Workspace {
         div()
             .flex()
             .h(px(34.))
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .border_b_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .text_sm()
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let active = index == self.active;
@@ -1511,13 +1517,17 @@ impl Workspace {
                     .gap_2()
                     .px_3()
                     .border_r_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .cursor_pointer()
-                    .text_color(rgb(if active { theme::TEXT } else { theme::MUTED }))
+                    .text_color(if active {
+                        theme::text()
+                    } else {
+                        theme::muted()
+                    })
                     .when(active, |tab| {
-                        tab.bg(rgb(theme::BACKGROUND))
+                        tab.bg(theme::background())
                             .border_b_2()
-                            .border_color(rgb(theme::ACCENT))
+                            .border_color(theme::accent())
                     })
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
@@ -1527,8 +1537,8 @@ impl Workspace {
                         div()
                             .id(("close", index))
                             .w(px(14.))
-                            .text_color(rgb(theme::MUTED))
-                            .hover(|style| style.text_color(rgb(theme::TEXT)))
+                            .text_color(theme::muted())
+                            .hover(|style| style.text_color(theme::text()))
                             .child(if dirty { "●" } else { "×" })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
@@ -1555,7 +1565,7 @@ impl Render for Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("Open a file from the project tree, or press Ctrl+P"),
         };
 
@@ -1597,8 +1607,8 @@ impl Render for Workspace {
             .relative()
             .size_full()
             .flex()
-            .bg(rgb(theme::BACKGROUND))
-            .text_color(rgb(theme::TEXT))
+            .bg(theme::background())
+            .text_color(theme::text())
             .children(self.render_dock(DockPosition::Left, window, cx))
             .child(
                 div()
@@ -1620,7 +1630,7 @@ impl Render for Workspace {
                                     .px_3()
                                     .py_1()
                                     .text_sm()
-                                    .text_color(rgb(theme::ERROR))
+                                    .text_color(theme::error())
                                     .child(notice)
                             }),
                     )

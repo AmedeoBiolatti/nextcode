@@ -302,16 +302,12 @@ impl Editor {
                 .flex()
                 .gap_2()
                 .font_family(theme::UI_FONT)
-                .child(
-                    div()
-                        .text_color(rgb(severity.color()))
-                        .child(severity.label()),
-                )
+                .child(div().text_color(severity.color()).child(severity.label()))
                 .child(message.clone())
                 .into_any_element()
         });
         let separator = (!hover.messages.is_empty() && !hover.docs.is_empty())
-            .then(|| div().h(px(1.)).bg(rgb(theme::BORDER)).into_any_element());
+            .then(|| div().h(px(1.)).bg(theme::border()).into_any_element());
         Some(
             div()
                 .id("hover-popover")
@@ -329,9 +325,9 @@ impl Editor {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .bg(rgb(theme::PANEL))
+                .bg(theme::panel())
                 .border_1()
-                .border_color(rgb(theme::BORDER))
+                .border_color(theme::border())
                 .rounded_md()
                 .shadow_md()
                 .text_sm()
@@ -350,18 +346,18 @@ pub(super) fn markdown_blocks(blocks: &[Block]) -> impl Iterator<Item = AnyEleme
     blocks.iter().map(|block| match block {
         Block::Code { text, .. } => div()
             .font_family(theme::MONO_FONT)
-            .text_color(rgb(theme::TEXT))
+            .text_color(theme::text())
             .child(SharedString::from(text.clone()))
             .into_any_element(),
         Block::Paragraph(text) => div()
             .font_family(theme::UI_FONT)
-            .text_color(rgb(theme::TEXT))
+            .text_color(theme::text())
             .child(SharedString::from(text.clone()))
             .into_any_element(),
-        Block::Rule => div().h(px(1.)).bg(rgb(theme::BORDER)).into_any_element(),
+        Block::Rule => div().h(px(1.)).bg(theme::border()).into_any_element(),
     })
 }
 
-fn is_content_modified<T>(result: &Result<T, lsp::Error>) -> bool {
+pub(super) fn is_content_modified<T>(result: &Result<T, lsp::Error>) -> bool {
     matches!(result, Err(lsp::Error::Response { code, .. }) if *code == CONTENT_MODIFIED)
 }

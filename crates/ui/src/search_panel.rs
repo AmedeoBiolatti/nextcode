@@ -4,8 +4,8 @@ use std::{ops::Range, path::PathBuf, time::Duration};
 
 use futures::StreamExt;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    SharedString, StyledText, Subscription, Task, Window, div, prelude::*, px, rgb, uniform_list,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla,
+    SharedString, StyledText, Subscription, Task, Window, div, prelude::*, px, uniform_list,
 };
 use search::{FileMatches, SearchEvent, SearchLimits, SearchQuery};
 
@@ -52,7 +52,7 @@ pub struct SearchPanel {
     whole_word: bool,
     results: Vec<FileMatches>,
     rows: Vec<Row>,
-    status: Option<(SharedString, u32)>,
+    status: Option<(SharedString, fn() -> Hsla)>,
     _search: Option<(SearchHandle, Task<()>)>,
     _debounce: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -134,12 +134,12 @@ impl SearchPanel {
         let (handle, mut events) = match self.project.search(&query, SearchLimits::default()) {
             Ok(started) => started,
             Err(err) => {
-                self.status = Some((err.into(), theme::ERROR));
+                self.status = Some((err.into(), theme::error));
                 cx.notify();
                 return;
             }
         };
-        self.status = Some(("Searching…".into(), theme::MUTED));
+        self.status = Some(("Searching…".into(), theme::muted));
         let task = cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {
                 let alive = this.update(cx, |this, cx| {
@@ -154,7 +154,7 @@ impl SearchPanel {
                             let more = if limit_hit { " (limit reached)" } else { "" };
                             this.status = Some((
                                 format!("{matches} matches in {files} files{more} · {files_searched} files searched").into(),
-                                theme::MUTED,
+                                theme::muted,
                             ));
                         }
                     }
@@ -207,14 +207,12 @@ impl SearchPanel {
             .font_family(theme::MONO_FONT)
             .cursor_pointer()
             .when(on, |button| {
-                button
-                    .bg(rgb(theme::ACTIVE_ROW))
-                    .text_color(rgb(theme::TEXT))
+                button.bg(theme::active_row()).text_color(theme::text())
             })
             .when(!on, |button| {
                 button
-                    .text_color(rgb(theme::MUTED))
-                    .hover(|style| style.text_color(rgb(theme::TEXT)))
+                    .text_color(theme::muted())
+                    .hover(|style| style.text_color(theme::text()))
             })
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| this.toggle(toggle, cx)))
@@ -245,20 +243,20 @@ impl SearchPanel {
                     .items_center()
                     .gap_2()
                     .text_sm()
-                    .child(div().flex_none().text_color(rgb(theme::TEXT)).child(name))
+                    .child(div().flex_none().text_color(theme::text()).child(name))
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
                             .text_xs()
-                            .text_color(rgb(theme::MUTED))
+                            .text_color(theme::muted())
                             .child(dir),
                     )
                     .child(
                         div()
                             .flex_none()
                             .text_xs()
-                            .text_color(rgb(theme::MUTED))
+                            .text_color(theme::muted())
                             .child(matches.lines.len().to_string()),
                     )
             }
@@ -269,7 +267,7 @@ impl SearchPanel {
                 let trimmed = found.text.trim_start();
                 let shift = found.text.len() - trimmed.len();
                 let highlight = HighlightStyle {
-                    background_color: Some(rgb(theme::SELECTION).into()),
+                    background_color: Some(theme::selection()),
                     font_weight: Some(FontWeight::BOLD),
                     ..Default::default()
                 };
@@ -289,7 +287,7 @@ impl SearchPanel {
                     .items_center()
                     .gap_2()
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                    .hover(|style| style.bg(theme::hover_row()))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(SearchPanelEvent::Open {
                             path: path.clone(),
@@ -302,7 +300,7 @@ impl SearchPanel {
                             .flex_none()
                             .w(px(36.))
                             .text_xs()
-                            .text_color(rgb(theme::MUTED))
+                            .text_color(theme::muted())
                             .child((found.line + 1).to_string()),
                     )
                     .child(
@@ -311,7 +309,7 @@ impl SearchPanel {
                             .truncate()
                             .font_family(theme::MONO_FONT)
                             .text_sm()
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child(StyledText::new(trimmed.to_owned()).with_highlights(highlights)),
                     )
             }
@@ -333,9 +331,9 @@ impl Render for SearchPanel {
                 .h(px(26.))
                 .px_2()
                 .py_1()
-                .bg(rgb(theme::BACKGROUND))
+                .bg(theme::background())
                 .border_1()
-                .border_color(rgb(theme::BORDER))
+                .border_color(theme::border())
                 .rounded_sm()
                 .child(editor.clone())
                 .when(empty, |input| {
@@ -345,7 +343,7 @@ impl Render for SearchPanel {
                             .top(px(4.))
                             .left(px(8.))
                             .text_sm()
-                            .text_color(rgb(theme::MUTED))
+                            .text_color(theme::muted())
                             .child(placeholder),
                     )
                 })
@@ -390,9 +388,11 @@ impl Render for SearchPanel {
                         include_empty,
                     ))
                     .child(input(&self.exclude, "Files to exclude", exclude_empty))
-                    .children(self.status.clone().map(|(status, color)| {
-                        div().text_xs().text_color(rgb(color)).child(status)
-                    })),
+                    .children(
+                        self.status.clone().map(|(status, color)| {
+                            div().text_xs().text_color(color()).child(status)
+                        }),
+                    ),
             )
             .child(
                 uniform_list(

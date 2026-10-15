@@ -9,7 +9,7 @@ use std::{
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
     KeyBinding, MouseButton, ScrollStrategy, SharedString, StyledText, Subscription, Task,
-    UniformListScrollHandle, Window, actions, div, prelude::*, px, rgb, uniform_list,
+    UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 use nucleo_matcher::{
     Config, Matcher, Utf32Str,
@@ -156,7 +156,7 @@ impl FileFinder {
         // Local paths use the platform separator, WSL paths `/`.
         let name_start = path.rfind(['/', MAIN_SEPARATOR]).map_or(0, |i| i + 1);
         let highlight = HighlightStyle {
-            color: Some(rgb(theme::ACCENT_TEXT).into()),
+            color: Some(theme::accent_text()),
             font_weight: Some(FontWeight::BOLD),
             ..Default::default()
         };
@@ -184,20 +184,20 @@ impl FileFinder {
             .items_center()
             .gap_2()
             .cursor_pointer()
-            .when(index == self.selected, |row| row.bg(rgb(theme::ACTIVE_ROW)))
+            .when(index == self.selected, |row| row.bg(theme::active_row()))
             .when(index != self.selected, |row| {
-                row.hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                row.hover(|style| style.bg(theme::hover_row()))
             })
             .on_click(cx.listener(move |this, _, _, cx| this.open(index, cx)))
             .child(
-                div().text_color(rgb(theme::TEXT)).child(
+                div().text_color(theme::text()).child(
                     StyledText::new(name).with_highlights(highlights(name_start..path.len())),
                 ),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(StyledText::new(dir).with_highlights(highlights(0..name_start))),
             )
     }
@@ -288,9 +288,9 @@ impl Render for FileFinder {
             .w(px(640.))
             .flex()
             .flex_col()
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .rounded_md()
             .shadow_lg()
             .text_sm()
@@ -300,7 +300,7 @@ impl Render for FileFinder {
                     .px_3()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .child(self.query.clone()),
             )
             .child(
@@ -319,9 +319,9 @@ impl Render for FileFinder {
                     .px_3()
                     .py_1()
                     .border_t_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(status),
             )
             // Keep clicks inside the modal from reaching the editor below.

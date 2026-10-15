@@ -4,7 +4,7 @@ use std::{collections::HashMap, path::PathBuf};
 
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton, ScrollStrategy,
-    SharedString, UniformListScrollHandle, Window, actions, div, prelude::*, px, rgb, uniform_list,
+    SharedString, UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 use language::Location;
 
@@ -154,9 +154,9 @@ impl Render for LocationPicker {
             .w(px(760.))
             .flex()
             .flex_col()
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .rounded_md()
             .shadow_lg()
             .text_sm()
@@ -165,8 +165,8 @@ impl Render for LocationPicker {
                     .px_3()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(theme::BORDER))
-                    .text_color(rgb(theme::MUTED))
+                    .border_color(theme::border())
+                    .text_color(theme::muted())
                     .child(format!("{} ({})", self.title, self.entries.len())),
             )
             .child(
@@ -187,11 +187,9 @@ impl Render for LocationPicker {
                                     .gap_3()
                                     .overflow_hidden()
                                     .cursor_pointer()
-                                    .when(index == this.selected, |row| {
-                                        row.bg(rgb(theme::ACTIVE_ROW))
-                                    })
+                                    .when(index == this.selected, |row| row.bg(theme::active_row()))
                                     .when(index != this.selected, |row| {
-                                        row.hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                                        row.hover(|style| style.bg(theme::hover_row()))
                                     })
                                     .on_click(
                                         cx.listener(move |this, _, _, cx| this.open(index, cx)),
@@ -199,7 +197,7 @@ impl Render for LocationPicker {
                                     .child(
                                         div()
                                             .flex_none()
-                                            .text_color(rgb(theme::TEXT))
+                                            .text_color(theme::text())
                                             .child(entry.name.clone()),
                                     )
                                     .child(
@@ -208,7 +206,7 @@ impl Render for LocationPicker {
                                             .min_w_0()
                                             .truncate()
                                             .font_family(theme::MONO_FONT)
-                                            .text_color(rgb(theme::TEXT))
+                                            .text_color(theme::text())
                                             .child(entry.preview.clone()),
                                     )
                                     .child(
@@ -217,7 +215,7 @@ impl Render for LocationPicker {
                                             .max_w(px(280.))
                                             .truncate()
                                             .text_xs()
-                                            .text_color(rgb(theme::MUTED))
+                                            .text_color(theme::muted())
                                             .child(entry.dir.clone()),
                                     )
                             })

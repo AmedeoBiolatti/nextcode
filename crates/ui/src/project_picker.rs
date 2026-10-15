@@ -4,7 +4,7 @@
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, MouseButton,
-    SharedString, Subscription, Window, actions, div, prelude::*, px, rgb,
+    SharedString, Subscription, Window, actions, div, prelude::*, px,
 };
 
 use crate::{
@@ -129,9 +129,9 @@ impl Render for ProjectPicker {
             .w(px(640.))
             .flex()
             .flex_col()
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .rounded_md()
             .shadow_lg()
             .text_sm()
@@ -141,7 +141,7 @@ impl Render for ProjectPicker {
                     .px_3()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .child(self.query.clone()),
             )
             .children(
@@ -157,10 +157,10 @@ impl Render for ProjectPicker {
                             .flex()
                             .items_center()
                             .cursor_pointer()
-                            .text_color(rgb(theme::TEXT))
-                            .when(index == self.selected, |row| row.bg(rgb(theme::ACTIVE_ROW)))
+                            .text_color(theme::text())
+                            .when(index == self.selected, |row| row.bg(theme::active_row()))
                             .when(index != self.selected, |row| {
-                                row.hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                                row.hover(|style| style.bg(theme::hover_row()))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| this.open(index, cx)))
                             .child(label.clone())
@@ -171,9 +171,9 @@ impl Render for ProjectPicker {
                     .px_3()
                     .py_1()
                     .border_t_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(hint),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

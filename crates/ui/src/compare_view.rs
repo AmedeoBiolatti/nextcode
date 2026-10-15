@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use git::{FileChange, Repository, Side};
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, SharedString, Task, Window, div,
-    prelude::*, px, rgb, uniform_list,
+    prelude::*, px, uniform_list,
 };
 
 use crate::{
@@ -193,9 +193,9 @@ impl CompareView {
             .py_px()
             .rounded_sm()
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+            .hover(|style| style.bg(theme::hover_row()))
             .child(label.into())
             .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)))
     }
@@ -217,7 +217,7 @@ pub fn render_change_node(
         .gap_2()
         .text_sm()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+        .hover(|style| style.bg(theme::hover_row()))
         .on_click(on_click);
     match node {
         Node::Dir {
@@ -227,7 +227,7 @@ pub fn render_change_node(
             ..
         } => row
             .pl(px(8. + 14. * *depth as f32))
-            .text_color(rgb(theme::MUTED))
+            .text_color(theme::muted())
             .child(if *collapsed { "▸" } else { "▾" })
             .child(label.clone())
             .into_any_element(),
@@ -243,7 +243,7 @@ pub fn render_change_node(
                 .child(
                     div()
                         .flex_none()
-                        .text_color(rgb(theme::TEXT))
+                        .text_color(theme::text())
                         .child(name.clone()),
                 )
                 .child(
@@ -252,14 +252,14 @@ pub fn render_change_node(
                         .min_w_0()
                         .truncate()
                         .text_xs()
-                        .text_color(rgb(theme::MUTED))
+                        .text_color(theme::muted())
                         .child(renamed.unwrap_or_else(|| dir.clone())),
                 )
                 .child(
                     div()
                         .w(px(12.))
                         .flex_none()
-                        .text_color(rgb(change_color(change.change)))
+                        .text_color(change_color(change.change))
                         .child(change.change.letter().to_string()),
                 )
                 .into_any_element()
@@ -286,12 +286,12 @@ impl Render for CompareView {
             .items_center()
             .gap_2()
             .border_b_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .text_sm()
             .child(Self::button("base", base, cx, |this, cx| {
                 cx.emit(CompareEvent::ChangeBase(this.repository.clone()))
             }))
-            .child(div().text_color(rgb(theme::MUTED)).child("↔"))
+            .child(div().text_color(theme::muted()).child("↔"))
             .child(Self::button("target", target, cx, |this, cx| {
                 cx.emit(CompareEvent::ChangeTarget(this.repository.clone()))
             }))
@@ -304,7 +304,7 @@ impl Render for CompareView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(format!("{count} files")),
             )
             .child(Self::button(
@@ -322,20 +322,20 @@ impl Render for CompareView {
                 .px_3()
                 .py_1()
                 .text_xs()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("Includes staged and unstaged changes; untracked files are not listed.")
         });
         let body = match (&self.error, &self.changes) {
             (Some(error), _) => div()
                 .p_3()
                 .text_sm()
-                .text_color(rgb(theme::ERROR))
+                .text_color(theme::error())
                 .child(error.clone())
                 .into_any_element(),
             (None, Some(changes)) if changes.is_empty() => div()
                 .p_3()
                 .text_sm()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("No differences.")
                 .into_any_element(),
             (None, Some(_)) => uniform_list(
@@ -350,7 +350,7 @@ impl Render for CompareView {
             (None, None) => div()
                 .p_3()
                 .text_sm()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("Comparing…")
                 .into_any_element(),
         };
@@ -359,8 +359,8 @@ impl Render for CompareView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::BACKGROUND))
-            .text_color(rgb(theme::TEXT))
+            .bg(theme::background())
+            .text_color(theme::text())
             .child(header)
             .children(note)
             .child(body)

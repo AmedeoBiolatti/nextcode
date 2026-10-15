@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use gpui::{Context, EventEmitter, SharedString, Window, div, prelude::*, px, rgb, uniform_list};
+use gpui::{Context, EventEmitter, SharedString, Window, div, prelude::*, px, uniform_list};
 use worktree::FileKind;
 
 use crate::{project::Project, theme};
@@ -168,15 +168,15 @@ impl Render for FileTree {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .text_sm()
-            .text_color(rgb(theme::TEXT))
+            .text_color(theme::text())
             .child(
                 div()
                     .px_3()
                     .py_2()
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(self.root_name.to_uppercase()),
             )
             .child(
@@ -199,11 +199,11 @@ impl Render for FileTree {
                                     .pl(px(12. + INDENT * row.depth as f32))
                                     .pr_2()
                                     .cursor_pointer()
-                                    .when(selected, |row| row.bg(rgb(theme::ACTIVE_ROW)))
+                                    .when(selected, |row| row.bg(theme::active_row()))
                                     .when(!selected, |row| {
-                                        row.hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                                        row.hover(|style| style.bg(theme::hover_row()))
                                     })
-                                    .child(div().text_color(rgb(theme::MUTED)).child(icon))
+                                    .child(div().text_color(theme::muted()).child(icon))
                                     .child(row.name.clone())
                                     .on_click(
                                         cx.listener(move |this, _, _, cx| this.activate(index, cx)),

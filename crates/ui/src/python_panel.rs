@@ -6,7 +6,7 @@ use std::{io, path::Path, time::Duration};
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Subscription, Task,
-    Window, div, prelude::*, px, rgb,
+    Window, div, prelude::*, px,
 };
 use python::{Dependency, DependencyKind, Interpreter, Lock, PyProject};
 use remote::RunOutput;
@@ -391,17 +391,17 @@ impl PythonPanel {
             .py_1()
             .flex()
             .flex_col()
-            .child(div().text_sm().text_color(rgb(theme::TEXT)).child(title))
+            .child(div().text_sm().text_color(theme::text()).child(title))
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(environment),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(details.join(" · ")),
             )
     }
@@ -412,11 +412,11 @@ impl PythonPanel {
             .px_2()
             .rounded_sm()
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .text_xs()
-            .text_color(rgb(theme::TEXT))
+            .text_color(theme::text())
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+            .hover(|style| style.bg(theme::hover_row()))
             .child(label.into())
     }
 
@@ -425,7 +425,7 @@ impl PythonPanel {
             .px_2()
             .pt_2()
             .text_xs()
-            .text_color(rgb(theme::MUTED))
+            .text_color(theme::muted())
             .child(title.to_uppercase())
     }
 
@@ -438,7 +438,7 @@ impl PythonPanel {
             .items_center()
             .gap_2()
             .text_sm()
-            .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+            .hover(|style| style.bg(theme::hover_row()))
     }
 
     fn render_ready(&self, info: &PythonInfo, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -472,12 +472,15 @@ impl PythonPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             );
         let status = match (info.in_sync, &info.uv) {
-            (_, None) => Some(("uv is not installed where the project lives", theme::ERROR)),
+            (_, None) => Some((
+                "uv is not installed where the project lives",
+                theme::error(),
+            )),
             (Some(false), _) => Some((
                 "Environment out of date: Sync to update .venv",
-                theme::WARNING,
+                theme::warning(),
             )),
-            (Some(true), _) => Some(("Environment up to date", theme::MUTED)),
+            (Some(true), _) => Some(("Environment up to date", theme::muted())),
             (None, _) => None,
         };
 
@@ -496,7 +499,7 @@ impl PythonPanel {
                         .cursor_pointer()
                         .child(
                             div()
-                                .text_color(rgb(theme::TEXT))
+                                .text_color(theme::text())
                                 .child(format!("{} {}", interpreter.implementation, version)),
                         )
                         .child(
@@ -505,7 +508,7 @@ impl PythonPanel {
                                 .min_w_0()
                                 .truncate()
                                 .text_xs()
-                                .text_color(rgb(theme::MUTED))
+                                .text_color(theme::muted())
                                 .child(detail),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| this.pin(version.clone(), cx)))
@@ -515,8 +518,8 @@ impl PythonPanel {
         let run = |id: &'static str, label: String, request: RunRequest| {
             Self::row(id)
                 .cursor_pointer()
-                .child(div().text_color(rgb(theme::ACCENT_TEXT)).child("▶"))
-                .child(div().text_color(rgb(theme::TEXT)).child(label))
+                .child(div().text_color(theme::accent_text()).child("▶"))
+                .child(div().text_color(theme::text()).child(label))
                 .on_click(
                     cx.listener(move |_, _, _, cx| cx.emit(PythonPanelEvent::Run(request.clone()))),
                 )
@@ -530,14 +533,9 @@ impl PythonPanel {
                 let request = RunRequest::Script(name.clone());
                 Self::row(("py-script", index))
                     .cursor_pointer()
-                    .child(div().text_color(rgb(theme::ACCENT_TEXT)).child("▶"))
-                    .child(div().text_color(rgb(theme::TEXT)).child(name.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::MUTED))
-                            .child("script"),
-                    )
+                    .child(div().text_color(theme::accent_text()).child("▶"))
+                    .child(div().text_color(theme::text()).child(name.clone()))
+                    .child(div().text_xs().text_color(theme::muted()).child("script"))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(PythonPanelEvent::Run(request.clone()))
                     }))
@@ -562,28 +560,28 @@ impl PythonPanel {
                     let (remove_name, remove_kind) = (name.clone(), dependency.kind.clone());
                     let upgrade_name = name.clone();
                     Self::row(("py-dep", index))
-                        .child(div().text_color(rgb(theme::TEXT)).child(name.clone()))
+                        .child(div().text_color(theme::text()).child(name.clone()))
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
                                 .text_xs()
-                                .text_color(rgb(theme::MUTED))
+                                .text_color(theme::muted())
                                 .child(dependency.requirement.specifier.clone()),
                         )
                         .children(dependency.locked.clone().map(|version| {
                             div()
                                 .text_xs()
-                                .text_color(rgb(theme::ACCENT_TEXT))
+                                .text_color(theme::accent_text())
                                 .child(version)
                         }))
                         .child(
                             div()
                                 .id(("py-dep-upgrade", index))
                                 .px_1()
-                                .text_color(rgb(theme::MUTED))
-                                .hover(|style| style.text_color(rgb(theme::TEXT)))
+                                .text_color(theme::muted())
+                                .hover(|style| style.text_color(theme::text()))
                                 .cursor_pointer()
                                 .child("↑")
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -599,8 +597,8 @@ impl PythonPanel {
                             div()
                                 .id(("py-dep-remove", index))
                                 .px_1()
-                                .text_color(rgb(theme::MUTED))
-                                .hover(|style| style.text_color(rgb(theme::ERROR)))
+                                .text_color(theme::muted())
+                                .hover(|style| style.text_color(theme::error()))
                                 .cursor_pointer()
                                 .child("×")
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -622,20 +620,17 @@ impl PythonPanel {
             .flex_col()
             .child(self.render_header(info))
             .child(actions)
-            .children(status.map(|(text, color)| {
-                div()
-                    .px_2()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(rgb(color))
-                    .child(text)
-            }))
+            .children(
+                status.map(|(text, color)| {
+                    div().px_2().pt_1().text_xs().text_color(color).child(text)
+                }),
+            )
             .children(self.busy.clone().map(|label| {
                 div()
                     .px_2()
                     .pt_1()
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(format!("{label}…"))
             }))
             .when(!self.output.is_empty() && !busy, |panel| {
@@ -645,14 +640,14 @@ impl PythonPanel {
                         .mt_1()
                         .p_1()
                         .rounded_sm()
-                        .bg(rgb(theme::BACKGROUND))
+                        .bg(theme::background())
                         .font_family(theme::MONO_FONT)
                         .text_xs()
-                        .text_color(rgb(if self.failed {
-                            theme::ERROR
+                        .text_color(if self.failed {
+                            theme::error()
                         } else {
-                            theme::MUTED
-                        }))
+                            theme::muted()
+                        })
                         .children(self.output.iter().map(|line| div().child(line.clone()))),
                 )
             })
@@ -690,9 +685,9 @@ impl PythonPanel {
                             .px_2()
                             .py_1()
                             .border_1()
-                            .border_color(rgb(theme::BORDER))
+                            .border_color(theme::border())
                             .rounded_sm()
-                            .bg(rgb(theme::BACKGROUND))
+                            .bg(theme::background())
                             .child(self.add_input.clone()),
                     )
                     .child(
@@ -717,19 +712,19 @@ impl Render for PythonPanel {
             State::Loading => div()
                 .p_2()
                 .text_sm()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("Reading the project…")
                 .into_any_element(),
             State::NoProject => div()
                 .p_2()
                 .text_sm()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("No pyproject.toml in this folder. `uv init` makes one.")
                 .into_any_element(),
             State::Failed(error) => div()
                 .p_2()
                 .text_sm()
-                .text_color(rgb(theme::ERROR))
+                .text_color(theme::error())
                 .child(error.clone())
                 .into_any_element(),
             State::Ready(info) => {
@@ -744,7 +739,7 @@ impl Render for PythonPanel {
             .id("python-panel")
             .size_full()
             .overflow_y_scroll()
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .child(body)
     }
 }

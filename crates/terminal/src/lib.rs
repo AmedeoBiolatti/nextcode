@@ -138,6 +138,8 @@ pub struct Palette {
     pub cursor: Rgb,
 }
 
+/// The UI's colors come from its theme; tests use these.
+#[cfg(test)]
 const fn rgb(value: u32) -> Rgb {
     Rgb {
         r: (value >> 16) as u8,
@@ -146,6 +148,7 @@ const fn rgb(value: u32) -> Rgb {
     }
 }
 
+#[cfg(test)]
 impl Default for Palette {
     fn default() -> Self {
         Self {

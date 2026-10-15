@@ -4,7 +4,7 @@
 use git::{Ref, RefKind, Repository};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton, PromptLevel,
-    SharedString, Subscription, Task, Window, div, prelude::*, px, rgb,
+    SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 
 use crate::{
@@ -238,9 +238,9 @@ impl Render for BranchPicker {
             .w(px(560.))
             .flex()
             .flex_col()
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .rounded_md()
             .shadow_lg()
             .text_sm()
@@ -249,7 +249,7 @@ impl Render for BranchPicker {
                     .px_3()
                     .pt_2()
                     .text_xs()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(title),
             )
             .child(
@@ -258,7 +258,7 @@ impl Render for BranchPicker {
                     .px_3()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .child(self.query.clone()),
             )
             .children(
@@ -293,9 +293,9 @@ impl Render for BranchPicker {
                             .items_center()
                             .gap_3()
                             .cursor_pointer()
-                            .when(index == self.selected, |row| row.bg(rgb(theme::ACTIVE_ROW)))
+                            .when(index == self.selected, |row| row.bg(theme::active_row()))
                             .when(index != self.selected, |row| {
-                                row.hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                                row.hover(|style| style.bg(theme::hover_row()))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| this.choose(index, cx)))
                             .child(
@@ -303,16 +303,16 @@ impl Render for BranchPicker {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child(name),
                             )
-                            .child(div().text_xs().text_color(rgb(theme::MUTED)).child(detail))
+                            .child(div().text_xs().text_color(theme::muted()).child(detail))
                             .children(deletable.map(|branch| {
                                 div()
                                     .id(("delete-branch", index))
                                     .px_1()
-                                    .text_color(rgb(theme::MUTED))
-                                    .hover(|style| style.text_color(rgb(theme::ERROR)))
+                                    .text_color(theme::muted())
+                                    .hover(|style| style.text_color(theme::error()))
                                     .child("×")
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
@@ -327,7 +327,7 @@ impl Render for BranchPicker {
                         .px_3()
                         .py_1()
                         .text_xs()
-                        .text_color(rgb(theme::MUTED))
+                        .text_color(theme::muted())
                         .child("Working…"),
                 )
             })
@@ -336,7 +336,7 @@ impl Render for BranchPicker {
                     .px_3()
                     .py_1()
                     .text_xs()
-                    .text_color(rgb(theme::ERROR))
+                    .text_color(theme::error())
                     .child(error)
             }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

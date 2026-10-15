@@ -2,13 +2,13 @@
 //! and the active project. Every window's root is a [`Shell`]; a project
 //! tab holds a `Workspace`, or `Connecting` while a remote project opens.
 
-use std::{path::PathBuf, rc::Rc};
+use std::{path::PathBuf, rc::Rc, sync::Arc};
 
 use gpui::{
     Action, AnyElement, AnyView, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle,
     Focusable, KeyBinding, KeyDownEvent, MouseButton, PathPromptOptions, PromptLevel, SharedString,
     Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, anchored,
-    deferred, div, prelude::*, px, rgb, size,
+    deferred, div, prelude::*, px, size,
 };
 
 use crate::{
@@ -20,7 +20,8 @@ use crate::{
     project_picker::{ProjectPicker, ProjectPickerEvent},
     recent,
     settings::Settings,
-    theme,
+    theme::{self, Theme},
+    theme_picker::{ThemePicker, ThemePickerEvent},
     workspace::{Preload, Workspace, WorkspaceEvent},
 };
 
@@ -36,6 +37,8 @@ actions!(
         ShowCommandPalette,
         CustomizeMenus,
         OpenSettings,
+        SelectTheme,
+        CustomizeTheme,
         Quit,
         About
     ]
@@ -135,7 +138,11 @@ pub struct Shell {
     /// The palette, and the focus to run its command with.
     palette: Option<(Entity<CommandPalette>, Subscription, Option<FocusHandle>)>,
     picker: Option<(Entity<ProjectPicker>, Subscription)>,
+    theme_picker: Option<(Entity<ThemePicker>, Subscription)>,
     notice: Option<SharedString>,
+    /// The theme last drawn, and what is wrong with it (dismissable).
+    theme: Arc<Theme>,
+    theme_notice: Option<SharedString>,
     /// Set once the user confirmed discarding unsaved changes on close.
     close_confirmed: bool,
     _activation: Subscription,
@@ -228,14 +235,17 @@ impl Shell {
                 .update(cx, |this, cx| this.should_close(window, cx))
                 .unwrap_or(true)
         });
-        // Picks up a `menus.json` edited elsewhere when the window returns.
+        // Picks up a `menus.json`, `settings.json` or theme edited elsewhere
+        // when the window returns.
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.refresh_menus(cx);
+                theme::refresh(cx);
             }
         });
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
+        theme::refresh(cx);
         let mut shell = Self {
             focus_handle,
             tabs: Vec::new(),
@@ -244,7 +254,10 @@ impl Shell {
             menu: None,
             palette: None,
             picker: None,
+            theme_picker: None,
             notice: None,
+            theme: theme::current(),
+            theme_notice: theme::problem().map(Into::into),
             close_confirmed: false,
             _activation: activation,
         };
@@ -597,6 +610,7 @@ impl Shell {
         if self.palette.is_some() {
             return;
         }
+        theme::refresh(cx);
         let focus = window.focused(cx);
         let commands: Vec<Command> = window
             .available_actions(cx)
@@ -674,6 +688,40 @@ impl Shell {
         }
     }
 
+    fn select_theme(&mut self, _: &SelectTheme, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        let previous = window.focused(cx);
+        let picker = cx.new(ThemePicker::new);
+        let subscription = cx.subscribe_in(&picker, window, move |this, _, event, window, cx| {
+            this.theme_picker = None;
+            match &previous {
+                Some(focus) => window.focus(focus),
+                None => window.focus(&this.focus_handle),
+            }
+            if let ThemePickerEvent::Select(name) = event
+                && let Err(err) = theme::select(name, cx)
+            {
+                this.notice = Some(format!("Could not select the theme: {err}").into());
+            }
+            cx.notify();
+        });
+        window.focus(&picker.focus_handle(cx));
+        self.theme_picker = Some((picker, subscription));
+        cx.notify();
+    }
+
+    /// Opens the current theme's file, first creating one that extends a
+    /// built-in theme.
+    fn customize_theme(&mut self, _: &CustomizeTheme, window: &mut Window, cx: &mut Context<Self>) {
+        match theme::customize(cx) {
+            Ok(path) => self.open_config(path, window, cx),
+            Err(err) => {
+                self.notice = Some(format!("Could not create a theme file: {err}").into());
+                cx.notify();
+            }
+        }
+    }
+
     /// Exits after one confirmation covering every window's unsaved files.
     fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
         let this_window = window.window_handle();
@@ -723,6 +771,7 @@ impl Shell {
     /// Opens menu `index`, resolving its rows for where focus is now.
     fn open_menu(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_menus(cx);
+        theme::refresh(cx);
         let Some(menu) = self.menus.menus.get(index) else {
             self.menu = None;
             return cx.notify();
@@ -768,9 +817,9 @@ impl Shell {
             .h(px(MENU_BAR_HEIGHT))
             .px_1()
             .gap_0p5()
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .border_b_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .text_sm()
             // Clicks on the bar keep focus where it is (the window would
             // otherwise take it): menu commands and the palette act there.
@@ -794,11 +843,11 @@ impl Shell {
                     .gap_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .bg(rgb(theme::BACKGROUND))
-                    .text_color(rgb(theme::MUTED))
+                    .border_color(theme::border())
+                    .bg(theme::background())
+                    .text_color(theme::muted())
                     .cursor_pointer()
-                    .hover(|style| style.border_color(rgb(theme::ACCENT)))
+                    .hover(|style| style.border_color(theme::accent()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
@@ -825,9 +874,9 @@ impl Shell {
             .py_0p5()
             .rounded_sm()
             .cursor_pointer()
-            .when(open.is_some(), |title| title.bg(rgb(theme::ACTIVE_ROW)))
+            .when(open.is_some(), |title| title.bg(theme::active_row()))
             .when(open.is_none(), |title| {
-                title.hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                title.hover(|style| style.bg(theme::hover_row()))
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -878,10 +927,10 @@ impl Shell {
             .flex()
             .flex_col()
             .text_sm()
-            .text_color(rgb(theme::TEXT))
-            .bg(rgb(theme::PANEL))
+            .text_color(theme::text())
+            .bg(theme::panel())
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .rounded_md()
             .shadow_lg()
             .children(rows.iter().enumerate().map(|(index, row)| {
@@ -902,7 +951,7 @@ impl Shell {
                     Row::Separator => div()
                         .my_1()
                         .h(px(1.))
-                        .bg(rgb(theme::BORDER))
+                        .bg(theme::border())
                         .into_any_element(),
                     Row::Command {
                         label,
@@ -913,9 +962,11 @@ impl Shell {
                         let enabled = action.is_some();
                         menu_row(("menu-row", depth * 1000 + index), label.clone(), enabled)
                             .on_hover(hover)
-                            .children(keys.clone().map(|keys| {
-                                div().text_xs().text_color(rgb(theme::MUTED)).child(keys)
-                            }))
+                            .children(
+                                keys.clone().map(|keys| {
+                                    div().text_xs().text_color(theme::muted()).child(keys)
+                                }),
+                            )
                             .when_some(action, |row, action| {
                                 row.on_click(cx.listener(move |this, _, window, cx| {
                                     this.run_menu_command(action.boxed_clone(), window, cx)
@@ -927,9 +978,9 @@ impl Shell {
                         let open = open_child == Some(index);
                         menu_row(("menu-row", depth * 1000 + index), label.clone(), true)
                             .relative()
-                            .when(open, |row| row.bg(rgb(theme::ACTIVE_ROW)))
+                            .when(open, |row| row.bg(theme::active_row()))
                             .on_hover(hover)
-                            .child(div().text_color(rgb(theme::MUTED)).child("›"))
+                            .child(div().text_color(theme::muted()).child("›"))
                             // Already inside the menu's deferred layer, which
                             // gpui does not nest; placed past the parent's
                             // rows so none paints over it.
@@ -959,9 +1010,9 @@ impl Shell {
             .flex()
             .flex_none()
             .h(px(30.))
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .border_b_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .text_sm()
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let active = index == self.active;
@@ -973,13 +1024,17 @@ impl Shell {
                     .gap_2()
                     .px_3()
                     .border_r_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .cursor_pointer()
-                    .text_color(rgb(if active { theme::TEXT } else { theme::MUTED }))
+                    .text_color(if active {
+                        theme::text()
+                    } else {
+                        theme::muted()
+                    })
                     .when(active, |tab| {
-                        tab.bg(rgb(theme::BACKGROUND))
+                        tab.bg(theme::background())
                             .border_b_2()
-                            .border_color(rgb(theme::ACCENT))
+                            .border_color(theme::accent())
                     })
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
@@ -993,8 +1048,8 @@ impl Shell {
                         div()
                             .id(("project-close", index))
                             .w(px(14.))
-                            .text_color(rgb(theme::MUTED))
-                            .hover(|style| style.text_color(rgb(theme::TEXT)))
+                            .text_color(theme::muted())
+                            .hover(|style| style.text_color(theme::text()))
                             .child("×")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
@@ -1009,8 +1064,8 @@ impl Shell {
                     .flex()
                     .items_center()
                     .cursor_pointer()
-                    .text_color(rgb(theme::MUTED))
-                    .hover(|style| style.text_color(rgb(theme::TEXT)))
+                    .text_color(theme::muted())
+                    .hover(|style| style.text_color(theme::text()))
                     .child("+")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.prompt_for_project(false, window, cx)
@@ -1027,8 +1082,8 @@ impl Shell {
                 .py_1()
                 .rounded_sm()
                 .cursor_pointer()
-                .text_color(rgb(theme::ACCENT_TEXT))
-                .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                .text_color(theme::accent_text())
+                .hover(|style| style.bg(theme::hover_row()))
                 .child(label)
         };
         let with_keys = |label: &str, action: &dyn Action| match commands::key_text(
@@ -1063,7 +1118,7 @@ impl Shell {
                     div()
                         .mt_4()
                         .text_sm()
-                        .text_color(rgb(theme::MUTED))
+                        .text_color(theme::muted())
                         .child("Recent projects"),
                 )
             })
@@ -1080,7 +1135,7 @@ impl Shell {
                             .rounded_sm()
                             .text_sm()
                             .cursor_pointer()
-                            .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                            .hover(|style| style.bg(theme::hover_row()))
                             .child(label)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open(location.clone(), window, cx)
@@ -1118,9 +1173,9 @@ fn menu_row(
         .child(div().flex_1().truncate().child(label))
         .when(enabled, |row| {
             row.cursor_pointer()
-                .hover(|style| style.bg(rgb(theme::ACTIVE_ROW)))
+                .hover(|style| style.bg(theme::active_row()))
         })
-        .when(!enabled, |row| row.text_color(rgb(theme::MUTED)))
+        .when(!enabled, |row| row.text_color(theme::muted()))
 }
 
 /// Menu items as rows: commands built and checked against where `focus`
@@ -1196,6 +1251,12 @@ impl Focusable for Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The theme changed (here or in another window): show its problem.
+        let theme = theme::current();
+        if !Arc::ptr_eq(&theme, &self.theme) {
+            self.theme = theme;
+            self.theme_notice = theme::problem().map(Into::into);
+        }
         let content = match self.tabs.get(self.active) {
             Some(tab) => tab.content.view().into_any_element(),
             None => self.render_welcome(window, cx).into_any_element(),
@@ -1223,6 +1284,8 @@ impl Render for Shell {
             .on_action(cx.listener(Self::show_command_palette))
             .on_action(cx.listener(Self::customize_menus))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::select_theme))
+            .on_action(cx.listener(Self::customize_theme))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::about))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -1235,8 +1298,8 @@ impl Render for Shell {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::BACKGROUND))
-            .text_color(rgb(theme::TEXT))
+            .bg(theme::background())
+            .text_color(theme::text())
             .child(self.render_menu_bar(window, cx))
             .when(!self.tabs.is_empty(), |shell| {
                 shell.child(self.render_project_tabs(cx))
@@ -1247,11 +1310,25 @@ impl Render for Shell {
                     .px_3()
                     .py_1()
                     .text_sm()
-                    .text_color(rgb(theme::ERROR))
+                    .text_color(theme::error())
                     .cursor_pointer()
                     .child(notice)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.notice = None;
+                        cx.notify();
+                    }))
+            }))
+            .children(self.theme_notice.clone().map(|notice| {
+                div()
+                    .id("theme-notice")
+                    .px_3()
+                    .py_1()
+                    .text_sm()
+                    .text_color(theme::error())
+                    .cursor_pointer()
+                    .child(notice)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.theme_notice = None;
                         cx.notify();
                     }))
             }))
@@ -1286,6 +1363,11 @@ impl Render for Shell {
             )
             .children(
                 self.picker
+                    .as_ref()
+                    .map(|(picker, _)| modal(picker.clone().into())),
+            )
+            .children(
+                self.theme_picker
                     .as_ref()
                     .map(|(picker, _)| modal(picker.clone().into())),
             )

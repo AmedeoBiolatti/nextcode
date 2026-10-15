@@ -10,14 +10,12 @@ use git::{
 };
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, Global, PromptLevel, SharedString, Task,
-    Window, div, prelude::*, px, rgb, uniform_list,
+    Window, div, prelude::*, px, uniform_list,
 };
 
 use crate::{git_panel::short_revision, project::Project, theme};
 
 const ROW_HEIGHT: f32 = 20.;
-const ADDED_BACKGROUND: u32 = 0x294436;
-const REMOVED_BACKGROUND: u32 = 0x4b2b2e;
 
 /// What a diff compares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,8 +265,8 @@ impl DiffView {
             .flex()
             .items_center()
             .gap_2()
-            .bg(rgb(theme::PANEL))
-            .text_color(rgb(theme::ACCENT_TEXT))
+            .bg(theme::panel())
+            .text_color(theme::accent_text())
             .child(div().flex_1().min_w_0().truncate().child(header.to_owned()))
             .children(self.hunk_actions().iter().map(|&(action, label)| {
                 div()
@@ -277,10 +275,10 @@ impl DiffView {
                     .rounded_sm()
                     .font_family(theme::UI_FONT)
                     .text_xs()
-                    .text_color(rgb(theme::TEXT))
-                    .bg(rgb(theme::BORDER))
+                    .text_color(theme::text())
+                    .bg(theme::border())
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::ACTIVE_ROW)))
+                    .hover(|style| style.bg(theme::active_row()))
                     .child(label)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.apply_hunk(hunk, action, window, cx)
@@ -313,20 +311,20 @@ impl DiffView {
                 .pr_2()
                 .flex()
                 .justify_end()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child(line.map(|line| line.to_string()).unwrap_or_default())
         };
         let (sign, background) = match kind {
             LineKind::Context => (" ", None),
-            LineKind::Added => ("+", Some(ADDED_BACKGROUND)),
-            LineKind::Removed => ("-", Some(REMOVED_BACKGROUND)),
+            LineKind::Added => ("+", Some(theme::diff_added())),
+            LineKind::Removed => ("-", Some(theme::diff_removed())),
         };
         div()
             .h(px(ROW_HEIGHT))
             .flex()
             .items_center()
             .overflow_hidden()
-            .when_some(background, |row, color| row.bg(rgb(color)))
+            .when_some(background, |row, color| row.bg(color))
             .child(number(numbers[0]))
             .when(show_both, |row| row.child(number(numbers[1])))
             .child(div().w(px(16.)).flex_none().child(sign))
@@ -339,8 +337,8 @@ impl DiffView {
             .px_2()
             .flex()
             .items_center()
-            .bg(rgb(theme::PANEL))
-            .text_color(rgb(theme::MUTED))
+            .bg(theme::panel())
+            .text_color(theme::muted())
             .child(format!("⋯ {lines} unchanged lines"))
             .into_any_element()
     }
@@ -374,7 +372,7 @@ impl DiffView {
                 let target = new.or(*old);
                 Self::line_cells(*kind, [*old, *new], true, text)
                     .id(index)
-                    .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                    .hover(|style| style.bg(theme::hover_row()))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.open_line(target, cx)))
                     .into_any_element()
@@ -401,7 +399,7 @@ impl DiffView {
                                 .min_w_0()
                                 .when(clickable, |cell| {
                                     cell.cursor_pointer()
-                                        .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                                        .hover(|style| style.bg(theme::hover_row()))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.open_line(target, cx)
                                         }))
@@ -412,14 +410,14 @@ impl DiffView {
                             .flex_1()
                             .min_w_0()
                             .h(px(ROW_HEIGHT))
-                            .bg(rgb(theme::PANEL))
+                            .bg(theme::panel())
                             .into_any_element(),
                     }
                 };
                 div()
                     .flex()
                     .child(half(left, "left"))
-                    .child(div().w(px(1.)).flex_none().bg(rgb(theme::BORDER)))
+                    .child(div().w(px(1.)).flex_none().bg(theme::border()))
                     .child(half(right, "right"))
                     .into_any_element()
             }
@@ -439,9 +437,9 @@ impl DiffView {
             .px_2()
             .rounded_sm()
             .cursor_pointer()
-            .text_color(rgb(if on { theme::TEXT } else { theme::MUTED }))
-            .when(on, |toggle| toggle.bg(rgb(theme::ACTIVE_ROW)))
-            .hover(|style| style.text_color(rgb(theme::TEXT)))
+            .text_color(if on { theme::text() } else { theme::muted() })
+            .when(on, |toggle| toggle.bg(theme::active_row()))
+            .hover(|style| style.text_color(theme::text()))
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| this.set_options(options, cx)))
     }
@@ -514,12 +512,12 @@ impl Render for DiffView {
         let body = match (&self.error, &self.diff) {
             (Some(error), _) => div()
                 .p_3()
-                .text_color(rgb(theme::ERROR))
+                .text_color(theme::error())
                 .child(error.clone())
                 .into_any_element(),
             (None, Some(diff)) if diff.rows.is_empty() => div()
                 .p_3()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child(if diff.binary {
                     "Binary files are not shown."
                 } else {
@@ -551,10 +549,10 @@ impl Render for DiffView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::BACKGROUND))
+            .bg(theme::background())
             .font_family(theme::MONO_FONT)
             .text_size(px(theme::EDITOR_FONT_SIZE))
-            .text_color(rgb(theme::TEXT))
+            .text_color(theme::text())
             .child(
                 div()
                     .px_3()
@@ -564,10 +562,10 @@ impl Render for DiffView {
                     .justify_between()
                     .gap_3()
                     .border_b_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .font_family(theme::UI_FONT)
                     .text_sm()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .child(div().min_w_0().truncate().child(header))
                     .child(toolbar),
             )

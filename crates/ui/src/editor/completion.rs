@@ -357,9 +357,9 @@ impl Editor {
         let list = div()
             .w(px(420.))
             .h(px(ROW_HEIGHT * rows as f32 + 2.))
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .border_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(theme::border())
             .rounded_md()
             .shadow_md()
             .child(
@@ -367,11 +367,12 @@ impl Editor {
                     "completions",
                     menu.candidates.len(),
                     cx.processor(|this, range: Range<usize>, _, cx| {
+                        let language = this.language();
                         let Some(menu) = &this.completion else {
                             return Vec::new();
                         };
                         range
-                            .map(|row| completion_row(menu, row, cx).into_any_element())
+                            .map(|row| completion_row(menu, language, row, cx).into_any_element())
                             .collect()
                     }),
                 )
@@ -389,9 +390,9 @@ impl Editor {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .bg(rgb(theme::PANEL))
+                .bg(theme::panel())
                 .border_1()
-                .border_color(rgb(theme::BORDER))
+                .border_color(theme::border())
                 .rounded_md()
                 .shadow_md()
                 .text_sm()
@@ -417,14 +418,15 @@ impl Editor {
 
 fn completion_row(
     menu: &CompletionMenu,
+    language: Option<Language>,
     row: usize,
     cx: &mut Context<Editor>,
 ) -> impl IntoElement + use<> {
     let candidate = &menu.candidates[row];
     let item = &menu.items[candidate.index];
-    let (badge, badge_color) = kind_badge(item.kind);
+    let (badge, badge_color) = kind_badge(item.kind, language);
     let highlight = HighlightStyle {
-        color: Some(rgb(theme::ACCENT_TEXT).into()),
+        color: Some(theme::accent_text()),
         font_weight: Some(FontWeight::BOLD),
         ..Default::default()
     };
@@ -452,6 +454,18 @@ fn completion_row(
             .tags
             .as_ref()
             .is_some_and(|tags| tags.contains(&lsp::types::CompletionItemTag::DEPRECATED));
+    // Deprecated items: the theme's `deprecated` modifier over muted text.
+    let label_style = if deprecated {
+        let muted = SyntaxStyle {
+            color: Some(theme::muted()),
+            ..SyntaxStyle::default()
+        };
+        theme::current()
+            .modifier_style("deprecated")
+            .map_or(muted, |modifier| modifier.over(muted))
+    } else {
+        SyntaxStyle::default()
+    };
 
     div()
         .id(row)
@@ -462,9 +476,9 @@ fn completion_row(
         .items_center()
         .gap_2()
         .overflow_hidden()
-        .when(row == menu.selected, |row| row.bg(rgb(theme::ACTIVE_ROW)))
+        .when(row == menu.selected, |row| row.bg(theme::active_row()))
         .when(row != menu.selected, |row| {
-            row.hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+            row.hover(|style| style.bg(theme::hover_row()))
         })
         .on_click(cx.listener(move |this, _, _, cx| this.accept_completion(Some(row), cx)))
         .child(
@@ -472,18 +486,26 @@ fn completion_row(
                 .w(px(16.))
                 .flex_none()
                 .text_xs()
-                .text_color(rgb(badge_color))
+                .text_color(badge_color)
                 .child(badge),
         )
         .child(
             div()
                 .flex_none()
-                .text_color(rgb(if deprecated {
-                    theme::MUTED
-                } else {
-                    theme::TEXT
-                }))
-                .when(deprecated, |label| label.line_through())
+                .text_color(label_style.color.unwrap_or_else(theme::text))
+                .when_some(label_style.background, |label, background| {
+                    label.bg(background)
+                })
+                .when(label_style.bold == Some(true), |label| {
+                    label.font_weight(FontWeight::BOLD)
+                })
+                .when(label_style.italic == Some(true), |label| label.italic())
+                .when(label_style.underline == Some(true), |label| {
+                    label.underline()
+                })
+                .when(label_style.strikethrough == Some(true), |label| {
+                    label.line_through()
+                })
                 .child(StyledText::new(item.label.clone()).with_highlights(highlights)),
         )
         .child(div().flex_1())
@@ -492,7 +514,7 @@ fn completion_row(
                 .flex_shrink()
                 .overflow_hidden()
                 .text_xs()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child(detail)
         }))
 }
@@ -518,38 +540,41 @@ fn completion_docs(item: &CompletionItem) -> Vec<language::markdown::Block> {
     blocks
 }
 
-/// A one-letter kind badge and its color.
-fn kind_badge(kind: Option<CompletionItemKind>) -> (&'static str, u32) {
-    use theme::{ACCENT_TEXT, MUTED};
+/// A one-letter kind badge and its color: the theme's color for the
+/// matching highlight scope in `language`.
+fn kind_badge(
+    kind: Option<CompletionItemKind>,
+    language: Option<Language>,
+) -> (&'static str, Hsla) {
+    let scope_color = |scope| {
+        let theme = theme::current();
+        syntax::Highlight::from_scope(scope).map_or(theme.ui.text, |highlight| {
+            theme.syntax_color(language, highlight)
+        })
+    };
     match kind {
         Some(
             CompletionItemKind::FUNCTION
             | CompletionItemKind::METHOD
             | CompletionItemKind::CONSTRUCTOR,
-        ) => ("ƒ", theme::highlight_color(syntax::Highlight::Function)),
-        Some(CompletionItemKind::VARIABLE) => ("v", ACCENT_TEXT),
+        ) => ("ƒ", scope_color("function")),
+        Some(CompletionItemKind::VARIABLE) => ("v", theme::accent_text()),
         Some(CompletionItemKind::FIELD | CompletionItemKind::PROPERTY) => {
-            ("p", theme::highlight_color(syntax::Highlight::Property))
+            ("p", scope_color("property"))
         }
         Some(
             CompletionItemKind::CLASS
             | CompletionItemKind::STRUCT
             | CompletionItemKind::INTERFACE
             | CompletionItemKind::TYPE_PARAMETER,
-        ) => ("C", theme::highlight_color(syntax::Highlight::Type)),
+        ) => ("C", scope_color("type")),
         Some(CompletionItemKind::ENUM | CompletionItemKind::ENUM_MEMBER) => {
-            ("E", theme::highlight_color(syntax::Highlight::Type))
+            ("E", scope_color("type"))
         }
-        Some(CompletionItemKind::MODULE) => {
-            ("M", theme::highlight_color(syntax::Highlight::Constant))
-        }
-        Some(CompletionItemKind::KEYWORD) => {
-            ("k", theme::highlight_color(syntax::Highlight::Keyword))
-        }
-        Some(CompletionItemKind::CONSTANT) => {
-            ("c", theme::highlight_color(syntax::Highlight::Constant))
-        }
-        Some(CompletionItemKind::SNIPPET) => ("s", MUTED),
-        _ => ("·", MUTED),
+        Some(CompletionItemKind::MODULE) => ("M", scope_color("constant")),
+        Some(CompletionItemKind::KEYWORD) => ("k", scope_color("keyword")),
+        Some(CompletionItemKind::CONSTANT) => ("c", scope_color("constant")),
+        Some(CompletionItemKind::SNIPPET) => ("s", theme::muted()),
+        _ => ("·", theme::muted()),
     }
 }

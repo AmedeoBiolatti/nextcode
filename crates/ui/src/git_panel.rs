@@ -5,8 +5,8 @@ use std::{collections::HashSet, io, ops::Range, time::Duration};
 
 use git::{Change, Entry, Repository, Status};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, SharedString,
-    Subscription, Task, Window, div, prelude::*, px, rgb, uniform_list,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, PromptLevel, SharedString,
+    Subscription, Task, Window, div, prelude::*, px, uniform_list,
 };
 
 use crate::{
@@ -106,8 +106,8 @@ pub struct GitPanel {
     state: State,
     rows: Vec<Row>,
     message: Entity<Editor>,
-    /// Result of the last operation (errors in red).
-    feedback: Option<(SharedString, u32)>,
+    /// Result of the last operation, with its color (errors in red).
+    feedback: Option<(SharedString, fn() -> Hsla)>,
     busy: bool,
     /// The next commit replaces the last one.
     amend: bool,
@@ -140,12 +140,13 @@ impl SyncAction {
     }
 }
 
-pub fn change_color(change: Change) -> u32 {
+pub fn change_color(change: Change) -> Hsla {
     match change {
-        Change::Added | Change::Untracked => 0x6aab73,
-        Change::Deleted | Change::Conflicted => theme::ERROR,
-        Change::Renamed | Change::Copied => theme::ACCENT_TEXT,
-        Change::Modified | Change::TypeChanged => theme::WARNING,
+        Change::Added | Change::Untracked => theme::git_added(),
+        Change::Deleted => theme::git_deleted(),
+        Change::Conflicted => theme::git_conflicted(),
+        Change::Renamed | Change::Copied => theme::git_renamed(),
+        Change::Modified | Change::TypeChanged => theme::git_modified(),
     }
 }
 
@@ -254,7 +255,7 @@ impl GitPanel {
 
     /// Shows the outcome of a git operation run elsewhere (a picker).
     pub fn report(&mut self, message: String, cx: &mut Context<Self>) {
-        self.feedback = Some((message.into(), theme::MUTED));
+        self.feedback = Some((message.into(), theme::muted));
         cx.notify();
     }
 
@@ -351,10 +352,10 @@ impl GitPanel {
                 this.busy = false;
                 match result {
                     Ok(message) => {
-                        this.feedback = message.map(|m| (m.into(), theme::MUTED));
+                        this.feedback = message.map(|m| (m.into(), theme::muted as fn() -> Hsla));
                         on_success(this, cx);
                     }
-                    Err(err) => this.feedback = Some((err.to_string().into(), theme::ERROR)),
+                    Err(err) => this.feedback = Some((err.to_string().into(), theme::error)),
                 }
                 this.refresh(cx);
             })
@@ -424,13 +425,13 @@ impl GitPanel {
         let staged = !self.entries(Section::Staged).is_empty();
         let amend = self.amend;
         if message.trim().is_empty() {
-            self.feedback = Some(("Enter a commit message".into(), theme::ERROR));
+            self.feedback = Some(("Enter a commit message".into(), theme::error));
             return cx.notify();
         }
         if !staged && !amend {
             self.feedback = Some((
                 "Nothing is staged; stage changes first".into(),
-                theme::ERROR,
+                theme::error,
             ));
             return cx.notify();
         }
@@ -509,8 +510,8 @@ impl GitPanel {
             div()
                 .id(id)
                 .px_1()
-                .text_color(rgb(theme::MUTED))
-                .hover(|style| style.text_color(rgb(theme::TEXT)))
+                .text_color(theme::muted())
+                .hover(|style| style.text_color(theme::text()))
                 .cursor_pointer()
                 .child(label)
         };
@@ -543,7 +544,7 @@ impl GitPanel {
             .items_center()
             .justify_between()
             .text_xs()
-            .text_color(rgb(theme::MUTED))
+            .text_color(theme::muted())
             .child(format!("{} ({count})", section.title().to_uppercase()))
             .child(actions)
     }
@@ -571,9 +572,9 @@ impl GitPanel {
                     .items_center()
                     .gap_2()
                     .text_sm()
-                    .text_color(rgb(theme::MUTED))
+                    .text_color(theme::muted())
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                    .hover(|style| style.bg(theme::hover_row()))
                     .on_click(cx.listener(move |this, _, _, cx| this.open(index, cx)))
                     .child(if *collapsed { "▸" } else { "▾" })
                     .child(label.clone())
@@ -598,8 +599,8 @@ impl GitPanel {
             div()
                 .id((id, index))
                 .px_1()
-                .text_color(rgb(theme::MUTED))
-                .hover(|style| style.text_color(rgb(theme::TEXT)))
+                .text_color(theme::muted())
+                .hover(|style| style.text_color(theme::text()))
                 .cursor_pointer()
                 .child(label)
         };
@@ -650,7 +651,7 @@ impl GitPanel {
             .gap_2()
             .text_sm()
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+            .hover(|style| style.bg(theme::hover_row()))
             .on_click(cx.listener(move |this, _, _, cx| this.open(index, cx)))
             .child(
                 div()
@@ -662,7 +663,7 @@ impl GitPanel {
                     .child(
                         div()
                             .flex_none()
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child(name.to_owned()),
                     )
                     .child(
@@ -670,7 +671,7 @@ impl GitPanel {
                             .min_w_0()
                             .truncate()
                             .text_xs()
-                            .text_color(rgb(theme::MUTED))
+                            .text_color(theme::muted())
                             .child(dir),
                     ),
             )
@@ -679,7 +680,7 @@ impl GitPanel {
                 div()
                     .w(px(12.))
                     .flex_none()
-                    .text_color(rgb(change_color(change)))
+                    .text_color(change_color(change))
                     .child(change.letter().to_string()),
             )
             .into_any_element()
@@ -710,8 +711,8 @@ impl GitPanel {
                 .id(id)
                 .px_1()
                 .text_xs()
-                .text_color(rgb(theme::MUTED))
-                .hover(|style| style.text_color(rgb(theme::TEXT)))
+                .text_color(theme::muted())
+                .hover(|style| style.text_color(theme::text()))
                 .cursor_pointer()
                 .child(label)
         };
@@ -756,12 +757,12 @@ impl GitPanel {
             .truncate()
             .px_1()
             .rounded_sm()
-            .text_color(rgb(theme::TEXT))
+            .text_color(theme::text())
             .child(format!("⎇ {text} ▾"))
             .when_some(repository.clone(), |branch, repository| {
                 branch
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                    .hover(|style| style.bg(theme::hover_row()))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(GitPanelEvent::Branches(repository.clone()))
                     }))
@@ -786,11 +787,11 @@ impl GitPanel {
                         .px_2()
                         .rounded_sm()
                         .border_1()
-                        .border_color(rgb(theme::BORDER))
+                        .border_color(theme::border())
                         .text_xs()
-                        .text_color(rgb(if busy { theme::MUTED } else { theme::TEXT }))
+                        .text_color(if busy { theme::muted() } else { theme::text() })
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                        .hover(|style| style.bg(theme::hover_row()))
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if !this.busy {
@@ -831,7 +832,7 @@ impl Render for GitPanel {
             State::Ready { status, .. } if status.entries.is_empty() => div()
                 .p_3()
                 .text_sm()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("No changes.")
                 .into_any_element(),
             State::Ready { .. } => uniform_list(
@@ -846,13 +847,13 @@ impl Render for GitPanel {
             State::NoRepository => div()
                 .p_3()
                 .text_sm()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("This project is not in a git repository.")
                 .into_any_element(),
             State::Failed(error) => div()
                 .p_3()
                 .text_sm()
-                .text_color(rgb(theme::ERROR))
+                .text_color(theme::error())
                 .child(error.clone())
                 .into_any_element(),
             State::Loading => div().into_any_element(),
@@ -865,7 +866,7 @@ impl Render for GitPanel {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::PANEL))
+            .bg(theme::panel())
             .child(self.render_branch(cx))
             .when(ready, |panel| {
                 panel.child(
@@ -882,9 +883,9 @@ impl Render for GitPanel {
                                 .px_2()
                                 .py_1()
                                 .border_1()
-                                .border_color(rgb(theme::BORDER))
+                                .border_color(theme::border())
                                 .rounded_sm()
-                                .bg(rgb(theme::BACKGROUND))
+                                .bg(theme::background())
                                 .child(self.message.clone()),
                         )
                         .child(
@@ -894,11 +895,11 @@ impl Render for GitPanel {
                                 .px_1()
                                 .py_1()
                                 .text_xs()
-                                .text_color(rgb(if self.amend {
-                                    theme::TEXT
+                                .text_color(if self.amend {
+                                    theme::text()
                                 } else {
-                                    theme::MUTED
-                                }))
+                                    theme::muted()
+                                })
                                 .cursor_pointer()
                                 .child(if self.amend { "☑ Amend" } else { "☐ Amend" })
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -913,12 +914,12 @@ impl Render for GitPanel {
                                 .py_1()
                                 .rounded_sm()
                                 .text_sm()
-                                .bg(rgb(if self.busy {
-                                    theme::BORDER
+                                .bg(if self.busy {
+                                    theme::border()
                                 } else {
-                                    theme::ACCENT
-                                }))
-                                .text_color(rgb(0xffffff))
+                                    theme::accent()
+                                })
+                                .text_color(theme::on_accent())
                                 .cursor_pointer()
                                 .child(match (self.busy, self.amend) {
                                     (true, _) => "…",
@@ -934,7 +935,7 @@ impl Render for GitPanel {
                     .px_2()
                     .pb_1()
                     .text_xs()
-                    .text_color(rgb(color))
+                    .text_color(color())
                     .child(text)
             }))
             .child(body)

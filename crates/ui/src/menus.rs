@@ -108,6 +108,8 @@ impl Default for MenuBar {
                         separator(),
                         plain("app::OpenSettings"),
                         plain("app::CustomizeMenus"),
+                        plain("app::SelectTheme"),
+                        plain("app::CustomizeTheme"),
                         separator(),
                         plain("app::Quit"),
                     ],

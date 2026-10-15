@@ -5,22 +5,41 @@
 //! layered over built-in defaults:
 //!
 //! ```json
-//! { "languages": { "python": { "server": {
+//! { "theme": "Light",
+//!   "semantic_highlighting": true,
+//!   "languages": { "python": { "server": {
 //!     "command": "basedpyright-langserver", "args": ["--stdio"],
 //!     "settings": { "basedpyright": { "analysis": { "typeCheckingMode": "strict" } } }
 //! } } } }
 //! ```
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use syntax::Language;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
+    /// The theme's name (see `theme`); `None` for the default.
+    pub theme: Option<String>,
+    /// Layer language servers' semantic tokens over syntax highlighting.
+    pub semantic_highlighting: bool,
     pub languages: HashMap<String, LanguageSettings>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: None,
+            semantic_highlighting: true,
+            languages: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -62,10 +81,14 @@ impl Settings {
     /// Loads the user settings; a missing file yields defaults, a broken one
     /// yields defaults plus the error to show.
     pub fn load() -> (Self, Option<String>) {
-        let Some(path) = Self::path() else {
-            return (Self::default(), None);
-        };
-        match std::fs::read_to_string(&path) {
+        match Self::path() {
+            Some(path) => Self::load_from(&path),
+            None => (Self::default(), None),
+        }
+    }
+
+    pub fn load_from(path: &Path) -> (Self, Option<String>) {
+        match std::fs::read_to_string(path) {
             Ok(text) => match serde_json::from_str(&text) {
                 Ok(settings) => (settings, None),
                 Err(err) => (Self::default(), Some(format!("{}: {err}", path.display()))),
@@ -126,7 +149,7 @@ fn default_server(language: Language) -> Option<ServerConfig> {
                     "install clangd with your package manager"
                 }),
             ),
-            Language::Sql => return None,
+            _ => return None,
         };
     Some(ServerConfig {
         enabled: true,
@@ -148,6 +171,27 @@ pub fn merge(base: &mut Value, overlay: Value) {
         }
         (base, overlay) => *base = overlay,
     }
+}
+
+/// Sets `"theme"` in the settings file at `path`, keeping everything else;
+/// creates the file if missing.
+pub fn write_theme(path: &Path, name: &str) -> Result<(), String> {
+    let fail = |err: &dyn std::fmt::Display| format!("{}: {err}", path.display());
+    let mut settings = match std::fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => json!({}),
+        Ok(text) => serde_json::from_str::<Value>(&text).map_err(|err| fail(&err))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(err) => return Err(fail(&err)),
+    };
+    let Some(object) = settings.as_object_mut() else {
+        return Err(fail(&"not a JSON object"));
+    };
+    object.insert("theme".into(), name.into());
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|err| fail(&err))?;
+    }
+    let text = serde_json::to_string_pretty(&settings).map_err(|err| fail(&err))?;
+    std::fs::write(path, text + "\n").map_err(|err| fail(&err))
 }
 
 /// The value at a dotted `section` (`"basedpyright.analysis"`), or the whole
@@ -188,11 +232,44 @@ mod tests {
             Value::Null
         );
         assert_eq!(settings.server_config(Language::Sql), None);
+        assert!(settings.semantic_highlighting);
+        let off: Settings =
+            serde_json::from_value(json!({ "semantic_highlighting": false })).unwrap();
+        assert!(!off.semantic_highlighting);
     }
 
     #[test]
     fn unknown_keys_are_rejected_instead_of_ignored() {
         let typo = json!({ "languages": { "python": { "server": { "comand": "x" } } } });
         assert!(serde_json::from_value::<Settings>(typo).is_err());
+    }
+
+    #[test]
+    fn writing_the_theme_keeps_other_settings() {
+        let dir =
+            std::env::temp_dir().join(format!("next_code-test-settings-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        write_theme(&path, "Light").unwrap();
+        let (settings, problem) = Settings::load_from(&path);
+        assert_eq!((settings.theme.as_deref(), problem), (Some("Light"), None));
+
+        let languages = json!({ "python": { "server": { "enabled": false } } });
+        std::fs::write(
+            &path,
+            json!({ "languages": languages, "theme": "Light" }).to_string(),
+        )
+        .unwrap();
+        write_theme(&path, "Dark (custom)").unwrap();
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            json!({ "languages": languages, "theme": "Dark (custom)" })
+        );
+
+        std::fs::write(&path, "{ broken").unwrap();
+        assert!(write_theme(&path, "Light").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ broken");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

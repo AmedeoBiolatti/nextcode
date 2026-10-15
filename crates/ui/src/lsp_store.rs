@@ -27,6 +27,7 @@ use syntax::Language;
 use text::Encoding;
 
 use crate::{
+    editor::semantic,
     project::Project,
     settings::{self, ServerConfig, Settings},
 };
@@ -41,6 +42,8 @@ pub struct RunningServer {
     pub sync: TextDocumentSyncKind,
     pub save_includes_text: bool,
     pub capabilities: ServerCapabilities,
+    /// The semantic-token legend, if the server serves full-document tokens.
+    pub semantic_legend: Option<semantic::Legend>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +65,8 @@ pub enum LspStoreEvent {
     ServerStopped(Language),
     StatusChanged(Language),
     DiagnosticsUpdated(PathBuf),
+    /// The server asked to re-request semantic tokens of open documents.
+    SemanticTokensRefresh(Language),
 }
 
 struct Slot {
@@ -356,6 +361,7 @@ impl LspStore {
                     encoding,
                     sync,
                     save_includes_text,
+                    semantic_legend: semantic::Legend::from_capabilities(&capabilities),
                     capabilities,
                 }));
                 slot.status = ServerStatus::Ready;
@@ -413,6 +419,10 @@ impl LspStore {
                     | "client/registerCapability"
                     | "client/unregisterCapability"
                     | "window/showMessageRequest" => Ok(Value::Null),
+                    "workspace/semanticTokens/refresh" => {
+                        cx.emit(LspStoreEvent::SemanticTokensRefresh(language));
+                        Ok(Value::Null)
+                    }
                     "workspace/applyEdit" => Ok(json!({ "applied": false })),
                     _ => {
                         Err(json!({ "code": -32601, "message": format!("unsupported: {method}") }))
@@ -535,11 +545,22 @@ fn client_capabilities() -> ClientCapabilities {
                     },
                 },
             },
+            "semanticTokens": {
+                // Deltas would only save transfer: decoding is O(tokens) either way.
+                "requests": { "full": true },
+                "tokenTypes": semantic::TOKEN_TYPES.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+                "tokenModifiers": semantic::TOKEN_MODIFIERS,
+                "formats": ["relative"],
+                "overlappingTokenSupport": false,
+                "multilineTokenSupport": false,
+                "augmentsSyntaxTokens": true,
+            },
         },
         "workspace": {
             "configuration": true,
             "workspaceFolders": true,
             "didChangeWatchedFiles": { "dynamicRegistration": true },
+            "semanticTokens": { "refreshSupport": true },
         },
         "window": { "workDoneProgress": true },
     }))

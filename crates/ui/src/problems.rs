@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    Context, Entity, EventEmitter, SharedString, Subscription, Window, div, prelude::*, px, rgb,
+    Context, Entity, EventEmitter, Hsla, SharedString, Subscription, Window, div, prelude::*, px,
     uniform_list,
 };
 use language::Location;
@@ -52,11 +52,11 @@ impl Severity {
         }
     }
 
-    fn badge(self) -> (&'static str, u32) {
+    fn badge(self) -> (&'static str, Hsla) {
         match self {
-            Self::Error => ("✕", theme::ERROR),
-            Self::Warning => ("⚠", theme::WARNING),
-            Self::Info => ("i", theme::ACCENT_TEXT),
+            Self::Error => ("✕", theme::error()),
+            Self::Warning => ("⚠", theme::warning()),
+            Self::Info => ("i", theme::accent_text()),
         }
     }
 }
@@ -158,7 +158,7 @@ impl Render for ProblemsPanel {
                 .size_full()
                 .p_3()
                 .text_sm()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .child("No problems reported by language servers.")
                 .into_any_element();
         }
@@ -180,12 +180,12 @@ impl Render for ProblemsPanel {
                             .items_center()
                             .gap_2()
                             .text_sm()
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child(path.clone())
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(theme::MUTED))
+                                    .text_color(theme::muted())
                                     .child(format!("{errors} errors, {warnings} warnings")),
                             ),
                         Row::Problem {
@@ -206,30 +206,24 @@ impl Render for ProblemsPanel {
                                 .gap_2()
                                 .text_sm()
                                 .cursor_pointer()
-                                .hover(|style| style.bg(rgb(theme::HOVER_ROW)))
+                                .hover(|style| style.bg(theme::hover_row()))
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.emit(ProblemsEvent::Open(location.clone()))
                                 }))
-                                .child(
-                                    div()
-                                        .w(px(14.))
-                                        .flex_none()
-                                        .text_color(rgb(color))
-                                        .child(badge),
-                                )
+                                .child(div().w(px(14.)).flex_none().text_color(color).child(badge))
                                 .child(
                                     div()
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .text_color(rgb(theme::TEXT))
+                                        .text_color(theme::text())
                                         .child(message.clone()),
                                 )
                                 .child(
                                     div()
                                         .flex_none()
                                         .text_xs()
-                                        .text_color(rgb(theme::MUTED))
+                                        .text_color(theme::muted())
                                         .child(position.clone()),
                                 )
                         }

@@ -654,7 +654,7 @@ impl Element for TerminalElement {
             window.paint_quad(fill(*cell, *color));
         }
         for selected in &layout.selection {
-            window.paint_quad(fill(*selected, rgb(theme::SELECTION)));
+            window.paint_quad(fill(*selected, theme::selection()));
         }
         if let Some(cursor) = layout.cursor {
             if focused {
@@ -762,7 +762,8 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> Option<Entity<TerminalView>> {
         let mut options = TerminalOptions::default_shell();
-        let palette = Palette::default();
+        // Existing terminals keep the palette they started with.
+        let palette = theme::current().terminal;
         let venv = self.venv();
         let started = if profile.remote {
             self.project.spawn_remote_shell(
@@ -867,8 +868,12 @@ impl Render for TerminalPanel {
                 .gap_2()
                 .cursor_pointer()
                 .text_sm()
-                .text_color(rgb(if active { theme::TEXT } else { theme::MUTED }))
-                .when(active, |tab| tab.bg(rgb(theme::BACKGROUND)))
+                .text_color(if active {
+                    theme::text()
+                } else {
+                    theme::muted()
+                })
+                .when(active, |tab| tab.bg(theme::background()))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.active = index;
                     if let Some((view, _)) = this.tabs.get(index) {
@@ -880,8 +885,8 @@ impl Render for TerminalPanel {
                 .child(
                     div()
                         .id(("terminal-close", index))
-                        .text_color(rgb(theme::MUTED))
-                        .hover(|style| style.text_color(rgb(theme::TEXT)))
+                        .text_color(theme::muted())
+                        .hover(|style| style.text_color(theme::text()))
                         .child("×")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
@@ -894,9 +899,9 @@ impl Render for TerminalPanel {
                 .id(SharedString::from(format!("new-terminal-{}", profile.name)))
                 .px_2()
                 .text_xs()
-                .text_color(rgb(theme::MUTED))
+                .text_color(theme::muted())
                 .cursor_pointer()
-                .hover(|style| style.text_color(rgb(theme::TEXT)))
+                .hover(|style| style.text_color(theme::text()))
                 .child(format!("+ {}", profile.name))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.spawn(&profile, window, cx);
@@ -914,7 +919,7 @@ impl Render for TerminalPanel {
                     .flex()
                     .items_center()
                     .border_b_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(theme::border())
                     .children(tabs)
                     .child(div().flex_1())
                     .children(new_buttons),
@@ -924,7 +929,7 @@ impl Render for TerminalPanel {
                     .px_2()
                     .py_1()
                     .text_sm()
-                    .text_color(rgb(theme::ERROR))
+                    .text_color(theme::error())
                     .child(error)
             }))
             .child(
