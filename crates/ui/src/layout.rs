@@ -10,10 +10,15 @@ use serde::{Deserialize, Serialize};
 pub enum PanelId {
     Files,
     Search,
-    Git,
+    /// PyCharm's Commit tool window. Saved layouts from before it was
+    /// renamed call it `git`.
+    #[serde(alias = "git")]
+    Commit,
     Python,
     Terminal,
     Problems,
+    /// PyCharm's Git tool window (the Log).
+    GitLog,
     Ports,
     Outline,
     CallHierarchy,
@@ -23,13 +28,14 @@ pub enum PanelId {
 }
 
 impl PanelId {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Files,
         Self::Search,
-        Self::Git,
+        Self::Commit,
         Self::Python,
         Self::Terminal,
         Self::Problems,
+        Self::GitLog,
         Self::Ports,
         Self::Outline,
         Self::CallHierarchy,
@@ -42,10 +48,11 @@ impl PanelId {
         match self {
             Self::Files => "Files",
             Self::Search => "Search",
-            Self::Git => "Git",
+            Self::Commit => "Commit",
             Self::Python => "Python",
             Self::Terminal => "Terminal",
             Self::Problems => "Problems",
+            Self::GitLog => "Git",
             Self::Ports => "Ports",
             Self::Outline => "Outline",
             Self::CallHierarchy => "Call Hierarchy",
@@ -57,13 +64,14 @@ impl PanelId {
 
     fn default_position(self) -> DockPosition {
         match self {
-            Self::Files | Self::Search | Self::Git | Self::Python | Self::Tests => {
+            Self::Files | Self::Search | Self::Commit | Self::Python | Self::Tests => {
                 DockPosition::Left
             }
             Self::Outline | Self::Debug => DockPosition::Right,
             Self::Terminal
             | Self::Problems
             | Self::Ports
+            | Self::GitLog
             | Self::CallHierarchy
             | Self::DebugConsole => DockPosition::Bottom,
         }
@@ -130,7 +138,7 @@ impl Default for Layout {
                 panels: vec![
                     PanelId::Files,
                     PanelId::Search,
-                    PanelId::Git,
+                    PanelId::Commit,
                     PanelId::Python,
                     PanelId::Tests,
                 ],
@@ -148,6 +156,7 @@ impl Default for Layout {
                 panels: vec![
                     PanelId::Terminal,
                     PanelId::Problems,
+                    PanelId::GitLog,
                     PanelId::Ports,
                     PanelId::CallHierarchy,
                     PanelId::DebugConsole,
@@ -371,7 +380,7 @@ mod tests {
             layout.left.panels,
             [
                 PanelId::Search,
-                PanelId::Git,
+                PanelId::Commit,
                 PanelId::Python,
                 PanelId::Tests
             ]
@@ -385,13 +394,14 @@ mod tests {
                 PanelId::Search,
                 PanelId::Terminal,
                 PanelId::Problems,
+                PanelId::GitLog,
                 PanelId::Ports,
                 PanelId::CallHierarchy,
                 PanelId::DebugConsole
             ]
         );
-        assert_eq!(layout.left.active, Some(PanelId::Git));
-        layout.move_panel(PanelId::Git, DockPosition::Right, None);
+        assert_eq!(layout.left.active, Some(PanelId::Commit));
+        layout.move_panel(PanelId::Commit, DockPosition::Right, None);
         layout.move_panel(PanelId::Python, DockPosition::Right, None);
         layout.move_panel(PanelId::Tests, DockPosition::Right, None);
         assert!(!layout.left.open, "an emptied dock closes");
@@ -407,6 +417,7 @@ mod tests {
             [
                 PanelId::Problems,
                 PanelId::Terminal,
+                PanelId::GitLog,
                 PanelId::Ports,
                 PanelId::CallHierarchy,
                 PanelId::DebugConsole
@@ -417,6 +428,7 @@ mod tests {
             layout.bottom.panels,
             [
                 PanelId::Terminal,
+                PanelId::GitLog,
                 PanelId::Ports,
                 PanelId::CallHierarchy,
                 PanelId::DebugConsole,
@@ -452,20 +464,21 @@ mod tests {
     #[test]
     fn normalize_repairs_hand_edited_layouts() {
         let mut layout: Layout = serde_json::from_str(
-            r#"{ "left": { "panels": ["files", "files", "terminal"], "active": "problems", "size": 5 },
+            r#"{ "left": { "panels": ["files", "files", "terminal", "git"], "active": "problems", "size": 5 },
                  "right": { "panels": ["terminal"] } }"#,
         )
         .unwrap();
         layout.normalize();
         // Search was missing and returns to its default (left) dock, as do
-        // Git, Python and Tests for layouts saved before they existed.
+        // Python and Tests for layouts saved before they existed; `git` is
+        // the Commit window's old name.
         assert_eq!(
             layout.left.panels,
             [
                 PanelId::Files,
                 PanelId::Terminal,
+                PanelId::Commit,
                 PanelId::Search,
-                PanelId::Git,
                 PanelId::Python,
                 PanelId::Tests
             ]

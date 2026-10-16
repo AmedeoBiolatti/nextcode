@@ -738,10 +738,10 @@ pub fn up(
                 .trim()
                 .split_once('\t')
                 .unwrap_or((inspect.trim(), ""));
-            let name = known_name
-                .unwrap_or_else(|| container_name.trim_start_matches('/').to_owned());
-            let user = configured_user
-                .or_else(|| (!image_user.is_empty()).then(|| image_user.to_owned()));
+            let name =
+                known_name.unwrap_or_else(|| container_name.trim_start_matches('/').to_owned());
+            let user =
+                configured_user.or_else(|| (!image_user.is_empty()).then(|| image_user.to_owned()));
             (name, user)
         }
     };
@@ -955,9 +955,7 @@ mod tests {
 
     #[test]
     fn listed_containers_carry_their_state_and_first_name() {
-        let found = parse_found(
-            "abc\trunning\tproj-dev-1\ndef\texited\tone,two\n\nghi\tcreated\n",
-        );
+        let found = parse_found("abc\trunning\tproj-dev-1\ndef\texited\tone,two\n\nghi\tcreated\n");
         let summary: Vec<_> = found
             .iter()
             .map(|found| (found.id.as_str(), found.running, found.name.as_str()))

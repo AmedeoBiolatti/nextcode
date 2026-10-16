@@ -375,20 +375,49 @@ disassembly.
 
 ## Git and multiple projects
 
-The Git panel (`Ctrl+Shift+G`, left dock) shows the branch, ahead/behind
-counts and changes in Merge Conflicts / Staged Changes / Changes sections,
-as a compact folder tree (single-folder chains like `src/editor` collapse
-into one row; folders fold) or as a flat list. Rows stage (`+`), unstage
-(`−`) or discard (`↺`, asks first; untracked files are deleted); clicking a
-row opens its diff in a tab, and clicking a diff line opens the file there.
-Enter in the message box commits what is staged; "Amend" rewrites the last
-commit instead (with what is staged, or just its message). Git runs where the
-project lives (inside WSL for WSL projects), and the panel refreshes on file
-changes and on index/ref changes (commits or checkouts from a terminal).
+The **Commit** tool window (`Alt+0`, also `Ctrl+Shift+G`; left dock) works
+like PyCharm's with its default "no staging area": a toolbar (Refresh,
+Rollback, Show Diff, Expand All, Collapse All, Group By Directory), then a
+tree of local changes with a checkbox per file, folder and group:
+**Changes** (every tracked change against HEAD), **Unversioned Files** and,
+during a merge, **Merge Conflicts**. File names are colored by status
+(modified blue, added green, deleted grey and struck through, unversioned
+red-brown), with the folder dimmed in the flat list. Commit commits exactly
+the checked files (`git commit --only`; checked unversioned files are added
+first, and what is staged for other files stays staged); new changes start
+checked and your choices persist across refreshes. Folder and group boxes
+are tri-state. **Amend** rewrites the last commit with the checked files (or
+just the message, which it starts from). The message box grows with the
+text; `Ctrl+Enter` commits. **Commit and Push…** commits, then opens the Push
+dialog: the outgoing commits and the target (`origin/<branch>`, marked new
+when the push sets the upstream), Push or Cancel.
+
+Double-click (or Enter, `Ctrl+D`) opens a file's diff (HEAD ↔ working
+tree); `F4` jumps to the file; Space toggles the selected row's checkbox.
+The right-click menu has Commit File… (checks only those files), Rollback…,
+Show Diff, Jump to Source, Add to VCS and Ignore (unversioned files: adds a
+root-anchored `/path` pattern to `.gitignore`), Delete… and Copy Path.
+**Rollback** (toolbar, menu, Git > Rollback…) acts on the selection, else
+the checked files, after asking: tracked files return to HEAD (index and
+working tree), added files leave version control but stay on disk, renames
+return to the old name, and unversioned files are deleted.
+
+With `"git": { "staging_area": true }` in `settings.json` (PyCharm's
+"Enable staging area") the window shows git's index instead: **Staged** /
+**Unstaged** groups with stage (`+`) and unstage (`−`) row buttons and menu
+items, and Commit commits what is staged. Hunk staging in diffs works in
+both modes. While a merge, rebase, cherry-pick or revert is in progress a
+banner says so with Abort (and Continue for a rebase); conflicted files show
+under Merge Conflicts, open in the editor, and `✓` (Mark Resolved) stages
+them; committing during a merge commits the whole result.
+
+Git runs where the project lives (inside WSL for WSL projects), and the
+window refreshes on file changes and on index/ref changes (commits or
+checkouts from a terminal).
 
 When git refuses a repository whose folder belongs to another user ("dubious
 ownership": a folder on another drive, a shared folder, a folder mounted into
-WSL), the panel says so and offers **Trust This Folder**, which adds it to
+WSL), the Commit window says so and offers **Trust This Folder**, which adds it to
 git's global `safe.directory` list where the project lives (what git's own
 message and VS Code suggest). Inside a dev container, where the bind-mounted
 workspace usually belongs to another user than the container's, the editor
@@ -401,27 +430,64 @@ or working tree come from `git diff` itself and act per hunk: "Stage hunk"
 and "Discard" (asks first) on unstaged changes, "Unstage hunk" on staged
 ones.
 
-**Branches**: clicking the branch name opens the branch picker: switch to a
-branch, a remote branch (checks out a tracking branch) or a tag (detached),
-type a new name to create a branch from HEAD and switch to it, or `×` to
-delete a branch (asks; "Force Delete" for unmerged ones). In History,
-"Create branch here…" starts a branch at the selected commit.
+**Branches**: the title bar shows the current branch (`⎇ main ▾`, with
+`↑n`/`↓n` against its upstream and the operation in progress). Clicking it
+(or Git > Branches…) opens PyCharm's branches popup: a search box, then
+Update Project…, Commit…, Push…, New Branch…, Checkout Tag or Revision…,
+and the **Recent** (from HEAD's reflog), **Local** and **Remote** branches
+with the current one starred and ahead/behind counts. Each branch opens a
+submenu: Checkout (a remote branch gets a tracking local branch), New
+Branch from '…'…, Checkout and Rebase onto '<current>', Compare with
+'<current>', Show Diff with Working Tree, Rebase '<current>' onto '…',
+Merge '…' into '<current>', Update (tracked branches; a branch that is not
+checked out is fast-forwarded), Push…, Rename…, Delete (asks again when the
+branch has unmerged commits; remote branches are deleted on the remote).
+Merges and rebases that stop on conflicts open the Commit window. New
+Branch asks for a name with "Checkout branch".
 
-**Fetch / Pull / Push** sit under the branch name with the behind/ahead
-counts. Fetch is `--all --prune`, pull is fast-forward only (diverged
-branches are left to a terminal), and the first push of a branch sets its
-upstream on `origin` (or the only remote). Git never prompts: credentials
-come from your credential helper or SSH agent, and failures are shown.
+**Update Project** fetches, then merges the upstream (or rebases onto it
+with `"git": { "update_method": "rebase" }`). Git > Fetch is `--all
+--prune`, Pull is fast-forward only, and Push… (the Push dialog) sets the
+upstream on `origin` (or the only remote) the first time. Git never
+prompts: credentials come from your credential helper or SSH agent, and
+failures are shown in the Commit window.
 
-**Worktrees…** lists the repository's worktrees; choosing one opens it in
-a project tab. Typing a branch name adds a worktree for it (creating the
-branch if needed) next to the repository as `<repository>-<branch>` and
-opens it; `×` removes one (asks; its branch is kept).
+**Worktrees…** (Git menu) lists the repository's worktrees; choosing one
+opens it in a project tab. Typing a branch name adds a worktree for it
+(creating the branch if needed) next to the repository as
+`<repository>-<branch>` and opens it; `×` removes one (asks; its branch is
+kept).
 
-**History** (panel toolbar) opens the commit graph of all branches (or the
-current one): lanes, branch/tag labels, author and age. Selecting a commit
-shows its details and changed files; each opens its diff against the first
-parent, and "Compare with working tree" starts a comparison from it.
+The **Git** tool window (`Alt+9`, View > Git, Git > Show Git Log; bottom
+dock) is PyCharm's Log tab. On the left, the **branches tree**: HEAD (the
+current branch), Local, Remote (per remote) and Tags; double-clicking a row
+filters the log to it. In the middle, a filter bar — text (subject, author
+or the start of a hash, as you type), **Branch ▾**, **User ▾** (me and the
+authors seen), **Date ▾** (last 24 hours … 12 months), **Paths ▾**
+(repository-relative, comma-separated; Git > Show History for Current File
+sets it to the active file), `✕` clears them — above the commit graph:
+lanes with HEAD's commit ringed, subject, branch/tag labels (HEAD's branch
+highlighted, remote branches outlined, tags ◆), author and age.
+The log loads 1000 commits at a time and the next page as the list nears
+its end, so long histories stay responsive; text, user and date filters
+draw the matches as one line (their parents are not listed), while branch
+and path filters keep the lanes (`git log --parents` rewrites them).
+
+Click selects a commit, `Ctrl`+click and `Shift`+click (or `Shift+Up/Down`)
+select several; `Ctrl+C` copies the selected hashes. On the right, the
+selection's **changed files** (for several commits, everything from the
+oldest one's parent to the newest one) — double-click opens that diff —
+above the **details**: full message, hash, author, date and the branches
+containing the commit. The right-click menu has Copy Revision Number,
+Create Patch… (`git format-patch` of the selection into a file you
+choose), Cherry-Pick (oldest first; merges excluded; already-applied
+commits are skipped), Checkout Revision (detached), Compare with Local,
+Reset Current Branch to Here… (Soft / Mixed / Hard / Keep), Revert Commit
+(newest first; a merge alone, against its first parent), Undo Commit
+(HEAD only, unless pushed: a soft reset keeping the changes), Edit Commit
+Message… (HEAD; contents and the index are kept), New Branch… and New
+Tag…. A cherry-pick or revert that stops on conflicts says which files and
+offers Abort; resolve and commit in the Commit window to finish it.
 
 **Compare…** compares the working tree with a branch, tag or any revision
 (`HEAD~3`, a commit id). A comparison tab lists the changed files as a tree
@@ -811,7 +877,7 @@ before a theme change keep their palette.
 - `ui` keys: `background`, `panel`, `border`, `text`, `muted`, `accent`,
   `accent_text`, `on_accent`, `warning`, `error`, `active_row`,
   `hover_row`, `selection`, `cursor`, `diff_added`, `diff_removed`,
-  `git_added`, `git_modified`, `git_renamed`, `git_deleted`,
+  `git_added`, `git_modified`, `git_renamed`, `git_deleted`, `git_unversioned`,
   `git_conflicted`, `graph_lanes` (a list, cycled), `branch`, `tag`,
   `lightbulb`, `breakpoint`, `debug_current_line`, `debug_frame_line`,
   `debug_arrow`, `run_marker`. An
@@ -952,8 +1018,15 @@ command in the project root, where
 the project lives), `git_status`, `git_diff`, `git_apply_hunk`, `git_stage`,
 `git_unstage`, `git_discard`, `git_commit`, `git_branch_create`,
 `git_switch`, `git_branch_delete`, `git_fetch`, `git_pull`, `git_push`,
+`git_commit_paths`, `git_rollback`, `git_add`, `git_ignore`,
+`git_operation_state`, `git_merge`, `git_rebase`, `git_continue_rebase`,
+`git_abort`, `git_branch_rename`, `git_remote_branch_delete`, `git_update`,
+`git_update_branch`, `git_branches`, `git_push_target`, `git_push_branch`,
 `git_worktrees`, `git_worktree_add`, `git_worktree_remove`, `git_log`,
-`git_refs`, `git_changes`, `git_commit_changes`, `python_info`, `python_sync`,
+`git_refs`, `git_changes`, `git_commit_changes`, `git_selection_changes`,
+`git_commit_details`, `git_cherry_pick`, `git_revert`, `git_reset`,
+`git_undo_commit`, `git_reword`, `git_tag`, `git_checkout_revision`,
+`git_patch`, `python_info`, `python_sync`,
 `python_lock`, `python_add`, `python_remove`, `python_pin`,
 `python_interpreters`, `python_test_at`, `devcontainer_configs`,
 `run_configurations`, `debug_request`, `tests_discover`, `tests_run`,

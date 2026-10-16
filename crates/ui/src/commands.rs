@@ -30,7 +30,8 @@ const LABELS: &[(&str, &str)] = &[
     ("workspace::ToggleFiles", "Files Panel"),
     ("workspace::ToggleSearch", "Find in Files"),
     ("workspace::ToggleTerminal", "Terminal Panel"),
-    ("workspace::ToggleGit", "Git Panel"),
+    ("workspace::ToggleCommit", "Commit Tool Window"),
+    ("workspace::ToggleGitLog", "Git Tool Window"),
     ("workspace::ToggleProblems", "Problems Panel"),
     ("workspace::TogglePorts", "Ports Panel"),
     ("ports::ForwardPort", "Forward a Port…"),
@@ -56,12 +57,17 @@ const LABELS: &[(&str, &str)] = &[
     ),
     ("workspace::ClosePane", "Close Editor Pane"),
     ("git::Branches", "Branches…"),
+    ("git::NewBranch", "New Branch…"),
+    ("git::CheckoutRevision", "Checkout Tag or Revision…"),
+    ("git::Update", "Update Project…"),
+    ("git::Rollback", "Rollback…"),
     ("git::Worktrees", "Worktrees…"),
-    ("git::History", "History"),
+    ("git::ShowLog", "Show Git Log"),
+    ("git::ShowFileHistory", "Show History for Current File"),
     ("git::Compare", "Compare Revisions…"),
     ("git::Fetch", "Fetch"),
     ("git::Pull", "Pull"),
-    ("git::Push", "Push"),
+    ("git::Push", "Push…"),
     ("git::Refresh", "Refresh Status"),
     ("python::Sync", "Sync Environment (uv sync)"),
     ("python::Lock", "Update Lock File (uv lock)"),
@@ -130,6 +136,9 @@ const HIDDEN_NAMESPACES: &[&str] = &[
     "command_palette",
     "theme_picker",
     "configuration_picker",
+    // Keys inside the Commit window and git dialogs.
+    "commit_panel",
+    "git_dialog",
 ];
 
 /// Building blocks of typing and list navigation, not commands.
@@ -338,7 +347,7 @@ mod tests {
         assert!(!in_palette("file_finder::Dismiss"));
         assert!(!in_palette("app::OpenRecentProject"));
         assert!(in_palette("editor::Copy"));
-        assert!(in_palette("workspace::ToggleGit"));
+        assert!(in_palette("workspace::ToggleCommit"));
     }
 
     #[test]

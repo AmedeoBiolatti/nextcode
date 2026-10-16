@@ -444,6 +444,9 @@ pub struct Editor {
     /// Input-field mode: no gutter or status bar; Enter, Tab and vertical
     /// motion bubble up to the parent view.
     single_line: bool,
+    /// Multi-line text field (a commit message): no gutter, status bar,
+    /// find bar or breadcrumbs; lines wrap.
+    text_area: bool,
     lsp: Option<LspDocument>,
     /// Language-server status shown in the status bar, with its color.
     lsp_status: Option<(SharedString, fn() -> Hsla)>,
@@ -705,6 +708,7 @@ impl Editor {
             project: None,
             syntax,
             single_line: false,
+            text_area: false,
             lsp: None,
             lsp_status: None,
             changes: Vec::new(),
@@ -894,6 +898,15 @@ impl Editor {
     pub fn single_line(cx: &mut Context<Self>) -> Self {
         Self {
             single_line: true,
+            ..Self::new(Buffer::new(""), cx)
+        }
+    }
+
+    /// A multi-line input with wrapped lines and no code-editor chrome.
+    pub fn text_area(cx: &mut Context<Self>) -> Self {
+        Self {
+            text_area: true,
+            word_wrap: Some(true),
             ..Self::new(Buffer::new(""), cx)
         }
     }
@@ -1408,6 +1421,7 @@ impl Editor {
     ) {
         self.start_mouse(window);
         if !self.single_line
+            && !self.text_area
             && (self.debug_gutter_click(event.position, cx)
                 || self.lightbulb_click(event.position, cx)
                 || self.fold_click(event.position, cx))
@@ -1753,7 +1767,7 @@ impl Editor {
         // Gutter: breakpoints (and run markers), the code-action
         // lightbulb, line numbers, then the fold chevrons' column.
         let (numbers_right, fold_left, gutter_width, breakpoint_left, marker_left, bulb_left) =
-            if self.single_line {
+            if self.single_line || self.text_area {
                 let left = bounds.left();
                 (left, left, px(0.), left, None, left)
             } else {
@@ -1903,7 +1917,7 @@ impl Editor {
             let shaped = shape(text, &runs);
 
             let line = row.line;
-            let gutter = row.first && !self.single_line;
+            let gutter = row.first && !self.single_line && !self.text_area;
             let folded_header = self.display.is_folded_header(&self.buffer, line);
             let number = gutter.then(|| {
                 let number = (line + 1).to_string();
@@ -2697,7 +2711,7 @@ impl Render for Editor {
                     .children(self.render_completions(cx))
                     .children(self.render_code_actions(cx)),
             )
-            .when(!self.single_line, |editor| {
+            .when(!self.single_line && !self.text_area, |editor| {
                 editor.child(
                     div()
                         .flex()
@@ -2755,7 +2769,7 @@ impl Render for Editor {
                         ),
                 )
             });
-        if self.single_line {
+        if self.single_line || self.text_area {
             return editor.into_any_element();
         }
         // The find bar and go-to-line input sit beside the text, not inside

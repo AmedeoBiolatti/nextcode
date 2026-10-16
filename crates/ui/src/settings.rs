@@ -24,7 +24,8 @@
 //!     "python": { "command": "python3", "args": ["-m", "debugpy.adapter"] } } },
 //!   "tests": { "discover_on_save": true, "pytest_args": ["-p", "no:randomly"],
 //!     "cargo_test_args": ["--features", "slow-tests"] },
-//!   "ports": { "auto_forward": true } }
+//!   "ports": { "auto_forward": true },
+//!   "git": { "staging_area": false, "update_method": "merge" } }
 //! ```
 
 use std::{
@@ -63,6 +64,7 @@ pub struct Settings {
     pub debug: DebugSettings,
     pub tests: TestSettings,
     pub ports: PortSettings,
+    pub git: GitSettings,
 }
 
 impl Default for Settings {
@@ -80,6 +82,7 @@ impl Default for Settings {
             debug: DebugSettings::default(),
             tests: TestSettings::default(),
             ports: PortSettings::default(),
+            git: GitSettings::default(),
         }
     }
 }
@@ -136,6 +139,26 @@ impl Default for PortSettings {
     fn default() -> Self {
         Self { auto_forward: true }
     }
+}
+
+/// `"git"`: the Commit window and Update Project.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitSettings {
+    /// Show git's index (Staged / Unstaged groups with stage and unstage),
+    /// like PyCharm's "Enable staging area"; else commits take the checked
+    /// files directly.
+    pub staging_area: bool,
+    /// How Update Project brings in the upstream's commits.
+    pub update_method: UpdateMethod,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMethod {
+    #[default]
+    Merge,
+    Rebase,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

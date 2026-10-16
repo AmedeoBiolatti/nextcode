@@ -3,11 +3,12 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app_state;
-mod branch_picker;
+mod branches_popup;
 mod call_hierarchy;
 mod change_tree;
 mod command_palette;
 mod commands;
+mod commit_panel;
 mod compare_view;
 mod connecting;
 mod debugger;
@@ -15,9 +16,9 @@ mod diff_view;
 mod editor;
 mod file_finder;
 mod file_tree;
-mod git_panel;
+mod git_dialogs;
+mod git_log;
 mod headless;
-mod history_view;
 mod layout;
 mod location_picker;
 mod lsp_store;
@@ -178,6 +179,7 @@ fn run() -> anyhow::Result<()> {
         theme_picker::bind_keys(cx);
         terminal_panel::bind_keys(cx);
         ports::panel::bind_keys(cx);
+        git_log::bind_keys(cx);
         theme::refresh(cx);
         app_state::init(cx);
         cx.on_window_closed(|cx| {

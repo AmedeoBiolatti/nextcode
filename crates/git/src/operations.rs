@@ -109,24 +109,15 @@ impl Repository {
         self.checked(&["pull", "--ff-only", "--quiet"]).map(drop)
     }
 
-    /// Pushes the current branch, setting its upstream on `origin` (or the
-    /// only remote) the first time.
+    /// Pushes the current branch to its upstream, setting it on `origin`
+    /// (or the only remote) the first time.
     pub fn push(&self, status: &Status) -> io::Result<()> {
-        if status.upstream.is_some() {
-            return self.checked(&["push", "--quiet"]).map(drop);
-        }
         let branch = status
             .branch
             .as_deref()
             .ok_or_else(|| invalid("cannot push a detached HEAD; create a branch first".into()))?;
-        let remotes = self.remotes()?;
-        let remote = remotes
-            .iter()
-            .find(|r| *r == "origin")
-            .or(remotes.first())
-            .ok_or_else(|| invalid("the repository has no remote to push to".into()))?;
-        self.checked(&["push", "--quiet", "-u", remote, branch])
-            .map(drop)
+        let target = self.push_target(branch)?;
+        self.push_branch(branch, &target)
     }
 
     pub fn worktrees(&self) -> io::Result<Vec<Worktree>> {

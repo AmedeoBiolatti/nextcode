@@ -361,6 +361,279 @@ fn headless_mode_stages_diffs_and_commits_with_git() {
     fs::remove_dir_all(&root).unwrap();
 }
 
+/// PyCharm's workflow over headless: commit a checked subset, roll back,
+/// ignore, merge with a conflict, rename, push to a bare remote.
+#[test]
+fn headless_mode_commits_chosen_files_merges_and_pushes() {
+    let base = std::env::temp_dir().join(format!("next_code_headless_flow_{}", std::process::id()));
+    fs::remove_dir_all(&base).ok();
+    fs::create_dir_all(&base).unwrap();
+    // The remote's URL keeps the plain path: on Windows `canonicalize`
+    // gives `\\?\C:\…`, which git reads as an ssh host.
+    let remote = base.join("remote.git");
+    let base = base.canonicalize().unwrap();
+    let root = base.join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    let git = |args: &[&str]| run(&root, args);
+    run(&base, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    git(&["config", "core.autocrlf", "false"]);
+    git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    fs::write(root.join("a.txt"), "a\n").unwrap();
+    fs::write(root.join("b.txt"), "b\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let ok = |reply: &Value| assert_eq!(reply["ok"], true, "{reply}");
+
+    // Modified a and b, an untracked c: commit only b and c.
+    fs::write(root.join("a.txt"), "a2\n").unwrap();
+    fs::write(root.join("b.txt"), "b2\n").unwrap();
+    fs::write(root.join("c.txt"), "c\n").unwrap();
+    let commit = headless.call(json!({
+        "cmd": "git_commit_paths", "paths": ["b.txt", "c.txt"], "message": "b and c",
+    }));
+    ok(&commit);
+    let status = headless.call(json!({ "cmd": "git_status" }));
+    assert_eq!(
+        status["result"]["entries"],
+        json!([{ "path": "a.txt", "orig_path": null, "staged": null, "unstaged": "modified" }]),
+        "{status}"
+    );
+
+    // Roll back a; ignore a new untracked file.
+    ok(&headless.call(json!({ "cmd": "git_rollback", "paths": ["a.txt"] })));
+    assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+    fs::write(root.join("out.log"), "x\n").unwrap();
+    ok(&headless.call(json!({ "cmd": "git_ignore", "paths": ["out.log"] })));
+    assert_eq!(
+        fs::read_to_string(root.join(".gitignore")).unwrap(),
+        "/out.log\n"
+    );
+    ok(&headless.call(json!({
+        "cmd": "git_commit_paths", "paths": [".gitignore"], "message": "ignore",
+    })));
+
+    // First push sets the upstream.
+    let target = headless.call(json!({ "cmd": "git_push_target" }));
+    assert_eq!(
+        target["result"]["target"],
+        json!({ "remote": "origin", "branch": "main", "new": true }),
+        "{target}"
+    );
+    assert_eq!(target["result"]["outgoing"].as_array().unwrap().len(), 3);
+    ok(&headless.call(json!({ "cmd": "git_push_branch" })));
+    let status = headless.call(json!({ "cmd": "git_status" }));
+    assert_eq!(status["result"]["upstream"], "origin/main", "{status}");
+
+    // A branch that conflicts with main: merging stops, then aborts.
+    ok(&headless.call(json!({ "cmd": "git_branch_create", "name": "topic" })));
+    fs::write(root.join("b.txt"), "topic\n").unwrap();
+    git(&["commit", "-q", "-am", "topic"]);
+    ok(&headless.call(json!({ "cmd": "git_switch", "name": "main" })));
+    fs::write(root.join("b.txt"), "main\n").unwrap();
+    git(&["commit", "-q", "-am", "main"]);
+    let merge = headless.call(json!({ "cmd": "git_merge", "name": "topic" }));
+    assert_eq!(merge["result"], "conflicts", "{merge}");
+    let state = headless.call(json!({ "cmd": "git_operation_state" }));
+    assert_eq!(state["result"], "merging");
+    ok(&headless.call(json!({ "cmd": "git_abort" })));
+    let state = headless.call(json!({ "cmd": "git_operation_state" }));
+    assert_eq!(state["result"], "none");
+
+    // Rename; tracking shows main one commit ahead of origin/main.
+    ok(&headless.call(json!({
+        "cmd": "git_branch_rename", "name": "topic", "new_name": "feature",
+    })));
+    let branches = headless.call(json!({ "cmd": "git_branches" }));
+    assert_eq!(
+        branches["result"]["tracking"],
+        json!([
+            { "name": "feature", "upstream": null, "ahead": 0, "behind": 0 },
+            { "name": "main", "upstream": "origin/main", "ahead": 1, "behind": 0 },
+        ]),
+        "{branches}"
+    );
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// The Git window's commands: filtered and paged log, selection changes,
+/// commit details, cherry-pick (incl. a conflict), revert, reset, undo,
+/// reword, tag, detached checkout and patches.
+#[test]
+fn headless_mode_filters_the_log_and_operates_on_commits() {
+    let root = std::env::temp_dir().join(format!("next_code_headless_log_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    git(&["config", "core.autocrlf", "false"]);
+    let commit = |file: &str, text: &str, message: &str| {
+        fs::write(root.join(file), text).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", message]);
+    };
+    for n in 1..=4 {
+        commit("main.txt", &format!("{n}\n"), &format!("main {n}"));
+    }
+    git(&["switch", "-q", "-c", "topic"]);
+    commit("t.txt", "t\n", "topic adds t");
+    commit("main.txt", "topic\n", "topic edits main");
+    git(&["switch", "-q", "main"]);
+    commit("main.txt", "5\n", "main 5");
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let ok = |reply: &Value| assert_eq!(reply["ok"], true, "{reply}");
+    let subjects = |reply: &Value| -> Vec<String> {
+        reply["result"]["commits"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{reply}"))
+            .iter()
+            .map(|c| c["subject"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Pages of 3 over all branches.
+    let first = headless.call(json!({ "cmd": "git_log", "limit": 3 }));
+    assert_eq!(first["result"]["next"], 3, "{first}");
+    let rest = headless.call(json!({ "cmd": "git_log", "limit": 10, "skip": 3 }));
+    assert_eq!(rest["result"]["next"], Value::Null, "{rest}");
+    assert_eq!(subjects(&first).len() + subjects(&rest).len(), 7);
+    // Filters.
+    let topic = headless.call(json!({ "cmd": "git_log", "text": "TOPIC" }));
+    assert_eq!(subjects(&topic), ["topic edits main", "topic adds t"]);
+    let main_only = headless.call(json!({ "cmd": "git_log", "branches": ["main"] }));
+    assert_eq!(subjects(&main_only).len(), 5);
+    let t_file = headless.call(json!({ "cmd": "git_log", "paths": ["t.txt"] }));
+    assert_eq!(subjects(&t_file), ["topic adds t"]);
+    let nobody = headless.call(json!({ "cmd": "git_log", "authors": ["nobody"] }));
+    assert_eq!(subjects(&nobody), Vec::<String>::new());
+    let future = headless.call(json!({ "cmd": "git_log", "since": 4_000_000_000_i64 }));
+    assert_eq!(subjects(&future), Vec::<String>::new());
+
+    // Two topic commits together, and one commit's details.
+    let span = headless.call(json!({
+        "cmd": "git_selection_changes", "newest": "topic", "oldest": "topic~1",
+    }));
+    let paths: Vec<&str> = span["result"]["changes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{span}"))
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["main.txt", "t.txt"]);
+    let details = headless.call(json!({ "cmd": "git_commit_details", "commit": "main~1" }));
+    assert_eq!(
+        details["result"],
+        json!({ "message": "main 4", "branches": ["main", "topic"], "pushed": false }),
+        "{details}"
+    );
+
+    // Cherry-pick "topic adds t" cleanly; "topic edits main" conflicts.
+    let id = |revision: &str| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", revision])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let picked = headless.call(json!({ "cmd": "git_cherry_pick", "commits": [id("topic~1")] }));
+    assert_eq!(
+        picked["result"],
+        json!({ "result": "done", "empty": 0 }),
+        "{picked}"
+    );
+    assert!(root.join("t.txt").exists());
+    let conflict = headless.call(json!({ "cmd": "git_cherry_pick", "commits": [id("topic")] }));
+    assert_eq!(
+        conflict["result"],
+        json!({ "result": "conflicts", "paths": ["main.txt"] }),
+        "{conflict}"
+    );
+    ok(&headless.call(json!({ "cmd": "git_abort" })));
+
+    // Revert the cherry-pick, then reset away the revert (hard).
+    let reverted = headless.call(json!({ "cmd": "git_revert", "commits": [id("HEAD")] }));
+    assert_eq!(reverted["result"]["result"], "done", "{reverted}");
+    assert!(!root.join("t.txt").exists());
+    ok(&headless.call(json!({ "cmd": "git_reset", "commit": "HEAD~1", "mode": "hard" })));
+    assert!(root.join("t.txt").exists());
+
+    // Undo the cherry-pick (kept staged), reword HEAD, tag it.
+    ok(&headless.call(json!({ "cmd": "git_undo_commit" })));
+    let status = headless.call(json!({ "cmd": "git_status" }));
+    assert_eq!(
+        status["result"]["entries"][0]["staged"], "added",
+        "{status}"
+    );
+    let reworded = headless.call(json!({ "cmd": "git_reword", "message": "main five" }));
+    assert!(
+        reworded["result"]["summary"]
+            .as_str()
+            .is_some_and(|s| s.ends_with(" main five")),
+        "{reworded}"
+    );
+    ok(&headless.call(json!({ "cmd": "git_tag", "name": "v5", "message": "five" })));
+    let refs = headless.call(json!({ "cmd": "git_refs" }));
+    assert!(
+        refs["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "v5" && r["kind"] == "tag"),
+        "{refs}"
+    );
+
+    // A patch of two commits, oldest first; a detached checkout.
+    let patch = headless.call(json!({
+        "cmd": "git_patch", "commits": [id("main~1"), id("main")],
+    }));
+    let text = patch["result"]["patch"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{patch}"));
+    assert!(text.find("main 4").unwrap() < text.find("main five").unwrap());
+    git(&["stash", "-q"]);
+    ok(&headless.call(json!({ "cmd": "git_checkout_revision", "commit": "main~2" })));
+    let status = headless.call(json!({ "cmd": "git_status" }));
+    assert_eq!(status["result"]["branch"], Value::Null, "{status}");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).unwrap();
+}
+
 #[test]
 fn headless_mode_reads_python_projects_and_dev_container_configs() {
     let root = std::env::temp_dir().join(format!("next_code_headless_py_{}", std::process::id()));

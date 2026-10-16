@@ -67,6 +67,8 @@ pub struct Status {
     pub branch: Option<String>,
     /// No commit yet on the branch.
     pub unborn: bool,
+    /// The checked-out commit; `None` before the first commit.
+    pub head: Option<String>,
     pub upstream: Option<String>,
     pub ahead: u32,
     pub behind: u32,
@@ -91,7 +93,10 @@ pub fn parse(output: &[u8]) -> io::Result<Status> {
             "#" => {
                 let (key, value) = rest.split_once(' ').unwrap_or((rest, ""));
                 match key {
-                    "branch.oid" => status.unborn = value == "(initial)",
+                    "branch.oid" => {
+                        status.unborn = value == "(initial)";
+                        status.head = (!status.unborn).then(|| value.to_owned());
+                    }
                     "branch.head" if value != "(detached)" => {
                         status.branch = Some(value.to_owned());
                     }

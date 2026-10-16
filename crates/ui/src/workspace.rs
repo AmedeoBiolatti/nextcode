@@ -21,16 +21,15 @@ use text::Buffer;
 use watcher::{Batch, ChangeKind};
 
 use crate::{
-    branch_picker::{BranchPicker, BranchPickerEvent},
     call_hierarchy::{CallHierarchyEvent, CallHierarchyPanel},
+    commit_panel::{CommitPanel, CommitPanelEvent, PreloadedRepository, SyncAction},
     compare_view::{CompareEvent, CompareView},
     connecting::PendingConnection,
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     editor::{Editor, EditorEvent, ReloadOutcome},
     file_finder::{FileFinder, FileFinderEvent},
     file_tree::{FileTree, OpenFile},
-    git_panel::{GitPanel, GitPanelEvent, PreloadedRepository, SyncAction},
-    history_view::{HistoryEvent, HistoryView},
+    git_log::GitLogPanel,
     layout::{DockPosition, Layout, PanelId},
     location_picker::{LocationPicker, LocationPickerEvent},
     lsp_store::{LspStore, LspStoreEvent, ServerStatus},
@@ -52,6 +51,8 @@ use crate::{
 mod debug;
 mod docks;
 mod edits;
+mod git_flows;
+mod log_window;
 mod panes;
 mod runs;
 mod session;
@@ -79,7 +80,15 @@ pub mod git_commands {
     gpui::actions!(
         git,
         [
-            Branches, Worktrees, History, Compare, Fetch, Pull, Push, Refresh
+            Branches,
+            Worktrees,
+            ShowLog,
+            ShowFileHistory,
+            Compare,
+            Fetch,
+            Pull,
+            Push,
+            Refresh
         ]
     );
 }
@@ -109,6 +118,7 @@ pub fn bind_keys(cx: &mut App) {
     symbols::bind_keys(cx);
     runs::bind_keys(cx);
     debug::bind_keys(cx);
+    git_flows::bind_keys(cx);
 }
 
 /// Work for the first window started before gpui (whose platform setup
@@ -143,7 +153,6 @@ struct NavEntry {
 enum TabContent {
     Editor(Entity<Editor>),
     Diff(Entity<DiffView>),
-    History(Entity<HistoryView>),
     Compare(Entity<CompareView>),
 }
 
@@ -178,7 +187,6 @@ impl Tab {
         match &self.content {
             TabContent::Editor(editor) => editor.focus_handle(cx),
             TabContent::Diff(diff) => diff.focus_handle(cx),
-            TabContent::History(view) => view.focus_handle(cx),
             TabContent::Compare(view) => view.focus_handle(cx),
         }
     }
@@ -187,7 +195,6 @@ impl Tab {
         match &self.content {
             TabContent::Editor(editor) => editor.clone().into(),
             TabContent::Diff(diff) => diff.clone().into(),
-            TabContent::History(view) => view.clone().into(),
             TabContent::Compare(view) => view.clone().into(),
         }
     }
@@ -196,7 +203,6 @@ impl Tab {
         match &self.content {
             TabContent::Editor(editor) => editor.entity_id(),
             TabContent::Diff(diff) => diff.entity_id(),
-            TabContent::History(view) => view.entity_id(),
             TabContent::Compare(view) => view.entity_id(),
         }
     }
@@ -246,7 +252,10 @@ pub struct Workspace {
     ports_panel: Entity<PortsPanel>,
     terminal: Entity<TerminalPanel>,
     search: Entity<SearchPanel>,
-    git: Entity<GitPanel>,
+    /// The Commit tool window.
+    commit: Entity<CommitPanel>,
+    /// The Git tool window (the Log).
+    git_log: Entity<GitLogPanel>,
     python: Entity<PythonPanel>,
     call_hierarchy: Entity<CallHierarchyPanel>,
     /// Follows the active editor (set while rendering).
@@ -264,8 +273,10 @@ pub struct Workspace {
     /// Go to Symbol (file/workspace) and breadcrumb lists.
     symbol_picker: Option<(Entity<SymbolPicker>, Subscription)>,
     revision_picker: Option<(Entity<RevisionPicker>, Subscription)>,
-    /// The branch or worktree picker.
+    /// The worktree picker, or a git dialog (new branch, push).
     git_modal: Option<(AnyView, Subscription)>,
+    /// The title-bar branch widget's popup.
+    branches_popup: Option<git_flows::BranchesPopupState>,
     back: Vec<NavEntry>,
     forward: Vec<NavEntry>,
     lsp_store: Entity<LspStore>,
@@ -337,27 +348,20 @@ impl Workspace {
         let problems = cx.new(|cx| ProblemsPanel::new(root.clone(), lsp_store.clone(), cx));
         let terminal = cx.new(|cx| TerminalPanel::new(project.clone(), cx));
         let search = cx.new(|cx| SearchPanel::new(project.clone(), cx));
-        let git = cx.new(|cx| GitPanel::new(project.clone(), git_preload, cx));
-        let git_subscription =
-            cx.subscribe_in(&git, window, |this, _, event, window, cx| match event {
-                GitPanelEvent::OpenDiff { repository, source } => {
+        let commit = cx.new(|cx| CommitPanel::new(project.clone(), git_preload, cx));
+        let commit_subscription =
+            cx.subscribe_in(&commit, window, |this, _, event, window, cx| match event {
+                CommitPanelEvent::OpenDiff { repository, source } => {
                     this.open_diff(repository.clone(), source.clone(), window, cx)
                 }
-                GitPanelEvent::OpenFile(path) => this.open(path, window, cx),
-                GitPanelEvent::OpenHistory(repository) => {
-                    this.open_history(repository.clone(), window, cx)
+                CommitPanelEvent::OpenFile(path) => this.open(path, window, cx),
+                CommitPanelEvent::Push(repository) => {
+                    this.open_push_dialog(repository.clone(), window, cx)
                 }
-                GitPanelEvent::Compare(repository) => {
-                    this.pick_revision(repository.clone(), RevisionPurpose::NewCompare, window, cx)
-                }
-                GitPanelEvent::Branches(repository) => {
-                    this.open_branch_picker(repository.clone(), None, window, cx)
-                }
-                GitPanelEvent::Worktrees(repository) => {
-                    this.open_worktree_picker(repository.clone(), window, cx)
-                }
-                GitPanelEvent::Refreshed => this.reload_diffs(cx),
+                CommitPanelEvent::Refreshed => this.reload_diffs(cx),
             });
+        let git_log = cx.new(|cx| GitLogPanel::new(project.clone(), cx));
+        let git_log_subscription = cx.subscribe_in(&git_log, window, Self::on_git_log_event);
         let python = cx.new(|cx| PythonPanel::new(project.clone(), cx));
         let python_subscription =
             cx.subscribe_in(&python, window, |this, _, event, window, cx| match event {
@@ -501,7 +505,8 @@ impl Workspace {
             ports_panel,
             terminal,
             search,
-            git,
+            commit,
+            git_log,
             python,
             call_hierarchy,
             outline: cx.new(OutlinePanel::new),
@@ -515,6 +520,7 @@ impl Workspace {
             symbol_picker: None,
             revision_picker: None,
             git_modal: None,
+            branches_popup: None,
             back: Vec::new(),
             forward: Vec::new(),
             lsp_store,
@@ -536,7 +542,8 @@ impl Workspace {
                 lsp_subscription,
                 problems_subscription,
                 search_subscription,
-                git_subscription,
+                commit_subscription,
+                git_log_subscription,
                 python_subscription,
                 call_hierarchy_subscription,
                 terminal_subscription,
@@ -602,7 +609,8 @@ impl Workspace {
             .update(cx, |tree, cx| tree.refresh(structural, batch.rescan, cx));
         self.lsp_store.read(cx).notify_file_changes(&batch.events);
         // Worktree edits change status as much as commits do.
-        self.git.update(cx, |git, cx| git.schedule_refresh(cx));
+        self.commit
+            .update(cx, |commit, cx| commit.schedule_refresh(cx));
         let python_files = ["pyproject.toml", "uv.lock", ".python-version"];
         if batch.rescan
             || batch.events.iter().any(|event| {
@@ -615,7 +623,8 @@ impl Workspace {
             self.python.update(cx, |python, cx| python.refresh(cx));
         }
         if batch.repository || batch.rescan {
-            self.reload_history(cx);
+            self.git_log
+                .update(cx, |log, cx| log.repository_changed(cx));
         }
         self.run_files_changed(&batch, cx);
 
@@ -733,46 +742,6 @@ impl Workspace {
         Some(&self.pane(pane)?.tabs.get(index)?.content)
     }
 
-    /// Opens (or activates) the commit history tab.
-    fn open_history(
-        &mut self,
-        repository: git::Repository,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some((pane, index)) =
-            self.find_tab(|tab| matches!(tab.content, TabContent::History(_)))
-        {
-            return self.activate(pane, index, window, cx);
-        }
-        let view = cx.new(|cx| HistoryView::new(repository, cx));
-        let subscription =
-            cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
-                HistoryEvent::OpenDiff { repository, source } => {
-                    this.open_diff(repository.clone(), source.clone(), window, cx)
-                }
-                HistoryEvent::Compare {
-                    repository,
-                    base,
-                    target,
-                } => {
-                    this.open_compare(repository.clone(), base.clone(), target.clone(), window, cx)
-                }
-                HistoryEvent::CreateBranch { repository, start } => {
-                    this.open_branch_picker(repository.clone(), Some(start.clone()), window, cx)
-                }
-            });
-        let root = self.project.root().to_path_buf();
-        self.push_tab(
-            TabContent::History(view),
-            root,
-            "Git History".into(),
-            subscription,
-            window,
-            cx,
-        );
-    }
-
     /// Opens (or activates) a comparison of `base` with `target`.
     pub(crate) fn open_compare(
         &mut self,
@@ -885,26 +854,6 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_branch_picker(
-        &mut self,
-        repository: git::Repository,
-        start: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let picker = cx.new(|cx| BranchPicker::new(repository, start, cx));
-        let subscription = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {
-            this.git_modal = None;
-            this.focus_active(window, cx);
-            if let BranchPickerEvent::Changed(message) = event {
-                this.repository_changed(Some(message.clone()), cx);
-            }
-        });
-        window.focus(&picker.focus_handle(cx));
-        self.git_modal = Some((picker.into(), subscription));
-        cx.notify();
-    }
-
     fn open_worktree_picker(
         &mut self,
         repository: git::Repository,
@@ -944,15 +893,16 @@ impl Workspace {
     }
 
     /// Re-reads git state everywhere after an operation from a view or
-    /// picker; `message` is reported in the Git panel.
+    /// popup; `message` is reported in the Commit window.
     fn repository_changed(&mut self, message: Option<String>, cx: &mut Context<Self>) {
-        self.git.update(cx, |git, cx| {
+        self.commit.update(cx, |commit, cx| {
             if let Some(message) = message {
-                git.report(message, cx);
+                commit.report(message, cx);
             }
-            git.refresh(cx);
+            commit.refresh(cx);
         });
-        self.reload_history(cx);
+        self.git_log
+            .update(cx, |log, cx| log.repository_changed(cx));
     }
 
     /// Recomputes open diffs and comparisons after the repository or the
@@ -962,16 +912,7 @@ impl Workspace {
             match &tab.content {
                 TabContent::Diff(diff) => diff.update(cx, |diff, cx| diff.reload(cx)),
                 TabContent::Compare(view) => view.update(cx, |view, cx| view.reload(cx)),
-                TabContent::Editor(_) | TabContent::History(_) => {}
-            }
-        }
-    }
-
-    /// Re-reads history tabs after commits, checkouts or ref changes.
-    fn reload_history(&mut self, cx: &mut Context<Self>) {
-        for tab in self.all_tabs() {
-            if let TabContent::History(view) = &tab.content {
-                view.update(cx, |view, cx| view.reload(cx));
+                TabContent::Editor(_) => {}
             }
         }
     }
@@ -1455,7 +1396,7 @@ impl Workspace {
 
     /// The project's repository, or a notice saying there is none (yet).
     fn repository_or_notice(&mut self, cx: &mut Context<Self>) -> Option<git::Repository> {
-        let repository = self.git.read(cx).repository();
+        let repository = self.commit.read(cx).repository();
         if repository.is_none() {
             self.notice = Some("No git repository here (or its status is still loading)".into());
             cx.notify();
@@ -1469,9 +1410,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(repository) = self.repository_or_notice(cx) {
-            self.open_branch_picker(repository, None, window, cx);
-        }
+        self.open_branches_popup(window, cx);
     }
 
     fn git_worktrees(
@@ -1482,17 +1421,6 @@ impl Workspace {
     ) {
         if let Some(repository) = self.repository_or_notice(cx) {
             self.open_worktree_picker(repository, window, cx);
-        }
-    }
-
-    fn git_history(
-        &mut self,
-        _: &git_commands::History,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(repository) = self.repository_or_notice(cx) {
-            self.open_history(repository, window, cx);
         }
     }
 
@@ -1509,8 +1437,8 @@ impl Workspace {
 
     fn git_sync(&mut self, action: SyncAction, cx: &mut Context<Self>) {
         if self.repository_or_notice(cx).is_some() {
-            self.show_panel(PanelId::Git, cx);
-            self.git.update(cx, |git, cx| git.sync(action, cx));
+            self.show_panel(PanelId::Commit, cx);
+            self.commit.update(cx, |commit, cx| commit.sync(action, cx));
         }
     }
 
@@ -1522,12 +1450,14 @@ impl Workspace {
         self.git_sync(SyncAction::Pull, cx);
     }
 
-    fn git_push(&mut self, _: &git_commands::Push, _: &mut Window, cx: &mut Context<Self>) {
-        self.git_sync(SyncAction::Push, cx);
+    fn git_push(&mut self, _: &git_commands::Push, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(repository) = self.repository_or_notice(cx) {
+            self.open_push_dialog(repository, window, cx);
+        }
     }
 
     fn git_refresh(&mut self, _: &git_commands::Refresh, _: &mut Window, cx: &mut Context<Self>) {
-        self.git.update(cx, |git, cx| git.refresh(cx));
+        self.commit.update(cx, |commit, cx| commit.refresh(cx));
     }
 
     fn python_sync(&mut self, _: &python_commands::Sync, _: &mut Window, cx: &mut Context<Self>) {
@@ -1767,12 +1697,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::reopen_in_container))
             .on_action(cx.listener(Self::git_branches))
             .on_action(cx.listener(Self::git_worktrees))
-            .on_action(cx.listener(Self::git_history))
             .on_action(cx.listener(Self::git_compare))
             .on_action(cx.listener(Self::git_fetch))
             .on_action(cx.listener(Self::git_pull))
             .on_action(cx.listener(Self::git_push))
             .on_action(cx.listener(Self::git_refresh))
+            .map(|element| self.on_git_actions(element, cx))
+            .map(|element| self.on_log_actions(element, cx))
             .on_action(cx.listener(Self::python_sync))
             .on_action(cx.listener(Self::python_lock))
             .on_action(cx.listener(Self::run_file))
@@ -1783,7 +1714,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::go_forward))
             .on_action(cx.listener(Self::toggle_files))
             .on_action(cx.listener(Self::toggle_search))
-            .on_action(cx.listener(Self::toggle_git))
+            .on_action(cx.listener(Self::toggle_commit))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_python))
             .on_action(cx.listener(Self::toggle_problems))
@@ -1899,6 +1830,7 @@ impl Render for Workspace {
                     .justify_center()
                     .child(picker.clone())
             }))
+            .children(self.render_branches_popup(cx))
             .children(self.render_configuration_picker())
     }
 }

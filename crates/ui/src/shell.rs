@@ -11,10 +11,10 @@ use std::{
 
 use gpui::{
     Action, AnyElement, AnyView, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle,
-    Focusable, Image, ImageFormat, KeyBinding, KeyDownEvent, MouseButton, PathPromptOptions,
-    Pixels, PromptLevel, SharedString, Subscription, TitlebarOptions, Window, WindowBounds,
-    WindowControlArea, WindowHandle, WindowOptions, actions, anchored, deferred, div, img,
-    prelude::*, px, size,
+    Focusable, Image, ImageFormat, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    PathPromptOptions, Pixels, PromptLevel, SharedString, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowControlArea, WindowHandle, WindowOptions, actions, anchored, deferred, div,
+    img, point, prelude::*, px, size,
 };
 
 use crate::{
@@ -89,22 +89,28 @@ pub fn bind_keys(cx: &mut App) {
 
 /// What a project tab shows.
 enum Content {
+    /// Restored from the last session and not shown yet: the project opens
+    /// when the tab is first activated, so background tabs cost nothing at
+    /// startup (no connection, watcher, git status or language servers).
+    Unloaded,
     Connecting(Entity<Connecting>),
     Workspace(Entity<Workspace>),
 }
 
 impl Content {
-    fn id(&self) -> EntityId {
+    fn id(&self) -> Option<EntityId> {
         match self {
-            Self::Connecting(view) => view.entity_id(),
-            Self::Workspace(view) => view.entity_id(),
+            Self::Unloaded => None,
+            Self::Connecting(view) => Some(view.entity_id()),
+            Self::Workspace(view) => Some(view.entity_id()),
         }
     }
 
-    fn view(&self) -> AnyView {
+    fn view(&self) -> Option<AnyView> {
         match self {
-            Self::Connecting(view) => view.clone().into(),
-            Self::Workspace(view) => view.clone().into(),
+            Self::Unloaded => None,
+            Self::Connecting(view) => Some(view.clone().into()),
+            Self::Workspace(view) => Some(view.clone().into()),
         }
     }
 }
@@ -112,14 +118,22 @@ impl Content {
 struct ProjectTab {
     location: Location,
     content: Content,
-    _subscription: Subscription,
+    _subscription: Option<Subscription>,
 }
 
 impl ProjectTab {
+    fn unloaded(location: Location) -> Self {
+        Self {
+            location,
+            content: Content::Unloaded,
+            _subscription: None,
+        }
+    }
+
     fn dirty_count(&self, cx: &App) -> usize {
         match &self.content {
             Content::Workspace(workspace) => workspace.read(cx).dirty_count(cx),
-            Content::Connecting(_) => 0,
+            Content::Unloaded | Content::Connecting(_) => 0,
         }
     }
 }
@@ -275,13 +289,14 @@ fn open_with(
     cx.open_window(options, |window, cx| {
         cx.new(|cx| {
             let mut shell = Shell::new(window, cx);
-            for (index, location) in tabs.into_iter().enumerate() {
+            // Only the active tab opens now; the others when first shown.
+            shell.tabs = tabs.into_iter().map(ProjectTab::unloaded).collect();
+            if !shell.tabs.is_empty() {
+                let active = active.min(shell.tabs.len() - 1);
                 let preload = preload
-                    .take_if(|(at, _)| *at == index)
+                    .take_if(|(at, _)| *at == active)
                     .map(|(_, preload)| preload);
-                shell.add_tab(location, preload, window, cx);
-            }
-            if active < shell.tabs.len() {
+                shell.load(active, preload, window, cx);
                 shell.activate(active, window, cx);
             }
             shell.remember(window, cx);
@@ -429,7 +444,21 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let content = match location.clone() {
+        self.tabs.push(ProjectTab::unloaded(location));
+        let index = self.tabs.len() - 1;
+        self.load(index, preload, window, cx);
+        self.activate(index, window, cx);
+    }
+
+    /// Opens the project of tab `index` (`preload` is its head start).
+    fn load(
+        &mut self,
+        index: usize,
+        preload: Option<Preload>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let content = match self.tabs[index].location.clone() {
             Location::Local(root) => {
                 let git = match preload {
                     Some(Preload::Local(git)) => Some(git),
@@ -448,12 +477,9 @@ impl Shell {
             }
         };
         let subscription = self.subscribe(&content, window, cx);
-        self.tabs.push(ProjectTab {
-            location,
-            content,
-            _subscription: subscription,
-        });
-        self.activate(self.tabs.len() - 1, window, cx);
+        let tab = &mut self.tabs[index];
+        tab.content = content;
+        tab._subscription = subscription;
     }
 
     fn subscribe(
@@ -461,8 +487,9 @@ impl Shell {
         content: &Content,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Subscription {
-        match content {
+    ) -> Option<Subscription> {
+        Some(match content {
+            Content::Unloaded => return None,
             Content::Connecting(connecting) => cx.subscribe_in(
                 connecting,
                 window,
@@ -484,15 +511,17 @@ impl Shell {
                         let dirty = workspace.read(cx).dirty_count(cx);
                         this.open(location.clone(), window, cx);
                         if dirty == 0
-                            && let Some(index) =
-                                this.tabs.iter().position(|tab| tab.content.id() == id)
+                            && let Some(index) = this
+                                .tabs
+                                .iter()
+                                .position(|tab| tab.content.id() == Some(id))
                         {
                             this.remove_tab(index, window, cx);
                         }
                     }
                 },
             ),
-        }
+        })
     }
 
     /// A remote project finished opening: its tab gets the workspace.
@@ -503,7 +532,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.tabs.iter().position(|tab| tab.content.id() == id) else {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.content.id() == Some(id))
+        else {
             return;
         };
         let location = project.location();
@@ -524,13 +557,16 @@ impl Shell {
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active = index;
         self.menu = None;
+        if matches!(self.tabs[index].content, Content::Unloaded) {
+            self.load(index, None, window, cx);
+        }
         let tab = &self.tabs[index];
         window.set_window_title(&window_title(Some(&tab.location)));
         match &tab.content {
             Content::Workspace(workspace) => {
                 workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx))
             }
-            Content::Connecting(_) => window.focus(&self.focus_handle),
+            Content::Unloaded | Content::Connecting(_) => window.focus(&self.focus_handle),
         }
         self.remember(window, cx);
         cx.notify();
@@ -976,6 +1012,7 @@ impl Shell {
                     .enumerate()
                     .map(|(index, menu)| self.render_menu_title(index, menu.label.clone(), cx)),
             )
+            .children(self.render_branch_widget(cx))
             .child(drag_area("title-drag-left"))
             .child(
                 div()
@@ -1011,6 +1048,76 @@ impl Shell {
             .when(CUSTOM_TITLE_BAR, |bar| {
                 bar.child(self.render_caption_buttons(window))
             })
+    }
+
+    /// PyCharm's branch widget: `⎇ main ▾` for the active project; a click
+    /// opens the branches popup below it.
+    fn render_branch_widget(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let Content::Workspace(workspace) = &self.tabs.get(self.active)?.content else {
+            return None;
+        };
+        let branch = workspace.read(cx).branch_widget(cx)?;
+        let workspace = workspace.clone();
+        Some(
+            div()
+                .id("branch-widget")
+                .ml_2()
+                .h(px(24.))
+                .px_2()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .max_w(px(260.))
+                .rounded_md()
+                .text_color(theme::text())
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::hover_row()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |_, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        let below = point(event.position.x - px(12.), px(MENU_BAR_HEIGHT));
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.open_branches_popup_at(Some(below), window, cx)
+                        });
+                    }),
+                )
+                .child(div().flex_none().text_color(theme::muted()).child("⎇"))
+                .child(div().min_w_0().truncate().child(branch.label))
+                .when(branch.ahead > 0, |widget| {
+                    widget.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::git_added())
+                            .child(format!("↑{}", branch.ahead)),
+                    )
+                })
+                .when(branch.behind > 0, |widget| {
+                    widget.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::accent_text())
+                            .child(format!("↓{}", branch.behind)),
+                    )
+                })
+                .children(branch.operation.map(|operation| {
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme::warning())
+                        .child(operation)
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child("▾"),
+                ),
+        )
     }
 
     /// The selected run configuration (click: pick another), Run and
@@ -1539,7 +1646,11 @@ impl Render for Shell {
             self.theme_notice = theme::problem().map(Into::into);
         }
         let content = match self.tabs.get(self.active) {
-            Some(tab) => tab.content.view().into_any_element(),
+            // The active tab is loaded (see `activate`).
+            Some(tab) => tab
+                .content
+                .view()
+                .map_or_else(|| div().into_any_element(), AnyView::into_any_element),
             None => self.render_welcome(window, cx).into_any_element(),
         };
         let modal = |view: AnyView| {
@@ -1881,16 +1992,21 @@ mod tests {
             |window: gpui::WindowHandle<Shell>, tab: usize, cx: &mut gpui::TestAppContext| {
                 window
                     .read_with(cx, |shell, cx| match &shell.tabs[tab].content {
-                        Content::Workspace(workspace) => workspace.read(cx).tab_paths(),
+                        Content::Workspace(workspace) => Some(workspace.read(cx).tab_paths()),
+                        Content::Unloaded => None,
                         Content::Connecting(_) => panic!("local projects open at once"),
                     })
                     .unwrap()
             };
         let restored = reopened[0].1;
-        assert_eq!(files(restored, 0, cx), [main_py]);
-        assert_eq!(files(restored, 1, cx), [notes]);
-        // The project in the background restored its files without taking
-        // focus from the active one: keys still reach the window.
+        assert_eq!(files(restored, 0, cx), Some(vec![main_py]));
+        assert_eq!(
+            files(restored, 1, cx),
+            None,
+            "the background project opens when shown"
+        );
+        // The active project restored its files and has focus: keys reach
+        // the window.
         let alpha_has_focus = restored
             .update(cx, |shell, window, cx| {
                 let Content::Workspace(workspace) = &shell.tabs[0].content else {
@@ -1902,7 +2018,9 @@ mod tests {
             .unwrap();
         assert!(alpha_has_focus);
         cx.simulate_keystrokes(restored.into(), "ctrl-alt-]");
+        cx.run_until_parked();
         assert_eq!(tabs(restored, cx).1, 1);
+        assert_eq!(files(restored, 1, cx), Some(vec![notes]));
         for (_, window) in reopened {
             close_window(window, cx);
         }
@@ -1967,7 +2085,7 @@ mod tests {
         let workspace = window
             .read_with(cx, |shell, _| match &shell.tabs[0].content {
                 Content::Workspace(workspace) => workspace.clone(),
-                Content::Connecting(_) => panic!("a local project opens at once"),
+                _ => panic!("a local project opens at once"),
             })
             .unwrap();
         cx.dispatch_action(window.into(), crate::workspace::ToggleFileFinder);
@@ -2107,7 +2225,7 @@ mod tests {
                 .find(|(command, _)| *command == name)
                 .map(|(_, keys)| keys.clone())
         };
-        for expected in ["workspace::ToggleGit", "git::Fetch", "python::Sync"] {
+        for expected in ["workspace::ToggleCommit", "git::Fetch", "python::Sync"] {
             assert!(
                 keys(expected).is_some(),
                 "{expected} missing from {commands:?}"

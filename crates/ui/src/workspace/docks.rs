@@ -18,7 +18,8 @@ actions!(
         ToggleFiles,
         ToggleSearch,
         ToggleTerminal,
-        ToggleGit,
+        ToggleCommit,
+        ToggleGitLog,
         TogglePython,
         ToggleProblems,
         TogglePorts,
@@ -36,8 +37,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-e", ToggleFiles, ctx),
         KeyBinding::new("alt-1", ToggleFiles, ctx),
         KeyBinding::new("secondary-shift-f", ToggleSearch, ctx),
-        // VS Code's Source Control shortcut.
-        KeyBinding::new("ctrl-shift-g", ToggleGit, ctx),
+        // PyCharm's Commit tool window; Ctrl+Shift+G is VS Code's Source
+        // Control shortcut.
+        KeyBinding::new("alt-0", ToggleCommit, ctx),
+        KeyBinding::new("ctrl-shift-g", ToggleCommit, ctx),
+        // PyCharm's Git tool window.
+        KeyBinding::new("alt-9", ToggleGitLog, ctx),
         KeyBinding::new("ctrl-`", ToggleTerminal, ctx),
         KeyBinding::new("alt-f12", ToggleTerminal, ctx),
         KeyBinding::new("secondary-shift-m", ToggleProblems, ctx),
@@ -86,7 +91,8 @@ impl Workspace {
             PanelId::Ports => Some(self.ports_panel.clone().into()),
             PanelId::Terminal => Some(self.terminal.clone().into()),
             PanelId::Search => Some(self.search.clone().into()),
-            PanelId::Git => Some(self.git.clone().into()),
+            PanelId::Commit => Some(self.commit.clone().into()),
+            PanelId::GitLog => Some(self.git_log.clone().into()),
             PanelId::Python => Some(self.python.clone().into()),
             PanelId::Outline => Some(self.outline.clone().into()),
             PanelId::CallHierarchy => Some(self.call_hierarchy.clone().into()),
@@ -142,18 +148,30 @@ impl Workspace {
         self.search.read(cx).focus(window, cx);
     }
 
-    /// Shows the Git panel (refreshing its status) and focuses the commit
-    /// message.
-    pub(super) fn toggle_git(
+    /// Shows the Commit window (refreshing its status) and focuses the
+    /// commit message; hides it when it is the visible panel of a dock that
+    /// has focus inside it (PyCharm's Alt+0).
+    pub(super) fn toggle_commit(
         &mut self,
-        _: &ToggleGit,
+        _: &ToggleCommit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_panel(PanelId::Git, cx);
-        self.git.update(cx, |git, cx| {
-            git.refresh(cx);
-            git.focus(window, cx);
+        let visible = self
+            .layout
+            .position_of(PanelId::Commit)
+            .is_some_and(|position| {
+                let dock = self.layout.dock(position);
+                dock.open && dock.active == Some(PanelId::Commit)
+            });
+        if visible && self.commit.read(cx).contains_focus(window, cx) {
+            self.toggle_panel(PanelId::Commit, cx);
+            return self.focus_active(window, cx);
+        }
+        self.show_panel(PanelId::Commit, cx);
+        self.commit.update(cx, |commit, cx| {
+            commit.refresh(cx);
+            commit.focus(window, cx);
         });
     }
 
@@ -352,6 +370,7 @@ impl Workspace {
             .h(px(HEADER_HEIGHT))
             .flex_none()
             .flex()
+            .overflow_hidden()
             .items_center()
             .border_b_1()
             .border_color(theme::border())
@@ -434,10 +453,14 @@ impl Workspace {
         active: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        // In a narrow dock inactive tabs shrink (their titles truncate)
+        // before the active one does.
         div()
             .id(SharedString::from(format!("panel-tab-{}", panel.title())))
             .h_full()
-            .px_3()
+            .px(px(6.))
+            .min_w_0()
+            .when(active, |tab| tab.flex_none())
             .flex()
             .items_center()
             .text_sm()
@@ -449,7 +472,7 @@ impl Workspace {
             })
             .when(active, |tab| tab.border_b_2().border_color(theme::accent()))
             .hover(|style| style.text_color(theme::text()))
-            .child(panel.title())
+            .child(div().min_w_0().truncate().child(panel.title()))
             .on_click(cx.listener(move |this, _, _, cx| this.show_panel(panel, cx)))
             .on_mouse_down(
                 MouseButton::Right,

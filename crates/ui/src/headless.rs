@@ -43,13 +43,36 @@
 //! | `git_switch` | `name` (branch, remote branch: tracked locally, or tag: detached) | `null` |
 //! | `git_branch_delete` | `name`, `force`? | `null` |
 //! | `git_fetch` / `git_pull` / `git_push` | | `null`; fetch is `--all --prune`, pull is fast-forward only, a first push sets the upstream |
+//! | `git_commit_paths` | `paths`, `message`, `amend`? | `{summary}`: commits exactly those files (`git commit --only`, untracked ones added first; a full commit while merging) |
+//! | `git_rollback` | `paths` | `null`: back to HEAD; added files leave version control, untracked files are deleted |
+//! | `git_add` / `git_ignore` | `paths` | `null`: add untracked files / append `/path` patterns to `.gitignore` |
+//! | `git_operation_state` | | `"none"`, `"merging"`, `"rebasing"`, `"cherry_picking"` or `"reverting"` |
+//! | `git_merge` | `name` | `"done"` or `"conflicts"` |
+//! | `git_rebase` | `onto`, `branch`? (checked out first) | `"done"` or `"conflicts"` |
+//! | `git_continue_rebase` / `git_abort` | | `"done"`/`"conflicts"` / `null` (aborts what is in progress) |
+//! | `git_branch_rename` | `name`, `new_name` | `null` |
+//! | `git_remote_branch_delete` | `name` (`origin/x`) | `null` |
+//! | `git_update` | `rebase`? | `"done"` or `"conflicts"`: fetch, then merge (or rebase onto) the upstream |
+//! | `git_update_branch` | `name` | `null`: fast-forwards a tracked branch that is not checked out |
+//! | `git_branches` | | `{tracking: [{name, upstream, ahead, behind}], recent}` |
+//! | `git_push_target` / `git_push_branch` | `name`? (default: current branch) | `{target: {remote, branch, new}, outgoing}` / `{target}` (pushes, `-u` when new) |
 //! | `git_worktrees` | | `[{path, head, branch, current, bare, locked, prunable}]` |
 //! | `git_worktree_add` | `name` (branch), `create`? (new branch), `start`?, `path`? (default: `<repository>-<branch>` next to it) | `{path}` |
 //! | `git_worktree_remove` | `path`, `force`? | `null` |
-//! | `git_log` | `limit`? (200), `all`? (true: every branch) | `{commits, graph}`: graph rows give each commit's lane and edges |
+//! | `git_log` | `limit`? (200), `skip`? (0), `branches`? (revisions; default every branch, remote branch and tag), `all`? (false without `branches`: HEAD only), `text`? (subject, author or hash prefix, case-insensitive), `authors`?, `since`?/`until`? (Unix seconds, commit date), `paths`? | `{commits, graph, next}`: graph rows give each commit's lane and edges (one line when text/author/date filters hide parents); `next` is the `skip` of the following page, `null` at the end |
 //! | `git_refs` | | `[{name, kind, target, head}]` |
 //! | `git_changes` | `base` (revision), `target`? (revision or `"worktree"`) | `[{path, orig_path, change}]` |
 //! | `git_commit_changes` | `commit` | `{commit, changes}` (against its first parent) |
+//! | `git_selection_changes` | `newest`, `oldest`? (default `newest`) | `{base, target, changes}`: from `oldest`'s first parent (`"empty"` for a root commit) to `newest` |
+//! | `git_commit_details` | `commit` | `{message, branches, pushed}` (full message, local and remote branches containing it, whether a remote branch does) |
+//! | `git_cherry_pick` | `commits` (oldest first; no merges) | `{result: "done", empty}` (`empty`: already applied, skipped) or `{result: "conflicts", paths}` |
+//! | `git_revert` | `commits` (newest first; a merge only alone, against its first parent) | as `git_cherry_pick` |
+//! | `git_reset` | `commit`, `mode`? (`"soft"`, `"mixed"` (default), `"hard"`, `"keep"`) | `null`: moves the current branch |
+//! | `git_undo_commit` | | `null`: soft reset of HEAD to its parent; refused when pushed or the first commit |
+//! | `git_reword` | `message` | `{summary}`: HEAD's message replaced, its contents and the index kept |
+//! | `git_tag` | `name`, `commit`? (HEAD), `message`? (annotated) | `null` |
+//! | `git_checkout_revision` | `commit` | `null`: detached HEAD |
+//! | `git_patch` | `commits` (oldest first) | `{patch}`: `git format-patch` mailbox (merges have none) |
 //! | `python_info` | | `null` without `pyproject.toml`, else `{name, version, requires_python, locked_packages, interpreter, environment_python, pinned, uv, in_sync, dependencies: [{name, specifier, kind, locked}], scripts}` |
 //! | `python_sync` / `python_lock` | `upgrade`? (lock) | `{code, stdout, stderr}` of `uv sync` / `uv lock` |
 //! | `python_add` | `requirement`, `group`? or `optional`? (extra) | `{code, stdout, stderr}` of `uv add` |
@@ -581,7 +604,30 @@ impl Session {
         let target = side("target").unwrap_or(git::Side::Worktree);
         let commit = request["commit"].as_str().map(str::to_owned);
         let limit = request["limit"].as_u64().unwrap_or(200) as usize;
-        let all = request["all"].as_bool().unwrap_or(true);
+        let skip = request["skip"].as_u64().unwrap_or(0) as usize;
+        let strings = |name: &str| -> Vec<String> {
+            request[name]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        };
+        let mut filter = git::LogFilter {
+            revisions: strings("branches"),
+            text: request["text"].as_str().unwrap_or_default().to_owned(),
+            authors: strings("authors"),
+            since: request["since"].as_i64(),
+            until: request["until"].as_i64(),
+            paths: paths.clone(),
+        };
+        if filter.revisions.is_empty() && !request["all"].as_bool().unwrap_or(true) {
+            filter.revisions.push("HEAD".into());
+        }
+        let commits = strings("commits");
+        let newest = request["newest"].as_str().map(str::to_owned);
+        let oldest = request["oldest"].as_str().map(str::to_owned);
+        let mode = request["mode"].as_str().map(str::to_owned);
         let amend = request["amend"].as_bool().unwrap_or(false);
         let force = request["force"].as_bool().unwrap_or(false);
         let name = request["name"].as_str().map(str::to_owned);
@@ -590,6 +636,10 @@ impl Session {
         let create = request["create"].as_bool().unwrap_or(false);
         let hunk = request["hunk"].as_u64().map(|hunk| hunk as usize);
         let action = request["action"].as_str().map(str::to_owned);
+        let onto = request["onto"].as_str().map(str::to_owned);
+        let branch = request["branch"].as_str().map(str::to_owned);
+        let new_name = request["new_name"].as_str().map(str::to_owned);
+        let rebase = request["rebase"].as_bool().unwrap_or(false);
         let command = command.to_owned();
         self.blocking(id, cx, move |project| {
             let repository = project.repository()?.ok_or_else(|| {
@@ -715,6 +765,86 @@ impl Session {
                 "git_fetch" => repository.fetch().map(|()| Value::Null),
                 "git_pull" => repository.pull().map(|()| Value::Null),
                 "git_push" => repository.push(&repository.status()?).map(|()| Value::Null),
+                // PyCharm's workflow (Commit window, branches popup).
+                "git_commit_paths" => {
+                    let entries: Vec<git::Entry> = repository
+                        .status()?
+                        .entries
+                        .into_iter()
+                        .filter(|entry| paths.contains(&entry.path))
+                        .collect();
+                    let summary = repository.commit_entries(&message, &entries, amend)?;
+                    Ok(json!({ "summary": summary }))
+                }
+                "git_rollback" => {
+                    let entries: Vec<git::Entry> = repository
+                        .status()?
+                        .entries
+                        .into_iter()
+                        .filter(|entry| paths.contains(&entry.path))
+                        .collect();
+                    repository.rollback(&entries).map(|()| Value::Null)
+                }
+                "git_add" => repository.add(&paths).map(|()| Value::Null),
+                "git_ignore" => {
+                    let file = project.repository_path(&repository, ".gitignore");
+                    let existing = match project.read_text(&file) {
+                        Ok(text) => text,
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+                        Err(err) => return Err(err),
+                    };
+                    project
+                        .write(&file, git::ignore_entries(&existing, &paths).into_bytes())
+                        .map(|()| Value::Null)
+                }
+                "git_operation_state" => Ok(json!(repository.operation_state()?)),
+                "git_merge" => {
+                    let name = name.ok_or_else(|| missing("name"))?;
+                    Ok(json!(repository.merge(&name)?))
+                }
+                "git_rebase" => {
+                    let onto = onto.ok_or_else(|| missing("onto"))?;
+                    Ok(json!(repository.rebase(&onto, branch.as_deref())?))
+                }
+                "git_continue_rebase" => Ok(json!(repository.continue_rebase()?)),
+                "git_abort" => repository
+                    .abort(repository.operation_state()?)
+                    .map(|()| Value::Null),
+                "git_branch_rename" => {
+                    let name = name.ok_or_else(|| missing("name"))?;
+                    let new_name = new_name.ok_or_else(|| missing("new_name"))?;
+                    repository
+                        .rename_branch(&name, &new_name)
+                        .map(|()| Value::Null)
+                }
+                "git_remote_branch_delete" => {
+                    let name = name.ok_or_else(|| missing("name"))?;
+                    repository.delete_remote_branch(&name).map(|()| Value::Null)
+                }
+                "git_update" => Ok(json!(repository.update(rebase)?)),
+                "git_update_branch" => {
+                    let name = name.ok_or_else(|| missing("name"))?;
+                    repository.update_branch(&name).map(|()| Value::Null)
+                }
+                "git_branches" => Ok(json!({
+                    "tracking": repository.branch_tracking()?,
+                    "recent": repository.recent_branches(5)?,
+                })),
+                "git_push_target" | "git_push_branch" => {
+                    let branch = match name {
+                        Some(name) => name,
+                        None => repository.status()?.branch.ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "HEAD is detached")
+                        })?,
+                    };
+                    let target = repository.push_target(&branch)?;
+                    if command == "git_push_branch" {
+                        repository.push_branch(&branch, &target)?;
+                        return Ok(json!({ "target": target }));
+                    }
+                    let outgoing = repository.outgoing(&branch, &target)?;
+                    Ok(json!({ "target": target, "outgoing": outgoing }))
+                }
                 "git_worktrees" => Ok(json!(repository.worktrees()?)),
                 "git_worktree_add" => {
                     let branch = name.ok_or_else(|| missing("name"))?;
@@ -728,9 +858,9 @@ impl Session {
                     Ok(Value::Null)
                 }
                 "git_log" => {
-                    let commits = repository.log(limit, all)?;
-                    let graph = git::graph(&commits);
-                    Ok(json!({ "commits": commits, "graph": graph }))
+                    let page = repository.log_page(&filter, skip, limit)?;
+                    let graph = filter.graph(&page.commits);
+                    Ok(json!({ "commits": page.commits, "graph": graph, "next": page.next }))
                 }
                 "git_refs" => Ok(json!(repository.refs()?)),
                 "git_changes" => {
@@ -744,6 +874,59 @@ impl Session {
                         "commit": commit,
                         "changes": repository.commit_changes(&commit)?,
                     }))
+                }
+                "git_selection_changes" => {
+                    let newest = repository.show(&newest.ok_or_else(|| missing("newest"))?)?;
+                    let oldest = match oldest {
+                        Some(oldest) => repository.show(&oldest)?,
+                        None => newest.clone(),
+                    };
+                    let span = repository.selection_changes(&newest, &oldest)?;
+                    Ok(json!({ "base": span.base, "target": span.target, "changes": span.changes }))
+                }
+                "git_commit_details" => {
+                    let commit = repository.resolve(&commit.ok_or_else(|| missing("commit"))?)?;
+                    Ok(json!({
+                        "message": repository.commit_message(&commit)?,
+                        "branches": repository.branches_containing(&commit)?,
+                        "pushed": repository.is_pushed(&commit)?,
+                    }))
+                }
+                "git_cherry_pick" => Ok(json!(repository.cherry_pick(&commits)?)),
+                "git_revert" => Ok(json!(repository.revert(&commits)?)),
+                "git_reset" => {
+                    let commit = commit.ok_or_else(|| missing("commit"))?;
+                    let mode = match mode.as_deref() {
+                        Some("soft") => git::ResetMode::Soft,
+                        Some("mixed") | None => git::ResetMode::Mixed,
+                        Some("hard") => git::ResetMode::Hard,
+                        Some("keep") => git::ResetMode::Keep,
+                        Some(other) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("unknown reset mode `{other}`"),
+                            ));
+                        }
+                    };
+                    repository.reset(&commit, mode)?;
+                    Ok(Value::Null)
+                }
+                "git_undo_commit" => repository.undo_last_commit().map(|()| Value::Null),
+                "git_reword" => Ok(json!({ "summary": repository.reword_head(&message)? })),
+                "git_tag" => {
+                    let name = name.ok_or_else(|| missing("name"))?;
+                    let at = commit.unwrap_or_else(|| "HEAD".into());
+                    let message = (!message.is_empty()).then_some(message.as_str());
+                    repository.create_tag(&name, &at, message)?;
+                    Ok(Value::Null)
+                }
+                "git_checkout_revision" => {
+                    let commit = commit.ok_or_else(|| missing("commit"))?;
+                    repository.checkout_revision(&commit).map(|()| Value::Null)
+                }
+                "git_patch" => {
+                    let patch = repository.create_patch(&commits)?;
+                    Ok(json!({ "patch": String::from_utf8_lossy(&patch) }))
                 }
                 other => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,

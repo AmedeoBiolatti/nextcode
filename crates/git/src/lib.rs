@@ -7,9 +7,12 @@
 
 mod diff;
 mod history;
+mod log;
 mod operations;
 mod patch;
+mod revisions;
 mod status;
+mod workflow;
 
 use std::{io, sync::Arc};
 
@@ -17,9 +20,14 @@ use serde::Serialize;
 
 pub use diff::{FULL_FILE, FileDiff, LineKind, Row, SideLine, SplitRow, diff, side_by_side};
 pub use history::{Commit, GraphRow, graph};
+pub use log::{LogFilter, LogPage, SelectionChanges};
 pub use operations::Worktree;
 pub use patch::{Hunk, HunkAction, Patch, parse_patch};
+pub use revisions::{ApplyOutcome, ResetMode};
 pub use status::{Change, Entry, Status};
+pub use workflow::{
+    BranchTracking, OperationState, Outcome, PushTarget, ignore_entries, not_fully_merged,
+};
 
 /// A file that differs between two revisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -313,28 +321,6 @@ impl Repository {
         Ok(diff(old.as_deref(), new.as_deref(), context))
     }
 
-    /// Up to `limit` commits, newest first in graph order: those reachable
-    /// from HEAD, or from every branch and tag with `all`. Empty before the
-    /// first commit.
-    pub fn log(&self, limit: usize, all: bool) -> io::Result<Vec<Commit>> {
-        let limit = format!("-n{limit}");
-        let mut args = vec!["log", "--topo-order", history::LOG_FORMAT, &limit];
-        if all {
-            args.push("--all");
-        }
-        let output = self.git(&args)?;
-        if output.code != Some(0) {
-            // A repository without commits has no HEAD to log.
-            let unborn = self.git(&["rev-parse", "--verify", "-q", "HEAD"])?.code != Some(0);
-            return if unborn {
-                Ok(Vec::new())
-            } else {
-                Err(failure("log", &output))
-            };
-        }
-        history::parse_log(&output.stdout)
-    }
-
     /// The commit `revision` names.
     pub fn show(&self, revision: &str) -> io::Result<Commit> {
         let id = self.resolve(revision)?;
@@ -578,7 +564,7 @@ fn dubious_ownership(stderr: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{fs, path::PathBuf, process::Command};
 
     use super::*;
@@ -649,7 +635,7 @@ mod tests {
         );
     }
 
-    struct LocalGit;
+    pub(crate) struct LocalGit;
 
     impl Runner for LocalGit {
         fn run_git(&self, args: &[String], input: Option<&[u8]>) -> io::Result<Output> {
@@ -675,7 +661,7 @@ mod tests {
         }
     }
 
-    fn temp_repo(name: &str) -> (PathBuf, Repository) {
+    pub(crate) fn temp_repo(name: &str) -> (PathBuf, Repository) {
         let dir = std::env::temp_dir().join(format!("next_code_git_{name}_{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
@@ -703,7 +689,7 @@ mod tests {
         (dir, repo)
     }
 
-    fn state(repo: &Repository) -> Vec<(String, Option<Change>, Option<Change>)> {
+    pub(crate) fn state(repo: &Repository) -> Vec<(String, Option<Change>, Option<Change>)> {
         repo.status()
             .unwrap()
             .entries
@@ -795,7 +781,9 @@ mod tests {
     #[test]
     fn history_refs_and_comparisons_follow_branches_and_renames() {
         let (dir, repo) = temp_repo("history");
-        assert_eq!(repo.log(10, true).unwrap(), [], "no commits yet");
+        let all_branches = LogFilter::default();
+        let log = |filter: &LogFilter| repo.log_page(filter, 0, 10).unwrap().commits;
+        assert_eq!(log(&all_branches), [], "no commits yet");
         let commit = |message: &str| {
             repo.stage(&[".".into()]).unwrap();
             repo.commit(message, false).unwrap();
@@ -813,7 +801,7 @@ mod tests {
         commit("main work");
         git(&["tag", "v1"]);
 
-        let all = repo.log(10, true).unwrap();
+        let all = log(&all_branches);
         assert_eq!(all.len(), 3);
         let rows = graph(&all);
         assert_eq!(
@@ -821,7 +809,11 @@ mod tests {
             Some(2),
             "two branches"
         );
-        assert_eq!(repo.log(10, false).unwrap().len(), 2, "HEAD only");
+        let head_only = LogFilter {
+            revisions: vec!["HEAD".into()],
+            ..LogFilter::default()
+        };
+        assert_eq!(log(&head_only).len(), 2, "HEAD only");
 
         let refs = repo.refs().unwrap();
         let names: Vec<(&str, RefKind, bool)> = refs

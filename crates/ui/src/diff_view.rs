@@ -13,7 +13,7 @@ use gpui::{
     Window, div, prelude::*, px, uniform_list,
 };
 
-use crate::{git_panel::short_revision, project::Project, theme};
+use crate::{commit_panel::short_revision, project::Project, theme};
 
 const ROW_HEIGHT: f32 = 20.;
 

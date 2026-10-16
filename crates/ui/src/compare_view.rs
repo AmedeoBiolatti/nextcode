@@ -12,8 +12,8 @@ use gpui::{
 
 use crate::{
     change_tree::{self, Node},
+    commit_panel::{change_color, short_revision},
     diff_view::DiffSource,
-    git_panel::{change_color, short_revision},
     theme,
 };
 

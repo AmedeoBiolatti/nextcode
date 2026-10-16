@@ -248,11 +248,14 @@ ui_colors! {
     /// Diff line backgrounds.
     diff_added,
     diff_removed,
-    /// Git change letters.
+    /// Git change colors (file names in the Commit window, change letters):
+    /// PyCharm's modified blue, added green, deleted grey, unversioned
+    /// red-brown.
     git_added,
     git_modified,
     git_renamed,
     git_deleted,
+    git_unversioned,
     git_conflicted,
     /// History ref labels: branches (other than HEAD's, which uses `accent`) and tags.
     branch,
