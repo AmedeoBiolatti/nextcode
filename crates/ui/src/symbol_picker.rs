@@ -66,11 +66,12 @@ enum Source {
     },
     Workspace {
         servers: Vec<(Language, Arc<RunningServer>)>,
-        root: PathBuf,
+        project: Project,
     },
     Directory {
         project: Project,
-        dir: PathBuf,
+        /// `None`: the folders of a multi-root project.
+        dir: Option<PathBuf>,
     },
 }
 
@@ -80,6 +81,8 @@ enum Target {
     Location(Location),
     File(PathBuf),
     Dir(PathBuf),
+    /// Up from a folder of a multi-root project to the list of folders.
+    Folders,
 }
 
 struct Item {
@@ -184,12 +187,12 @@ impl SymbolPicker {
     /// `workspace/symbol` on `servers` as the user types.
     pub fn workspace(
         servers: Vec<(Language, Arc<RunningServer>)>,
-        root: PathBuf,
+        project: Project,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut picker = Self::new(
             "Go to Symbol in Workspace",
-            Source::Workspace { servers, root },
+            Source::Workspace { servers, project },
             cx,
         );
         picker.status = Some(if picker.workspace_servers().is_empty() {
@@ -208,7 +211,14 @@ impl SymbolPicker {
         selected: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut picker = Self::new("Files", Source::Directory { project, dir }, cx);
+        let mut picker = Self::new(
+            "Files",
+            Source::Directory {
+                project,
+                dir: Some(dir),
+            },
+            cx,
+        );
         picker.load_directory(selected, cx);
         picker
     }
@@ -301,6 +311,31 @@ impl SymbolPicker {
         let (project, dir) = (project.clone(), dir.clone());
         self.items.clear();
         self.matches.clear();
+        let Some(dir) = dir else {
+            self._load = Task::ready(());
+            self.items = project
+                .roots()
+                .iter()
+                .map(|root| Item {
+                    badge: "▸",
+                    color: theme::muted(),
+                    name: root.name.clone(),
+                    depth: 0,
+                    detail: SharedString::default(),
+                    hint: root.path.display().to_string().into(),
+                    target: Target::Dir(root.path.clone()),
+                })
+                .collect();
+            self.status = None;
+            self.title = "Folders".into();
+            self.filter(cx);
+            if let Some(index) =
+                selected.and_then(|name| self.items.iter().position(|item| item.name == name))
+            {
+                self.select(index, cx);
+            }
+            return cx.notify();
+        };
         self.status = Some("Loading…".into());
         cx.notify();
         self._load = cx.spawn(async move |this, cx| {
@@ -318,20 +353,23 @@ impl SymbolPicker {
                     }
                 };
                 let mut items = Vec::new();
-                if dir != project.root()
-                    && let Some(parent) = dir
-                        .parent()
-                        .filter(|parent| parent.starts_with(project.root()))
+                let up = |target| Item {
+                    badge: "▴",
+                    color: theme::muted(),
+                    name: "..".into(),
+                    depth: 0,
+                    detail: SharedString::default(),
+                    hint: SharedString::default(),
+                    target,
+                };
+                // Up within the folder holding `dir`, then to the folders.
+                let root = &project.root_for(&dir).path;
+                if dir != *root
+                    && let Some(parent) = dir.parent().filter(|parent| parent.starts_with(root))
                 {
-                    items.push(Item {
-                        badge: "▴",
-                        color: theme::muted(),
-                        name: "..".into(),
-                        depth: 0,
-                        detail: SharedString::default(),
-                        hint: SharedString::default(),
-                        target: Target::Dir(parent.to_path_buf()),
-                    });
+                    items.push(up(Target::Dir(parent.to_path_buf())));
+                } else if project.is_multi_root() && project.root_index_of(&dir).is_some() {
+                    items.push(up(Target::Folders));
                 }
                 items.extend(entries.into_iter().map(|entry| {
                     let path = project.join(&dir, &entry.name);
@@ -352,7 +390,7 @@ impl SymbolPicker {
                 }));
                 this.status = items.is_empty().then(|| "Empty folder".into());
                 this.items = items;
-                this.title = relative(project.root(), &dir).into();
+                this.title = path_label(&project, &dir).into();
                 this.filter(cx);
                 if let Some(index) =
                     selected.and_then(|name| this.items.iter().position(|item| item.name == name))
@@ -377,10 +415,10 @@ impl SymbolPicker {
     fn search_workspace(&mut self, cx: &mut Context<Self>) {
         let query = self.query.read(cx).text();
         let servers = self.workspace_servers();
-        let Source::Workspace { root, .. } = &self.source else {
+        let Source::Workspace { project, .. } = &self.source else {
             return;
         };
-        let root = root.clone();
+        let project = project.clone();
         if query.trim().is_empty() || servers.is_empty() {
             self._load = Task::ready(());
             self.items.clear();
@@ -425,7 +463,7 @@ impl SymbolPicker {
                                 .map(model::workspace_symbols)
                                 .unwrap_or_default()
                                 .into_iter()
-                                .map(|symbol| workspace_item(symbol, &root, *language)),
+                                .map(|symbol| workspace_item(symbol, &project, *language)),
                         ),
                         Err(err) => errors.push(err.to_string()),
                     }
@@ -504,10 +542,19 @@ impl SymbolPicker {
             Target::File(path) => cx.emit(SymbolPickerEvent::OpenFile(path)),
             Target::Dir(path) => {
                 if let Source::Directory { dir, .. } = &mut self.source {
-                    *dir = path;
+                    *dir = Some(path);
                 }
                 self.query.update(cx, |query, cx| query.set_text("", cx));
                 self.load_directory(None, cx);
+            }
+            Target::Folders => {
+                // Preselect the folder we leave.
+                let mut left = None;
+                if let Source::Directory { project, dir } = &mut self.source {
+                    left = dir.take().map(|dir| project.root_for(&dir).name.clone());
+                }
+                self.query.update(cx, |query, cx| query.set_text("", cx));
+                self.load_directory(left, cx);
             }
         }
     }
@@ -600,7 +647,21 @@ fn relative(root: &Path, path: &Path) -> String {
     }
 }
 
-fn workspace_item(symbol: model::WorkspaceSymbolItem, root: &Path, language: Language) -> Item {
+/// How the picker names `path`: relative to the root, after its folder's
+/// name (`api › src`) when the project has several.
+fn path_label(project: &Project, path: &Path) -> String {
+    if project.is_multi_root() {
+        project.display_path(path)
+    } else {
+        relative(project.root(), path)
+    }
+}
+
+fn workspace_item(
+    symbol: model::WorkspaceSymbolItem,
+    project: &Project,
+    language: Language,
+) -> Item {
     let (badge, color) = symbol_kind_badge(symbol.kind, Some(language));
     let line = symbol
         .range
@@ -609,7 +670,7 @@ fn workspace_item(symbol: model::WorkspaceSymbolItem, root: &Path, language: Lan
     Item {
         badge,
         color,
-        hint: format!("{}{line}", relative(root, &symbol.path)).into(),
+        hint: format!("{}{line}", path_label(project, &symbol.path)).into(),
         detail: symbol.container.unwrap_or_default().into(),
         name: symbol.name,
         depth: 0,
@@ -787,5 +848,78 @@ mod tests {
         );
         assert_eq!(relative(root, root), ".");
         assert_eq!(relative(root, Path::new("/usr/lib/x.rs")), "/usr/lib/x.rs");
+    }
+
+    #[test]
+    fn multi_root_paths_are_labelled_with_their_folder() {
+        let (api, web) = (PathBuf::from("/ws/api"), PathBuf::from("/ws/web"));
+        let project = Project::local_folders(&[&api, &web]);
+        assert_eq!(
+            path_label(&project, &web.join("src").join("a.rs")),
+            "web › src/a.rs"
+        );
+        assert_eq!(path_label(&project, &api), "api");
+        let single = Project::local(api.clone());
+        assert_eq!(
+            path_label(&single, &api.join("src").join("a.rs")),
+            "src/a.rs"
+        );
+        assert_eq!(path_label(&single, &api), ".");
+    }
+
+    #[gpui::test]
+    fn folders_are_the_top_level_of_a_multi_root_directory_list(cx: &mut gpui::TestAppContext) {
+        let base =
+            std::env::temp_dir().join(format!("next_code_symbol_dirs_{}", std::process::id()));
+        let (api, web) = (base.join("api"), base.join("web"));
+        std::fs::create_dir_all(api.join("src")).unwrap();
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(web.join("index.ts"), "").unwrap();
+        let project = Project::local_folders(&[&api, &web]);
+        let picker = cx.new(|cx| SymbolPicker::directory(project, api.join("src"), None, cx));
+        cx.run_until_parked();
+        let shown = |cx: &mut gpui::TestAppContext| {
+            picker.read_with(cx, |picker, _| {
+                let names = picker
+                    .matches
+                    .iter()
+                    .map(|m| picker.items[m.index].name.clone());
+                (
+                    picker.title.to_string(),
+                    names.collect::<Vec<_>>(),
+                    picker.selected,
+                )
+            })
+        };
+        assert_eq!(shown(cx), ("api › src".into(), vec!["..".to_owned()], 0));
+
+        // Up to the folder, then to the list of folders (the left one selected).
+        picker.update(cx, |picker, cx| picker.choose(0, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            shown(cx),
+            ("api".into(), vec!["..".into(), "src".into()], 0)
+        );
+        picker.update(cx, |picker, cx| picker.choose(0, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            shown(cx),
+            ("Folders".into(), vec!["api".into(), "web".into()], 0)
+        );
+
+        // Into the other folder.
+        picker.update(cx, |picker, cx| picker.choose(1, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            shown(cx),
+            ("web".into(), vec!["..".into(), "index.ts".into()], 0)
+        );
+        picker.update(cx, |picker, cx| picker.choose(0, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            shown(cx),
+            ("Folders".into(), vec!["api".into(), "web".into()], 1)
+        );
+        std::fs::remove_dir_all(base).ok();
     }
 }

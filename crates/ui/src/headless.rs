@@ -7,13 +7,20 @@
 //! Each gets one reply line, `{"id": 1, "ok": true, "result": ...}` or
 //! `{"id": 1, "ok": false, "error": "..."}`; replies of slow commands may
 //! overtake earlier ones. Unsolicited lines carry an `"event"` field.
-//! Paths are absolute or relative to the project root.
+//! Paths are absolute or relative to the project root: the first folder of
+//! a multi-root workspace, or the folder named by the request's `root`
+//! (index or name) for any command taking `path`, `paths`, `dir`,
+//! `new_path` or `file`. Git commands use the repository of that folder
+//! (default: the first); an absolute `path` of `git_diff`,
+//! `git_apply_hunk`, `git_line_changes`, `git_stage_line_change`,
+//! `git_blame` or `git_shelf_diff` picks the repository of the folder
+//! holding it instead.
 //!
 //! | `cmd` | parameters | result |
 //! |---|---|---|
-//! | `info` | | `root`, `remote`, `location` |
-//! | `list_dir` | `path`? | `[{name, is_dir}]` |
-//! | `list_files` | | root-relative paths |
+//! | `info` | | `root` (the first folder), `roots: [{index, name, path}]`, `workspace_file` (`null` if none), `remote`, `location` |
+//! | `list_dir` | `path`? (default: the folder) | `[{name, is_dir}]` |
+//! | `list_files` | `root`? | folder-relative paths of that folder; without `root`, a multi-root workspace lists every folder's as `[{root, path}]` (`root`: folder index) |
 //! | `read` | `path` | `{text}` |
 //! | `write` | `path`, `text` | `null`; open documents are synced |
 //! | `stat` | `path` | `{kind: "file" \| "dir" \| null}` |
@@ -21,8 +28,8 @@
 //! | `rename_path` | `path`, `new_path` (rename or move; the target must not exist, a folder cannot go into itself) | `{path, edits: [{server, applied, changed, failure}], problems}`: running language servers that registered for `workspace/willRenameFiles` (e.g. rust-analyzer) edit their references first (`problems`: servers that failed or timed out); open documents follow; `didRenameFiles` after |
 //! | `copy_path` | `path`, `dir`? (default: its folder) | `{path}` of the copy: the same name if free in `dir`, else `name copy.ext`, `name copy 2.ext`, … |
 //! | `delete_path` | `path` or `paths`, `trash`? (Recycle Bin, local Windows projects only) | `null`; folders go with their contents, open documents close |
-//! | `search` | `pattern`, `regex`?, `case_sensitive`?, `whole_word`?, `include`?, `exclude`? | `{files, matches, files_searched, limit_hit}` |
-//! | `replace` | `pattern`, `replacement`, `regex`?, `case_sensitive`?, `whole_word`?, `include`?, `exclude`?, `paths`? (only files under these) | `{files: [{path, replacements}], replacements, skipped: [{path, reason}], failed: [{path, error}], limit_hit}`; `$1`/`${name}` expand in regex mode |
+//! | `search` | `pattern`, `regex`?, `case_sensitive`?, `whole_word`?, `include`?, `exclude`? | `{files: [{path, lines: [{line, column, text}]}], matches, files_searched, limit_hit}`; every folder is searched, and in a multi-root workspace files also carry `root` (folder index) and `relative` (folder-relative path) |
+//! | `replace` | `pattern`, `replacement`, `regex`?, `case_sensitive`?, `whole_word`?, `include`?, `exclude`?, `paths`? (only files under these) | `{files: [{path, replacements}], replacements, skipped: [{path, reason}], failed: [{path, error}], limit_hit}` (`files` with `root` and `relative` as for `search`); `$1`/`${name}` expand in regex mode |
 //! | `watch` / `unwatch` | | starts/stops `files_changed` events |
 //! | `open` | `path`, `timeout_ms`? | starts the language server, opens the document: `{language, server, encoding}` |
 //! | `close` | `path` | `null` |
@@ -34,12 +41,13 @@
 //! | `semantic_tokens` | `path` (open) | `[{line, start, end, text, scope, modifiers}]`: the server's tokens as the editor decodes them; `start`/`end` are UTF-8 byte columns, `scope` is the highlight scope (`null`: modifiers only) |
 //! | `signature_help` | `path` (open), `line`, `character` | `null` outside a call, else `{active_signature, active_parameter, signatures: [{label, parameters, active}]}`: `parameters` are the parameters' label texts, `active` the highlighted one's byte range in `label` (as the popover shows it) or `null` |
 //! | `inlay_hints` | `path` (open), `start_line`? (0), `end_line`? (last line) | `[{line, character, label, kind, padding_left, padding_right}]` (LSP position; `kind`: `"type"`, `"parameter"` or `null`) |
+//! | `spell_check` | `path` and/or `text`, `language`? (language id; default: from `path`) | `{misspellings: [{word, start, end, line, column, suggestions}]}`: unknown words as the editor underlines them (`start`/`end` byte offsets, `line`/`column` LSP position), with up to 5 corrections; `text` is checked as the file at `path` (unsaved contents) |
 //! | `rename` | `path` (open), `line`, `character`, `new_name` | `{applied, changed, failure}`: the server's workspace edit, written to disk (open documents synced); `changed` lists edited/created/renamed files, `failure` `{index, path, message}` or `null` |
 //! | `code_actions` | `path` (open), `line`, `character`, `end_line`?, `end_character`? | `[{index, title, kind, preferred}]`, quick fixes first; the diagnostics touching the range are sent along |
 //! | `apply_code_action` | `index` (from the last `code_actions`) | `{applied, changed, failure}` after resolving the action, applying its edit and running its command |
 //! | `format` | `path` | `{text, changed}`: formats like Format Document (settings' `formatter`, else the language server, which needs the file `open`) and writes the file |
 //! | `exec` | `command`, `timeout_ms`? | `{code, stdout, stderr}`; runs in the project root where it lives |
-//! | `git_status` | | `{root, prefix, branch, unborn, upstream, ahead, behind, entries: [{path, orig_path, staged, unstaged}]}` |
+//! | `git_status` | `all`? (every folder's repository) | `{root, prefix, branch, unborn, upstream, ahead, behind, entries: [{path, orig_path, staged, unstaged}]}`; with `all`, `[{root, repository_root, status}]`: one per repository (`root`: the first folder in it) |
 //! | `git_stage` / `git_unstage` / `git_discard` | `paths` (repository-relative) | `null`; discarding deletes untracked files |
 //! | `git_commit` | `message`, `amend`? | `{summary}` (`<hash> <subject>`) |
 //! | `git_diff` | `path` (repository-relative); `staged`?, or `old` (revision) and `new`? (revision or `"worktree"`, the default); `whole_file`? | `{rows, added, removed, binary}`; index diffs come from `git diff` and include `hunk` rows `{index, header}` |
@@ -267,7 +275,25 @@ async fn serve(
             std::process::exit(1);
         }
     };
-    let Ok(session) = cx.new(|cx| Session::new(project, out.clone(), cx)) else {
+    // The user's settings under the workspace file's and the first
+    // folder's `.next_code/settings.json` (read where the project lives).
+    let layering = project.clone();
+    let (settings, problems) = cx
+        .background_spawn(async move {
+            let (user, user_error) = Settings::load();
+            crate::settings::set_current(user);
+            let (settings, layered_error) = layering.layered_settings(None);
+            let problems: Vec<String> = user_error.into_iter().chain(layered_error).collect();
+            (settings, problems)
+        })
+        .await;
+    for problem in problems {
+        out.event(
+            "warning",
+            json!({ "message": format!("Settings ignored: {problem}") }),
+        );
+    }
+    let Ok(session) = cx.new(|cx| Session::new(project, settings, out.clone(), cx)) else {
         return;
     };
     session
@@ -384,6 +410,101 @@ fn path_json(path: &Path) -> Value {
     path.to_string_lossy().into()
 }
 
+/// The folder a request's `root` names (its index, or a folder name or
+/// path); `None` without `root`.
+fn root_param(project: &Project, request: &Value) -> Result<Option<usize>, String> {
+    let count = project.roots().len();
+    match &request["root"] {
+        Value::Null => Ok(None),
+        Value::Number(number) => number
+            .as_u64()
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|&index| index < count)
+            .map(Some)
+            .ok_or_else(|| format!("no folder {number}: the project has {count}")),
+        Value::String(name) => project
+            .root_named(name)
+            .map(Some)
+            .ok_or_else(|| format!("no folder named `{name}`")),
+        other => Err(format!(
+            "`root` must be a folder index or name, not {other}"
+        )),
+    }
+}
+
+/// A file of a search answer: `{path}`, plus its folder's index `root` and
+/// its folder-relative `relative` path in a multi-root workspace.
+fn file_json(project: &Project, path: &Path) -> Value {
+    let mut file = json!({ "path": path_json(path) });
+    if project.is_multi_root()
+        && let Some((root, relative)) = project.relative(path)
+    {
+        file["root"] = root.into();
+        file["relative"] = relative.into();
+    }
+    file
+}
+
+/// The repository of a git request: that of the folder holding `path` when
+/// it is absolute (`path` becomes repository-relative), else of folder
+/// `root`. Blocks.
+fn request_repository(
+    project: &Project,
+    root: usize,
+    path: Option<&mut String>,
+) -> io::Result<git::Repository> {
+    let inside = path
+        .as_deref()
+        .filter(|path| Path::new(path.as_str()).has_root())
+        .and_then(|path| project.relative(Path::new(path.as_str())));
+    let index = inside.as_ref().map_or(root, |(index, _)| *index);
+    let repository = project.repository_in(index)?.ok_or_else(|| {
+        let message = if project.is_multi_root() {
+            format!(
+                "folder `{}` is not in a git repository",
+                project.roots()[index].name
+            )
+        } else {
+            "the project is not in a git repository".to_owned()
+        };
+        io::Error::new(io::ErrorKind::NotFound, message)
+    })?;
+    if let (Some(path), Some((_, relative))) = (path, inside) {
+        *path = format!("{}{relative}", repository.prefix());
+    }
+    Ok(repository)
+}
+
+/// `git_status`: the status with the repository's `root` and the folder's
+/// `prefix` in it. Blocks.
+fn repository_status(repository: &git::Repository) -> io::Result<Value> {
+    let mut status = json!(repository.status()?);
+    status["root"] = repository.root().into();
+    status["prefix"] = repository.prefix().into();
+    Ok(status)
+}
+
+/// `git_status` with `all`: `[{root, repository_root, status}]`, one per
+/// repository (folders sharing one report it once, under the first).
+/// Blocks.
+fn every_repository_status(project: &Project) -> io::Result<Value> {
+    let mut seen = HashSet::new();
+    let mut list = Vec::new();
+    for root in 0..project.roots().len() {
+        let Some(repository) = project.repository_in(root)? else {
+            continue;
+        };
+        if seen.insert(repository.root().to_owned()) {
+            list.push(json!({
+                "root": root,
+                "repository_root": repository.root(),
+                "status": repository_status(&repository)?,
+            }));
+        }
+    }
+    Ok(Value::Array(list))
+}
+
 /// A request's string array `name` (missing: empty).
 fn strings(request: &Value, name: &str) -> Vec<String> {
     request[name]
@@ -424,19 +545,12 @@ fn status_text(status: &ServerStatus) -> String {
 }
 
 impl Session {
-    fn new(project: Project, out: Out, cx: &mut Context<Self>) -> Self {
-        let (settings, settings_error) = Settings::load();
-        if let Some(error) = settings_error {
-            out.event(
-                "warning",
-                json!({ "message": format!("Settings ignored: {error}") }),
-            );
-        }
+    fn new(project: Project, settings: Arc<Settings>, out: Out, cx: &mut Context<Self>) -> Self {
         let ports = cx.new(|cx| crate::ports::Ports::new(project.clone(), &settings.ports, cx));
         let ports_subscription = cx.subscribe(&ports, |this, _, event, _| {
             this.on_ports_event(event);
         });
-        let store = cx.new(|_| LspStore::new(project.clone(), Arc::new(settings)));
+        let store = cx.new(|_| LspStore::new(project.clone(), settings));
         let workflows = cx.new(|cx| {
             crate::workflows::Workflows::new(
                 Box::new(workflows::HeadlessHost::new(project.clone())),
@@ -493,7 +607,8 @@ impl Session {
                 );
             }
             &LspStoreEvent::StatusChanged(language) => {
-                if let Some((name, status)) = store.read(cx).status(language) {
+                // Servers of other folders report as the first folder's.
+                if let Some((name, status)) = store.read(cx).status(language, self.project.root()) {
                     self.out.event(
                         "server_status",
                         json!({
@@ -504,12 +619,18 @@ impl Session {
                     );
                 }
             }
-            // A restarted server must learn about the open documents again.
-            &LspStoreEvent::ServerStarted(language) => {
-                let server = store.update(cx, |store, cx| store.server(language, cx));
-                if let Some(server) = server {
-                    for document in self.documents.values().filter(|d| d.language == language) {
-                        did_open(&server, document);
+            // A restarted server must learn about its open documents again.
+            LspStoreEvent::ServerStarted(language, started) => {
+                let paths: Vec<PathBuf> = self
+                    .documents
+                    .iter()
+                    .filter(|(_, document)| document.language == *language)
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                for path in paths {
+                    let server = store.update(cx, |store, cx| store.server(*language, &path, cx));
+                    if server.is_some_and(|server| Arc::ptr_eq(&server, started)) {
+                        did_open(started, &self.documents[&path]);
                     }
                 }
             }
@@ -535,29 +656,64 @@ impl Session {
             self.out.reply(&id, Err("missing `cmd`".into()));
             return false;
         };
+        if let Err(err) = root_param(&self.project, &request) {
+            self.out.reply(&id, Err(err));
+            return false;
+        }
         match cmd {
-            "info" => self.out.reply(
-                &id,
-                Ok(json!({
-                    "root": path_json(self.project.root()),
-                    "remote": self.project.is_remote(),
-                    "location": self.project.location().to_string(),
-                })),
-            ),
+            "info" => {
+                let roots: Vec<Value> = self
+                    .project
+                    .roots()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, root)| {
+                        json!({ "index": index, "name": root.name, "path": path_json(&root.path) })
+                    })
+                    .collect();
+                self.out.reply(
+                    &id,
+                    Ok(json!({
+                        "root": path_json(self.project.root()),
+                        "roots": roots,
+                        "workspace_file": self.project.workspace_file(),
+                        "remote": self.project.is_remote(),
+                        "location": self.project.location().to_string(),
+                    })),
+                )
+            }
             "list_dir" => {
                 let path = request["path"].as_str().map_or_else(
-                    || self.project.root().to_path_buf(),
-                    |p| self.project.path(p),
+                    || self.project.roots()[self.root(&request)].path.clone(),
+                    |p| self.path(&request, p),
                 );
                 self.blocking(id, cx, move |project| {
                     let entries = project.read_dir(&path)?;
                     Ok(json!(entries))
                 });
             }
-            "list_files" => self.blocking(id, cx, |project| Ok(json!(project.list_files()?))),
+            "list_files" => {
+                let root = root_param(&self.project, &request).ok().flatten();
+                self.blocking(id, cx, move |project| {
+                    if root.is_some() || !project.is_multi_root() {
+                        return Ok(json!(project.list_files(root.unwrap_or(0))?));
+                    }
+                    // Every folder's files, labelled with the folder.
+                    let mut files = Vec::new();
+                    for root in 0..project.roots().len() {
+                        files.extend(
+                            project
+                                .list_files(root)?
+                                .into_iter()
+                                .map(|path| json!({ "root": root, "path": path })),
+                        );
+                    }
+                    Ok(Value::Array(files))
+                });
+            }
             "read" => match param_str(&request, "path") {
                 Ok(path) => {
-                    let path = self.project.path(path);
+                    let path = self.path(&request, path);
                     self.blocking(id, cx, move |project| {
                         Ok(json!({ "text": project.read_text(&path)? }))
                     });
@@ -566,7 +722,7 @@ impl Session {
             },
             "stat" => match param_str(&request, "path") {
                 Ok(path) => {
-                    let path = self.project.path(path);
+                    let path = self.path(&request, path);
                     self.blocking(id, cx, move |project| {
                         let kind = match project.kind(&path)? {
                             Some(FileKind::File) => json!("file"),
@@ -592,9 +748,9 @@ impl Session {
             "open" => self.open(id, &request, cx),
             "close" => match param_str(&request, "path") {
                 Ok(path) => {
-                    let path = self.project.path(path);
+                    let path = self.path(&request, path);
                     if let Some(document) = self.documents.remove(&path)
-                        && let Some(server) = self.running(document.language, cx)
+                        && let Some(server) = self.running(document.language, &path, cx)
                     {
                         server
                             .connection
@@ -622,6 +778,7 @@ impl Session {
             "workspace_symbols" => self.workspace_symbols(id, &request, cx),
             "signature_help" => self.signature_help(id, &request, cx),
             "inlay_hints" => self.inlay_hints(id, &request, cx),
+            "spell_check" => self.spell_check(id, &request, cx),
             "exec" => match param_str(&request, "command") {
                 Ok(command) => {
                     let command = command.to_owned();
@@ -662,7 +819,8 @@ impl Session {
         false
     }
 
-    /// `git_*` commands, run against the repository containing the project.
+    /// `git_*` commands, run against the repository of the request's
+    /// folder (see [`request_repository`]).
     fn git(&self, id: Value, command: &str, request: &Value, cx: &mut Context<Self>) {
         let paths: Vec<String> = request["paths"]
             .as_array()
@@ -671,7 +829,18 @@ impl Session {
             .filter_map(|path| path.as_str().map(str::to_owned))
             .collect();
         let message = request["message"].as_str().unwrap_or_default().to_owned();
-        let path = request["path"].as_str().map(str::to_owned);
+        let mut path = request["path"].as_str().map(str::to_owned);
+        let root = self.root(request);
+        let every_repository = command == "git_status" && request["all"].as_bool().unwrap_or(false);
+        // Commands whose `path` is repository-relative (else a folder).
+        let repository_path = matches!(
+            command,
+            "git_diff"
+                | "git_apply_hunk"
+                | "git_line_changes"
+                | "git_stage_line_change"
+                | "git_blame"
+        );
         let staged = request["staged"].as_bool().unwrap_or(false);
         let context = if request["whole_file"].as_bool().unwrap_or(false) {
             git::FULL_FILE
@@ -731,12 +900,11 @@ impl Session {
         let line_change = request["change"].as_u64().map(|change| change as usize);
         let command = command.to_owned();
         self.blocking(id, cx, move |project| {
-            let repository = project.repository()?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "the project is not in a git repository",
-                )
-            })?;
+            if every_repository {
+                return every_repository_status(project);
+            }
+            let repository =
+                request_repository(project, root, path.as_mut().filter(|_| repository_path))?;
             let missing = |name: &str| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -754,12 +922,7 @@ impl Session {
                     })
             };
             match command.as_str() {
-                "git_status" => {
-                    let mut status = json!(repository.status()?);
-                    status["root"] = repository.root().into();
-                    status["prefix"] = repository.prefix().into();
-                    Ok(status)
-                }
+                "git_status" => repository_status(&repository),
                 "git_stage" => repository.stage(&paths).map(|()| Value::Null),
                 "git_unstage" => repository.unstage(&paths).map(|()| Value::Null),
                 "git_discard" => {
@@ -1096,7 +1259,8 @@ impl Session {
         );
         let index = request["index"].as_u64().map(|index| index as usize);
         let shelf = request["shelf"].as_str().map(str::to_owned);
-        let path = request["path"].as_str().map(str::to_owned);
+        let mut path = request["path"].as_str().map(str::to_owned);
+        let root = self.root(request);
         let context = if flag("whole_file") {
             git::FULL_FILE
         } else {
@@ -1104,12 +1268,7 @@ impl Session {
         };
         let command = command.to_owned();
         self.blocking(id, cx, move |project| {
-            let repository = project.repository()?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "the project is not in a git repository",
-                )
-            })?;
+            let repository = request_repository(project, root, path.as_mut())?;
             let missing = |name: &str| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1166,7 +1325,7 @@ impl Session {
             text("name"),
             text("requirement"),
             text("version"),
-            text("path"),
+            text("path").map(|path| self.path(request, &path)),
         );
         let kind = match (text("group"), text("optional")) {
             (Some(group), _) => python::DependencyKind::Group(group),
@@ -1186,7 +1345,7 @@ impl Session {
             if command == "python_test_at" {
                 let path = path.ok_or_else(|| missing("path"))?;
                 let line = line.ok_or_else(|| missing("line"))?;
-                let text = project.read_text(&project.path(&path))?;
+                let text = project.read_text(&path)?;
                 return Ok(json!(python::test_at(&text, line)));
             }
             let info = crate::python_panel::load(project)?;
@@ -1273,9 +1432,30 @@ impl Session {
         .detach();
     }
 
-    fn running(&self, language: Language, cx: &mut Context<Self>) -> Option<Arc<RunningServer>> {
+    /// The folder the request's `root` names (checked in `handle`), else
+    /// the first.
+    fn root(&self, request: &Value) -> usize {
+        root_param(&self.project, request)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    /// A path parameter of the request: absolute as is, else relative to
+    /// the request's folder (see [`Session::root`]).
+    fn path(&self, request: &Value, input: &str) -> PathBuf {
+        self.project.path_in(self.root(request), input)
+    }
+
+    /// The server serving the open document `path`.
+    fn running(
+        &self,
+        language: Language,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<RunningServer>> {
         self.store
-            .update(cx, |store, cx| store.server(language, cx))
+            .update(cx, |store, cx| store.server(language, path, cx))
     }
 
     /// The open document the request's `path` names and its running
@@ -1287,7 +1467,7 @@ impl Session {
         cx: &mut Context<Self>,
     ) -> Option<OpenDocument> {
         let path = match param_str(request, "path") {
-            Ok(path) => self.project.path(path),
+            Ok(path) => self.path(request, path),
             Err(err) => {
                 self.out.reply(id, Err(err));
                 return None;
@@ -1305,7 +1485,7 @@ impl Session {
             document.text.clone(),
             document.language,
         );
-        let Some(server) = self.running(language, cx) else {
+        let Some(server) = self.running(language, &path, cx) else {
             self.out
                 .reply(id, Err("the language server is not running".into()));
             return None;
@@ -1339,7 +1519,7 @@ impl Session {
 
     fn write(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
         let (path, text) = match (param_str(request, "path"), param_str(request, "text")) {
-            (Ok(path), Ok(text)) => (self.project.path(path), text.to_owned()),
+            (Ok(path), Ok(text)) => (self.path(request, path), text.to_owned()),
             (Err(err), _) | (_, Err(err)) => return self.out.reply(&id, Err(err)),
         };
         let project = self.project.clone();
@@ -1365,7 +1545,7 @@ impl Session {
         let Some(language) = self.documents.get(path).map(|document| document.language) else {
             return;
         };
-        let server = self.running(language, cx);
+        let server = self.running(language, path, cx);
         let Some(document) = self.documents.get_mut(path) else {
             return;
         };
@@ -1407,14 +1587,21 @@ impl Session {
             let mut files = Vec::new();
             while let Some(event) = events.next().await {
                 match event {
-                    SearchEvent::File(file) => files.push(json!({
-                        "path": path_json(&file.path),
-                        "lines": file.lines.iter().map(|line| json!({
-                            "line": line.line,
-                            "column": line.column,
-                            "text": line.text,
-                        })).collect::<Vec<_>>(),
-                    })),
+                    SearchEvent::File(file) => {
+                        let mut found = file_json(&project, &file.path);
+                        found["lines"] = file
+                            .lines
+                            .iter()
+                            .map(|line| {
+                                json!({
+                                    "line": line.line,
+                                    "column": line.column,
+                                    "text": line.text,
+                                })
+                            })
+                            .collect();
+                        files.push(found);
+                    }
                     SearchEvent::Done {
                         files_searched,
                         matches,
@@ -1449,6 +1636,10 @@ impl Session {
             while let Some(batch) = batches.next().await {
                 let alive = this.update(cx, |this, cx| {
                     this.store.read(cx).notify_file_changes(&batch.events);
+                    // `tests_*` read a folder's settings again once it changed.
+                    this.project.folder_settings_changed(
+                        batch.events.iter().map(|event| event.path.as_path()),
+                    );
                     let changes: Vec<Value> = batch
                         .events
                         .iter()
@@ -1481,7 +1672,7 @@ impl Session {
 
     fn open(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
         let path = match param_str(request, "path") {
-            Ok(path) => self.project.path(path),
+            Ok(path) => self.path(request, path),
             Err(err) => return self.out.reply(&id, Err(err)),
         };
         let Some(language) = Language::from_path(&path) else {
@@ -1512,8 +1703,8 @@ impl Session {
             let deadline = Instant::now() + timeout;
             loop {
                 let Ok(step) = this.update(cx, |this, cx| {
-                    let server = this.running(language, cx);
-                    let status = this.store.read(cx).status(language);
+                    let server = this.running(language, &path, cx);
+                    let status = this.store.read(cx).status(language, &path);
                     (server, status)
                 }) else {
                     return;
@@ -1574,21 +1765,30 @@ impl Session {
     /// long) until the file's server published for it and has been idle for
     /// [`SETTLE`]: servers often publish an empty list before checking.
     fn diagnostics(&self, id: Value, request: &Value, cx: &mut Context<Self>) {
-        let path = request["path"].as_str().map(|path| self.project.path(path));
+        let path = request["path"]
+            .as_str()
+            .map(|path| self.path(request, path));
         let wait = millis(request, "wait_ms", Duration::ZERO);
         cx.spawn(async move |this, cx| {
             let deadline = Instant::now() + wait;
             let mut settled_since: Option<Instant> = None;
             loop {
                 let Ok(settled) = this.update(cx, |this, cx| {
-                    let languages: Vec<Language> = match &path {
-                        Some(path) => Language::from_path(path).into_iter().collect(),
-                        None => this.documents.values().map(|d| d.language).collect(),
+                    let documents: Vec<(Language, &Path)> = match &path {
+                        Some(path) => Language::from_path(path)
+                            .map(|language| (language, path.as_path()))
+                            .into_iter()
+                            .collect(),
+                        None => this
+                            .documents
+                            .iter()
+                            .map(|(path, d)| (d.language, path.as_path()))
+                            .collect(),
                     };
                     let store = this.store.read(cx);
-                    let idle = languages.iter().all(|&language| {
+                    let idle = documents.iter().all(|&(language, path)| {
                         !matches!(
-                            store.status(language),
+                            store.status(language, path),
                             Some((_, ServerStatus::Starting | ServerStatus::Busy(_)))
                         )
                     });
@@ -1789,6 +1989,51 @@ impl Session {
         self.reply_request::<SignatureHelpRequest>(id, document.server, params, map, cx);
     }
 
+    /// Unknown words of `text` or of the file at `path` (the text is
+    /// checked as that file: Markdown, prose or code by its language;
+    /// `language` overrides it), with corrections.
+    fn spell_check(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
+        let path = request["path"]
+            .as_str()
+            .map(|path| self.path(request, path));
+        let text = request["text"].as_str().map(str::to_owned);
+        let language = match request["language"].as_str() {
+            Some(name) => match Language::ALL
+                .into_iter()
+                .find(|language| language.id() == name)
+            {
+                Some(language) => Some(language),
+                None => {
+                    return self
+                        .out
+                        .reply(&id, Err(format!("unknown language `{name}`")));
+                }
+            },
+            None => path.as_deref().and_then(Language::from_path),
+        };
+        self.blocking(id, cx, move |project| {
+            let text = match (text, &path) {
+                (Some(text), _) => text,
+                (None, Some(path)) => project.read_text(path)?,
+                (None, None) => {
+                    return Err(io::Error::other(
+                        "missing string parameter `path` or `text`",
+                    ));
+                }
+            };
+            let settings = project.settings_for(path.as_deref());
+            let misspellings = crate::editor::spell::check_document(
+                Some(project),
+                path.as_deref(),
+                &text,
+                language,
+                &settings,
+            )
+            .map_err(io::Error::other)?;
+            Ok(json!({ "misspellings": misspellings }))
+        });
+    }
+
     /// Inlay hints of a line range (default: the whole document).
     fn inlay_hints(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
         let Some(document) = self.document(&id, request, cx) else {
@@ -1893,7 +2138,7 @@ impl Session {
             .read(cx)
             .running_servers()
             .into_iter()
-            .map(|(_, server)| server)
+            .map(|(_, _, server)| server)
             .filter(|server| {
                 server
                     .capabilities
@@ -1963,7 +2208,7 @@ impl Session {
 
     fn semantic_tokens(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
         let path = match param_str(request, "path") {
-            Ok(path) => self.project.path(path),
+            Ok(path) => self.path(request, path),
             Err(err) => return self.out.reply(&id, Err(err)),
         };
         let Some(document) = self.documents.get(&path) else {
@@ -1974,7 +2219,7 @@ impl Session {
         };
         let params = semantic::params(document.uri.clone());
         let buffer = text::Buffer::new(&document.text);
-        let Some(server) = self.running(document.language, cx) else {
+        let Some(server) = self.running(document.language, &path, cx) else {
             return self
                 .out
                 .reply(&id, Err("the language server is not running".into()));

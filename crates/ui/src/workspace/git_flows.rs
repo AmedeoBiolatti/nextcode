@@ -2,6 +2,11 @@
 //! from the title bar's branch widget), its branch commands, the New
 //! Branch / Rename / Checkout Revision dialogs, the Push dialog and Update
 //! Project.
+//!
+//! With several repositories (folders of a multi-root project), commands
+//! act on the active editor's file's repository, else the first one; the
+//! branches popup acts on the repository it shows; Update Project updates
+//! them all.
 
 use std::io;
 
@@ -34,7 +39,8 @@ pub(super) struct BranchesPopupState {
 
 /// What the title bar's branch widget shows.
 pub struct BranchWidget {
-    /// The branch, or a short commit id when detached.
+    /// The branch, or a short commit id when detached; with several
+    /// repositories prefixed with the repository (`api: main`).
     pub label: SharedString,
     pub ahead: u32,
     pub behind: u32,
@@ -55,7 +61,9 @@ impl Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &CheckoutRevision, window, cx| {
-                this.checkout_revision_dialog(window, cx)
+                if let Some(repository) = this.repository_or_notice(cx) {
+                    this.checkout_revision_dialog(repository, window, cx)
+                }
             }))
             .on_action(cx.listener(|this, _: &Update, _, cx| this.update_project(cx)))
             .on_action(cx.listener(|this, _: &Rollback, window, cx| {
@@ -65,16 +73,32 @@ impl Workspace {
             }))
     }
 
-    /// The branch widget's content, once the repository is read.
+    /// The active tab's file (diff tabs: the file they compare).
+    fn active_path(&self) -> Option<&Path> {
+        self.active_tab().map(|tab| tab.path.as_path())
+    }
+
+    /// The repository git commands act on (PyCharm's): the active
+    /// editor's file's, else the first one; `None` until status is read.
+    pub(super) fn active_repository(&self, cx: &App) -> Option<Repository> {
+        let commit = self.commit.read(cx);
+        let repo = commit.active_repo(self.active_path())?;
+        Some(repo.repository().clone())
+    }
+
+    /// The branch widget's content, once status is read: the active
+    /// repository's branch.
     pub fn branch_widget(&self, cx: &App) -> Option<BranchWidget> {
         let commit = self.commit.read(cx);
-        let status = commit.status()?;
-        let label = match (&status.branch, &status.head) {
-            (Some(branch), _) => branch.clone(),
-            (None, Some(head)) => commit_panel::short_revision(head).to_owned(),
-            (None, None) => "HEAD".to_owned(),
+        let repo = commit.active_repo(self.active_path())?;
+        let status = repo.status();
+        let branch = commit_panel::branch_label(status);
+        let label = if commit.repos().len() > 1 {
+            format!("{}: {branch}", repo.name())
+        } else {
+            branch
         };
-        let operation = match commit.operation() {
+        let operation = match repo.operation() {
             git::OperationState::None => None,
             git::OperationState::Merging => Some("Merging"),
             git::OperationState::Rebasing => Some("Rebasing"),
@@ -93,7 +117,8 @@ impl Workspace {
         self.open_branches_popup_at(None, window, cx);
     }
 
-    /// Opens (or, if open, closes) the branches popup below `position`.
+    /// Opens (or, if open, closes) the branches popup below `position`,
+    /// showing the active repository (others a click away).
     pub fn open_branches_popup_at(
         &mut self,
         position: Option<Point<Pixels>>,
@@ -104,16 +129,27 @@ impl Workspace {
             self.focus_active(window, cx);
             return cx.notify();
         }
-        let Some(repository) = self.repository_or_notice(cx) else {
+        if self.repository_or_notice(cx).is_none() {
             return;
-        };
-        let popup = cx.new(|cx| BranchesPopup::new(repository, window, cx));
+        }
+        let commit = self.commit.read(cx);
+        let repositories: Vec<Repository> = commit
+            .repos()
+            .iter()
+            .map(|repo| repo.repository().clone())
+            .collect();
+        let active = self
+            .active_path()
+            .and_then(|path| commit.repo_index_for(path))
+            .unwrap_or(0);
+        let popup = cx.new(|cx| BranchesPopup::new(repositories, active, window, cx));
         let subscription = cx.subscribe_in(&popup, window, |this, _, event, window, cx| {
             this.branches_popup = None;
             match event {
-                BranchesPopupEvent::Run(command) => {
-                    this.run_popup_command(command.clone(), window, cx)
-                }
+                BranchesPopupEvent::Run {
+                    repository,
+                    command,
+                } => this.run_popup_command(repository.clone(), command.clone(), window, cx),
                 BranchesPopupEvent::Dismissed => this.focus_active(window, cx),
             }
             cx.notify();
@@ -145,21 +181,25 @@ impl Workspace {
         })
     }
 
-    fn current_branch(&self, cx: &App) -> Option<String> {
-        self.commit.read(cx).status()?.branch.clone()
+    /// `repository`'s checked-out branch, as its last status read it.
+    fn branch_of(&self, repository: &Repository, cx: &App) -> Option<String> {
+        self.commit
+            .read(cx)
+            .repo_of(repository)?
+            .status()
+            .branch
+            .clone()
     }
 
     fn run_popup_command(
         &mut self,
+        repository: Repository,
         command: PopupCommand,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(repository) = self.repository_or_notice(cx) else {
-            return;
-        };
         self.focus_active(window, cx);
-        let current = self.current_branch(cx);
+        let current = self.branch_of(&repository, cx);
         match command {
             PopupCommand::UpdateProject => self.update_project(cx),
             PopupCommand::Commit => {
@@ -174,10 +214,11 @@ impl Workspace {
             }
             PopupCommand::Push(branch) => self.open_push_dialog_for(repository, branch, window, cx),
             PopupCommand::NewBranch(start) => self.new_branch_dialog(repository, start, window, cx),
-            PopupCommand::CheckoutRevision => self.checkout_revision_dialog(window, cx),
+            PopupCommand::CheckoutRevision => self.checkout_revision_dialog(repository, window, cx),
             PopupCommand::Checkout(branch) => {
                 let done = format!("Checked out {}", branch.name);
                 self.run_git(
+                    repository,
                     done,
                     move |repo| repo.switch_branch(&branch).map(|()| None),
                     cx,
@@ -188,6 +229,7 @@ impl Workspace {
                     return;
                 };
                 self.run_git_outcome(
+                    repository,
                     format!("Rebased {branch} onto {onto}"),
                     move |repo| repo.rebase(&onto, Some(&branch)),
                     cx,
@@ -203,17 +245,18 @@ impl Workspace {
             }
             PopupCommand::RebaseOnto(branch) => {
                 let what = format!("Rebased {} onto {branch}", current.unwrap_or_default());
-                self.run_git_outcome(what, move |repo| repo.rebase(&branch, None), cx);
+                self.run_git_outcome(repository, what, move |repo| repo.rebase(&branch, None), cx);
             }
             PopupCommand::Merge(branch) => {
                 let what = format!("Merged {branch} into {}", current.unwrap_or_default());
-                self.run_git_outcome(what, move |repo| repo.merge(&branch), cx);
+                self.run_git_outcome(repository, what, move |repo| repo.merge(&branch), cx);
             }
             PopupCommand::Update(branch) => {
                 if current.as_deref() == Some(branch.as_str()) {
                     self.update_project(cx);
                 } else {
                     self.run_git(
+                        repository,
                         format!("Updated {branch}"),
                         move |repo| repo.update_branch(&branch).map(|()| None),
                         cx,
@@ -237,6 +280,7 @@ impl Workspace {
                     move |this, name, _, _, cx| {
                         let old = branch.clone();
                         this.run_git(
+                            repository.clone(),
                             format!("Renamed {old} to {name}"),
                             move |repo| repo.rename_branch(&old, &name).map(|()| None),
                             cx,
@@ -274,6 +318,7 @@ impl Workspace {
                 }
                 this.update(cx, |this, cx| {
                     this.run_git(
+                        repository,
                         format!("Deleted remote branch {name}"),
                         move |repo| repo.delete_remote_branch(&name).map(|()| None),
                         cx,
@@ -323,6 +368,7 @@ impl Workspace {
             }
             this.update(cx, |this, cx| {
                 this.run_git(
+                    repository,
                     format!("Deleted branch {name}"),
                     move |repo| repo.delete_branch(&name, true).map(|()| None),
                     cx,
@@ -334,20 +380,71 @@ impl Workspace {
     }
 
     /// Update Project: fetch, then merge or rebase the upstream
-    /// (`git.update_method`).
+    /// (`git.update_method`), in every repository.
     pub(super) fn update_project(&mut self, cx: &mut Context<Self>) {
-        let rebase = settings::current().git.update_method == UpdateMethod::Rebase;
-        self.run_git_outcome(
-            "Project updated".into(),
-            move |repo| repo.update(rebase),
-            cx,
-        );
-    }
-
-    fn checkout_revision_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.repository_or_notice(cx).is_none() {
             return;
         }
+        let rebase = settings::current().git.update_method == UpdateMethod::Rebase;
+        let repositories: Vec<Repository> = self
+            .commit
+            .read(cx)
+            .repos()
+            .iter()
+            .map(|repo| repo.repository().clone())
+            .collect();
+        let several = repositories.len() > 1;
+        cx.spawn(async move |this, cx| {
+            let results: Vec<(String, io::Result<Outcome>)> = cx
+                .background_spawn(async move {
+                    repositories
+                        .iter()
+                        .map(|repository| {
+                            let name = commit_panel::repository_name(repository).to_owned();
+                            (name, repository.update(rebase))
+                        })
+                        .collect()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let (mut lines, mut errors, mut conflicts) = (Vec::new(), Vec::new(), false);
+                for (name, result) in results {
+                    let prefix = if several {
+                        format!("{name}: ")
+                    } else {
+                        String::new()
+                    };
+                    match result {
+                        Ok(Outcome::Done) => lines.push(format!("{prefix}Project updated")),
+                        Ok(Outcome::Conflicts) => {
+                            conflicts = true;
+                            lines.push(format!(
+                                "{prefix}Stopped on conflicts: resolve them under Merge Conflicts"
+                            ));
+                        }
+                        Err(err) => errors.push(format!("{prefix}{err}")),
+                    }
+                }
+                if !errors.is_empty() {
+                    errors.extend(lines);
+                    return this.git_failed(errors.join("; "), cx);
+                }
+                if conflicts {
+                    this.show_panel(PanelId::Commit, cx);
+                }
+                this.repository_changed(Some(lines.join("; ")), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn checkout_revision_dialog(
+        &mut self,
+        repository: Repository,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let dialog = cx.new(|cx| {
             InputDialog::new(
                 "Checkout Tag or Revision",
@@ -361,8 +458,9 @@ impl Workspace {
         });
         self.open_input_dialog(
             dialog,
-            |this, revision, _, _, cx| {
+            move |this, revision, _, _, cx| {
                 this.run_git(
+                    repository.clone(),
                     format!("Checked out {revision} (detached HEAD)"),
                     move |repo| {
                         let id = repo.resolve(&revision)?;
@@ -402,7 +500,6 @@ impl Workspace {
                 cx,
             )
         });
-        let _ = repository;
         self.open_input_dialog(
             dialog,
             move |this, name, checkout, _, cx| {
@@ -413,6 +510,7 @@ impl Workspace {
                     format!("Created branch {name}")
                 };
                 this.run_git(
+                    repository.clone(),
                     done,
                     move |repo| {
                         repo.create_branch(&name, start.as_deref(), checkout)
@@ -449,14 +547,14 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The Push dialog for the current branch.
+    /// The Push dialog for `repository`'s current branch.
     pub(super) fn open_push_dialog(
         &mut self,
         repository: Repository,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.current_branch(cx) {
+        match self.branch_of(&repository, cx) {
             Some(branch) => self.open_push_dialog_for(repository, branch, window, cx),
             None => {
                 self.notice = Some("Cannot push a detached HEAD; create a branch first".into());
@@ -465,6 +563,8 @@ impl Workspace {
         }
     }
 
+    /// The Push dialog; once it closes, the next repository Commit and
+    /// Push committed in (see [`CommitPanel::next_push`]) gets its own.
     fn open_push_dialog_for(
         &mut self,
         repository: Repository,
@@ -479,6 +579,9 @@ impl Workspace {
             if let PushDialogEvent::Pushed(message) = event {
                 this.repository_changed(Some(message.clone()), cx);
             }
+            if let Some(next) = this.commit.update(cx, |commit, _| commit.next_push()) {
+                this.open_push_dialog(next, window, cx);
+            }
             cx.notify();
         });
         window.focus(&dialog.focus_handle(cx));
@@ -486,16 +589,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Runs a git operation in the background, then re-reads git state
-    /// and reports `done` (or the operation's own message) in the Commit
-    /// window; failures are reported there too.
+    /// Runs a git operation on `repository` in the background, then
+    /// re-reads git state and reports `done` (or the operation's own
+    /// message) in the Commit window; failures are reported there too.
     pub(super) fn run_git(
         &mut self,
+        repository: Repository,
         done: String,
         operation: impl FnOnce(&Repository) -> io::Result<Option<String>> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
         self.run_git_with(
+            repository,
             move |repo| Ok((operation(repo)?.unwrap_or(done), false)),
             cx,
         );
@@ -505,11 +610,13 @@ impl Workspace {
     /// they are listed under Merge Conflicts.
     fn run_git_outcome(
         &mut self,
+        repository: Repository,
         done: String,
         operation: impl FnOnce(&Repository) -> io::Result<Outcome> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
         self.run_git_with(
+            repository,
             move |repo| {
                 Ok(match operation(repo)? {
                     Outcome::Done => (done, false),
@@ -525,12 +632,10 @@ impl Workspace {
 
     fn run_git_with(
         &mut self,
+        repository: Repository,
         operation: impl FnOnce(&Repository) -> io::Result<(String, bool)> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
-        let Some(repository) = self.repository_or_notice(cx) else {
-            return;
-        };
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { operation(&repository) })
@@ -556,5 +661,59 @@ impl Workspace {
         self.repository_changed(None, cx);
         self.commit
             .update(cx, |commit, cx| commit.report_error(error, cx));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+
+    use super::*;
+    use crate::commit_panel::test_support;
+
+    #[gpui::test]
+    fn the_branch_widget_shows_the_active_files_repository(cx: &mut TestAppContext) {
+        let (dir, project) = test_support::three_folders("branch_widget");
+        cx.update(|cx| {
+            crate::editor::bind_keys(cx);
+            super::super::bind_keys(cx);
+        });
+        let window = cx.add_window(|window, cx| Workspace::new(project, None, window, cx));
+        cx.run_until_parked();
+        let label = |cx: &mut TestAppContext| {
+            window
+                .read_with(cx, |workspace, cx| {
+                    workspace
+                        .branch_widget(cx)
+                        .map(|widget| widget.label.to_string())
+                })
+                .unwrap()
+        };
+        // No editor: the first repository.
+        assert_eq!(label(cx).as_deref(), Some("api: main"));
+        for (file, expected) in [
+            ("web/a.txt", "web: dev"),
+            ("api/a.txt", "api: main"),
+            // A folder without a repository falls back to the first one.
+            ("docs/notes.txt", "api: main"),
+        ] {
+            window
+                .update(cx, |workspace, window, cx| {
+                    workspace.open(&dir.join(file), window, cx)
+                })
+                .unwrap();
+            cx.run_until_parked();
+            assert_eq!(label(cx).as_deref(), Some(expected), "{file}");
+        }
+        window
+            .read_with(cx, |workspace, cx| {
+                let repository = workspace.active_repository(cx).unwrap();
+                assert_eq!(commit_panel::repository_name(&repository), "api");
+            })
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        if let Some(state) = crate::layout::state_root() {
+            std::fs::remove_dir_all(state).ok();
+        }
     }
 }

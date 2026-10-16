@@ -49,6 +49,7 @@ impl Workspace {
                 self.terminal
                     .update(cx, |terminal, cx| terminal.new_terminal_in(dir, window, cx));
             }
+            FileTreeEvent::RemoveFolder(index) => self.remove_folder(*index, cx),
             FileTreeEvent::Notice(message) => self.file_notice(message.clone(), cx),
         }
     }
@@ -68,17 +69,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let store = self.lsp_store.read(cx);
-        let servers: Vec<(SharedString, Arc<RunningServer>)> = store
+        let servers: Vec<(SharedString, Arc<RunningServer>)> = self
+            .lsp_store
+            .read(cx)
             .running_servers()
             .into_iter()
-            .map(|(language, server)| {
-                let name = store
-                    .status(language)
-                    .map(|(name, _)| name)
-                    .unwrap_or_else(|| language.id().into());
-                (name, server)
-            })
+            .map(|(_, name, server)| (name, server))
             .collect();
         let project = self.project.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -144,12 +140,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let root = self.project.root().to_path_buf();
         let mut updates = Vec::new();
         for (name, encoding, edit) in edits {
             let report = self.apply_workspace_edit(edit, encoding, cx);
             if report.failure.is_some() {
-                problems.push(report.summary(&format!("{name}'s rename edits"), &root));
+                problems.push(report.summary(&format!("{name}'s rename edits"), &self.project));
             } else if !report.changed.is_empty() {
                 let files = match report.changed.len() {
                     1 => "1 file".to_owned(),
@@ -185,11 +180,7 @@ impl Workspace {
                         Ok(()) => done.push(file_move),
                         Err(err) => problems.push(format!(
                             "Could not move {}: {err}",
-                            file_move
-                                .0
-                                .strip_prefix(&root)
-                                .unwrap_or(&file_move.0)
-                                .display()
+                            shown_path(&this.project, &file_move.0)
                         )),
                     }
                 }
@@ -232,13 +223,7 @@ impl Workspace {
         if paths.is_empty() {
             return;
         }
-        let root = self.project.root().to_path_buf();
-        let shown = |path: &Path| {
-            path.strip_prefix(&root)
-                .unwrap_or(path)
-                .display()
-                .to_string()
-        };
+        let shown = |path: &Path| shown_path(&self.project, path);
         let message = match paths.as_slice() {
             [path] => format!("Delete `{}`?", shown(path)),
             _ => format!("Delete {} items?", paths.len()),
@@ -350,6 +335,18 @@ impl Workspace {
             self.remove_tab(pane, index, window, cx);
         }
     }
+}
+
+/// How file prompts name `path`: relative to its folder, after the
+/// folder's name in multi-folder projects (`api › src/main.py`).
+fn shown_path(project: &crate::project::Project, path: &Path) -> String {
+    if project.is_multi_root() {
+        return project.display_path(path);
+    }
+    path.strip_prefix(project.root())
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 #[cfg(test)]

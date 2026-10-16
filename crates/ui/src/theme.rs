@@ -25,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::SystemTime,
 };
@@ -648,32 +648,6 @@ static LOADED: Mutex<Option<Loaded>> = Mutex::new(None);
 static SEMANTIC_HIGHLIGHTING: AtomicBool = AtomicBool::new(true);
 /// `"auto_close_brackets"` from `settings.json` as of the last refresh.
 static AUTO_CLOSE_BRACKETS: AtomicBool = AtomicBool::new(true);
-/// `"word_wrap"` per language as of the last refresh: bit 0 for plain
-/// text, bit `i + 1` for `Language::ALL[i]`.
-static WORD_WRAP: LazyLock<AtomicU32> =
-    LazyLock::new(|| AtomicU32::new(language_mask(&Settings::default(), Settings::word_wrap)));
-/// `"inlay_hints"` per language, like [`WORD_WRAP`].
-static INLAY_HINTS: LazyLock<AtomicU32> =
-    LazyLock::new(|| AtomicU32::new(language_mask(&Settings::default(), Settings::inlay_hints)));
-
-/// A per-language setting as bits: bit 0 for plain text, bit `i + 1` for
-/// `Language::ALL[i]`.
-fn language_mask(settings: &Settings, value: fn(&Settings, Option<Language>) -> bool) -> u32 {
-    let languages = Language::ALL.iter().enumerate();
-    languages.fold(value(settings, None) as u32, |mask, (i, &language)| {
-        mask | (value(settings, Some(language)) as u32) << (i + 1)
-    })
-}
-
-fn language_bit(mask: &AtomicU32, language: Option<Language>) -> bool {
-    let bit = language.map_or(0, |language| {
-        1 + Language::ALL
-            .iter()
-            .position(|&known| known == language)
-            .unwrap_or(0)
-    });
-    mask.load(Ordering::Relaxed) & (1 << bit) != 0
-}
 
 /// Whether editors layer language-server semantic tokens over syntax
 /// highlighting; follows `settings.json` like the theme.
@@ -686,16 +660,6 @@ pub fn auto_close_brackets() -> bool {
     AUTO_CLOSE_BRACKETS.load(Ordering::Relaxed)
 }
 
-/// Whether editors of `language` (`None`: plain text) start wrapped.
-pub fn word_wrap(language: Option<Language>) -> bool {
-    language_bit(&WORD_WRAP, language)
-}
-
-/// Whether editors of `language` show inlay hints (`"inlay_hints"`).
-pub fn inlay_hints(language: Option<Language>) -> bool {
-    language_bit(&INLAY_HINTS, language)
-}
-
 fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())
@@ -704,8 +668,10 @@ fn modified(path: &Path) -> Option<SystemTime> {
 
 /// Re-reads the theme chosen in `settings.json` when that file, the themes
 /// folder or a theme file in use changed, then redraws every window. Cheap
-/// when nothing changed.
+/// when nothing changed. Also re-reads the user's spelling dictionary
+/// (`words.txt`) when it changed.
 pub fn refresh(cx: &mut App) {
+    crate::editor::spell::refresh_user_words(cx);
     let mut loaded = LOADED.lock();
     if let Some(loaded) = &*loaded
         && loaded
@@ -723,14 +689,6 @@ pub fn refresh(cx: &mut App) {
             let problem = problem.map(|problem| format!("Settings ignored: {problem}"));
             SEMANTIC_HIGHLIGHTING.store(settings.semantic_highlighting, Ordering::Relaxed);
             AUTO_CLOSE_BRACKETS.store(settings.auto_close_brackets, Ordering::Relaxed);
-            WORD_WRAP.store(
-                language_mask(&settings, Settings::word_wrap),
-                Ordering::Relaxed,
-            );
-            INLAY_HINTS.store(
-                language_mask(&settings, Settings::inlay_hints),
-                Ordering::Relaxed,
-            );
             let theme = settings.theme.clone();
             crate::settings::set_current(settings);
             (theme, problem)

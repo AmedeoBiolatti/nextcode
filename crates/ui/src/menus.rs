@@ -98,6 +98,10 @@ impl Default for MenuBar {
                             list: List::RecentProjects,
                         },
                         separator(),
+                        plain("app::OpenWorkspace"),
+                        plain("workspace::AddFolderToWorkspace"),
+                        plain("workspace::SaveWorkspaceAs"),
+                        separator(),
                         plain("workspace::ReopenInContainer"),
                         separator(),
                         plain("editor::Save"),
@@ -185,6 +189,7 @@ impl Default for MenuBar {
                         separator(),
                         labeled("editor::ToggleWordWrap", "Word Wrap"),
                         labeled("editor::ToggleInlayHints", "Inlay Hints"),
+                        labeled("editor::ToggleVimMode", "Vim Mode"),
                         Item::Submenu {
                             label: "Folding".into(),
                             items: vec![

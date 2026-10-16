@@ -9,7 +9,13 @@
 //! open editors take the edits as one undo step per file, other files are
 //! written, files changed since the search are skipped.
 
-use std::{collections::HashSet, ops::Range, path::PathBuf, rc::Rc, time::Duration};
+use std::{
+    collections::HashSet,
+    ops::Range,
+    path::{Path, PathBuf},
+    rc::Rc,
+    time::Duration,
+};
 
 use futures::StreamExt;
 use gpui::{
@@ -205,6 +211,26 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// Whether an unsaved document at a path is searched: `query`'s include
+/// and exclude globs, relative to the project folder holding the path
+/// (`None` when the globs are invalid; the disk search reports that).
+fn unsaved_filter(
+    project: &Project,
+    query: &SearchQuery,
+) -> Option<impl Fn(&Path) -> bool + use<>> {
+    let filters = project
+        .roots()
+        .iter()
+        .map(|root| PathFilter::new(&root.path, query).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let project = project.clone();
+    Some(move |path: &Path| {
+        project
+            .root_index_of(path)
+            .is_some_and(|root| filters[root].matches(path))
+    })
+}
+
 pub struct SearchPanel {
     project: Project,
     query: Entity<Editor>,
@@ -372,9 +398,9 @@ impl SearchPanel {
         // Unsaved editors are searched as shown; their files' disk results
         // are dropped.
         let mut in_memory = HashSet::new();
-        if let Ok(filter) = PathFilter::new(self.project.root(), &query) {
+        if let Some(searched) = unsaved_filter(&self.project, &query) {
             for (path, text) in (self.unsaved)(cx) {
-                if !filter.matches(&path) {
+                if !searched(&path) {
                     continue;
                 }
                 if let Ok(lines) = search::search_text(&query, &text)
@@ -634,7 +660,7 @@ impl SearchPanel {
         } else {
             theme::muted
         };
-        self.notice = Some((report.summary(self.project.root()).into(), color));
+        self.notice = Some((report.summary(&self.project).into(), color));
         let this = cx.entity().downgrade();
         cx.defer(move |cx| {
             this.update(cx, |this, cx| this.start_search(true, cx)).ok();
@@ -813,19 +839,7 @@ impl SearchPanel {
         match row {
             Row::File { file } => {
                 let result = &self.results[file];
-                let shown = result
-                    .path
-                    .strip_prefix(self.project.root())
-                    .unwrap_or(&result.path);
-                let name = shown
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                let dir = shown
-                    .parent()
-                    .map(|dir| dir.display().to_string())
-                    .unwrap_or_default();
+                let (name, dir) = self.project.display_parts(&result.path);
                 let count: usize = result.lines.iter().map(|line| line.matches.len()).sum();
                 base.px_2()
                     .text_sm()
@@ -1120,6 +1134,66 @@ mod tests {
         let (old, _) = &marks[0];
         assert_eq!(&text[old.clone()], "x");
         assert!(text.len() < 50, "{text}");
+    }
+
+    #[test]
+    fn result_files_are_labelled_with_their_folder_when_there_are_several() {
+        let (api, web) = (PathBuf::from("/ws/api"), PathBuf::from("/ws/web"));
+        let project = Project::local_folders(&[&api, &web]);
+        let parts = |path: PathBuf| project.display_parts(&path);
+        assert_eq!(
+            parts(web.join("src").join("lib.rs")),
+            ("lib.rs".into(), "web › src".into())
+        );
+        assert_eq!(parts(api.join("a.txt")), ("a.txt".into(), "api".into()));
+        // Outside every folder: the full directory.
+        let outside = PathBuf::from("/tmp/x.txt");
+        assert_eq!(
+            parts(outside.clone()),
+            (
+                "x.txt".into(),
+                outside.parent().unwrap().display().to_string()
+            )
+        );
+        // One folder: relative to it, no folder name.
+        let single = Project::local(api.clone());
+        assert_eq!(
+            single.display_parts(&api.join("src").join("lib.rs")),
+            ("lib.rs".into(), "src".into())
+        );
+        assert_eq!(
+            single.display_parts(&api.join("a.txt")),
+            ("a.txt".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn unsaved_documents_are_filtered_by_globs_relative_to_their_folder() {
+        let (api, web) = (PathBuf::from("/ws/api"), PathBuf::from("/ws/web"));
+        let project = Project::local_folders(&[&api, &web]);
+        let query = SearchQuery {
+            pattern: "x".into(),
+            include: vec!["/src".into()],
+            exclude: vec!["/src/gen".into()],
+            ..Default::default()
+        };
+        let searched = unsaved_filter(&project, &query).unwrap();
+        assert!(searched(&api.join("src").join("a.rs")));
+        assert!(searched(&web.join("src").join("b.rs")));
+        assert!(!searched(&web.join("lib").join("c.rs")), "not included");
+        assert!(
+            !searched(&web.join("src").join("gen").join("d.rs")),
+            "excluded"
+        );
+        assert!(
+            !searched(Path::new("/elsewhere/src/e.rs")),
+            "outside every folder"
+        );
+        let invalid = SearchQuery {
+            include: vec!["[".into()],
+            ..query
+        };
+        assert!(unsaved_filter(&project, &invalid).is_none());
     }
 
     fn file(path: &str, text: &str, query: &SearchQuery) -> FileMatches {

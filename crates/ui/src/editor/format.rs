@@ -112,9 +112,11 @@ pub(crate) async fn run(
             fallback,
         } => {
             let project = project.ok_or("the file has no project")?;
-            let lookup = (project.clone(), command.clone());
+            // In the file's folder: its virtualenv and tool configs.
+            let folder = project.root_for(&job.path).path.clone();
+            let lookup = (project.clone(), command.clone(), folder.clone());
             let program = executor
-                .spawn(async move { lookup.0.find_executable(&lookup.1) })
+                .spawn(async move { lookup.0.find_executable_in(&lookup.1, &lookup.2) })
                 .await
                 .map_err(|err| format!("cannot look up {command}: {err}"))?;
             let Some(program) = program else {
@@ -135,7 +137,8 @@ pub(crate) async fn run(
             let name = command.clone();
             let output = executor
                 .spawn(async move {
-                    project.run_program(
+                    project.run_program_in(
+                        &folder,
                         &program,
                         &args,
                         &[],
@@ -247,7 +250,7 @@ impl Editor {
         if let Some((delay, output)) = self.format.fake.clone() {
             return Ok((Plan::Fake { delay, output }, job));
         }
-        let plan = plan(&crate::settings::current(), language, self.server())?;
+        let plan = plan(&self.file_settings(), language, self.server())?;
         Ok((plan, job))
     }
 
@@ -339,7 +342,7 @@ impl Editor {
         if self.format.on_save {
             return true;
         }
-        self.project.is_some() && crate::settings::current().format_on_save(self.language())
+        self.project.is_some() && self.file_settings().format_on_save(self.language())
     }
 
     /// Ctrl+S: formats first when `format_on_save` is on, giving the

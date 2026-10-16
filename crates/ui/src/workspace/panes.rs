@@ -431,7 +431,12 @@ impl Workspace {
                     }
                 }
                 Some(_) => {}
-                None => editor.update(cx, |editor, _| editor.detach_server(true)),
+                None => {
+                    editor.update(cx, |editor, _| editor.detach_server(true));
+                    // Its unknown words leave the Problems panel with it.
+                    self.problems
+                        .update(cx, |problems, cx| problems.set_spelling(&tab.path, &[], cx));
+                }
             }
         }
         let was_active = self.active_pane == pane;

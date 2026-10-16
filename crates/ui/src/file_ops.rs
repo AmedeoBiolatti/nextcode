@@ -313,7 +313,7 @@ pub fn copy_into(project: &Project, sources: &[PathBuf], dir: &Path) -> io::Resu
 
 /// Copies `path` next to itself (`a copy.py`).
 pub fn duplicate(project: &Project, path: &Path) -> io::Result<PathBuf> {
-    let dir = path.parent().unwrap_or(project.root());
+    let dir = path.parent().unwrap_or(&project.root_for(path).path);
     let mut copies = copy_into(project, &[path.to_path_buf()], dir)?;
     copies
         .pop()

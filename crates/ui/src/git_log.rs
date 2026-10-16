@@ -3,7 +3,10 @@
 //! branch), a filter bar (text, branch, user, date, paths) above the commit
 //! graph (paged `git log`, more pages load while scrolling), and on the
 //! right the selected commits' changed files (double-click opens a diff)
-//! above their details. Commit operations live in `actions.rs`.
+//! above their details. Commit operations live in `actions.rs`. With
+//! several repositories (folders of a multi-root project) a Repository
+//! selector leads the filter bar; the log follows the active editor's
+//! repository until one is picked there.
 
 mod actions;
 mod branches;
@@ -26,6 +29,7 @@ pub use actions::{ResetDialog, ResetDialogEvent};
 
 use crate::{
     change_tree::{self, Node},
+    commit_panel::{group_folders, repository_key, repository_name},
     compare_view::render_change_node,
     diff_view::DiffSource,
     editor::{self, Editor, EditorEvent},
@@ -144,6 +148,8 @@ struct Details {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FilterKind {
+    /// Which repository the log shows (several repositories only).
+    Repository,
     Branch,
     User,
     Date,
@@ -165,7 +171,15 @@ const DATE_RANGES: [(&str, i64); 4] = [
 
 pub struct GitLogPanel {
     project: Project,
+    /// The repository shown.
     repo: RepoState,
+    /// Every repository of the project's folders (one per repository).
+    repositories: Vec<Repository>,
+    /// Show this repository (by key) once the repositories are found.
+    preferred: Option<String>,
+    /// The user picked the repository: showing the log no longer follows
+    /// the active editor.
+    chosen: bool,
     focus_handle: FocusHandle,
 
     refs: Vec<Ref>,
@@ -371,6 +385,9 @@ impl GitLogPanel {
         Self {
             project,
             repo: RepoState::Unknown,
+            repositories: Vec::new(),
+            preferred: None,
+            chosen: false,
             focus_handle: cx.focus_handle(),
             refs: Vec::new(),
             head: None,
@@ -421,7 +438,7 @@ impl GitLogPanel {
         }
     }
 
-    /// Finds the repository and loads the log, the first time the panel
+    /// Finds the repositories and loads the log, the first time the panel
     /// is shown.
     fn start(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.repo, RepoState::Unknown) {
@@ -430,19 +447,75 @@ impl GitLogPanel {
         self.repo = RepoState::Discovering;
         let project = self.project.clone();
         self._load = cx.spawn(async move |this, cx| {
-            let found = cx
-                .background_spawn(async move { project.repository() })
-                .await;
+            let found = cx.background_spawn(async move { discover(&project) }).await;
             this.update(cx, |this, cx| {
                 this.repo = match found {
-                    Ok(Some(repository)) => RepoState::Ready(repository),
-                    Ok(None) => RepoState::Missing,
+                    Ok(repositories) => {
+                        let preferred = this.preferred.take();
+                        let index = repositories
+                            .iter()
+                            .position(|r| Some(repository_key(r.root())) == preferred)
+                            .unwrap_or(0);
+                        let shown = repositories.get(index).cloned();
+                        this.repositories = repositories;
+                        shown.map_or(RepoState::Missing, RepoState::Ready)
+                    }
                     Err(err) => RepoState::Failed(err.to_string().into()),
                 };
                 this.reload(cx);
             })
             .ok();
         });
+    }
+
+    /// Shows `repository`'s log (once found, if discovery is running).
+    pub fn select_repository(&mut self, repository: &Repository, cx: &mut Context<Self>) {
+        let key = repository_key(repository.root());
+        match self
+            .repositories
+            .iter()
+            .position(|r| repository_key(r.root()) == key)
+        {
+            Some(index) => self.switch_repository(index, cx),
+            None => self.preferred = Some(key),
+        }
+    }
+
+    /// The log follows the active editor's repository until the user
+    /// picks one.
+    pub fn prefer_repository(&mut self, repository: &Repository, cx: &mut Context<Self>) {
+        if !self.chosen {
+            self.select_repository(repository, cx);
+        }
+    }
+
+    /// Shows repository `index`: another repository's branches, commits
+    /// and paths, so those filters and the selection start over.
+    fn switch_repository(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(repository) = self.repositories.get(index).cloned() else {
+            return;
+        };
+        let key = repository_key(repository.root());
+        if matches!(&self.repo, RepoState::Ready(shown) if repository_key(shown.root()) == key) {
+            return;
+        }
+        self.repo = RepoState::Ready(repository);
+        self.popup = None;
+        self.menu = None;
+        self.refs.clear();
+        self.head = None;
+        self.selected_branch = None;
+        self.rebuild_branches();
+        self.commits.clear();
+        self.graph.clear();
+        self.selected.clear();
+        self.anchor = None;
+        self.details = None;
+        self.filter.revisions.clear();
+        self.filter.paths.clear();
+        self.path_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.reload(cx);
     }
 
     /// The repository changed (commits, refs, checkouts): reloads what is
@@ -965,6 +1038,11 @@ impl GitLogPanel {
         let user = (!self.filter.authors.is_empty()).then(|| self.filter.authors.join(", "));
         let date = self.date_label.map(str::to_owned);
         let paths = (!self.filter.paths.is_empty()).then(|| self.filter.paths.join(", "));
+        let shown = self
+            .repository()
+            .map(|repository| repository_name(&repository).to_owned());
+        let repository = (self.repositories.len() > 1)
+            .then(|| self.filter_button(FilterKind::Repository, "Repository", shown, cx));
         div()
             .flex_none()
             .h(px(32.))
@@ -975,6 +1053,7 @@ impl GitLogPanel {
             .border_b_1()
             .border_color(theme::border())
             .text_sm()
+            .children(repository)
             .child(
                 div()
                     .w(px(180.))
@@ -1064,6 +1143,26 @@ impl GitLogPanel {
         let popup = self.popup.as_ref()?;
         let mut items: Vec<gpui::AnyElement> = Vec::new();
         match popup.kind {
+            FilterKind::Repository => {
+                let shown = self.repository().map(|r| repository_key(r.root()));
+                for (index, repository) in self.repositories.iter().enumerate() {
+                    let checked = shown.as_deref() == Some(&*repository_key(repository.root()));
+                    items.push(
+                        Self::popup_item(
+                            ("repository", index),
+                            repository_name(repository).to_owned(),
+                            checked,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.chosen = true;
+                            this.popup = None;
+                            this.switch_repository(index, cx);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                    );
+                }
+            }
             FilterKind::Branch => {
                 items.push(
                     Self::popup_item("branch-all", "All", self.filter.revisions.is_empty())
@@ -1547,6 +1646,48 @@ impl GitLogPanel {
                     .child(self.render_details(cx)),
             )
             .into_any_element()
+    }
+}
+
+/// Every folder's repository, looked for in all folders at once, one per
+/// repository in folder order (folders without one are skipped). Fails
+/// only when no folder has one and a folder failed. Blocks.
+fn discover(project: &Project) -> std::io::Result<Vec<Repository>> {
+    let results: Vec<std::io::Result<Option<Repository>>> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..project.roots().len())
+            .map(|root| scope.spawn(move || project.repository_in(root)))
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .unwrap_or_else(|_| Err(std::io::Error::other("git panicked")))
+            })
+            .collect()
+    });
+    let mut error = None;
+    let found: Vec<Option<Repository>> = results
+        .into_iter()
+        .map(|result| {
+            result.unwrap_or_else(|err| {
+                error.get_or_insert(err);
+                None
+            })
+        })
+        .collect();
+    let keys: Vec<Option<String>> = found
+        .iter()
+        .map(|found| found.as_ref().map(|r| repository_key(r.root())))
+        .collect();
+    let (groups, _) = group_folders(&keys);
+    let repositories: Vec<Repository> = groups
+        .iter()
+        .filter_map(|folders| found[folders[0]].clone())
+        .collect();
+    match error {
+        Some(err) if repositories.is_empty() => Err(err),
+        _ => Ok(repositories),
     }
 }
 

@@ -15,14 +15,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use lsp::{Incoming, LanguageServer, Logger};
+use parking_lot::Mutex;
 use remote::{AgentClient, PipedProcess, RunOutput, StreamHandle, agent_path};
 use search::{SearchEvent, SearchLimits, SearchQuery};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use terminal::{Palette, Terminal, TerminalEvent};
 use watcher::Batch;
 use worktree::{DirEntry, FileKind};
+
+use crate::{
+    settings::Settings,
+    workspace_file::{self, Folder},
+};
 
 /// What the user asked to open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +48,19 @@ pub enum Location {
         /// the folder's first one.
         config: Option<String>,
     },
+    /// Several folders on one machine (a multi-root workspace), saved in a
+    /// workspace file or not (untitled).
+    Workspace {
+        /// The WSL distro holding the folders (and the file); `None` for
+        /// this machine.
+        distro: Option<String>,
+        /// A `*.next_code-workspace` or VS Code `*.code-workspace` file;
+        /// opening reads its folders and settings.
+        file: Option<String>,
+        /// Absolute folders: the workspace for an untitled one, the last
+        /// ones read from `file` otherwise.
+        folders: Vec<Folder>,
+    },
 }
 
 impl fmt::Display for Location {
@@ -48,6 +69,26 @@ impl fmt::Display for Location {
             Self::Local(root) => write!(f, "{}", root.display()),
             Self::Wsl { distro, path } => write!(f, "{path} [WSL: {distro}]"),
             Self::DevContainer { folder, .. } => write!(f, "{folder} [Dev Container]"),
+            Self::Workspace {
+                distro,
+                file,
+                folders,
+            } => {
+                match (file, folders.as_slice()) {
+                    (Some(file), _) => write!(f, "{file} [Workspace]")?,
+                    (None, [first, rest @ ..]) => {
+                        write!(f, "{}", first.path)?;
+                        if !rest.is_empty() {
+                            write!(f, " + {} more [Workspace]", rest.len())?;
+                        }
+                    }
+                    (None, []) => write!(f, "[Workspace]")?,
+                }
+                match distro {
+                    Some(distro) => write!(f, " [WSL: {distro}]"),
+                    None => Ok(()),
+                }
+            }
         }
     }
 }
@@ -55,10 +96,15 @@ impl fmt::Display for Location {
 /// Prefix of typed dev container locations (`devcontainer:C:\src\p`).
 const DEVCONTAINER_PREFIX: &str = "devcontainer:";
 
+/// A folder's own next_code files (`settings.json`, `run.json`, …).
+const FOLDER_SETTINGS_DIR: &str = ".next_code";
+
 impl Location {
     /// Reads a typed location: `\\wsl.localhost\<distro>\path` (or
     /// `\\wsl$\...`), `<distro>:/linux/path` (or `<distro>:~/...`),
     /// `devcontainer:<one of those or a local path>`, else a local path.
+    /// Paths of workspace files (`*.next_code-workspace`,
+    /// `*.code-workspace`) are workspaces.
     pub fn parse(input: &str) -> Option<Self> {
         let input = input.trim();
         if input.is_empty() {
@@ -71,7 +117,7 @@ impl Location {
             });
         }
         if let Some(wsl) = wsl_unc_path(input) {
-            return Some(wsl);
+            return Some(wsl.workspace_file_as_workspace());
         }
         // One-letter prefixes are Windows drives (`C:/dev`).
         if let Some((distro, path)) = input.split_once(':')
@@ -79,28 +125,73 @@ impl Location {
             && !distro.contains(['/', '\\', ' '])
             && (path.starts_with('/') || path.starts_with('~'))
         {
-            return Some(Self::Wsl {
-                distro: distro.to_owned(),
-                path: path.to_owned(),
-            });
+            return Some(
+                Self::Wsl {
+                    distro: distro.to_owned(),
+                    path: path.to_owned(),
+                }
+                .workspace_file_as_workspace(),
+            );
         }
-        Some(Self::Local(PathBuf::from(input)))
+        Some(Self::Local(PathBuf::from(input)).workspace_file_as_workspace())
+    }
+
+    /// A local or WSL path naming a workspace file becomes that workspace.
+    pub fn workspace_file_as_workspace(self) -> Self {
+        match self {
+            Self::Local(path) if workspace_file::Format::of(&path.to_string_lossy()).is_some() => {
+                Self::Workspace {
+                    distro: None,
+                    file: Some(path.to_string_lossy().into_owned()),
+                    folders: Vec::new(),
+                }
+            }
+            Self::Wsl { distro, path } if workspace_file::Format::of(&path).is_some() => {
+                Self::Workspace {
+                    distro: Some(distro),
+                    file: Some(path),
+                    folders: Vec::new(),
+                }
+            }
+            other => other,
+        }
     }
 
     /// Local paths made absolute (also inside a dev container location).
     pub fn absolute(self) -> Self {
+        let local = |path: &str| {
+            std::path::absolute(path)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.to_owned())
+        };
         match self {
             Self::Local(root) => Self::Local(std::path::absolute(&root).unwrap_or(root)),
             Self::DevContainer { folder, config } => Self::DevContainer {
                 folder: Box::new(folder.absolute()),
                 config,
             },
-            wsl => wsl,
+            Self::Workspace {
+                distro: None,
+                file,
+                folders,
+            } => Self::Workspace {
+                distro: None,
+                file: file.as_deref().map(local),
+                folders: folders
+                    .into_iter()
+                    .map(|folder| Folder {
+                        path: local(&folder.path),
+                        name: folder.name,
+                    })
+                    .collect(),
+            },
+            other => other,
         }
     }
 
     /// Whether both open the same project; a dev container location without
-    /// a config means the folder's first one, whichever that is.
+    /// a config means the folder's first one, whichever that is. Saved
+    /// workspaces are the same file whatever folders they had.
     pub fn opens_same(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -113,9 +204,91 @@ impl Location {
                     config: config_b,
                 },
             ) => a == b && (config_a.is_none() || config_b.is_none() || config_a == config_b),
+            (
+                Self::Workspace {
+                    distro: distro_a,
+                    file: Some(file_a),
+                    ..
+                },
+                Self::Workspace {
+                    distro: distro_b,
+                    file: Some(file_b),
+                    ..
+                },
+            ) => distro_a == distro_b && same_path(file_a, file_b, distro_a.is_some()),
             _ => self == other,
         }
     }
+
+    /// The machine's path syntax: POSIX inside WSL and containers (and
+    /// everywhere off Windows).
+    pub fn posix(&self) -> bool {
+        match self {
+            Self::Local(_) | Self::Workspace { distro: None, .. } => !cfg!(windows),
+            _ => true,
+        }
+    }
+
+    /// The per-project state key (layout, session) of a workspace: its
+    /// file, or a hash of an untitled one's folders. `None` for other
+    /// locations (see [`Project::state_key`]).
+    pub fn workspace_state_key(&self) -> Option<String> {
+        let Self::Workspace {
+            distro,
+            file,
+            folders,
+        } = self
+        else {
+            return None;
+        };
+        let machine = distro
+            .as_deref()
+            .map_or("local".into(), |d| format!("wsl:{d}"));
+        Some(match file {
+            Some(file) => format!("workspace:{machine}:{file}"),
+            None => {
+                // FNV-1a: stable across Rust versions, unlike `DefaultHasher`.
+                let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                for byte in folders
+                    .iter()
+                    .flat_map(|folder| folder.path.bytes().chain([0]))
+                {
+                    hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+                }
+                let first = folders.first().map_or(String::new(), |folder| {
+                    workspace_file::folder_name(&folder.path, self.posix())
+                });
+                format!("workspace:{machine}:untitled:{first}:{hash:016x}")
+            }
+        })
+    }
+}
+
+/// Whether two paths of one machine name the same file (Windows paths
+/// ignore case).
+fn same_path(a: &str, b: &str, posix: bool) -> bool {
+    if posix || !cfg!(windows) {
+        a == b
+    } else {
+        a.eq_ignore_ascii_case(b)
+    }
+}
+
+/// A folder of the project, named by `name` or its last component.
+fn root_of_path(path: PathBuf, name: Option<String>, posix: bool) -> Root {
+    Root {
+        name: name
+            .clone()
+            .unwrap_or_else(|| workspace_file::folder_name(&path.to_string_lossy(), posix)),
+        custom_name: name,
+        path,
+    }
+}
+
+/// A folder-relative path labelled with its folder (`api › src/main.rs`),
+/// as multi-root lists show it.
+pub fn root_label(root: &str, relative: &str) -> String {
+    format!("{root} › {relative}")
 }
 
 /// `\\wsl.localhost\Ubuntu\home\me` (or `\\wsl$\...`) names a WSL project;
@@ -142,8 +315,49 @@ fn wsl_unc_path(path: &str) -> Option<Location> {
 pub struct Project(Arc<Inner>);
 
 struct Inner {
+    /// The first folder (`roots[0]`): the working directory of language
+    /// servers and tools, and the folder of single-folder projects.
     root: PathBuf,
+    /// Every folder of the project in order; one unless it is a
+    /// multi-root workspace. Fixed for the project's life: changing the
+    /// folders reopens the project (see `Workspace::set_folders`).
+    roots: Vec<Root>,
+    /// Set for workspaces (a workspace file, or several folders).
+    workspace: Option<WorkspaceInfo>,
+    /// Settings layered per folder (see [`Project::settings_for`]).
+    folder_settings: Mutex<Vec<Option<FolderSettings>>>,
     backend: Backend,
+}
+
+/// A folder of the project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Root {
+    pub path: PathBuf,
+    /// What the tree and labels show: the workspace file's `name`, else
+    /// the folder's own name.
+    pub name: String,
+    /// The workspace file's `name`, if it gave one.
+    pub custom_name: Option<String>,
+}
+
+struct WorkspaceInfo {
+    /// The workspace file, in the machine's path syntax; `None` while
+    /// untitled.
+    file: Option<String>,
+    /// The file's `settings` (VS Code keys translated); `Null` if none.
+    settings: Value,
+}
+
+/// One folder's layered settings and the user settings they were built
+/// from (rebuilt when those change).
+struct FolderSettings {
+    user: Arc<Settings>,
+    /// The folder's `settings.json` (`Null` if none) and why it was
+    /// unreadable, kept so new user settings layer without reading again.
+    folder: (Value, Option<String>),
+    layered: Arc<Settings>,
+    /// Why the folder's or workspace's settings were ignored.
+    error: Option<String>,
 }
 
 enum Backend {
@@ -196,12 +410,67 @@ impl Drop for ContainerHost {
 pub enum WatchHandle {
     Local(#[allow(dead_code)] watcher::ProjectWatcher),
     Remote(#[allow(dead_code)] StreamHandle),
+    /// One per folder of a multi-root project.
+    Many(#[allow(dead_code)] Vec<WatchHandle>),
 }
 
 /// Cancels the search when dropped.
 pub enum SearchHandle {
     Local(#[allow(dead_code)] search::SearchHandle),
     Remote(#[allow(dead_code)] StreamHandle),
+    /// One per folder of a multi-root project.
+    Many(#[allow(dead_code)] Vec<SearchHandle>),
+}
+
+/// Forwards the folders' searches as one: each file once (nested folders
+/// find some twice), up to `limits.max_matches` matches, then a `Done`
+/// with the totals.
+async fn merge_searches(
+    receivers: Vec<UnboundedReceiver<SearchEvent>>,
+    limits: SearchLimits,
+    tx: futures::channel::mpsc::UnboundedSender<SearchEvent>,
+) {
+    let mut pending = receivers.len();
+    let mut events = futures::stream::select_all(receivers);
+    let mut seen = std::collections::HashSet::new();
+    let (mut files_searched, mut matches, mut limit_hit) = (0, 0, false);
+    while pending > 0
+        && let Some(event) = events.next().await
+    {
+        match event {
+            SearchEvent::File(file) => {
+                if matches >= limits.max_matches {
+                    limit_hit = true;
+                    break;
+                }
+                if seen.insert(file.path.clone()) {
+                    matches += file
+                        .lines
+                        .iter()
+                        .map(|line| line.ranges.len().max(1))
+                        .sum::<usize>();
+                    if tx.unbounded_send(SearchEvent::File(file)).is_err() {
+                        return;
+                    }
+                }
+            }
+            SearchEvent::Done {
+                files_searched: searched,
+                limit_hit: hit,
+                ..
+            } => {
+                pending -= 1;
+                files_searched += searched;
+                limit_hit |= hit;
+            }
+        }
+    }
+    tx.unbounded_send(SearchEvent::Done {
+        files_searched,
+        matches,
+        limit_hit,
+    })
+    .ok();
 }
 
 /// Ends a local child process when dropped.
@@ -216,9 +485,34 @@ impl Drop for KillOnDrop {
 
 impl Project {
     pub fn local(root: PathBuf) -> Self {
+        Self::build(vec![root_of_path(root, None, false)], None, Backend::Local)
+    }
+
+    /// A local untitled workspace over `folders` (tests of multi-root
+    /// behaviour).
+    #[cfg(test)]
+    pub fn local_folders(folders: &[&Path]) -> Self {
+        let roots = folders
+            .iter()
+            .map(|path| root_of_path(path.to_path_buf(), None, false))
+            .collect();
+        Self::build(
+            roots,
+            Some(WorkspaceInfo {
+                file: None,
+                settings: Value::Null,
+            }),
+            Backend::Local,
+        )
+    }
+
+    fn build(roots: Vec<Root>, workspace: Option<WorkspaceInfo>, backend: Backend) -> Self {
         Self(Arc::new(Inner {
-            root,
-            backend: Backend::Local,
+            root: roots[0].path.clone(),
+            folder_settings: Mutex::new((0..roots.len()).map(|_| None).collect()),
+            roots,
+            workspace,
+            backend,
         }))
     }
 
@@ -226,15 +520,20 @@ impl Project {
     /// long as WSL takes to start.
     pub fn connect_wsl(distro: &str, path: &str) -> io::Result<Self> {
         let connection = remote::wsl::connect(distro, path)?;
-        Ok(Self(Arc::new(Inner {
-            root: PathBuf::from(connection.info.root),
-            backend: Backend::Remote {
+        Ok(Self::build(
+            vec![root_of_path(
+                PathBuf::from(connection.info.root),
+                None,
+                true,
+            )],
+            None,
+            Backend::Remote {
                 client: connection.client,
                 host: RemoteHost::Wsl {
                     distro: distro.to_owned(),
                 },
             },
-        })))
+        ))
     }
 
     /// Opens `location`, reporting steps of slow ones (dev containers) to
@@ -246,7 +545,77 @@ impl Project {
             Location::DevContainer { folder, config } => {
                 Self::connect_devcontainer(folder, config.as_deref(), progress)
             }
+            Location::Workspace {
+                distro,
+                file,
+                folders,
+            } => Self::open_workspace(distro.as_deref(), file.as_deref(), folders, progress),
         }
+    }
+
+    /// Opens a multi-root workspace: reads its file (where it lives) when
+    /// it has one, else takes `folders`.
+    fn open_workspace(
+        distro: Option<&str>,
+        file: Option<&str>,
+        folders: &[Folder],
+        progress: &mut dyn FnMut(&str),
+    ) -> io::Result<Self> {
+        let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
+        let posix = distro.is_some() || !cfg!(windows);
+        // The agent starts in the file's folder, else the first folder.
+        let start = match (file, folders.first()) {
+            (Some(file), _) => workspace_file::parent(file, posix),
+            (None, Some(folder)) => folder.path.clone(),
+            (None, None) => return Err(invalid("the workspace has no folders".into())),
+        };
+        let backend = match distro {
+            None => Backend::Local,
+            Some(distro) => {
+                progress(&format!("Connecting to WSL distro '{distro}'"));
+                let connection = remote::wsl::connect(distro, &start)?;
+                Backend::Remote {
+                    client: connection.client,
+                    host: RemoteHost::Wsl {
+                        distro: distro.to_owned(),
+                    },
+                }
+            }
+        };
+        let (folders, settings) = match file {
+            Some(file) => {
+                let text = match &backend {
+                    Backend::Local => fs::read(file),
+                    Backend::Remote { client, .. } => client.read_file(file),
+                }
+                .and_then(worktree::decode_text)
+                .map_err(|err| io::Error::new(err.kind(), format!("{file}: {err}")))?;
+                let parsed = workspace_file::parse(&text, file, posix).map_err(invalid)?;
+                for warning in &parsed.warnings {
+                    progress(warning);
+                }
+                (parsed.folders, parsed.settings)
+            }
+            None => (folders.to_vec(), Value::Null),
+        };
+        if folders.is_empty() {
+            return Err(invalid(format!(
+                "{} has no folders",
+                file.unwrap_or("the workspace")
+            )));
+        }
+        let roots = folders
+            .into_iter()
+            .map(|folder| root_of_path(PathBuf::from(folder.path), folder.name, posix))
+            .collect();
+        Ok(Self::build(
+            roots,
+            Some(WorkspaceInfo {
+                file: file.map(str::to_owned),
+                settings,
+            }),
+            backend,
+        ))
     }
 
     /// Brings up the dev container of `folder` and opens its workspace
@@ -272,6 +641,13 @@ impl Project {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "a dev container cannot contain another one",
+                ));
+            }
+            Location::Workspace { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "dev containers open a single folder, not a multi-root workspace: \
+                     reopen one of its folders in the container",
                 ));
             }
         };
@@ -310,22 +686,32 @@ impl Project {
             ports: started.ports.clone(),
         };
         let connection = remote::container::connect(&target, &started.workspace_folder)?;
-        Ok(Self(Arc::new(Inner {
-            root: PathBuf::from(connection.info.root),
-            backend: Backend::Remote {
+        Ok(Self::build(
+            vec![root_of_path(
+                PathBuf::from(connection.info.root),
+                None,
+                true,
+            )],
+            None,
+            Backend::Remote {
                 client: connection.client,
                 host: RemoteHost::Container(Box::new(container)),
             },
-        })))
+        ))
     }
 
     /// The `devcontainer.json` files of this project's folder (none for a
-    /// project already in a container). Blocks.
+    /// project already in a container, or with several folders: dev
+    /// containers open one). Blocks.
     pub fn devcontainer_configs(&self) -> io::Result<Vec<String>> {
-        if let Backend::Remote {
-            host: RemoteHost::Container(_),
-            ..
-        } = &self.0.backend
+        if self.is_multi_root()
+            || matches!(
+                &self.0.backend,
+                Backend::Remote {
+                    host: RemoteHost::Container(_),
+                    ..
+                }
+            )
         {
             return Ok(Vec::new());
         }
@@ -333,11 +719,135 @@ impl Project {
         devcontainer::find_configs(&host, &self.0.root.to_string_lossy())
     }
 
+    /// The first folder (the only one unless this is a multi-root
+    /// workspace): tools and language servers run here.
     pub fn root(&self) -> &Path {
         &self.0.root
     }
 
+    /// Every folder, in the workspace's order (`roots()[0]` is
+    /// [`Project::root`]).
+    pub fn roots(&self) -> &[Root] {
+        &self.0.roots
+    }
+
+    /// Whether the project has several folders (lists then label paths
+    /// with their folder, see [`Project::display_path`]).
+    pub fn is_multi_root(&self) -> bool {
+        self.0.roots.len() > 1
+    }
+
+    /// The workspace file, when the project is a saved workspace.
+    pub fn workspace_file(&self) -> Option<&str> {
+        self.0.workspace.as_ref()?.file.as_deref()
+    }
+
+    /// Whether the project is a workspace (saved or untitled) rather than
+    /// a single folder.
+    pub fn is_workspace(&self) -> bool {
+        self.0.workspace.is_some()
+    }
+
+    /// The workspace file's settings (`Null` if none).
+    pub fn workspace_settings(&self) -> &Value {
+        static NULL: Value = Value::Null;
+        self.0
+            .workspace
+            .as_ref()
+            .map_or(&NULL, |workspace| &workspace.settings)
+    }
+
+    /// The index of the folder holding `path` (the innermost when folders
+    /// nest), `None` outside every folder.
+    pub fn root_index_of(&self, path: &Path) -> Option<usize> {
+        self.0
+            .roots
+            .iter()
+            .enumerate()
+            .filter(|(_, root)| path.starts_with(&root.path))
+            .max_by_key(|(_, root)| root.path.components().count())
+            .map(|(index, _)| index)
+    }
+
+    /// The folder holding `path`, else the first one.
+    pub fn root_for(&self, path: &Path) -> &Root {
+        &self.0.roots[self.root_index_of(path).unwrap_or(0)]
+    }
+
+    /// `path` relative to its folder, `/`-separated, with that folder's
+    /// index; `None` outside every folder (and for a folder itself).
+    pub fn relative(&self, path: &Path) -> Option<(usize, String)> {
+        let index = self.root_index_of(path)?;
+        let relative = path.strip_prefix(&self.0.roots[index].path).ok()?;
+        let parts: Vec<_> = relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect();
+        (!parts.is_empty()).then(|| (index, parts.join("/")))
+    }
+
+    /// How lists show `path`: relative to its folder, after the folder's
+    /// name and ` › ` when the project has several (`api › src/main.rs`);
+    /// the full path outside every folder.
+    pub fn display_path(&self, path: &Path) -> String {
+        match self.relative(path) {
+            Some((index, relative)) if self.is_multi_root() => {
+                root_label(&self.0.roots[index].name, &relative)
+            }
+            Some((_, relative)) => relative,
+            None => match self.root_index_of(path) {
+                Some(index) if self.is_multi_root() => self.0.roots[index].name.clone(),
+                _ => path.to_string_lossy().into_owned(),
+            },
+        }
+    }
+
+    /// `path` split as result lists show it: the file name, and the folder
+    /// it is in as [`Project::display_path`] shows folders (`api › src`,
+    /// just `api` at a folder's top) when the project has several; else
+    /// relative to the root (empty at its top), the full parent outside.
+    pub fn display_parts(&self, path: &Path) -> (String, String) {
+        let name = |path: &Path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        if self.is_multi_root()
+            && let Some(index) = self.root_index_of(path)
+            && let Some(dir) = path
+                .parent()
+                .filter(|dir| dir.starts_with(&self.0.roots[index].path))
+        {
+            let root = &self.0.roots[index];
+            let dir = match self.relative(dir) {
+                Some((_, relative)) => root_label(&root.name, &relative),
+                None => root.name.clone(),
+            };
+            return (name(path), dir);
+        }
+        let shown = path.strip_prefix(&self.0.root).unwrap_or(path);
+        let dir = shown
+            .parent()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        (name(shown), dir)
+    }
+
     pub fn location(&self) -> Location {
+        if self.0.workspace.is_some() {
+            return Location::Workspace {
+                distro: match &self.0.backend {
+                    Backend::Remote {
+                        host: RemoteHost::Wsl { distro },
+                        ..
+                    } => Some(distro.clone()),
+                    _ => None,
+                },
+                file: self.workspace_file().map(str::to_owned),
+                folders: self.folders(),
+            };
+        }
         match &self.0.backend {
             Backend::Local => Location::Local(self.0.root.clone()),
             Backend::Remote {
@@ -355,6 +865,66 @@ impl Project {
                 config: Some(container.config.clone()),
             },
         }
+    }
+
+    /// The folders as a workspace file lists them (absolute paths).
+    pub fn folders(&self) -> Vec<Folder> {
+        self.0
+            .roots
+            .iter()
+            .map(|root| Folder {
+                path: root.path.to_string_lossy().into_owned(),
+                name: root.custom_name.clone(),
+            })
+            .collect()
+    }
+
+    /// The project with `folders` instead of its own, on the same machine
+    /// (keeping the workspace file); `Err` says why it cannot (dev
+    /// containers have one folder). One folder without a workspace file
+    /// is a plain folder project again.
+    pub fn with_folders(&self, folders: Vec<Folder>) -> Result<Location, String> {
+        if self.in_container() {
+            return Err("A dev container project has a single folder: \
+                        open the other folder in its own project tab."
+                .into());
+        }
+        if folders.is_empty() {
+            return Err("A workspace needs at least one folder.".into());
+        }
+        let file = self.workspace_file().map(str::to_owned);
+        let distro = match self.location() {
+            Location::Wsl { distro, .. }
+            | Location::Workspace {
+                distro: Some(distro),
+                ..
+            } => Some(distro),
+            _ => None,
+        };
+        if file.is_none() && folders.len() == 1 && folders[0].name.is_none() {
+            let path = folders[0].path.clone();
+            return Ok(match distro {
+                Some(distro) => Location::Wsl { distro, path },
+                None => Location::Local(PathBuf::from(path)),
+            });
+        }
+        Ok(Location::Workspace {
+            distro,
+            file,
+            folders,
+        })
+    }
+
+    /// The text to save as a workspace file at `file` (on the project's
+    /// machine): the folders, relative to the file where they share a
+    /// folder, and the workspace settings.
+    pub fn workspace_text(&self, file: &str) -> String {
+        workspace_file::to_text(
+            &self.folders(),
+            self.workspace_settings(),
+            file,
+            self.location().posix(),
+        )
     }
 
     /// Another directory reached the same way as this project (e.g. a git
@@ -379,6 +949,9 @@ impl Project {
 
     /// Identifies the project in per-project state such as the saved layout.
     pub fn state_key(&self) -> String {
+        if let Some(key) = self.location().workspace_state_key() {
+            return key;
+        }
         match &self.0.backend {
             Backend::Local => self.0.root.to_string_lossy().into_owned(),
             Backend::Remote {
@@ -451,20 +1024,48 @@ impl Project {
         }
     }
 
-    /// The absolute path of a root-relative one from [`Project::list_files`].
+    /// The absolute path of a path relative to the first folder.
     pub fn resolve(&self, relative: &str) -> PathBuf {
         self.join(&self.0.root, relative)
     }
 
-    /// A path given by a user or script: absolute as is, else root-relative.
-    /// Local paths are rebuilt from their components, so `src/a.rs` matches
-    /// the `src\a.rs` the rest of the editor uses on Windows.
+    /// The absolute path of a path relative to folder `root` (as
+    /// [`Project::list_files`] lists them).
+    pub fn resolve_in(&self, root: usize, relative: &str) -> PathBuf {
+        self.join(&self.0.roots[root].path, relative)
+    }
+
+    /// A path given by a user or script: absolute as is, else relative to
+    /// the first folder. Local paths are rebuilt from their components, so
+    /// `src/a.rs` matches the `src\a.rs` the rest of the editor uses on
+    /// Windows.
     pub fn path(&self, input: &str) -> PathBuf {
+        self.path_in(0, input)
+    }
+
+    /// [`Project::path`] relative to folder `root`.
+    pub fn path_in(&self, root: usize, input: &str) -> PathBuf {
+        let root = &self.0.roots[root].path;
         match &self.0.backend {
-            Backend::Local => self.0.root.join(input).components().collect(),
+            Backend::Local => root.join(input).components().collect(),
             Backend::Remote { .. } if input.starts_with('/') => PathBuf::from(input),
-            Backend::Remote { .. } => self.resolve(input),
+            Backend::Remote { .. } => self.join(root, input),
         }
+    }
+
+    /// The folder a user or script names: its index, its name, or its
+    /// path.
+    pub fn root_named(&self, name: &str) -> Option<usize> {
+        let roots = &self.0.roots;
+        if let Ok(index) = name.parse::<usize>()
+            && index < roots.len()
+        {
+            return Some(index);
+        }
+        roots
+            .iter()
+            .position(|root| root.name == name)
+            .or_else(|| roots.iter().position(|root| root.path == Path::new(name)))
     }
 
     /// The children of `dir`, gitignore-aware, dirs first.
@@ -475,11 +1076,13 @@ impl Project {
         }
     }
 
-    /// Every non-ignored file, as sorted root-relative paths.
-    pub fn list_files(&self) -> io::Result<Vec<String>> {
+    /// Every non-ignored file of folder `root`, as sorted paths relative
+    /// to it (see [`Project::resolve_in`]).
+    pub fn list_files(&self, root: usize) -> io::Result<Vec<String>> {
+        let root = &self.0.roots[root].path;
         match &self.0.backend {
-            Backend::Local => Ok(worktree::list_files(&self.0.root)),
-            Backend::Remote { client, .. } => client.list_files(agent_path(&self.0.root)?),
+            Backend::Local => Ok(worktree::list_files(root)),
+            Backend::Remote { client, .. } => client.list_files(agent_path(root)?),
         }
     }
 
@@ -610,76 +1213,126 @@ impl Project {
         Err(io::Error::other(format!("{program}: {}", stderr.trim())))
     }
 
+    /// Watches every folder; batches of all of them arrive on one channel.
     pub fn watch(&self, debounce: Duration) -> io::Result<(WatchHandle, UnboundedReceiver<Batch>)> {
-        match &self.0.backend {
-            Backend::Local => {
-                let (watcher, batches) =
-                    watcher::watch(&self.0.root, debounce).map_err(io::Error::other)?;
-                Ok((WatchHandle::Local(watcher), batches))
-            }
-            Backend::Remote { client, .. } => {
-                let (handle, batches) = client.watch(agent_path(&self.0.root)?, debounce)?;
-                Ok((WatchHandle::Remote(handle), batches))
-            }
+        let mut handles = Vec::new();
+        let mut receivers = Vec::new();
+        for root in &self.0.roots {
+            let (handle, batches) = match &self.0.backend {
+                Backend::Local => {
+                    let (watcher, batches) =
+                        watcher::watch(&root.path, debounce).map_err(io::Error::other)?;
+                    (WatchHandle::Local(watcher), batches)
+                }
+                Backend::Remote { client, .. } => {
+                    let (handle, batches) = client.watch(agent_path(&root.path)?, debounce)?;
+                    (WatchHandle::Remote(handle), batches)
+                }
+            };
+            handles.push(handle);
+            receivers.push(batches);
         }
+        if handles.len() == 1 {
+            return Ok((handles.remove(0), receivers.remove(0)));
+        }
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        thread::Builder::new()
+            .name("watch-merge".into())
+            .spawn(move || {
+                futures::executor::block_on(futures::stream::select_all(receivers).for_each(
+                    |batch| {
+                        tx.unbounded_send(batch).ok();
+                        async {}
+                    },
+                ));
+            })?;
+        Ok((WatchHandle::Many(handles), rx))
     }
 
-    /// Searches the project; the error is shown as-is.
+    /// Searches every folder; the error is shown as-is. Several folders'
+    /// results arrive as one search: files as found, then one `Done`
+    /// totalling them, after `limits.max_matches` matches at most.
     pub fn search(
         &self,
         query: &SearchQuery,
         limits: SearchLimits,
     ) -> Result<(SearchHandle, UnboundedReceiver<SearchEvent>), String> {
-        match &self.0.backend {
-            Backend::Local => search::search(&self.0.root, query, limits)
-                .map(|(handle, events)| (SearchHandle::Local(handle), events))
-                .map_err(|err| err.to_string()),
-            Backend::Remote { client, .. } => agent_path(&self.0.root)
-                .and_then(|root| client.search(root, query, limits))
-                .map(|(handle, events)| (SearchHandle::Remote(handle), events))
-                .map_err(|err| err.to_string()),
+        let mut handles = Vec::new();
+        let mut receivers = Vec::new();
+        for root in &self.0.roots {
+            let (handle, events) = match &self.0.backend {
+                Backend::Local => search::search(&root.path, query, limits)
+                    .map(|(handle, events)| (SearchHandle::Local(handle), events))
+                    .map_err(|err| err.to_string()),
+                Backend::Remote { client, .. } => agent_path(&root.path)
+                    .and_then(|root| client.search(root, query, limits))
+                    .map(|(handle, events)| (SearchHandle::Remote(handle), events))
+                    .map_err(|err| err.to_string()),
+            }?;
+            handles.push(handle);
+            receivers.push(events);
         }
+        if handles.len() == 1 {
+            return Ok((handles.remove(0), receivers.remove(0)));
+        }
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        thread::Builder::new()
+            .name("search-merge".into())
+            .spawn(move || futures::executor::block_on(merge_searches(receivers, limits, tx)))
+            .map_err(|err| err.to_string())?;
+        Ok((SearchHandle::Many(handles), rx))
     }
 
-    /// Finds a tool where the project lives (its virtualenv first).
+    /// Finds a tool where the project lives (the first folder's
+    /// virtualenv first).
     pub fn find_executable(&self, command: &str) -> io::Result<Option<PathBuf>> {
+        self.find_executable_in(command, &self.0.root)
+    }
+
+    /// Finds a tool where the project lives (`dir`'s virtualenv first).
+    pub fn find_executable_in(&self, command: &str, dir: &Path) -> io::Result<Option<PathBuf>> {
         match &self.0.backend {
-            Backend::Local => Ok(worktree::find_executable(command, &self.0.root)),
+            Backend::Local => Ok(worktree::find_executable(command, dir)),
             Backend::Remote { client, .. } => Ok(client
-                .find_executable(command, agent_path(&self.0.root)?)?
+                .find_executable(command, agent_path(dir)?)?
                 .map(PathBuf::from)),
         }
     }
 
+    /// The first folder's virtualenv interpreter.
     pub fn python_interpreter(&self) -> io::Result<Option<PathBuf>> {
+        self.python_interpreter_in(&self.0.root)
+    }
+
+    /// `dir`'s virtualenv interpreter.
+    pub fn python_interpreter_in(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
         match &self.0.backend {
-            Backend::Local => Ok(worktree::python_interpreter(&self.0.root)),
+            Backend::Local => Ok(worktree::python_interpreter(dir)),
             Backend::Remote { client, .. } => Ok(client
-                .python_interpreter(agent_path(&self.0.root)?)?
+                .python_interpreter(agent_path(dir)?)?
                 .map(PathBuf::from)),
         }
     }
 
-    /// Starts a language server where the project lives, in its root.
+    /// Starts a language server where the project lives, in `cwd` (a
+    /// folder of the project).
     pub fn spawn_language_server(
         &self,
         program: &Path,
         args: &[String],
+        cwd: &Path,
         logger: Option<Logger>,
     ) -> io::Result<(LanguageServer, UnboundedReceiver<Incoming>)> {
         match &self.0.backend {
             Backend::Local => {
                 let mut command = Command::new(program);
-                command.args(args).current_dir(&self.0.root);
+                command.args(args).current_dir(cwd);
                 remote::launch::no_window(&mut command);
                 LanguageServer::spawn(&mut command, logger)
             }
-            Backend::Remote { client, .. } => client.spawn_language_server(
-                agent_path(program)?,
-                args,
-                agent_path(&self.0.root)?,
-                logger,
-            ),
+            Backend::Remote { client, .. } => {
+                client.spawn_language_server(agent_path(program)?, args, agent_path(cwd)?, logger)
+            }
         }
     }
 
@@ -775,7 +1428,7 @@ impl Project {
         )
     }
 
-    /// Runs `program` in the project root where the project lives with
+    /// Runs `program` in the first folder where the project lives with
     /// `input` on its stdin, killing it after `timeout`.
     pub fn run_program(
         &self,
@@ -785,21 +1438,29 @@ impl Project {
         input: Option<&[u8]>,
         timeout: Duration,
     ) -> io::Result<RunOutput> {
+        self.run_program_in(&self.0.root, program, args, env, input, timeout)
+    }
+
+    /// [`Project::run_program`] in `cwd`.
+    pub fn run_program_in(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        env: &[(&str, &str)],
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> io::Result<RunOutput> {
         match &self.0.backend {
-            Backend::Remote { client, .. } => client.run(
-                program,
-                args,
-                agent_path(&self.0.root)?,
-                env,
-                input,
-                timeout,
-            ),
+            Backend::Remote { client, .. } => {
+                client.run(program, args, agent_path(cwd)?, env, input, timeout)
+            }
             Backend::Local => {
                 let mut command = Command::new(program);
                 command
                     .args(args)
                     .envs(env.iter().copied())
-                    .current_dir(&self.0.root)
+                    .current_dir(cwd)
                     .stdin(if input.is_some() {
                         Stdio::piped()
                     } else {
@@ -850,16 +1511,24 @@ impl Project {
         }
     }
 
-    /// The git repository containing the project root, if any. Blocks.
-    pub fn repository(&self) -> io::Result<Option<git::Repository>> {
-        let root = self.0.root.to_string_lossy().into_owned();
+    /// The git repository containing folder `root`, if any. Blocks.
+    pub fn repository_in(&self, root: usize) -> io::Result<Option<git::Repository>> {
+        let root = self.0.roots[root].path.to_string_lossy().into_owned();
         git::Repository::discover(Arc::new(GitRunner(self.clone())), &root)
     }
 
-    /// The repository containing the project root with its status, read
+    /// The repository containing the first folder with its status, read
     /// concurrently. Blocks.
     pub fn open_repository(&self) -> io::Result<Option<(git::Repository, git::Status)>> {
-        let root = self.0.root.to_string_lossy().into_owned();
+        self.open_repository_in(0)
+    }
+
+    /// [`Project::open_repository`] for folder `root`.
+    pub fn open_repository_in(
+        &self,
+        root: usize,
+    ) -> io::Result<Option<(git::Repository, git::Status)>> {
+        let root = self.0.roots[root].path.to_string_lossy().into_owned();
         git::Repository::open(Arc::new(GitRunner(self.clone())), &root)
     }
 
@@ -870,14 +1539,95 @@ impl Project {
     }
 
     /// A root-relative repository path (`/`-separated) as a project path.
-    /// Paths inside the project are built from the project root, so they
-    /// match the editor's paths even where git spells the root differently
-    /// (e.g. long vs 8.3 names on Windows).
+    /// Paths inside the folder the repository was discovered from are
+    /// built from that folder, so they match the editor's paths even where
+    /// git spells the root differently (e.g. long vs 8.3 names on Windows).
     pub fn repository_path(&self, repository: &git::Repository, relative: &str) -> PathBuf {
         match relative.strip_prefix(repository.prefix()) {
-            Some(inside) => self.join(&self.0.root, inside),
+            Some(inside) => self.join(Path::new(repository.dir()), inside),
             None => self.join(Path::new(repository.root()), relative),
         }
+    }
+
+    /// The settings for `path` (or the first folder): the user's, under
+    /// the workspace file's `settings`, under the folder's own
+    /// `.next_code/settings.json`. Cached per folder; rebuilt (without
+    /// reading again) when the user settings change. The first call per
+    /// folder, and the first after [`Project::folder_settings_changed`],
+    /// reads its file where the project lives (`Workspace` does that on a
+    /// background thread when it opens).
+    pub fn settings_for(&self, path: Option<&Path>) -> Arc<Settings> {
+        self.layered_settings(path).0
+    }
+
+    /// [`Project::settings_for`] and why workspace or folder settings were
+    /// ignored, if they were.
+    pub fn layered_settings(&self, path: Option<&Path>) -> (Arc<Settings>, Option<String>) {
+        let user = crate::settings::current();
+        let index = path.and_then(|path| self.root_index_of(path)).unwrap_or(0);
+        let folder = match &self.0.folder_settings.lock()[index] {
+            Some(cached) if Arc::ptr_eq(&cached.user, &user) => {
+                return (cached.layered.clone(), cached.error.clone());
+            }
+            Some(cached) => Some(cached.folder.clone()),
+            None => None,
+        };
+        let file = self.folder_settings_file(index);
+        let (folder, read_error) = match folder {
+            Some(folder) => folder,
+            None => match self.read_text(&file) {
+                Ok(text) => {
+                    match serde_json::from_str::<Value>(&devcontainer::jsonc::to_json(&text)) {
+                        Ok(value) => (value, None),
+                        Err(err) => (Value::Null, Some(format!("{}: {err}", file.display()))),
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => (Value::Null, None),
+                Err(err) => (Value::Null, Some(format!("{}: {err}", file.display()))),
+            },
+        };
+        let mut error = read_error.clone();
+        let workspace = self.workspace_settings();
+        let layered = user.layered(&[workspace, &folder]).unwrap_or_else(|err| {
+            error = Some(format!("{}: {err}", file.display()));
+            // The workspace's settings alone may still be fine.
+            user.layered(&[workspace]).unwrap_or_else(|err| {
+                error = Some(format!(
+                    "{}: {err}",
+                    self.workspace_file().unwrap_or("workspace settings")
+                ));
+                (*user).clone()
+            })
+        });
+        let layered = Arc::new(layered);
+        self.0.folder_settings.lock()[index] = Some(FolderSettings {
+            user,
+            folder: (folder, read_error),
+            layered: layered.clone(),
+            error: error.clone(),
+        });
+        (layered, error)
+    }
+
+    /// Folder `root`'s own settings file.
+    fn folder_settings_file(&self, root: usize) -> PathBuf {
+        let dir = self.join(&self.0.roots[root].path, FOLDER_SETTINGS_DIR);
+        self.join(&dir, "settings.json")
+    }
+
+    /// Forgets the settings of folders whose `.next_code/settings.json`
+    /// is among `paths` (changed on disk); true if any was.
+    pub fn folder_settings_changed<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> bool {
+        let mut changed = false;
+        for path in paths {
+            if let Some(index) = self.root_index_of(path)
+                && path == self.folder_settings_file(index)
+            {
+                self.0.folder_settings.lock()[index] = None;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// A repository file's working-tree bytes, read where the project
@@ -1101,5 +1851,270 @@ impl devcontainer::Host for FolderHost {
 
     fn windows(&self) -> bool {
         cfg!(windows) && !self.0.is_remote()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh temp dir for one test.
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nc-project-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn folder(path: &Path) -> Folder {
+        Folder {
+            path: path.to_string_lossy().into_owned(),
+            name: None,
+        }
+    }
+
+    fn untitled(folders: Vec<Folder>) -> Location {
+        Location::Workspace {
+            distro: None,
+            file: None,
+            folders,
+        }
+    }
+
+    #[test]
+    fn workspace_file_paths_parse_as_workspaces_wherever_they_live() {
+        let workspace = |distro: Option<&str>, file: &str| Location::Workspace {
+            distro: distro.map(str::to_owned),
+            file: Some(file.to_owned()),
+            folders: Vec::new(),
+        };
+        assert_eq!(
+            Location::parse("/src/all.next_code-workspace").unwrap(),
+            workspace(None, "/src/all.next_code-workspace")
+        );
+        assert_eq!(
+            Location::parse("Ubuntu:/home/me/team.code-workspace").unwrap(),
+            workspace(Some("Ubuntu"), "/home/me/team.code-workspace")
+        );
+        assert_eq!(
+            Location::parse(r"\\wsl.localhost\Ubuntu\home\me\a.next_code-workspace").unwrap(),
+            workspace(Some("Ubuntu"), "/home/me/a.next_code-workspace")
+        );
+        // Folders (and other files) stay what they were.
+        assert_eq!(
+            Location::parse("Ubuntu:/home/me/p").unwrap(),
+            Location::Wsl {
+                distro: "Ubuntu".into(),
+                path: "/home/me/p".into()
+            }
+        );
+        assert!(matches!(
+            Location::parse("/src/workspace.json").unwrap(),
+            Location::Local(_)
+        ));
+    }
+
+    #[test]
+    fn a_saved_workspace_is_the_same_project_whatever_its_folders() {
+        let file = |folders: Vec<Folder>| Location::Workspace {
+            distro: None,
+            file: Some("/w/a.next_code-workspace".into()),
+            folders,
+        };
+        let one = file(vec![folder(Path::new("/w/x"))]);
+        let two = file(vec![folder(Path::new("/w/x")), folder(Path::new("/w/y"))]);
+        assert!(one.opens_same(&two));
+        assert_eq!(one.workspace_state_key(), two.workspace_state_key());
+        // Untitled workspaces are their folders, in order.
+        let a = untitled(vec![folder(Path::new("/w/x")), folder(Path::new("/w/y"))]);
+        let b = untitled(vec![folder(Path::new("/w/y")), folder(Path::new("/w/x"))]);
+        assert!(!a.opens_same(&b));
+        assert_ne!(a.workspace_state_key(), b.workspace_state_key());
+        assert_eq!(
+            a.workspace_state_key(),
+            untitled(vec![folder(Path::new("/w/x")), folder(Path::new("/w/y"))])
+                .workspace_state_key(),
+            "keys are stable"
+        );
+        assert_eq!(Location::Local("/w/x".into()).workspace_state_key(), None);
+    }
+
+    #[test]
+    fn paths_resolve_to_the_innermost_folder_and_are_labelled_by_it() {
+        let dir = temp("roots");
+        let (api, web, nested) = (
+            dir.join("api"),
+            dir.join("web"),
+            dir.join("web").join("lib"),
+        );
+        for folder in [&api, &web, &nested] {
+            fs::create_dir_all(folder).unwrap();
+        }
+        let mut folders = vec![folder(&api), folder(&web), folder(&nested)];
+        folders[1].name = Some("Frontend".into());
+        let project = Project::open(&untitled(folders), &mut |_| {}).unwrap();
+        assert!(project.is_multi_root() && project.is_workspace());
+        assert_eq!(project.root(), api.as_path());
+        let names: Vec<_> = project
+            .roots()
+            .iter()
+            .map(|root| root.name.as_str())
+            .collect();
+        assert_eq!(names, ["api", "Frontend", "lib"]);
+
+        let file = nested.join("x").join("a.rs");
+        assert_eq!(project.root_index_of(&file), Some(2), "innermost folder");
+        assert_eq!(project.relative(&file), Some((2, "x/a.rs".into())));
+        assert_eq!(project.display_path(&file), "lib › x/a.rs");
+        assert_eq!(
+            project.display_path(&web.join("index.ts")),
+            "Frontend › index.ts"
+        );
+        let outside = dir.join("elsewhere.txt");
+        assert_eq!(project.root_index_of(&outside), None);
+        assert_eq!(project.root_for(&outside).name, "api");
+        assert_eq!(project.display_path(&outside), outside.to_string_lossy());
+        assert_eq!(project.root_named("Frontend"), Some(1));
+        assert_eq!(project.root_named("2"), Some(2));
+        assert_eq!(project.root_named("nope"), None);
+        assert_eq!(project.path_in(1, "src/a.ts"), web.join("src").join("a.ts"));
+
+        // A single folder labels nothing.
+        let single = Project::local(api.clone());
+        assert_eq!(single.display_path(&api.join("src/main.rs")), "src/main.rs");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn workspace_files_open_with_relative_folders_and_layer_settings() {
+        let dir = temp("file");
+        let (app, lib) = (dir.join("ws").join("app"), dir.join("lib"));
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(lib.join(".next_code")).unwrap();
+        let file = dir.join("ws").join("all.next_code-workspace");
+        fs::write(
+            &file,
+            r#"{ "folders": [{ "path": "app" }, { "path": "../lib", "name": "Library" }],
+                 // comments are fine
+                 "settings": { "format_on_save": true, "word_wrap": true } }"#,
+        )
+        .unwrap();
+        fs::write(
+            lib.join(".next_code").join("settings.json"),
+            r#"{ "word_wrap": false }"#,
+        )
+        .unwrap();
+        let location = Location::parse(&file.to_string_lossy()).unwrap();
+        let project = Project::open(&location, &mut |_| {}).unwrap();
+        let paths: Vec<_> = project
+            .roots()
+            .iter()
+            .map(|root| root.path.clone())
+            .collect();
+        assert_eq!(paths, [app.clone(), lib.clone()]);
+        assert_eq!(project.workspace_file(), Some(&*file.to_string_lossy()));
+        assert!(matches!(
+            project.location(),
+            Location::Workspace { file: Some(_), ref folders, .. } if folders.len() == 2
+        ));
+
+        // user < workspace file < folder settings.
+        let in_app = project.settings_for(Some(&app.join("main.py")));
+        assert!(in_app.format_on_save && in_app.word_wrap);
+        let in_lib = project.settings_for(Some(&lib.join("x.py")));
+        assert!(in_lib.format_on_save && !in_lib.word_wrap);
+
+        // A broken folder file is reported and skipped once it changes.
+        let settings = lib.join(".next_code").join("settings.json");
+        fs::write(&settings, "{ broken").unwrap();
+        assert!(
+            project.layered_settings(Some(&lib)).1.is_none(),
+            "still cached"
+        );
+        assert!(project.folder_settings_changed([settings.as_path()]));
+        let (in_lib, error) = project.layered_settings(Some(&lib));
+        assert!(error.is_some_and(|error| error.contains("settings.json")));
+        assert!(in_lib.word_wrap, "the workspace layer still applies");
+        assert!(!project.folder_settings_changed([app.join("settings.json").as_path()]));
+
+        // Saving writes the folders relative to the file where possible.
+        let text = project.workspace_text(&file.to_string_lossy());
+        let parsed = workspace_file::parse(&text, &file.to_string_lossy(), !cfg!(windows)).unwrap();
+        assert_eq!(parsed.folders, project.folders());
+        assert!(text.contains("\"app\""), "{text}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn changing_folders_keeps_the_machine_and_drops_back_to_a_folder() {
+        let dir = temp("with");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let single = Project::local(a.clone());
+        assert_eq!(
+            single.with_folders(vec![folder(&a), folder(&b)]),
+            Ok(untitled(vec![folder(&a), folder(&b)]))
+        );
+        let two = Project::open(&untitled(vec![folder(&a), folder(&b)]), &mut |_| {}).unwrap();
+        assert_eq!(
+            two.with_folders(vec![folder(&b)]),
+            Ok(Location::Local(b.clone()))
+        );
+        assert!(two.with_folders(Vec::new()).is_err());
+        assert!(
+            Project::open(&untitled(Vec::new()), &mut |_| {}).is_err(),
+            "a workspace needs a folder"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_search_covers_every_folder_once() {
+        let dir = temp("search");
+        let (a, b) = (dir.join("a"), dir.join("a").join("b"));
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("one.txt"), "needle\n").unwrap();
+        fs::write(b.join("two.txt"), "needle needle\n").unwrap();
+        let project = Project::open(&untitled(vec![folder(&a), folder(&b)]), &mut |_| {}).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            ..Default::default()
+        };
+        let collect = |limits| {
+            let (_handle, events) = project.search(&query, limits).unwrap();
+            futures::executor::block_on(events.collect::<Vec<_>>())
+        };
+        let events = collect(SearchLimits::default());
+        let mut files: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                SearchEvent::File(file) => Some(file.path.clone()),
+                SearchEvent::Done { .. } => None,
+            })
+            .collect();
+        files.sort();
+        // `b` lies inside `a` too: its file is reported once.
+        assert_eq!(files, [a.join("b").join("two.txt"), a.join("one.txt")]);
+        assert!(matches!(
+            events.last(),
+            Some(SearchEvent::Done {
+                matches: 3,
+                limit_hit: false,
+                ..
+            })
+        ));
+        let limited = collect(SearchLimits {
+            max_matches: 1,
+            ..SearchLimits::default()
+        });
+        assert!(matches!(
+            limited.last(),
+            Some(SearchEvent::Done {
+                limit_hit: true,
+                ..
+            })
+        ));
+        fs::remove_dir_all(dir).ok();
     }
 }

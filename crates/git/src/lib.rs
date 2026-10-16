@@ -115,6 +115,8 @@ pub struct Repository {
     runner: Arc<dyn Runner>,
     root: String,
     prefix: String,
+    /// The directory it was discovered from, as the caller spelled it.
+    dir: String,
 }
 
 impl Repository {
@@ -152,6 +154,7 @@ impl Repository {
             runner,
             root,
             prefix,
+            dir: dir.to_owned(),
         }))
     }
 
@@ -201,6 +204,12 @@ impl Repository {
     /// top level, else a root-relative path ending in `/`.
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+
+    /// The directory [`Repository::discover`] was given (the caller's
+    /// spelling); [`Repository::prefix`] is relative to it.
+    pub fn dir(&self) -> &str {
+        &self.dir
     }
 
     fn git(&self, args: &[&str]) -> io::Result<Output> {

@@ -44,6 +44,7 @@ actions!(
     [
         OpenProject,
         OpenProjectInNewWindow,
+        OpenWorkspace,
         OpenRecent,
         CloseProject,
         NextProject,
@@ -242,6 +243,36 @@ pub(crate) fn tab_title(location: &Location) -> String {
             }
             folder => format!("{} [Container]", tab_title(folder)),
         },
+        Location::Workspace {
+            distro,
+            file,
+            folders,
+        } => {
+            let posix = location.posix();
+            let name = match file {
+                Some(file) => {
+                    let name = crate::workspace_file::folder_name(file, posix);
+                    let stem = name
+                        .rsplit_once('.')
+                        .map_or(name.as_str(), |(stem, _)| stem)
+                        .to_owned();
+                    format!("{stem} (Workspace)")
+                }
+                None => folders
+                    .iter()
+                    .map(|folder| {
+                        folder.name.clone().unwrap_or_else(|| {
+                            crate::workspace_file::folder_name(&folder.path, posix)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            match distro {
+                Some(distro) => format!("{name} [{distro}]"),
+                None => name,
+            }
+        }
     }
 }
 
@@ -533,6 +564,21 @@ impl Shell {
                     cx.new(|cx| Workspace::new(Project::local(root), git, window, cx)),
                 )
             }
+            // Local workspaces open at once (reading the file is quick);
+            // a failure shows in the Connecting view, with Retry.
+            TabTarget::Project(location @ Location::Workspace { distro: None, .. })
+                if preload.is_none() =>
+            {
+                match Project::open(&location, &mut |_| {}) {
+                    Ok(project) => {
+                        self.tabs[index].target = TabTarget::Project(project.location());
+                        Content::Workspace(cx.new(|cx| Workspace::new(project, None, window, cx)))
+                    }
+                    Err(_) => Content::Connecting(
+                        cx.new(|cx| Connecting::new(location, None, window, cx)),
+                    ),
+                }
+            }
             TabTarget::Project(remote) => {
                 let pending = match preload {
                     Some(Preload::Remote(pending)) => Some(pending),
@@ -645,9 +691,34 @@ impl Shell {
                             this.remove_tab(index, window, cx);
                         }
                     }
+                    WorkspaceEvent::Reopen(location) => {
+                        let id = workspace.entity_id();
+                        this.reopen(id, location.clone(), window, cx);
+                    }
                 },
             ),
         })
+    }
+
+    /// The workspace `id` with other folders: its tab opens `location`
+    /// in its place (the workspace saved its session for it first).
+    fn reopen(
+        &mut self,
+        id: EntityId,
+        location: Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.content.id() == Some(id))
+        else {
+            return;
+        };
+        self.tabs[index] = Tab::unloaded(TabTarget::Project(location.absolute()));
+        self.load(index, None, window, cx);
+        self.activate(index, window, cx);
     }
 
     /// A remote project finished opening: its tab gets the workspace.
@@ -833,6 +904,42 @@ impl Shell {
 
     fn open_project(&mut self, _: &OpenProject, window: &mut Window, cx: &mut Context<Self>) {
         self.prompt_for_project(false, window, cx);
+    }
+
+    /// File > Open Workspace from File…: a `*.next_code-workspace` or VS
+    /// Code `*.code-workspace` file (Ctrl+R also takes a typed one).
+    fn open_workspace(&mut self, _: &OpenWorkspace, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open Workspace".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.first() else {
+                return;
+            };
+            let path = path.to_string_lossy().into_owned();
+            this.update_in(cx, |this, window, cx| match Location::parse(&path) {
+                Some(location @ Location::Workspace { .. }) => this.open(location, window, cx),
+                _ => {
+                    this.notice = Some(
+                        format!(
+                            "{path} is not a workspace file (*.{} or *.{})",
+                            crate::workspace_file::EXTENSION,
+                            crate::workspace_file::VSCODE_EXTENSION
+                        )
+                        .into(),
+                    );
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_project_in_new_window(
@@ -2134,6 +2241,7 @@ impl Render for Shell {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_project))
             .on_action(cx.listener(Self::open_project_in_new_window))
+            .on_action(cx.listener(Self::open_workspace))
             .on_action(cx.listener(Self::open_recent))
             .on_action(cx.listener(Self::open_recent_project))
             .on_action(cx.listener(Self::close_project))
@@ -2548,6 +2656,85 @@ mod tests {
         cx.dispatch_action(window.into(), CloseProject);
         assert_eq!(tabs(window, cx), (Vec::new(), 0));
         assert_eq!(title(cx), "next_code");
+        cleanup(root);
+    }
+
+    #[gpui::test]
+    fn folders_join_a_workspace_that_saves_and_reopens_from_recent(cx: &mut gpui::TestAppContext) {
+        let (root, alpha, _) = two_projects("multi-root");
+        cx.update(app_state::init);
+        let window = open_shell(alpha, cx);
+        let main_py = root.join("alpha").join("main.py");
+        open_file(window, 0, &main_py, cx);
+        let workspace = |cx: &mut gpui::TestAppContext| {
+            window
+                .read_with(cx, |shell, _| shell.workspace_entities()[0].clone())
+                .unwrap()
+        };
+        let roots = |cx: &mut gpui::TestAppContext| {
+            workspace(cx).read_with(cx, |workspace, _| {
+                let project = workspace.project();
+                project
+                    .roots()
+                    .iter()
+                    .map(|root| root.name.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        // Add Folder: the same tab reopens with both folders and the file.
+        let beta = root.join("beta").to_string_lossy().into_owned();
+        workspace(cx).update(cx, |workspace, cx| workspace.add_folders(vec![beta], cx));
+        cx.run_until_parked();
+        assert_eq!(tabs(window, cx), (vec!["alpha, beta".to_owned()], 0));
+        assert_eq!(roots(cx), ["alpha", "beta"]);
+        assert_eq!(
+            workspace(cx).read_with(cx, |workspace, _| workspace.tab_paths()),
+            std::slice::from_ref(&main_py),
+            "the session came along"
+        );
+
+        // Save Workspace As: written next to the folders, tab named after it.
+        let file = root.join("both");
+        workspace(cx).update(cx, |workspace, cx| {
+            workspace.write_workspace_file(&file.to_string_lossy(), cx)
+        });
+        cx.run_until_parked();
+        let file = root.join("both.next_code-workspace");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("\"alpha\"") && text.contains("\"beta\""),
+            "{text}"
+        );
+        assert_eq!(tabs(window, cx), (vec!["both (Workspace)".to_owned()], 0));
+        settle(cx);
+        let saved = app_state::load().unwrap();
+        assert!(matches!(
+            &saved.windows[0].tabs[0],
+            TabTarget::Project(Location::Workspace { file: Some(_), folders, .. }) if folders.len() == 2
+        ));
+
+        // Close it, then reopen it from Recent.
+        cx.dispatch_action(window.into(), CloseProject);
+        assert_eq!(tabs(window, cx), (Vec::new(), 0));
+        let recent = recent::load();
+        assert_eq!(tab_title(&recent[0]), "both (Workspace)");
+        cx.dispatch_action(
+            window.into(),
+            OpenRecentProject {
+                location: recent[0].clone(),
+            },
+        );
+        cx.run_until_parked();
+        assert_eq!(roots(cx), ["alpha", "beta"]);
+
+        // Remove Folder rewrites the file; the workspace stays one.
+        workspace(cx).update(cx, |workspace, cx| workspace.remove_folder(0, cx));
+        cx.run_until_parked();
+        assert_eq!(roots(cx), ["beta"]);
+        assert_eq!(tabs(window, cx), (vec!["both (Workspace)".to_owned()], 0));
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("\"alpha\""), "{text}");
         cleanup(root);
     }
 

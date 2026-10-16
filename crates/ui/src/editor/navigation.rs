@@ -93,7 +93,7 @@ impl Goto {
 }
 
 impl Editor {
-    pub(super) fn server(&self) -> Option<Arc<RunningServer>> {
+    pub(crate) fn server(&self) -> Option<Arc<RunningServer>> {
         self.lsp.as_ref().map(|doc| doc.server.clone())
     }
 

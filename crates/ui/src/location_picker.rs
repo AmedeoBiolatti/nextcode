@@ -36,7 +36,8 @@ struct Entry {
     location: Location,
     /// `file.py:12`.
     name: SharedString,
-    /// Containing directory, relative to the project root when inside it.
+    /// Containing directory, relative to the project root when inside it
+    /// (`root › dir` when the project has several folders).
     dir: SharedString,
     /// The target line's text, trimmed.
     preview: SharedString,
@@ -72,18 +73,10 @@ impl LocationPicker {
                     .unwrap_or_default()
                     .trim()
                     .to_owned();
-                let shown = location
-                    .path
-                    .strip_prefix(project.root())
-                    .unwrap_or(&location.path);
-                let file_name = shown.file_name().unwrap_or_default().to_string_lossy();
+                let (file_name, dir) = project.display_parts(&location.path);
                 Entry {
                     name: format!("{file_name}:{}", line + 1).into(),
-                    dir: shown
-                        .parent()
-                        .map(|dir| dir.display().to_string())
-                        .unwrap_or_default()
-                        .into(),
+                    dir: dir.into(),
                     preview: preview.into(),
                     location,
                 }
@@ -228,5 +221,54 @@ impl Render for LocationPicker {
                 .track_scroll(self.scroll.clone())
                 .h(px(ROW_HEIGHT * rows as f32)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+    use lsp::types::{Position, Range};
+
+    use super::*;
+
+    #[gpui::test]
+    fn references_are_labelled_with_their_folder_when_there_are_several(cx: &mut TestAppContext) {
+        let base = std::env::temp_dir().join(format!("next_code_locations_{}", std::process::id()));
+        let (api, web) = (base.join("api"), base.join("web"));
+        std::fs::create_dir_all(web.join("src")).unwrap();
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::write(web.join("src").join("lib.rs"), "fn a() {}\n    call();\n").unwrap();
+        std::fs::write(api.join("main.rs"), "call();\n").unwrap();
+        let at = |path: PathBuf, line| Location {
+            path,
+            range: Range::new(Position::new(line, 0), Position::new(line, 4)),
+        };
+        let locations = vec![
+            at(web.join("src").join("lib.rs"), 1),
+            at(api.join("main.rs"), 0),
+        ];
+        let project = Project::local_folders(&[&api, &web]);
+        let picker = cx.new(|cx| LocationPicker::new("References".into(), locations, &project, cx));
+        picker.read_with(cx, |picker, _| {
+            let shown: Vec<(&str, &str, &str)> = picker
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.name.as_ref(),
+                        entry.dir.as_ref(),
+                        entry.preview.as_ref(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                shown,
+                [
+                    ("lib.rs:2", "web › src", "call();"),
+                    ("main.rs:1", "api", "call();")
+                ]
+            );
+        });
+        std::fs::remove_dir_all(base).ok();
     }
 }

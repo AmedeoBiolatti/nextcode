@@ -663,34 +663,47 @@ impl Syntax {
     /// blocks (from the line of their `:`), HTML and JSX elements,
     /// Markdown sections and fenced code, TOML tables.
     pub fn fold_ranges(&self, lines: Range<usize>) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> = self
+            .scopes(lines.clone())
+            .into_iter()
+            .filter(|scope| scope.header < lines.end)
+            .map(|scope| (scope.header, scope.last))
+            .collect();
+        ranges.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        ranges.dedup_by_key(|range| range.0);
+        ranges
+    }
+
+    /// The foldable regions of `fold_ranges` with the line each one's
+    /// construct opens on (`def`/`class`/`fn` of a multi-line signature,
+    /// after decorators), for those whose opening line intersects `lines`.
+    /// Unsorted; several may share a header line.
+    pub fn scopes(&self, lines: Range<usize>) -> Vec<Scope> {
         let Some(tree) = &self.tree else {
             return Vec::new();
         };
-        let mut ranges = Vec::new();
+        let mut scopes = Vec::new();
         let mut stack = vec![tree.root_node()];
         let mut cursor = tree.walk();
         while let Some(node) = stack.pop() {
             if node.end_position().row < lines.start {
                 continue;
             }
-            // Checked before the start: a Python block's header is the line
-            // before it.
-            if let Some((header, last)) = self.fold_range(node)
-                && header < lines.end
-                && last >= lines.start
+            // Checked before the start: a scope opens before its body.
+            if let Some(scope) = self.fold_range(node)
+                && scope.opening < lines.end
+                && scope.last >= lines.start
             {
-                ranges.push((header, last));
+                scopes.push(scope);
             }
             if node.start_position().row < lines.end {
                 stack.extend(node.children(&mut cursor));
             }
         }
-        ranges.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        ranges.dedup_by_key(|range| range.0);
-        ranges
+        scopes
     }
 
-    fn fold_range(&self, node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
+    fn fold_range(&self, node: tree_sitter::Node<'_>) -> Option<Scope> {
         let start = node.start_position().row;
         let end_position = node.end_position();
         // A node ending at a line start (its line break included) ends on
@@ -710,11 +723,16 @@ impl Syntax {
             _ => end,
         };
         let kind = node.kind();
+        let python_block = self.language == Language::Python && kind == "block";
         let range = match (self.language, kind) {
             (Language::Python, "block") => {
-                let header = node
-                    .prev_sibling()
-                    .map_or(start, |colon| colon.start_position().row);
+                // The `:` before the block; comments between them are
+                // extras among the siblings.
+                let mut colon = node.prev_sibling();
+                while let Some(extra) = colon.filter(|sibling| sibling.is_extra()) {
+                    colon = extra.prev_sibling();
+                }
+                let header = colon.map_or(start, |colon| colon.start_position().row);
                 (header, end)
             }
             (Language::Html, "element" | "script_element" | "style_element")
@@ -740,8 +758,46 @@ impl Syntax {
                 (start, closing_kept(last))
             }
         };
-        (range.1 > range.0).then_some(range)
+        if range.1 <= range.0 {
+            return None;
+        }
+        // A Python block, or a construct's `body`, opens with the
+        // construct (its first token after decorators and comments).
+        let opening = node
+            .parent()
+            .filter(|parent| {
+                python_block && parent.kind() != "module"
+                    || parent
+                        .child_by_field_name("body")
+                        .is_some_and(|body| body.id() == node.id())
+            })
+            .and_then(|parent| {
+                let mut cursor = parent.walk();
+                parent
+                    .children(&mut cursor)
+                    .find(|child| !child.is_extra() && child.kind() != "decorator")
+                    .map(|child| child.start_position().row)
+            })
+            .map_or(range.0, |row| row.min(range.0));
+        Some(Scope {
+            opening,
+            header: range.0,
+            last: range.1,
+        })
     }
+}
+
+/// A foldable region (see `Syntax::fold_ranges`) and where its construct
+/// opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scope {
+    /// First line of the construct: `def`/`fn`/`class`/`if`… (the first of
+    /// a multi-line signature, after decorators).
+    pub opening: usize,
+    /// The line that stays shown when folded.
+    pub header: usize,
+    /// Last hidden line.
+    pub last: usize,
 }
 
 fn point(point: text::Point) -> Point {
@@ -1253,6 +1309,98 @@ y = 2
             folds(Language::Python, "def f():\n    pass\nx = 1\n"),
             [(0, 1)]
         );
+    }
+
+    #[test]
+    fn python_bodies_starting_with_a_comment_or_docstring_fold_from_the_colon() {
+        let source = "\
+class Inventory:
+    \"\"\"Keeps track of stock.\"\"\"
+
+    def receive(self, count):
+        # Receive the items
+        if count > 0:
+            # positive
+            return count
+        return 0
+
+    def ship(self, count):
+        \"\"\"Ship them.\"\"\"
+        return count
+";
+        assert_eq!(
+            folds(Language::Python, source),
+            [(0, 12), (3, 8), (5, 7), (10, 12)]
+        );
+    }
+
+    fn openings(language: Language, source: &str) -> Vec<(usize, usize, usize)> {
+        let buffer = Buffer::new(source);
+        let mut scopes: Vec<_> = Syntax::new(language, &buffer)
+            .scopes(0..buffer.line_count())
+            .into_iter()
+            .map(|s| (s.opening, s.header, s.last))
+            .collect();
+        scopes.sort();
+        scopes
+    }
+
+    #[test]
+    fn scopes_open_on_the_constructs_first_line() {
+        let python = "\
+class A:
+    @property
+    def g(
+        self,
+    ):
+        # first a comment
+        return 1
+
+    def h(self):
+        \"\"\"Doc.\"\"\"
+        if x:
+            pass
+        else:
+            # comment
+            pass
+";
+        assert_eq!(
+            openings(Language::Python, python),
+            [
+                (0, 0, 14),
+                // `g`: parameters, then the body from `def` (not `@property`).
+                (2, 2, 3),
+                (2, 4, 6),
+                (8, 8, 14),
+                (10, 10, 11),
+                (12, 12, 14)
+            ]
+        );
+        let rust = "\
+impl A {
+    #[inline]
+    fn g(
+        a: u32,
+    ) -> u32 {
+        foo(
+            a,
+        )
+    }
+}
+";
+        assert_eq!(
+            openings(Language::Rust, rust),
+            // impl, parameters, body (from `fn`), call arguments (own line).
+            [(0, 0, 8), (2, 2, 3), (2, 4, 7), (5, 5, 6)]
+        );
+        let js = "\
+function f(a) {
+  return g(
+    a,
+  );
+}
+";
+        assert_eq!(openings(Language::JavaScript, js), [(0, 0, 3), (1, 1, 2)]);
     }
 
     #[test]

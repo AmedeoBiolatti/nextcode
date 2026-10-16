@@ -158,7 +158,8 @@ impl Workspace {
         cx.notify();
     }
 
-    fn selected_or_notice(&mut self, cx: &mut Context<Self>) -> Option<Configuration> {
+    /// The selected configuration and its folder.
+    fn selected_or_notice(&mut self, cx: &mut Context<Self>) -> Option<(Configuration, usize)> {
         let selected = self.runs.configs.selected().cloned();
         if selected.is_none() {
             let message = if self.runs.configs.loaded {
@@ -168,18 +169,21 @@ impl Workspace {
             };
             self.report(message.into(), cx);
         }
-        selected
+        selected.map(|config| {
+            let folder = self.runs.configs.folder(&config.name);
+            (config, folder)
+        })
     }
 
     pub fn run_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(config) = self.selected_or_notice(cx) {
-            self.run_in_terminal(config, window, cx);
+        if let Some((config, folder)) = self.selected_or_notice(cx) {
+            self.run_in_terminal(config, folder, window, cx);
         }
     }
 
     pub fn debug_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(config) = self.selected_or_notice(cx) {
-            self.debug(config, window, cx);
+        if let Some((config, folder)) = self.selected_or_notice(cx) {
+            self.debug(config, folder, window, cx);
         }
     }
 
@@ -201,32 +205,36 @@ impl Workspace {
         self.debug_selected(window, cx);
     }
 
-    /// Runs `config` in a terminal tab named after it (a rerun replaces
-    /// the tab), where the project lives.
+    /// Runs `config` (of folder `folder`) in a terminal tab named after it
+    /// (a rerun replaces the tab), started in that folder where the
+    /// project lives.
     fn run_in_terminal(
         &mut self,
         config: Configuration,
+        folder: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let resolved = match run_config::resolve(&self.project, &config, &self.active(cx)) {
+        let resolved = match run_config::resolve(&self.project, folder, &config, &self.active(cx)) {
             Ok(resolved) => resolved,
             Err(err) => return self.report(format!("Cannot run {}: {err}", config.name), cx),
         };
         let project = self.project.clone();
         let task = cx.background_spawn(async move {
-            let runner = run_config::python_runner(&project);
+            let runner = run_config::python_runner(&project, folder);
             resolved
                 .command(&runner)
-                .map(|command| run_config::terminal_line(&project, &command))
+                .map(|command| run_config::terminal_line(&project, folder, &command))
         });
+        // The first folder is the terminal's default.
+        let dir = (folder > 0).then(|| self.project.roots()[folder].path.clone());
         cx.spawn_in(window, async move |this, cx| {
             let line = task.await;
             this.update_in(cx, |this, window, cx| match line {
                 Ok(line) => {
                     this.show_panel(PanelId::Terminal, cx);
                     this.terminal.update(cx, |terminal, cx| {
-                        terminal.run_command(&config.name, &line, window, cx)
+                        terminal.run_command(&config.name, &line, dir.as_deref(), window, cx)
                     });
                 }
                 Err(err) => this.report(format!("Cannot run {}: {err}", config.name), cx),
@@ -236,10 +244,16 @@ impl Workspace {
         .detach();
     }
 
-    /// Debugs `config`: builds the debug request (building cargo
-    /// configurations first) and hands it to the debugger.
-    fn debug(&mut self, config: Configuration, window: &mut Window, cx: &mut Context<Self>) {
-        let resolved = match run_config::resolve(&self.project, &config, &self.active(cx)) {
+    /// Debugs `config` (of folder `folder`): builds the debug request
+    /// (building cargo configurations first) and hands it to the debugger.
+    fn debug(
+        &mut self,
+        config: Configuration,
+        folder: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let resolved = match run_config::resolve(&self.project, folder, &config, &self.active(cx)) {
             Ok(resolved) => resolved,
             Err(err) => return self.report(format!("Cannot debug {}: {err}", config.name), cx),
         };
@@ -248,7 +262,9 @@ impl Workspace {
         }
         let project = self.project.clone();
         let task =
-            cx.background_spawn(async move { run_config::debug_request(&project, &resolved) });
+            cx.background_spawn(
+                async move { run_config::debug_request(&project, folder, &resolved) },
+            );
         self.hand_to_debugger(config.name, task, window, cx);
     }
 
@@ -327,15 +343,22 @@ impl Workspace {
         self.edit_configurations_file(window, cx);
     }
 
-    /// Opens `.next_code/run.json`, creating it (with an example and the
-    /// automatic configurations as templates) if missing.
+    /// Opens `.next_code/run.json` of the active file's folder (else the
+    /// first), creating it (with an example and that folder's automatic
+    /// configurations as templates) if missing.
     fn edit_configurations_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let path = self.project.resolve(run::config::RUN_JSON);
+        let folder = self
+            .active_tab()
+            .and_then(|tab| self.project.root_index_of(&tab.path))
+            .unwrap_or(0);
+        let path = self.project.resolve_in(folder, run::config::RUN_JSON);
         if matches!(self.project.kind(&path), Ok(None)) {
-            let dir = self.project.resolve(".next_code");
+            let dir = self.project.resolve_in(folder, ".next_code");
             let created = self.project.create_dir_all(&dir).and_then(|()| {
-                self.project
-                    .write(&path, run_config::template(&self.runs.configs).into_bytes())
+                self.project.write(
+                    &path,
+                    run_config::template(&self.runs.configs, folder).into_bytes(),
+                )
             });
             if let Err(err) = created {
                 return self.report(format!("Cannot create {}: {err}", path.display()), cx);
@@ -432,8 +455,9 @@ impl Workspace {
         self.hand_to_debugger(name, task, window, cx);
     }
 
-    /// The Python panel's run buttons: scripts and the current file run as
-    /// configurations in terminal tabs; tests run in the Tests panel.
+    /// The Python panel's run buttons: scripts (of the first folder, whose
+    /// project the panel shows) and the current file (in its folder) run
+    /// as configurations in terminal tabs; tests run in the Tests panel.
     pub(super) fn run_python(
         &mut self,
         request: RunRequest,
@@ -445,6 +469,11 @@ impl Workspace {
             let line = editor.buffer().line_of(editor.cursor());
             Some((tab.path.clone(), line, editor.text()))
         });
+        let folder = active
+            .as_ref()
+            .and_then(|(path, _, _)| self.project.root_index_of(path))
+            .unwrap_or(0);
+        // Relative to its folder, as pytest and the interpreter there take it.
         let file = active
             .as_ref()
             .map(|(path, _, _)| crate::python_panel::project_relative(&self.project, path));
@@ -468,33 +497,39 @@ impl Workspace {
                         args: Vec::new(),
                     },
                 ),
+                0,
                 window,
                 cx,
             ),
-            RunRequest::CurrentFile => match file {
-                Some(file) => self.run_in_terminal(
+            RunRequest::CurrentFile => match (file, &active) {
+                (Some(file), Some((path, _, _))) => self.run_in_terminal(
                     configuration(
-                        format!("Run {file}"),
+                        format!("Run {}", self.project.display_path(path)),
                         run::Kind::Python {
                             target: PythonTarget::Script(file),
                             args: Vec::new(),
                             interpreter: None,
                         },
                     ),
+                    folder,
                     window,
                     cx,
                 ),
-                None => self.report(need_file(), cx),
+                _ => self.report(need_file(), cx),
             },
             RunRequest::Tests => self.show_tests_and_run(RunTarget::Pytest, cx),
             RunRequest::TestFile => match file {
-                Some(file) => self.show_tests_and_run(RunTarget::Ids(vec![file]), cx),
+                Some(file) => {
+                    let id = engine::test_id(&self.project, folder, &file);
+                    self.show_tests_and_run(RunTarget::Ids(vec![id]), cx)
+                }
                 None => self.report(need_file(), cx),
             },
             RunRequest::TestAtCursor => match (&active, &file) {
                 (Some((_, line, text)), Some(file)) => match python::test_at(text, *line) {
                     Some(node) => {
-                        self.show_tests_and_run(RunTarget::Ids(vec![format!("{file}::{node}")]), cx)
+                        let id = engine::test_id(&self.project, folder, &format!("{file}::{node}"));
+                        self.show_tests_and_run(RunTarget::Ids(vec![id]), cx)
                     }
                     None => self.report("The cursor is not in a test function or class".into(), cx),
                 },
@@ -775,8 +810,8 @@ mod tests {
             line: Some(3),
         };
         let request = |config: &Configuration| {
-            run_config::resolve(&project, config, &active)
-                .and_then(|resolved| run_config::debug_request(&project, &resolved))
+            run_config::resolve(&project, 0, config, &active)
+                .and_then(|resolved| run_config::debug_request(&project, 0, &resolved))
         };
         let app = request(&configs[0]).unwrap();
         assert_eq!(app.adapter, crate::debugger::DebugAdapterKind::Python);

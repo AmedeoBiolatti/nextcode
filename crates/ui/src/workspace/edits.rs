@@ -98,12 +98,12 @@ impl Workspace {
             }
         }
         for (editor, path, owner) in moved {
-            editor.update(cx, |editor, cx| editor.set_file_path(path, cx));
+            editor.update(cx, |editor, cx| editor.set_file_path(path.clone(), cx));
             let language = editor.read(cx).language();
             if owner && let Some(language) = language {
                 let server = self
                     .lsp_store
-                    .update(cx, |store, cx| store.server(language, cx));
+                    .update(cx, |store, cx| store.server(language, &path, cx));
                 if let Some(server) = server {
                     editor.update(cx, |editor, cx| editor.attach_server(server, cx));
                 }
@@ -183,7 +183,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let report = self.apply_workspace_edit(edit, server.encoding, cx);
-        let summary = report.summary(label, self.project.root());
+        let summary = report.summary(label, &self.project);
         if report.failure.is_some() {
             self.notice = Some(summary.into());
             cx.notify();
@@ -216,7 +216,7 @@ impl Workspace {
         request.respond(report.response());
         if report.failure.is_some() {
             let label = request.label.as_deref().unwrap_or("Edit");
-            self.notice = Some(report.summary(label, self.project.root()).into());
+            self.notice = Some(report.summary(label, &self.project).into());
             cx.notify();
         }
     }

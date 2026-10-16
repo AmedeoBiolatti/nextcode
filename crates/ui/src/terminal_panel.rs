@@ -92,6 +92,16 @@ pub fn profiles(project: &Project) -> Vec<Profile> {
     }
 }
 
+/// Where New Terminal starts: the folder holding `near` (the active
+/// editor's file); `None` for the first folder, the shell's default (also
+/// when `near` is outside every folder).
+fn shell_folder(project: &Project, near: Option<&Path>) -> Option<PathBuf> {
+    match near.and_then(|path| project.root_index_of(path)) {
+        Some(index) if index > 0 => Some(project.roots()[index].path.clone()),
+        _ => None,
+    }
+}
+
 /// Starts `program` in a pty where `project` lives (in its root), or on
 /// this machine in the home folder without one, as a view named `title`
 /// that stays when the program exits. `tap` follows its output.
@@ -164,6 +174,9 @@ pub struct TerminalView {
     /// this name (shell titles don't replace it) and running it again
     /// replaces the tab.
     run_name: Option<SharedString>,
+    /// The folder the shell started in, shown after the title in a
+    /// multi-root project.
+    folder: Option<SharedString>,
     /// A program's tab (workflows) stays when the program exits, showing
     /// its exit code; a shell's tab closes.
     keep_on_exit: bool,
@@ -228,6 +241,7 @@ impl TerminalView {
             profile,
             title: SharedString::default(),
             run_name: None,
+            folder: None,
             keep_on_exit: false,
             exit: None,
             focus_handle: cx.focus_handle(),
@@ -260,11 +274,15 @@ impl TerminalView {
         };
         // Long titles are usually paths; keep the end.
         let chars: Vec<char> = title.chars().collect();
-        let title = if chars.len() > 28 {
+        let mut title = if chars.len() > 28 {
             format!("…{}", chars[chars.len() - 27..].iter().collect::<String>())
         } else {
             title.to_owned()
         };
+        // Run names already say which folder.
+        if let (Some(folder), None) = (&self.folder, &self.run_name) {
+            title = format!("{title} ({folder})");
+        }
         match self.exit {
             Some(Some(code)) if self.keep_on_exit => format!("{title} (exit {code})").into(),
             Some(None) if self.keep_on_exit => format!("{title} (ended)").into(),
@@ -877,13 +895,15 @@ impl TerminalPanel {
         }
     }
 
-    /// Runs `command_line` in a tab of the default shell named `title`, so
-    /// its output stays visible; running the same title again replaces
-    /// that tab (stopping what still runs there) in place.
+    /// Runs `command_line` in a tab of the default shell (started in `dir`,
+    /// default the first folder) named `title`, so its output stays
+    /// visible; running the same title again replaces that tab (stopping
+    /// what still runs there) in place.
     pub fn run_command(
         &mut self,
         title: &str,
         command_line: &str,
+        dir: Option<&Path>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -896,7 +916,7 @@ impl TerminalPanel {
                 .as_ref()
                 .is_some_and(|name| name.as_ref() == title)
         });
-        if let Some(view) = self.spawn(&profile, window, cx) {
+        if let Some(view) = self.spawn_in(&profile, dir, window, cx) {
             let line = format!("{command_line}\r");
             view.update(cx, |view, cx| {
                 view.run_name = Some(title.to_owned().into());
@@ -972,10 +992,17 @@ impl TerminalPanel {
         self.tabs.iter().map(|(view, _)| view.clone()).collect()
     }
 
-    /// Starts the default shell in a new tab and focuses it.
-    pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Starts the default shell in a new tab and focuses it, in the folder
+    /// of `near` (the active editor's file), else the first folder.
+    pub fn new_terminal(
+        &mut self,
+        near: Option<&Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(profile) = profiles(&self.project).into_iter().next() {
-            self.spawn(&profile, window, cx);
+            let dir = shell_folder(&self.project, near);
+            self.spawn_in(&profile, dir.as_deref(), window, cx);
         }
     }
 
@@ -987,9 +1014,10 @@ impl TerminalPanel {
         }
     }
 
-    /// The project's virtualenv (`.venv`) as `(dir, bin dir)`, if any.
-    fn venv(&self) -> Option<(PathBuf, PathBuf)> {
-        let venv = self.project.resolve(".venv");
+    /// The virtualenv (`.venv`) of the folder at `folder` as `(dir, bin
+    /// dir)`, if any.
+    fn venv(&self, folder: &Path) -> Option<(PathBuf, PathBuf)> {
+        let venv = self.project.join(folder, ".venv");
         let bin = self.project.join(
             &venv,
             if self.project.is_remote() || !cfg!(windows) {
@@ -1010,7 +1038,8 @@ impl TerminalPanel {
         self.spawn_in(profile, None, window, cx)
     }
 
-    /// Starts `profile`'s shell in `cwd` (default: the project root).
+    /// Starts `profile`'s shell in `cwd` (default: the first folder), with
+    /// the virtualenv of the folder holding it.
     fn spawn_in(
         &mut self,
         profile: &Profile,
@@ -1021,7 +1050,12 @@ impl TerminalPanel {
         let mut options = TerminalOptions::default_shell();
         // Existing terminals keep the palette they started with.
         let palette = theme::current().terminal;
-        let venv = self.venv();
+        let folder = self.project.root_for(cwd.unwrap_or(self.project.root()));
+        let venv = self.venv(&folder.path);
+        let folder_name: Option<SharedString> = self
+            .project
+            .is_multi_root()
+            .then(|| folder.name.clone().into());
         let started = if profile.remote {
             self.project.spawn_remote_terminal(
                 None,
@@ -1062,7 +1096,11 @@ impl TerminalPanel {
         };
         self.error = None;
         let name = profile.name;
-        let view = cx.new(|cx| TerminalView::new(terminal, events, name, palette, cx));
+        let view = cx.new(|cx| {
+            let mut view = TerminalView::new(terminal, events, name, palette, cx);
+            view.folder = folder_name;
+            view
+        });
         // Remote login shells set PATH from their profiles: activate after.
         if profile.remote
             && let Some((venv, _)) = &venv
@@ -1257,5 +1295,22 @@ mod tests {
         assert_eq!(press("alt-space", None), Some(b"\x1b ".to_vec()));
         assert_eq!(press("backspace", None), Some(vec![0x7f]));
         assert_eq!(press("a", Some("a")), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn new_terminals_start_in_the_active_files_folder() {
+        let base = std::env::temp_dir().join("next_code_terminal_roots");
+        let (api, web) = (base.join("api"), base.join("web"));
+        let project = Project::local_folders(&[&api, &web]);
+        let file = |folder: &Path| folder.join("src").join("main.py");
+        assert_eq!(shell_folder(&project, Some(&file(&web))), Some(web.clone()));
+        // The first folder is the shell's default, as is no file or one
+        // outside the folders.
+        assert_eq!(shell_folder(&project, Some(&file(&api))), None);
+        assert_eq!(shell_folder(&project, None), None);
+        assert_eq!(shell_folder(&project, Some(&file(&base))), None);
+        // One folder: always the default.
+        let single = Project::local(web.clone());
+        assert_eq!(shell_folder(&single, Some(&file(&web))), None);
     }
 }

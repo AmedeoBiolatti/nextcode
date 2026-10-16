@@ -47,19 +47,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let running = self.lsp_store.read(cx).running_servers();
+        let running: Vec<_> = self
+            .lsp_store
+            .read(cx)
+            .running_servers()
+            .into_iter()
+            .map(|(language, _, server)| (language, server))
+            .collect();
         let language = self
             .active_tab()
             .and_then(Tab::editor)
             .and_then(|editor| editor.read(cx).language());
+        // Every running server of the active language, else all of them.
         let servers = match language
-            .and_then(|language| running.iter().find(|(running, _)| *running == language))
+            .filter(|&language| running.iter().any(|(running, _)| *running == language))
         {
-            Some(server) => vec![server.clone()],
+            Some(language) => running
+                .into_iter()
+                .filter(|(running, _)| *running == language)
+                .collect(),
             None => running,
         };
-        let root = self.project.root().to_path_buf();
-        let picker = cx.new(|cx| SymbolPicker::workspace(servers, root, cx));
+        let project = self.project.clone();
+        let picker = cx.new(|cx| SymbolPicker::workspace(servers, project, cx));
         self.show_symbol_picker(picker, window, cx);
     }
 

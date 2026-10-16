@@ -8,6 +8,12 @@ const LABELS: &[(&str, &str)] = &[
     ("app::OpenProject", "Open Project…"),
     ("app::OpenProjectInNewWindow", "Open Project in New Window…"),
     ("app::OpenRecent", "Open Recent…"),
+    ("app::OpenWorkspace", "Open Workspace from File…"),
+    (
+        "workspace::AddFolderToWorkspace",
+        "Add Folder to Workspace…",
+    ),
+    ("workspace::SaveWorkspaceAs", "Save Workspace As…"),
     ("app::CloseProject", "Close Project"),
     ("app::NextProject", "Next Project Tab"),
     ("app::PreviousProject", "Previous Project Tab"),
@@ -116,6 +122,7 @@ const LABELS: &[(&str, &str)] = &[
     ("editor::GoToImplementation", "Go to Implementation"),
     ("editor::ShowSignatureHelp", "Show Parameter Hints"),
     ("editor::ToggleInlayHints", "Toggle Inlay Hints"),
+    ("editor::ToggleVimMode", "Toggle Vim Mode"),
     ("editor::FindReferences", "Find References"),
     ("editor::ShowCallHierarchy", "Show Call Hierarchy"),
     ("editor::GoToSymbol", "Go to Symbol in File…"),
@@ -151,6 +158,10 @@ const LABELS: &[(&str, &str)] = &[
     ("file_tree::Paste", "Paste Files"),
     ("file_tree::Duplicate", "Duplicate File"),
     ("file_tree::RevealInFileManager", "Reveal in File Manager"),
+    (
+        "file_tree::RemoveFolderFromWorkspace",
+        "Remove Folder from Workspace",
+    ),
 ];
 
 /// Namespaces of modal pickers: their actions only mean something inside.

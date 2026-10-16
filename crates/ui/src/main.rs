@@ -49,6 +49,7 @@ mod theme_picker;
 mod workflows;
 mod workspace;
 mod workspace_edit;
+mod workspace_file;
 mod worktree_picker;
 
 use std::{ffi::OsString, path::PathBuf};
@@ -58,12 +59,13 @@ use gpui::{App, Application};
 
 use crate::project::Location;
 
-const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code --automation [--port PORT] [--width PX] [--height PX] [--state-dir DIR] -- [PROJECT_DIR]\n\nWithout a project, the windows open when next_code last closed reopen (else the welcome screen;\n\"restore_windows\": false in settings.json always shows it). PROJECT_DIR . is the current directory,\nwhich --headless and --devcontainer also use when no project is given.\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).";
+const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code [--headless] --workspace <FILE>\n       next_code --automation [--port PORT] [--width PX] [--height PX] [--state-dir DIR] -- [PROJECT_DIR]\n\nWithout a project, the windows open when next_code last closed reopen (else the welcome screen;\n\"restore_windows\": false in settings.json always shows it). PROJECT_DIR . is the current directory,\nwhich --headless and --devcontainer also use when no project is given.\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).\n--workspace opens a multi-root workspace file (local, or <DISTRO>:/path in WSL); PROJECT_DIR\nnaming a *.next_code-workspace or VS Code *.code-workspace file opens it too.";
 
 /// Reads the command line: a local directory (`.` is the current one), a
 /// `\\wsl.localhost\<distro>\...` path, or `--wsl <distro> <linux path>`,
-/// optionally preceded by `--devcontainer` (alone: the current directory).
-/// `None`: no project, reopen the last session's windows.
+/// optionally preceded by `--devcontainer` (alone: the current directory);
+/// or a workspace file (`--workspace <file>`, or a path with a workspace
+/// file extension). `None`: no project, reopen the last session's windows.
 fn parse_args(args: &[OsString]) -> anyhow::Result<Option<Location>> {
     match args {
         [flag, rest @ ..] if flag == "--devcontainer" => Ok(Some(Location::DevContainer {
@@ -78,6 +80,26 @@ fn parse_args(args: &[OsString]) -> anyhow::Result<Option<Location>> {
             })),
             _ => anyhow::bail!("--wsl needs a distro and a Linux path\n{USAGE}"),
         },
+        [flag, rest @ ..] if flag == "--workspace" => {
+            let location = match rest {
+                [file] => Location::parse(&file.to_string_lossy()),
+                _ => None,
+            };
+            match location {
+                Some(Location::Local(file)) => Ok(Some(Location::Workspace {
+                    distro: None,
+                    file: Some(file.to_string_lossy().into_owned()),
+                    folders: Vec::new(),
+                })),
+                Some(Location::Wsl { distro, path }) => Ok(Some(Location::Workspace {
+                    distro: Some(distro),
+                    file: Some(path),
+                    folders: Vec::new(),
+                })),
+                Some(workspace @ Location::Workspace { .. }) => Ok(Some(workspace)),
+                _ => anyhow::bail!("--workspace needs one workspace file\n{USAGE}"),
+            }
+        }
         [path] if path == "--help" || path == "-h" => anyhow::bail!("{USAGE}"),
         [path] => Location::parse(&path.to_string_lossy())
             .map(Some)
@@ -91,7 +113,7 @@ fn current_dir() -> Location {
     Location::Local(PathBuf::from("."))
 }
 
-/// Local folders made absolute and checked.
+/// Local folders and workspace files made absolute and checked.
 fn checked(location: Location) -> anyhow::Result<Location> {
     Ok(match location {
         Location::Local(root) => {
@@ -104,6 +126,19 @@ fn checked(location: Location) -> anyhow::Result<Location> {
             folder: Box::new(checked(*folder)?),
             config,
         },
+        Location::Workspace {
+            distro: None,
+            file: Some(file),
+            folders,
+        } => {
+            let file = std::path::absolute(&file).with_context(|| format!("resolving {file}"))?;
+            anyhow::ensure!(file.is_file(), "{} is not a file", file.display());
+            Location::Workspace {
+                distro: None,
+                file: Some(file.to_string_lossy().into_owned()),
+                folders,
+            }
+        }
         wsl => wsl,
     })
 }
@@ -301,5 +336,69 @@ mod tests {
         };
         assert!(opened.opens_same(&in_container(wsl("Ubuntu", "/p"))));
         assert!(!opened.opens_same(&wsl("Ubuntu", "/p")));
+    }
+
+    fn workspace(distro: Option<&str>, file: &str) -> Location {
+        Location::Workspace {
+            distro: distro.map(str::to_owned),
+            file: Some(file.into()),
+            folders: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn workspace_files_open_as_multi_root_workspaces() {
+        // `--workspace` takes any file name, local or typed WSL.
+        assert_eq!(
+            project(&["--workspace", "team.json"]),
+            workspace(None, "team.json")
+        );
+        assert_eq!(
+            project(&["--workspace", "Ubuntu:/home/me/all.next_code-workspace"]),
+            workspace(Some("Ubuntu"), "/home/me/all.next_code-workspace")
+        );
+        // Plain paths with a workspace extension (any case) are workspaces.
+        assert_eq!(
+            project(&["all.next_code-workspace"]),
+            workspace(None, "all.next_code-workspace")
+        );
+        assert_eq!(
+            project(&[r"C:\src\App.Code-Workspace"]),
+            workspace(None, r"C:\src\App.Code-Workspace")
+        );
+        assert_eq!(
+            project(&["Ubuntu:~/w.code-workspace"]),
+            workspace(Some("Ubuntu"), "~/w.code-workspace")
+        );
+        assert!(parse_args(&args(&["--workspace"])).is_err());
+        assert!(parse_args(&args(&["--workspace", "a", "b"])).is_err());
+        assert!(parse_args(&args(&["--workspace", "devcontainer:p"])).is_err());
+
+        // Local files are made absolute and must exist; WSL ones are read
+        // where they live, when opened.
+        let dir = std::env::temp_dir().join(format!("next_code_main_ws_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("w.code-workspace");
+        std::fs::write(&file, "{\"folders\": []}").unwrap();
+        let named = file.to_string_lossy().into_owned();
+        assert_eq!(
+            checked(project(&["--workspace", &named])).unwrap(),
+            workspace(None, &named)
+        );
+        assert_eq!(
+            checked(project(&[&named])).unwrap(),
+            workspace(None, &named)
+        );
+        let missing = dir.join("missing.next_code-workspace");
+        assert!(checked(workspace(None, &missing.to_string_lossy())).is_err());
+        assert!(
+            checked(workspace(None, &dir.to_string_lossy())).is_err(),
+            "a folder"
+        );
+        assert_eq!(
+            checked(workspace(Some("Ubuntu"), "/nowhere.code-workspace")).unwrap(),
+            workspace(Some("Ubuntu"), "/nowhere.code-workspace")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

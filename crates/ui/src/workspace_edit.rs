@@ -297,13 +297,8 @@ impl Report {
     }
 
     /// One line for the status bar, e.g. "Rename: changed 3 files".
-    pub fn summary(&self, label: &str, root: &Path) -> String {
-        let show = |path: &Path| {
-            path.strip_prefix(root)
-                .unwrap_or(path)
-                .display()
-                .to_string()
-        };
+    pub fn summary(&self, label: &str, project: &Project) -> String {
+        let show = |path: &Path| shown(project, path);
         match &self.failure {
             Some(failure) => format!(
                 "{label} failed at {}: {}{}",
@@ -482,13 +477,8 @@ impl ReplaceReport {
 
     /// One line for a notice, e.g. "Replaced 3 matches in 2 files; skipped
     /// a.py (changed since the search)".
-    pub fn summary(&self, root: &Path) -> String {
-        let show = |path: &Path| {
-            path.strip_prefix(root)
-                .unwrap_or(path)
-                .display()
-                .to_string()
-        };
+    pub fn summary(&self, project: &Project) -> String {
+        let show = |path: &Path| shown(project, path);
         let plural =
             |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         let mut summary = format!(
@@ -504,6 +494,20 @@ impl ReplaceReport {
             summary += &format!("; {} failed: {message}", show(path));
         }
         summary
+    }
+}
+
+/// `path` as notices name it: relative to the root, or as
+/// [`Project::display_path`] (`api › src/a.py`) when the project has
+/// several folders.
+fn shown(project: &Project, path: &Path) -> String {
+    if project.is_multi_root() {
+        project.display_path(path)
+    } else {
+        path.strip_prefix(project.root())
+            .unwrap_or(path)
+            .display()
+            .to_string()
     }
 }
 
@@ -742,7 +746,10 @@ mod tests {
         assert_eq!(report.changed, [open_path.clone(), disk_path.clone()]);
         assert_eq!(open.docs[&open_path], (4, "new();\nnew();\n".into()));
         assert_eq!(fs::read_to_string(&disk_path).unwrap(), "fn new() {}\n");
-        assert_eq!(report.summary("Rename", &root), "Rename: changed 2 files");
+        assert_eq!(
+            report.summary("Rename", &project),
+            "Rename: changed 2 files"
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -911,7 +918,7 @@ mod tests {
         assert_eq!(report.skipped[0].0, stale);
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, missing);
-        let summary = report.summary(&root);
+        let summary = report.summary(&project);
         assert!(
             summary.starts_with(
                 "Replaced 4 matches in 2 files; skipped stale.py (changed since the search); \
@@ -920,5 +927,29 @@ mod tests {
             "{summary}"
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn summaries_name_files_with_their_folder_in_a_multi_root_project() {
+        let (api, web) = (PathBuf::from("/ws/api"), PathBuf::from("/ws/web"));
+        let project = Project::local_folders(&[&api, &web]);
+        let report = ReplaceReport {
+            replaced: vec![(api.join("a.py"), 2)],
+            skipped: vec![(api.join("src").join("b.py"), "changed".into())],
+            failed: vec![(web.join("c.py"), "denied".into())],
+        };
+        assert_eq!(
+            report.summary(&project),
+            "Replaced 2 matches in 1 file; skipped api › src/b.py (changed since the search); \
+             web › c.py failed: denied"
+        );
+        let edits = Report {
+            changed: vec![web.join("lib").join("x.ts")],
+            ..Report::default()
+        };
+        assert_eq!(
+            edits.summary("Rename", &project),
+            "Rename: changed web › lib/x.ts"
+        );
     }
 }

@@ -518,4 +518,30 @@ impl Editor {
             .find(|entry| entry.transaction == id)
             .cloned()
     }
+
+    /// Merges the buffer's undo steps from `depth` on (see
+    /// `Buffer::undo_depth`) into one, whose undo restores the selections
+    /// from before the first of them (a Vim command or insert session).
+    pub(super) fn group_undo_since(&mut self, depth: usize) {
+        let Some((first, kept)) = self.buffer.group_undo(depth) else {
+            return;
+        };
+        let before = self
+            .history
+            .iter()
+            .find(|entry| entry.transaction == first)
+            .map(|entry| entry.before.clone());
+        self.history.retain(|entry| {
+            entry.transaction == kept || !(first..kept).contains(&entry.transaction)
+        });
+        if let Some(before) = before
+            && let Some(entry) = self
+                .history
+                .iter_mut()
+                .rev()
+                .find(|e| e.transaction == kept)
+        {
+            entry.before = before;
+        }
+    }
 }

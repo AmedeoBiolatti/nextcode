@@ -595,6 +595,236 @@ fn headless_mode_stages_diffs_and_commits_with_git() {
     fs::remove_dir_all(&root).unwrap();
 }
 
+/// A multi-root workspace over headless: two git repositories as the
+/// folders of a `.next_code-workspace` file (one relative, one absolute
+/// with a name, plus settings), then a VS Code `.code-workspace` naming a
+/// folder by `file:` URI.
+#[test]
+fn headless_mode_opens_multi_root_workspaces() {
+    let base = std::env::temp_dir().join(format!("next_code_headless_ws_{}", std::process::id()));
+    fs::remove_dir_all(&base).ok();
+    for dir in ["api/src", "web", "ws", "config"] {
+        fs::create_dir_all(base.join(dir)).unwrap();
+    }
+    // Windows' canonical form (`\\?\C:\…`) is not how users write folders.
+    let base = if cfg!(windows) {
+        base
+    } else {
+        base.canonicalize().unwrap()
+    };
+    let (api, web) = (base.join("api"), base.join("web"));
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let status = background_command("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    fs::write(
+        api.join("src").join("main.rs"),
+        "fn main() {} // needle api\n",
+    )
+    .unwrap();
+    fs::write(api.join("notes.md"), "# notes\n").unwrap();
+    fs::write(web.join("index.js"), "// needle web\n").unwrap();
+    for dir in [&api, &web] {
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        git(dir, &["config", "core.autocrlf", "false"]);
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+    fs::write(web.join("index.js"), "// needle web\nconsole.log(1);\n").unwrap();
+    // The workspace's settings format Markdown with a program that prints
+    // a hash of the text, which shows they apply.
+    let file = base.join("ws").join("team.next_code-workspace");
+    let workspace = json!({
+        "folders": [
+            { "path": "../api" },
+            { "path": web.to_string_lossy(), "name": "frontend" },
+        ],
+        "settings": {
+            "languages": {
+                "markdown": {
+                    "formatter": { "command": "git", "args": ["hash-object", "--stdin"] }
+                }
+            }
+        },
+    });
+    fs::write(&file, format!("// Two repositories.\n{workspace:#}\n")).unwrap();
+    let config = base.join("config");
+
+    let mut headless = Headless::launch(
+        &[std::ffi::OsStr::new("--workspace"), file.as_os_str()],
+        &[("XDG_CONFIG_HOME", &config)],
+    );
+    let ready = headless.next(|line| line["event"].is_string());
+    assert_eq!(ready["event"], "ready", "{ready}");
+
+    let info = headless.call(json!({ "cmd": "info" }))["result"].clone();
+    let roots = info["roots"].as_array().unwrap_or_else(|| panic!("{info}"));
+    let names: Vec<&str> = roots
+        .iter()
+        .map(|root| root["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["api", "frontend"], "{info}");
+    assert_eq!(roots[1]["index"], 1);
+    assert_eq!(
+        PathBuf::from(roots[0]["path"].as_str().unwrap()),
+        api,
+        "{info}"
+    );
+    assert_eq!(
+        PathBuf::from(roots[1]["path"].as_str().unwrap()),
+        web,
+        "{info}"
+    );
+    assert_eq!(
+        info["root"], roots[0]["path"],
+        "`root` stays the first folder"
+    );
+    assert_eq!(info["workspace_file"], file.to_string_lossy().as_ref());
+
+    // `list_files` answers in the platform's separator (`src\main.rs` on
+    // Windows); `PathBuf::from("src/main.rs")` would keep the `/`.
+    let native = |path: &str| {
+        path.split('/')
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let files = headless.call(json!({ "cmd": "list_files" }));
+    assert_eq!(
+        files["result"],
+        json!([
+            { "root": 0, "path": "notes.md" },
+            { "root": 0, "path": native("src/main.rs") },
+            { "root": 1, "path": "index.js" },
+        ]),
+        "{files}"
+    );
+    let one = headless.call(json!({ "cmd": "list_files", "root": "frontend" }));
+    assert_eq!(one["result"], json!(["index.js"]), "{one}");
+
+    let read = headless.call(json!({ "cmd": "read", "root": 1, "path": "index.js" }));
+    assert!(
+        read["result"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("console.log")),
+        "{read}"
+    );
+    let bad = headless.call(json!({ "cmd": "read", "root": 2, "path": "index.js" }));
+    assert!(
+        bad["error"].as_str().unwrap().contains("no folder 2"),
+        "{bad}"
+    );
+    let bad = headless.call(json!({ "cmd": "read", "root": "nope", "path": "index.js" }));
+    assert_eq!(bad["ok"], false, "{bad}");
+
+    let search = headless.call(json!({ "cmd": "search", "pattern": "needle" }));
+    let mut found: Vec<(u64, String)> = search["result"]["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{search}"))
+        .iter()
+        .map(|file| {
+            (
+                file["root"].as_u64().unwrap(),
+                file["relative"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [(0, "src/main.rs".to_owned()), (1, "index.js".to_owned())],
+        "{search}"
+    );
+
+    let status = headless.call(json!({ "cmd": "git_status", "root": 1 }));
+    assert_eq!(status["result"]["branch"], "main", "{status}");
+    assert_eq!(
+        status["result"]["entries"],
+        json!([{ "path": "index.js", "orig_path": null, "staged": null, "unstaged": "modified" }]),
+        "{status}"
+    );
+    let first = headless.call(json!({ "cmd": "git_status" }));
+    assert_eq!(
+        first["result"]["entries"],
+        json!([]),
+        "the first folder: {first}"
+    );
+    let all = headless.call(json!({ "cmd": "git_status", "all": true }));
+    let repositories: Vec<(u64, usize)> = all["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{all}"))
+        .iter()
+        .map(|entry| {
+            (
+                entry["root"].as_u64().unwrap(),
+                entry["status"]["entries"].as_array().unwrap().len(),
+            )
+        })
+        .collect();
+    assert_eq!(repositories, [(0, 0), (1, 1)], "{all}");
+    // An absolute path picks its folder's repository.
+    let diff = headless.call(json!({
+        "cmd": "git_diff", "path": web.join("index.js").to_string_lossy(),
+    }));
+    assert_eq!(diff["result"]["added"], 1, "{diff}");
+
+    let format = headless.call(json!({ "cmd": "format", "path": "notes.md" }));
+    let hash = format["result"]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{format}"));
+    assert!(
+        hash.trim().len() == 40 && hash.trim().bytes().all(|b| b.is_ascii_hexdigit()),
+        "the workspace's formatter ran: {format}"
+    );
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+
+    // VS Code's file, named as a plain path: a `file:` URI folder first.
+    let web_text = web.to_string_lossy().replace('\\', "/").replace(' ', "%20");
+    let uri = match web_text.strip_prefix('/') {
+        Some(rest) => format!("file:///{rest}"),
+        None => format!("file:///{web_text}"),
+    };
+    let legacy = base.join("ws").join("legacy.code-workspace");
+    fs::write(
+        &legacy,
+        format!(
+            "{{\n  \"folders\": [{{ \"uri\": \"{uri}\" }}, {{ \"path\": \"../api\" }},],\n}}\n"
+        ),
+    )
+    .unwrap();
+    let mut headless = Headless::launch(&[legacy.as_os_str()], &[("XDG_CONFIG_HOME", &config)]);
+    let ready = headless.next(|line| line["event"].is_string());
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let info = headless.call(json!({ "cmd": "info" }))["result"].clone();
+    let names: Vec<&str> = info["roots"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{info}"))
+        .iter()
+        .map(|root| root["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["web", "api"], "{info}");
+    assert_eq!(PathBuf::from(info["root"].as_str().unwrap()), web, "{info}");
+    let files = headless.call(json!({ "cmd": "list_files", "root": 1 }));
+    assert_eq!(
+        files["result"],
+        json!(["notes.md", native("src/main.rs")]),
+        "{files}"
+    );
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&base).unwrap();
+}
+
 /// The editor's change markers, Stage Hunk and blame over headless.
 #[test]
 fn headless_mode_reports_line_changes_stages_one_and_blames() {
@@ -3032,5 +3262,107 @@ fn headless_mode_runs_a_workflow_step_in_a_dev_container() {
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
     assert!(headless.child.wait().unwrap().success());
     drop(containers);
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `spell_check` on files and on text: comment/string/docstring scoping,
+/// corrections, the project's `.next_code/words.txt` and (where the config
+/// dir can be redirected) the user's words, settings and extra
+/// dictionaries.
+#[test]
+fn headless_mode_spell_checks_files_and_text() {
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_spell_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".next_code")).unwrap();
+    fs::write(
+        project.join("a.py"),
+        "\"\"\"Modul for frobnitz zorblax.\"\"\"\n\n\
+         def recieve_data(argumnt):\n    \
+         # Retreive the data\n    \
+         return f\"Helo {argumnt}\"\n",
+    )
+    .unwrap();
+    fs::write(project.join(".next_code").join("words.txt"), "frobnitz\n").unwrap();
+    let config = root.join("config");
+    let dictionaries = config.join("next_code").join("dictionaries");
+    fs::create_dir_all(&dictionaries).unwrap();
+    fs::write(config.join("next_code").join("words.txt"), "Zorblax\n").unwrap();
+    fs::write(dictionaries.join("xx_TEST.aff"), "SET UTF-8\n").unwrap();
+    fs::write(dictionaries.join("xx_TEST.dic"), "1\nhelo\n").unwrap();
+    let project = project.canonicalize().unwrap();
+    let redirected = cfg!(target_os = "linux");
+
+    let mut headless = Headless::start_with(&project, &[("XDG_CONFIG_HOME", &config)]);
+    let ready = headless.next(|line| line["event"].is_string());
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let words = |reply: &Value| -> Vec<String> {
+        reply["result"]["misspellings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{reply}"))
+            .iter()
+            .map(|m| m["word"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let file = headless.call(json!({ "cmd": "spell_check", "path": "a.py" }));
+    let mut expected = vec!["Modul", "Retreive", "Helo"];
+    if !redirected {
+        expected.insert(1, "zorblax");
+    }
+    assert_eq!(
+        words(&file),
+        expected,
+        "identifiers are not checked: {file}"
+    );
+    let modul = &file["result"]["misspellings"][0];
+    assert_eq!(
+        (modul["start"].as_u64(), modul["end"].as_u64()),
+        (Some(3), Some(8))
+    );
+    let retreive = &file["result"]["misspellings"][expected.len() - 2];
+    assert_eq!(
+        (retreive["line"].as_u64(), retreive["column"].as_u64()),
+        (Some(3), Some(6))
+    );
+    assert_eq!(retreive["suggestions"][0], "Retrieve", "{retreive}");
+
+    // Unsaved text checked as the file; Markdown and prose without a path.
+    let text = headless.call(json!({
+        "cmd": "spell_check", "path": "a.py", "text": "x = 1  # an exampel\nmispeled = 2\n",
+    }));
+    assert_eq!(words(&text), ["exampel"]);
+    let markdown = headless.call(json!({
+        "cmd": "spell_check", "language": "markdown",
+        "text": "# Titel\n\nSee `fooBarr` and [docs](https://exmaple.com).\n\n```\nmispeled\n```\n",
+    }));
+    assert_eq!(words(&markdown), ["Titel"]);
+    let prose = headless.call(json!({ "cmd": "spell_check", "text": "Fix teh bug" }));
+    assert_eq!(words(&prose), ["teh"]);
+    let unknown = headless.call(json!({ "cmd": "spell_check", "text": "x", "language": "cobol" }));
+    assert_eq!(unknown["ok"], false, "{unknown}");
+
+    if redirected {
+        // An extra dictionary from the config dir, chosen in settings.
+        fs::write(
+            config.join("next_code").join("settings.json"),
+            r#"{ "spell": { "languages": ["en_US", "xx_TEST"], "check_code": false } }"#,
+        )
+        .unwrap();
+        assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+        assert!(headless.child.wait().unwrap().success());
+        headless = Headless::start_with(&project, &[("XDG_CONFIG_HOME", &config)]);
+        headless.next(|line| line["event"].is_string());
+        let code = headless.call(json!({ "cmd": "spell_check", "path": "a.py" }));
+        assert_eq!(words(&code), Vec::<String>::new(), "check_code off: {code}");
+        let notes = headless.call(json!({
+            "cmd": "spell_check", "path": "notes.md", "text": "Helo Modul",
+        }));
+        assert_eq!(words(&notes), ["Modul"]);
+    }
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
     fs::remove_dir_all(&root).ok();
 }

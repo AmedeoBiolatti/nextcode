@@ -43,7 +43,9 @@ mod go_to_line;
 mod indent_guides;
 mod inlay_hints;
 mod lines;
+mod minimap;
 mod navigation;
+mod project_settings;
 mod rename;
 mod scrollbar;
 mod selections;
@@ -51,9 +53,12 @@ pub(crate) mod semantic;
 mod server_edits;
 pub(crate) mod signature_help;
 pub(crate) mod snippets;
+pub(crate) mod spell;
+mod sticky_scroll;
 mod symbols;
 #[cfg(test)]
 mod tests;
+mod vim;
 
 use display_map::{DisplayMap, DisplayRow};
 use editing::{HistoryEntry, SelectionEdit};
@@ -274,6 +279,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-shift-up", PreviousChange, ctx),
         KeyBinding::new("ctrl-alt-z", RollbackLines, ctx),
     ]);
+    vim::init(cx);
     cx.bind_keys([KeyBinding::new(
         "escape",
         CloseHunkPopup,
@@ -421,6 +427,13 @@ pub enum EditorEvent {
     LoadBlame,
     /// A click on an annotation: show this commit.
     ShowCommit(String),
+    /// With `spell.in_problems`: the file's unknown words (empty when the
+    /// setting is turned off).
+    Spelling(Vec<spell::SpellingProblem>),
+    /// Vim's `:q` (`discard`: `:q!`): close this editor's tab.
+    Close {
+        discard: bool,
+    },
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -521,6 +534,14 @@ pub struct Editor {
     blame: blame::BlameState,
     /// The gutter's right-click menu.
     gutter_menu: Option<git_gutter::GutterMenu>,
+    /// Unknown words and their quick fixes.
+    spell: spell::SpellState,
+    /// The minimap's cached blocks and hover.
+    minimap: minimap::MinimapState,
+    /// Sticky scroll's cached regions and hover.
+    sticky: sticky_scroll::StickyState,
+    /// Vim emulation (`"vim_mode"`).
+    vim: vim::VimState,
 }
 
 /// A mouse drag in progress.
@@ -532,6 +553,8 @@ enum Drag {
     Column { line: usize, column: usize },
     /// The scrollbar thumb, held `grab` below its top.
     Scrollbar { grab: Pixels },
+    /// The minimap's slider, from window `y` where the scroll was `scroll`.
+    Minimap { y: Pixels, scroll: Pixels },
 }
 
 /// Most severe first, so `min` picks what to show.
@@ -629,6 +652,10 @@ struct EditorLayout {
     guides: Option<indent_guides::IndentGuides>,
     /// When the rows don't fit.
     scrollbar: Option<scrollbar::ScrollbarLayout>,
+    /// The minimap column, when shown.
+    minimap: Option<minimap::MinimapLayout>,
+    /// Scope headers pinned at the top of the text.
+    sticky: Option<sticky_scroll::StickyLayout>,
 }
 
 /// One visible screen row.
@@ -787,6 +814,10 @@ impl Editor {
             git: Default::default(),
             blame: Default::default(),
             gutter_menu: None,
+            spell: Default::default(),
+            minimap: Default::default(),
+            sticky: Default::default(),
+            vim: Default::default(),
         }
     }
 
@@ -797,10 +828,7 @@ impl Editor {
     /// Whether lines wrap at the view's width: Alt+Z's choice, else
     /// `"word_wrap"` for the language.
     pub fn wraps(&self) -> bool {
-        !self.single_line
-            && self
-                .word_wrap
-                .unwrap_or_else(|| theme::word_wrap(self.language()))
+        !self.single_line && self.word_wrap.unwrap_or_else(|| self.word_wrap_setting())
     }
 
     /// Like VS Code, for every editor (also those opened later) until the
@@ -1229,6 +1257,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.changes = changes;
+        self.vim_edited();
         let edited = !self.changes.is_empty();
         if edited {
             self.version += 1;
@@ -1251,6 +1280,7 @@ impl Editor {
         self.shift_semantic_tokens();
         self.map_symbols();
         self.snippet_edited();
+        self.spell_edited();
         self.debug_gutter_edited(cx);
         // Folds move with the text (or open when edited inside); edited
         // lines wrap again.
@@ -1479,7 +1509,10 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.start_mouse(window);
-        if self.scrollbar_mouse_down(event.position, cx) {
+        if self.scrollbar_mouse_down(event.position, cx)
+            || self.minimap_mouse_down(event.position, cx)
+            || self.sticky_mouse_down(event.position, cx)
+        {
             return;
         }
         if !self.single_line && !self.text_area && self.gutter_menu.take().is_some() {
@@ -1561,7 +1594,10 @@ impl Editor {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.drag, Some(Drag::Scrollbar { .. })) {
+        if matches!(
+            self.drag,
+            Some(Drag::Scrollbar { .. } | Drag::Minimap { .. })
+        ) {
             // The thumb dims again.
             cx.notify();
         }
@@ -1585,6 +1621,7 @@ impl Editor {
                 self.set_selections(selections, cx);
             }
             Some(Drag::Scrollbar { grab }) => self.scrollbar_drag(event.position.y, grab, cx),
+            Some(Drag::Minimap { y, scroll }) => self.minimap_drag(event.position.y, y, scroll, cx),
             None => {
                 let over_scrollbar = self.over_scrollbar(event.position);
                 if over_scrollbar != self.scrollbar_hovered {
@@ -1595,12 +1632,15 @@ impl Editor {
                 let over_gutter = self.layout.as_ref().is_some_and(|layout| {
                     layout.bounds.contains(&event.position)
                         && event.position.x < layout.text_bounds.left()
+                        && !self.over_minimap(event.position)
                 });
                 if over_gutter != self.gutter_hovered {
                     self.gutter_hovered = over_gutter;
                     cx.notify();
                 }
                 self.mouse_position = Some(event.position);
+                self.minimap_mouse_moved(event.position, cx);
+                self.sticky_mouse_moved(event.position, cx);
                 self.blame_mouse_moved(event.position, cx);
                 self.update_link(Some(event.position), event.modifiers.secondary(), cx);
                 self.update_hover(event.position, cx)
@@ -1643,7 +1683,10 @@ impl Editor {
     /// over text.
     fn character_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
         let layout = self.layout.as_ref()?;
-        if !layout.text_bounds.contains(&position) || self.over_scrollbar(position) {
+        if !layout.text_bounds.contains(&position)
+            || self.over_scrollbar(position)
+            || self.over_sticky(position)
+        {
             return None;
         }
         let (index, row) = layout.row_layout_at(position.y, self.scroll.y)?;
@@ -1824,6 +1867,9 @@ impl Editor {
 
     /// Shapes the visible rows and resolves scrolling for `bounds`.
     fn layout(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {
+        // The minimap's column comes off the gutter and text's part.
+        let full_bounds = bounds;
+        let (bounds, minimap_column) = self.minimap_split(bounds);
         let style = window.text_style();
         let font = style.font();
         let font_size = style.font_size.to_pixels(window.rem_size());
@@ -1919,6 +1965,9 @@ impl Editor {
             } else if top + line_height > self.scroll.y + viewport.height {
                 self.scroll.y = top + line_height - viewport.height;
             }
+            // Not under the pinned scope headers either.
+            self.scroll.y =
+                self.sticky_autoscroll(cursor_row, self.scroll.y, line_height, viewport.height);
         }
         let max_scroll_y = line_height * self.display.row_count().saturating_sub(1) as f32;
         self.scroll.y = self.scroll.y.min(max_scroll_y).max(px(0.));
@@ -2104,7 +2153,7 @@ impl Editor {
         let scrollbar = (!self.single_line && !self.text_area)
             .then(|| {
                 scrollbar::ScrollbarLayout::new(
-                    text_bounds,
+                    minimap::scrollbar_area(text_bounds, full_bounds, minimap_column),
                     line_height,
                     self.display.row_count(),
                     self.scroll.y,
@@ -2112,9 +2161,12 @@ impl Editor {
             })
             .flatten();
 
+        let minimap =
+            minimap_column.map(|column| self.layout_minimap(column, line_height, viewport.height));
+        let sticky = self.layout_sticky(window, bounds.left(), text_bounds, line_height);
         let glyph = |glyph: &str| shape(glyph.into(), &[run(glyph.len(), muted)]);
         self.layout = Some(EditorLayout {
-            bounds,
+            bounds: full_bounds,
             text_bounds,
             line_height,
             em_width,
@@ -2133,6 +2185,8 @@ impl Editor {
             run_marker: shape("▶".into(), &[run("▶".len(), theme::run_marker())]),
             guides,
             scrollbar,
+            minimap,
+            sticky,
         });
     }
 
@@ -2142,6 +2196,7 @@ impl Editor {
         } else {
             self.cached_bracket_pair()
         };
+        self.update_vim_highlights(cx);
         let Some(layout) = &self.layout else {
             return;
         };
@@ -2150,7 +2205,7 @@ impl Editor {
         let focused = self.focus_handle.is_focused(window);
         let (matches, active_match) = match &self.find {
             Some(find) if find.open => (find.matches.as_slice(), self.active_match()),
-            _ => (&[][..], None),
+            _ => (self.vim_highlights(), None),
         };
         let bracket_ranges: Vec<Range<usize>> = brackets
             .into_iter()
@@ -2297,6 +2352,8 @@ impl Editor {
                         inline.paint(point(x, top), line_height, window, cx).ok();
                     }
 
+                    self.paint_spelling(layout, row, text_left, top, window);
+
                     // The Ctrl+hover link to a definition.
                     if let Some(link) = &self.link
                         && link.start < end
@@ -2336,20 +2393,21 @@ impl Editor {
                     }
 
                     if focused {
-                        for s in on_row().filter(|s| row.row.shows(s.head, s.at_row_end)) {
-                            let x = text_left + row.x_for(s.head);
-                            window.paint_quad(fill(
-                                Bounds::from_corners(
-                                    point(x, top),
-                                    point(x + px(2.), top + line_height),
-                                ),
-                                theme::cursor(),
-                            ));
+                        for s in on_row() {
+                            let head = self.cursor_head(s);
+                            if !row.row.shows(head, s.at_row_end) {
+                                continue;
+                            }
+                            let (cursor, color) =
+                                self.cursor_quad(head, row, text_left, top, layout);
+                            window.paint_quad(fill(cursor, color));
                         }
                     }
                 }
             },
         );
+        self.paint_sticky(layout, window, cx);
+        self.paint_minimap(layout, window);
         self.paint_scrollbar(layout, window);
     }
 }
@@ -2623,7 +2681,8 @@ impl IntoElement for EditorElement {
 
 impl Element for EditorElement {
     type RequestLayoutState = ();
-    type PrepaintState = Option<Hitbox>;
+    /// Areas with their own mouse cursor: scrollbar, minimap, sticky lines.
+    type PrepaintState = Vec<(Hitbox, CursorStyle)>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -2654,11 +2713,33 @@ impl Element for EditorElement {
         _: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Hitbox> {
+    ) -> Vec<(Hitbox, CursorStyle)> {
         self.editor.update(cx, |editor, _| {
             editor.layout(bounds, window);
-            let track = editor.layout.as_ref()?.scrollbar.as_ref()?.track;
-            Some(window.insert_hitbox(track, HitboxBehavior::Normal))
+            let Some(layout) = editor.layout.as_ref() else {
+                return Vec::new();
+            };
+            let areas = [
+                layout
+                    .scrollbar
+                    .as_ref()
+                    .map(|s| (s.track, CursorStyle::Arrow)),
+                layout
+                    .minimap
+                    .as_ref()
+                    .map(|m| (m.bounds, CursorStyle::Arrow)),
+                layout.sticky.as_ref().map(|s| {
+                    (
+                        s.bounds(layout.text_bounds.top()),
+                        CursorStyle::PointingHand,
+                    )
+                }),
+            ];
+            areas
+                .into_iter()
+                .flatten()
+                .map(|(area, style)| (window.insert_hitbox(area, HitboxBehavior::Normal), style))
+                .collect()
         })
     }
 
@@ -2668,12 +2749,12 @@ impl Element for EditorElement {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut (),
-        scrollbar: &mut Option<Hitbox>,
+        hitboxes: &mut Vec<(Hitbox, CursorStyle)>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(scrollbar) = scrollbar {
-            window.set_cursor_style(CursorStyle::Arrow, scrollbar);
+        for (hitbox, style) in hitboxes.iter() {
+            window.set_cursor_style(*style, hitbox);
         }
         let focus_handle = self.editor.read(cx).focus_handle.clone();
         window.handle_input(
@@ -2700,6 +2781,8 @@ impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // `settings.json` may have toggled semantic highlighting.
         self.sync_semantic_setting(cx);
+        // Vim mode toggled, or the mouse/IDE changed the selection.
+        self.sync_vim(cx);
         if !self.single_line {
             // The inlay-hint setting or toggle, and hints for scrolled-to
             // lines.
@@ -2709,6 +2792,7 @@ impl Render for Editor {
             // behind.
             self.follow_cursor_for_code_actions(cx);
             self.snippet_selections_changed();
+            self.follow_spelling(cx);
         }
         // Alt+Z in another editor.
         if let Some(&WordWrapOverride(wrap)) = cx.try_global::<WordWrapOverride>()
@@ -2743,6 +2827,10 @@ impl Render for Editor {
                     .unwrap_or_default(),
                 theme::muted(),
             ),
+        };
+        let (message, message_color) = match self.vim_command_line() {
+            Some(line) => (line, theme::text()),
+            None => (message, message_color),
         };
         let count = |severity| {
             self.diagnostics
@@ -2839,6 +2927,7 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::go_to_line_action))
                     .on_action(cx.listener(Self::go_to_symbol))
                     .on_action(cx.listener(Self::toggle_word_wrap))
+                    .on_action(cx.listener(Self::toggle_vim_mode))
                     .on_action(cx.listener(Self::fold))
                     .on_action(cx.listener(Self::unfold))
                     .on_action(cx.listener(Self::toggle_fold))
@@ -2945,6 +3034,8 @@ impl Render for Editor {
                         .text_xs()
                         .text_color(theme::muted())
                         .whitespace_nowrap()
+                        // Vim's mode, pending keys and recording.
+                        .children(self.render_vim_status(cx))
                         // In a narrow pane the path and the language-server
                         // status share the shrinking (both start at their
                         // natural width) before the position gives way.

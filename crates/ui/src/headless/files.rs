@@ -25,7 +25,7 @@ impl Session {
         match cmd {
             "create_file" | "create_dir" => {
                 let path = match param_str(request, "path") {
-                    Ok(path) => self.project.path(path),
+                    Ok(path) => self.path(request, path),
                     Err(err) => return self.out.reply(&id, Err(err)),
                 };
                 let kind = if cmd == "create_dir" {
@@ -41,11 +41,11 @@ impl Session {
             }
             "copy_path" => {
                 let path = match param_str(request, "path") {
-                    Ok(path) => self.project.path(path),
+                    Ok(path) => self.path(request, path),
                     Err(err) => return self.out.reply(&id, Err(err)),
                 };
                 let dir = match request["dir"].as_str() {
-                    Some(dir) => self.project.path(dir),
+                    Some(dir) => self.path(request, dir),
                     None => path.parent().unwrap_or(self.project.root()).to_path_buf(),
                 };
                 self.blocking(id, cx, move |project| {
@@ -65,10 +65,10 @@ impl Session {
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .map(|path| self.project.path(path))
+            .map(|path| self.path(request, path))
             .collect();
         if let Some(path) = request["path"].as_str() {
-            paths.push(self.project.path(path));
+            paths.push(self.path(request, path));
         }
         if paths.is_empty() {
             return self.out.reply(
@@ -111,20 +111,15 @@ impl Session {
     /// changed, failure}], problems}`.
     fn rename_path(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
         let (from, to) = match (param_str(request, "path"), param_str(request, "new_path")) {
-            (Ok(from), Ok(to)) => (self.project.path(from), self.project.path(to)),
+            (Ok(from), Ok(to)) => (self.path(request, from), self.path(request, to)),
             (Err(err), _) | (_, Err(err)) => return self.out.reply(&id, Err(err)),
         };
-        let store = self.store.read(cx);
-        let servers: Vec<(String, Arc<RunningServer>)> = store
+        let servers: Vec<(String, Arc<RunningServer>)> = self
+            .store
+            .read(cx)
             .running_servers()
             .into_iter()
-            .map(|(language, server)| {
-                let name = store
-                    .status(language)
-                    .map(|(name, _)| name.to_string())
-                    .unwrap_or_else(|| language.id().to_owned());
-                (name, server)
-            })
+            .map(|(_, name, server)| (name.to_string(), server))
             .collect();
         let project = self.project.clone();
         cx.spawn(async move |this, cx| {

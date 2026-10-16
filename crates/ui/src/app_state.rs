@@ -9,7 +9,10 @@
 //! keep every window open at that moment. A window without tabs is kept
 //! only when it is the only one.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use gpui::{App, Bounds, Global, Pixels, Task, WindowBounds, WindowId, point, px, size};
 use serde::{Deserialize, Serialize};
@@ -165,7 +168,23 @@ impl AppState {
             match location {
                 Location::Local(root) => root.is_dir(),
                 Location::DevContainer { folder, .. } => exists(folder),
-                Location::Wsl { .. } => true,
+                Location::Wsl { .. }
+                | Location::Workspace {
+                    distro: Some(_), ..
+                } => true,
+                Location::Workspace {
+                    distro: None,
+                    file: Some(file),
+                    ..
+                } => Path::new(file).is_file(),
+                // An untitled workspace reopens while a folder is left.
+                Location::Workspace {
+                    distro: None,
+                    file: None,
+                    folders,
+                } => folders
+                    .iter()
+                    .any(|folder| Path::new(&folder.path).is_dir()),
             }
         }
         fn tab_exists(tab: &TabTarget) -> bool {

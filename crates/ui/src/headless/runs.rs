@@ -19,7 +19,7 @@ impl Session {
     ) {
         let file = request["file"]
             .as_str()
-            .map(|file| self.project.path(file).to_string_lossy().into_owned());
+            .map(|file| self.path(request, file).to_string_lossy().into_owned());
         let active = Active {
             file,
             line: request["line"].as_u64().map(|line| line as usize + 1),
@@ -40,16 +40,23 @@ impl Session {
             match command.as_str() {
                 "run_configurations" => {
                     let configs = run_config::load(project);
-                    let runner = run_config::python_runner(project);
+                    // Each configuration runs in its own folder.
+                    let mut runners = HashMap::new();
                     let rows: Vec<Value> = configs
                         .configurations
                         .iter()
                         .map(|config| {
+                            let folder = configs.folder(&config.name);
+                            let runner = runners
+                                .entry(folder)
+                                .or_insert_with(|| run_config::python_runner(project, folder));
                             let mut row = json!(run_config::describe(config));
-                            row["command"] = match run_config::resolve(project, config, &active)
-                                .and_then(|resolved| resolved.command(&runner))
+                            row["command"] = match run_config::resolve(project, folder, config, &active)
+                                .and_then(|resolved| resolved.command(runner))
                             {
-                                Ok(command) => json!(run_config::terminal_line(project, &command)),
+                                Ok(command) => {
+                                    json!(run_config::terminal_line(project, folder, &command))
+                                }
                                 Err(err) => json!({ "error": err }),
                             };
                             row
@@ -67,13 +74,15 @@ impl Session {
                             .selected()
                             .ok_or_else(|| invalid("no usable configuration".into()))?,
                     };
-                    let resolved = run_config::resolve(project, config, &active).map_err(invalid)?;
-                    let request = run_config::debug_request(project, &resolved).map_err(io::Error::other)?;
+                    let folder = configs.folder(&config.name);
+                    let resolved =
+                        run_config::resolve(project, folder, config, &active).map_err(invalid)?;
+                    let request = run_config::debug_request(project, folder, &resolved)
+                        .map_err(io::Error::other)?;
                     Ok(json!(request))
                 }
                 "tests_discover" => {
-                    let settings = Settings::load().0.tests;
-                    let discovery = engine::discover(project, &settings);
+                    let discovery = engine::discover(project);
                     Ok(json!({
                         "nodes": discovery.tree.nodes,
                         "roots": discovery.tree.roots,
@@ -82,8 +91,7 @@ impl Session {
                     }))
                 }
                 "tests_run" => {
-                    let settings = Settings::load().0.tests;
-                    let discovery = engine::discover(project, &settings);
+                    let discovery = engine::discover(project);
                     let tree = &discovery.tree;
                     let nodes: Vec<usize> = if ids.is_empty() {
                         tree.roots.clone()
@@ -92,7 +100,7 @@ impl Session {
                             .map(|id| tree.get(id).ok_or_else(|| invalid(format!("unknown test `{id}`"))))
                             .collect::<io::Result<_>>()?
                     };
-                    let report = engine::run_nodes(project, tree, &nodes, &settings);
+                    let report = engine::run_nodes(project, tree, &discovery.folders, &nodes);
                     let summaries = tree.summarize(&report.results, &Default::default());
                     let roots: Vec<Value> = tree
                         .roots

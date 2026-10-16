@@ -13,6 +13,8 @@
 //!   "word_wrap": false,
 //!   "inlay_hints": true,
 //!   "format_on_save": false,
+//!   "vim_mode": false,
+//!   "vim": { "ctrl_keys": true, "in_commit_message": false },
 //!   "languages": { "markdown": { "word_wrap": true }, "python": { "inlay_hints": false,
 //!     "format_on_save": true,
 //!     "formatter": { "command": "ruff", "args": ["format", "--stdin-filename", "{file}", "-"] },
@@ -25,8 +27,16 @@
 //!   "tests": { "discover_on_save": true, "pytest_args": ["-p", "no:randomly"],
 //!     "cargo_test_args": ["--features", "slow-tests"] },
 //!   "ports": { "auto_forward": true },
-//!   "git": { "staging_area": false, "update_method": "merge", "inline_blame": false } }
+//!   "git": { "staging_area": false, "update_method": "merge", "inline_blame": false },
+//!   "editor": { "minimap": { "enabled": true, "max_columns": 120, "side": "right" },
+//!     "sticky_scroll": { "enabled": true, "max_lines": 5 } },
+//!   "spell": { "enabled": true, "languages": ["en_US"], "check_code": true, "in_problems": false } }
 //! ```
+//!
+//! A file's effective settings layer, later winning key by key: these, a
+//! workspace file's `"settings"`, then its folder's own
+//! `.next_code/settings.json` (see `Project::settings_for`,
+//! [`Settings::layered`]).
 
 use std::{
     collections::HashMap,
@@ -65,6 +75,16 @@ pub struct Settings {
     pub tests: TestSettings,
     pub ports: PortSettings,
     pub git: GitSettings,
+    pub spell: SpellSettings,
+    pub editor: EditorSettings,
+    /// Vim emulation in file editors ("Toggle Vim Mode" flips it until
+    /// the editor exits).
+    pub vim_mode: bool,
+    pub vim: VimSettings,
+    /// The JSON these settings were read from (an empty object for
+    /// defaults), so workspace and folder settings can layer over it.
+    #[serde(skip)]
+    pub raw: Arc<Value>,
 }
 
 impl Default for Settings {
@@ -83,6 +103,85 @@ impl Default for Settings {
             tests: TestSettings::default(),
             ports: PortSettings::default(),
             git: GitSettings::default(),
+            spell: SpellSettings::default(),
+            editor: EditorSettings::default(),
+            vim_mode: false,
+            vim: VimSettings::default(),
+            raw: Arc::new(json!({})),
+        }
+    }
+}
+
+/// `"vim"`: options of the Vim emulation (`"vim_mode"` turns it on).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VimSettings {
+    /// Ctrl keys Vim uses in normal and visual mode (Ctrl+D/U/F/B/R/A/X/V)
+    /// do the Vim thing; `false` leaves them to the IDE.
+    pub ctrl_keys: bool,
+    /// Vim also edits the Commit tool window's message.
+    pub in_commit_message: bool,
+}
+
+impl Default for VimSettings {
+    fn default() -> Self {
+        Self {
+            ctrl_keys: true,
+            in_commit_message: false,
+        }
+    }
+}
+
+/// `"editor"`: the code editor's chrome.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EditorSettings {
+    pub minimap: MinimapSettings,
+    pub sticky_scroll: StickyScrollSettings,
+}
+
+/// `"editor.minimap"`: the scaled-down document beside file editors.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MinimapSettings {
+    pub enabled: bool,
+    /// Columns drawn per line (longer lines are cut).
+    pub max_columns: usize,
+    pub side: MinimapSide,
+}
+
+impl Default for MinimapSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_columns: 120,
+            side: MinimapSide::Right,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MinimapSide {
+    Left,
+    #[default]
+    Right,
+}
+
+/// `"editor.sticky_scroll"`: headers of the scopes around the first
+/// visible line pinned at the top of the text.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StickyScrollSettings {
+    pub enabled: bool,
+    pub max_lines: usize,
+}
+
+impl Default for StickyScrollSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_lines: 5,
         }
     }
 }
@@ -164,6 +263,32 @@ pub enum UpdateMethod {
     Rebase,
 }
 
+/// `"spell"`: spell checking in editors (see `editor::spell`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpellSettings {
+    pub enabled: bool,
+    /// Hunspell dictionaries: `en_US` is built in, others are read from
+    /// `<config>/next_code/dictionaries/<language>.aff` and `.dic`.
+    pub languages: Vec<String>,
+    /// Check comments, docstrings and strings of code; off, only Markdown,
+    /// plain text and commit messages are checked.
+    pub check_code: bool,
+    /// List the open files' unknown words in the Problems panel.
+    pub in_problems: bool,
+}
+
+impl Default for SpellSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            languages: vec![spell::BUILT_IN.to_owned()],
+            check_code: true,
+            in_problems: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LanguageSettings {
@@ -177,6 +302,8 @@ pub struct LanguageSettings {
     /// How to format the language's files (default: the language server;
     /// for Python, `ruff format` when it is installed).
     pub formatter: Option<FormatterSetting>,
+    /// Overrides `spell.enabled` for the language.
+    pub spell: Option<bool>,
 }
 
 impl Settings {
@@ -202,6 +329,15 @@ impl Settings {
             .and_then(|language| self.languages.get(language.id()))
             .and_then(|settings| settings.format_on_save)
             .unwrap_or(self.format_on_save)
+    }
+
+    /// Whether editors of `language` (`None`: plain text) are spell
+    /// checked.
+    pub fn spell(&self, language: Option<Language>) -> bool {
+        language
+            .and_then(|language| self.languages.get(language.id()))
+            .and_then(|settings| settings.spell)
+            .unwrap_or(self.spell.enabled)
     }
 
     /// How `language` files are formatted.
@@ -320,14 +456,37 @@ impl Settings {
     }
 
     pub fn load_from(path: &Path) -> (Self, Option<String>) {
-        match std::fs::read_to_string(path) {
-            Ok(text) => match serde_json::from_str(&text) {
-                Ok(settings) => (settings, None),
-                Err(err) => (Self::default(), Some(format!("{}: {err}", path.display()))),
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
+        let parsed = match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str::<Value>(&text)
+                .map_err(|err| err.to_string())
+                .and_then(|raw| Self::default().layered(&[&raw])),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(err.to_string()),
+        };
+        match parsed {
+            Ok(settings) => (settings, None),
             Err(err) => (Self::default(), Some(format!("{}: {err}", path.display()))),
         }
+    }
+
+    /// These settings with `layers` merged over their JSON in order (later
+    /// layers win; `null` layers are skipped): workspace file settings,
+    /// then a folder's `.next_code/settings.json` (see `Project::settings`).
+    pub fn layered(&self, layers: &[&Value]) -> Result<Self, String> {
+        let mut raw = match &*self.raw {
+            Value::Object(_) => (*self.raw).clone(),
+            _ => json!({}),
+        };
+        for layer in layers.iter().filter(|layer| !layer.is_null()) {
+            if !layer.is_object() {
+                return Err("settings must be a JSON object".into());
+            }
+            merge(&mut raw, (*layer).clone());
+        }
+        let mut settings: Self =
+            serde_json::from_value(raw.clone()).map_err(|err| err.to_string())?;
+        settings.raw = Arc::new(raw);
+        Ok(settings)
     }
 
     /// Server for `language`, or `None` if the language has none.

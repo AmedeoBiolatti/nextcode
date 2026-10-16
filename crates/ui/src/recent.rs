@@ -48,8 +48,9 @@ pub fn record(location: &Location) {
     }
 }
 
+/// A saved workspace is one entry whatever folders it had last.
 fn push_front(list: &mut Vec<Location>, location: Location) {
-    list.retain(|known| *known != location);
+    list.retain(|known| !known.opens_same(&location) && *known != location);
     list.insert(0, location);
     list.truncate(LIMIT);
 }
@@ -69,5 +70,30 @@ mod tests {
         push_front(&mut list, local("new"));
         assert_eq!(list.len(), LIMIT, "the oldest entry falls off");
         assert_eq!(list[0], local("new"));
+    }
+
+    #[test]
+    fn a_saved_workspace_is_listed_once_with_its_latest_folders() {
+        use crate::workspace_file::Folder;
+        let workspace = |folders: &[&str]| Location::Workspace {
+            distro: None,
+            file: Some("/w/all.next_code-workspace".into()),
+            folders: folders
+                .iter()
+                .map(|path| Folder {
+                    path: (*path).into(),
+                    name: None,
+                })
+                .collect(),
+        };
+        let mut list = vec![Location::Local(PathBuf::from("/w/a")), workspace(&["/w/a"])];
+        push_front(&mut list, workspace(&["/w/a", "/w/b"]));
+        assert_eq!(
+            list,
+            [
+                workspace(&["/w/a", "/w/b"]),
+                Location::Local(PathBuf::from("/w/a"))
+            ]
+        );
     }
 }

@@ -1,5 +1,6 @@
 //! The Tests panel (`PanelId::Tests`): pytest and cargo tests found where
-//! the project lives, as a tree with status icons and counts, a filter,
+//! the project lives (under a node per folder in a multi-root workspace),
+//! as a tree with status icons and counts, a filter,
 //! run/debug per node, and a details area with the selected test's
 //! failure (or the last run's output). Discovery and runs happen on
 //! background threads through [`engine`].
@@ -61,6 +62,8 @@ pub struct TestsPanel {
     filter: Entity<Editor>,
     tree: Option<Arc<TestTree>>,
     package_dirs: Arc<HashMap<String, String>>,
+    /// Each folder's own tree with several folders (see [`engine`]).
+    folders: Arc<Vec<TestTree>>,
     errors: Vec<SharedString>,
     results: HashMap<String, TestResult>,
     running: HashSet<String>,
@@ -106,6 +109,7 @@ impl TestsPanel {
             filter,
             tree: None,
             package_dirs: Arc::default(),
+            folders: Arc::default(),
             errors: Vec::new(),
             results: HashMap::new(),
             running: HashSet::new(),
@@ -142,8 +146,7 @@ impl TestsPanel {
         self.status = Some("Discovering tests…".into());
         cx.notify();
         let project = self.project.clone();
-        let settings = settings::current().tests.clone();
-        let task = cx.background_spawn(async move { engine::discover(&project, &settings) });
+        let task = cx.background_spawn(async move { engine::discover(&project) });
         self._discover = Some(cx.spawn(async move |this, cx| {
             let discovery = task.await;
             this.update(cx, |this, cx| this.discovered(discovery, cx))
@@ -179,6 +182,7 @@ impl TestsPanel {
         self.status = Some(format!("{count} tests").into());
         self.errors = discovery.errors.into_iter().map(Into::into).collect();
         self.package_dirs = Arc::new(discovery.package_dirs);
+        self.folders = Arc::new(discovery.folders);
         self.tree = Some(Arc::new(tree));
         cx.emit(TestsPanelEvent::Changed);
         cx.notify();
@@ -220,7 +224,13 @@ impl TestsPanel {
         };
         let nodes: Vec<usize> = match &target {
             RunTarget::All => tree.roots.clone(),
-            RunTarget::Pytest => tree.get("pytest").into_iter().collect(),
+            RunTarget::Pytest => tree
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.kind == NodeKind::Root && node.tool == Tool::Pytest)
+                .map(|(index, _)| index)
+                .collect(),
             RunTarget::Failed => tree
                 .nodes
                 .iter()
@@ -256,12 +266,8 @@ impl TestsPanel {
             }
             return cx.notify();
         }
-        let plan_leaves: HashSet<String> = tree
-            .plan(&nodes)
-            .into_iter()
-            .flat_map(|(_, leaves)| leaves)
-            .collect();
-        self.running = plan_leaves;
+        let folders = self.folders.clone();
+        self.running = engine::planned_leaves(&self.project, &tree, &folders, &nodes);
         // The failed file nodes being rerun lose their old error.
         for &index in &nodes {
             self.results.remove(&tree.nodes[index].id);
@@ -270,9 +276,8 @@ impl TestsPanel {
         cx.emit(TestsPanelEvent::Changed);
         cx.notify();
         let project = self.project.clone();
-        let settings = settings::current().tests.clone();
         let task = cx
-            .background_spawn(async move { engine::run_nodes(&project, &tree, &nodes, &settings) });
+            .background_spawn(async move { engine::run_nodes(&project, &tree, &folders, &nodes) });
         self._run = Some(cx.spawn(async move |this, cx| {
             let report = task.await;
             this.update(cx, |this, cx| this.finished(report, cx)).ok();
@@ -742,6 +747,7 @@ mod tests {
             results,
             errors: Vec::new(),
             package_dirs: HashMap::new(),
+            folders: Vec::new(),
         }
     }
 

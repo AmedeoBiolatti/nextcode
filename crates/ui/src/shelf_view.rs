@@ -138,7 +138,24 @@ impl ShelfView {
         }
     }
 
+    /// Lists `repository`'s shelves from the next refresh; another
+    /// repository's shelves are cleared at once.
     pub fn set_repository(&mut self, repository: Option<Repository>) {
+        let root = |repository: &Option<Repository>| {
+            repository
+                .as_ref()
+                .map(|r| crate::commit_panel::repository_key(r.root()))
+        };
+        if root(&self.repository) != root(&repository) {
+            self.shelves.clear();
+            self.rows.clear();
+            self.selected = None;
+            self.menu = None;
+            self.loaded = false;
+            self.error = None;
+            // A read of the previous repository's shelves is stale.
+            self._load = Task::ready(());
+        }
         self.repository = repository;
     }
 
@@ -721,7 +738,7 @@ mod tests {
 
         // Shelved through the project, as the Shelve dialog does.
         let project = Project::local(dir.clone());
-        let repository = project.repository().unwrap().unwrap();
+        let repository = project.repository_in(0).unwrap().unwrap();
         let files = ProjectFiles::new(&project, &repository);
         let paths = ["a.txt".to_owned(), "src/new.rs".to_owned()];
         repository.shelve(&files, &paths, "Login fix").unwrap();

@@ -370,3 +370,45 @@ fn menu_operations_change_the_repository_and_report(cx: &mut TestAppContext) {
     });
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[gpui::test]
+fn several_repositories_show_one_log_at_a_time(cx: &mut TestAppContext) {
+    let (dir, project) = crate::commit_panel::test_support::three_folders("log_repos");
+    commit(&dir.join("web"), "w.txt", "w\n", "web change");
+    let panel = cx.new(|cx| GitLogPanel::new(project, cx));
+    panel.update(cx, |panel, cx| panel.start(cx));
+    cx.run_until_parked();
+    let web = panel.update(cx, |panel, cx| {
+        // docs has no repository: skipped.
+        let names: Vec<&str> = panel.repositories.iter().map(repository_name).collect();
+        assert_eq!(names, ["api", "web"]);
+        assert_eq!(
+            subjects(panel),
+            ["first"],
+            "the first repository by default"
+        );
+        panel.filter.revisions = vec!["main".into()];
+        let web = panel.repositories[1].clone();
+        panel.select_repository(&web, cx);
+        web
+    });
+    cx.run_until_parked();
+    panel.update(cx, |panel, cx| {
+        assert_eq!(subjects(panel), ["web change", "first"]);
+        assert!(
+            panel.filter.revisions.is_empty(),
+            "branch filters are per repository"
+        );
+        assert!(panel.refs.iter().any(|r| r.name == "dev"));
+        // Following the active editor stops once the user picked one.
+        let api = panel.repositories[0].clone();
+        panel.chosen = true;
+        panel.prefer_repository(&api, cx);
+    });
+    cx.run_until_parked();
+    panel.read_with(cx, |panel, _| {
+        let shown = panel.repository().unwrap();
+        assert_eq!(repository_key(shown.root()), repository_key(web.root()));
+    });
+    std::fs::remove_dir_all(dir).ok();
+}

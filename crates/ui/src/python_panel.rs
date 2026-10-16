@@ -47,7 +47,8 @@ pub struct PythonInfo {
     pub in_sync: Option<bool>,
 }
 
-/// Reads the project's Python state. `None` without a `pyproject.toml`.
+/// Reads the Python state of the project's first folder (its uv project,
+/// `.venv` and interpreter). `None` without a `pyproject.toml` there.
 /// Blocks (several reads and a `uv sync --check`).
 pub fn load(project: &Project) -> io::Result<Option<PythonInfo>> {
     let read = |name: &str| match project.read_text(&project.resolve(name)) {
@@ -99,7 +100,7 @@ pub fn load(project: &Project) -> io::Result<Option<PythonInfo>> {
     }))
 }
 
-/// Runs `uv` with `args` in the project root. Blocks.
+/// Runs `uv` with `args` in the first folder. Blocks.
 pub fn run_uv(project: &Project, uv: &str, args: &[String]) -> io::Result<RunOutput> {
     project.run_program(
         uv,
@@ -769,10 +770,11 @@ impl Render for PythonPanel {
     }
 }
 
-/// A path inside the project, as uv and pytest take it (root-relative,
-/// `/`-separated), or as is when outside.
+/// A path inside the project, as uv and pytest take it (relative to its
+/// folder, `/`-separated), or as is when outside every folder.
 pub fn project_relative(project: &Project, path: &Path) -> String {
-    match path.strip_prefix(project.root()) {
+    let root = project.root_for(path);
+    match path.strip_prefix(&root.path) {
         Ok(relative) => relative
             .components()
             .map(|part| part.as_os_str().to_string_lossy().into_owned())

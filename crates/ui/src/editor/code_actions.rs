@@ -1,15 +1,19 @@
 //! Code actions and quick fixes (Ctrl+., JetBrains Alt+Enter): a menu at
 //! the cursor with the server's actions for the primary selection and the
-//! diagnostics under it, and a lightbulb in the gutter when the cursor
-//! line has any (requested a moment after the cursor or text settles).
+//! diagnostics under it (after the spelling fixes of an unknown word
+//! there, see `spell`), and a lightbulb in the gutter when the cursor line
+//! has any (requested a moment after the cursor or text settles).
 
-use gpui::{FontWeight, ScrollStrategy, UniformListScrollHandle, uniform_list};
+use gpui::{
+    Corner, FontWeight, ScrollStrategy, UniformListScrollHandle, anchored, deferred, uniform_list,
+};
 use lsp::types::{
     CodeAction, CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionTriggerKind, Command, ExecuteCommandParams,
     request::{CodeActionRequest, CodeActionResolveRequest, ExecuteCommand},
 };
 
+use super::spell::SpellFix;
 use super::*;
 use crate::lsp_store;
 
@@ -47,11 +51,20 @@ pub(super) struct CodeActionState {
 pub(super) struct CodeActionMenu {
     /// Where the menu opens (the cursor).
     anchor: usize,
+    /// Fixes for the unknown word at the cursor, listed first.
+    spell: Vec<SpellFix>,
     /// Quick fixes first, preferred first among them.
     actions: Vec<CodeActionOrCommand>,
     selected: usize,
     scroll: UniformListScrollHandle,
-    server: Arc<RunningServer>,
+    /// The server of `actions` (`None` when there are none).
+    server: Option<Arc<RunningServer>>,
+}
+
+impl CodeActionMenu {
+    fn len(&self) -> usize {
+        self.spell.len() + self.actions.len()
+    }
 }
 
 fn supports_code_actions(server: &RunningServer) -> bool {
@@ -270,14 +283,50 @@ impl Editor {
 
     /// Ctrl+. / Alt+Enter: the actions at the primary selection.
     pub(super) fn quick_fix(&mut self, _: &QuickFix, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(server) = self.server() else {
-            self.notice = Some("No language server for this file".into());
-            return cx.notify();
+        self.open_quick_fixes(cx);
+    }
+
+    /// Opens the menu: spelling fixes for an unknown word at the cursor,
+    /// then the server's actions.
+    fn open_quick_fixes(&mut self, cx: &mut Context<Self>) {
+        let server = self.server().filter(|server| supports_code_actions(server));
+        let Some(word) = self.spell_target() else {
+            let Some(server) = self.server() else {
+                self.notice = Some("No language server for this file".into());
+                return cx.notify();
+            };
+            if !supports_code_actions(&server) {
+                self.notice = Some("The language server has no code actions".into());
+                return cx.notify();
+            }
+            return self.request_code_actions(server, None, cx);
         };
-        if !supports_code_actions(&server) {
-            self.notice = Some("The language server has no code actions".into());
-            return cx.notify();
+        let fixes = self.spell_fixes(word, cx);
+        match server {
+            Some(server) => self.request_code_actions(server, Some(fixes), cx),
+            None => {
+                let (version, range) = (self.version, self.primary().range());
+                self.code_actions._request = Some(cx.spawn(async move |this, cx| {
+                    let fixes = fixes.await;
+                    this.update(cx, |this, cx| {
+                        if this.version == version && this.primary().range() == range {
+                            this.open_code_actions(Vec::new(), None, fixes, cx);
+                        }
+                    })
+                    .ok();
+                }));
+            }
         }
+    }
+
+    /// The server's actions at the primary selection (cached ones when
+    /// still current), opened after `spell` fixes if any.
+    fn request_code_actions(
+        &mut self,
+        server: Arc<RunningServer>,
+        spell: Option<Task<Vec<SpellFix>>>,
+        cx: &mut Context<Self>,
+    ) {
         let range = self.primary().range();
         let version = self.version;
         if let Some((v, r, actions)) = &self.code_actions.cached
@@ -285,7 +334,19 @@ impl Editor {
             && *r == range
         {
             let actions = actions.clone();
-            return self.open_code_actions(actions, server, cx);
+            let Some(spell) = spell else {
+                return self.open_code_actions(actions, Some(server), Vec::new(), cx);
+            };
+            self.code_actions._request = Some(cx.spawn(async move |this, cx| {
+                let fixes = spell.await;
+                this.update(cx, |this, cx| {
+                    if this.version == version && this.primary().range() == range {
+                        this.open_code_actions(actions, Some(server), fixes, cx);
+                    }
+                })
+                .ok();
+            }));
+            return;
         }
         let Some(params) = self.code_action_params(&range, CodeActionTriggerKind::INVOKED) else {
             return;
@@ -300,6 +361,10 @@ impl Editor {
                 Duration::from_millis(400),
             )
             .await;
+            let fixes = match spell {
+                Some(spell) => spell.await,
+                None => Vec::new(),
+            };
             this.update(cx, |this, cx| {
                 if this.version != version || this.primary().range() != range {
                     return;
@@ -308,7 +373,11 @@ impl Editor {
                     Ok(actions) => {
                         let actions = usable(actions.unwrap_or_default());
                         this.code_actions.cached = Some((version, range, actions.clone()));
-                        this.open_code_actions(actions, server, cx);
+                        this.open_code_actions(actions, Some(server), fixes, cx);
+                    }
+                    // Spelling fixes still help when the server fails.
+                    Err(_) if !fixes.is_empty() => {
+                        this.open_code_actions(Vec::new(), None, fixes, cx);
                     }
                     Err(err) => {
                         this.notice = Some(format!("Code actions failed: {err}").into());
@@ -323,23 +392,30 @@ impl Editor {
     fn open_code_actions(
         &mut self,
         actions: Vec<CodeActionOrCommand>,
-        server: Arc<RunningServer>,
+        server: Option<Arc<RunningServer>>,
+        spell: Vec<SpellFix>,
         cx: &mut Context<Self>,
     ) {
-        if actions.is_empty() {
+        if actions.is_empty() && spell.is_empty() {
             self.notice = Some("No code actions available here".into());
             return cx.notify();
         }
+        // An earlier "nothing here" notice (e.g. no language server) no
+        // longer applies once the menu has something to show.
+        self.notice = None;
         self.completion = None;
         self.completion_generation += 1;
         self.hover = None;
         let primary = self.primary();
-        self.code_actions.lightbulb = Some((
-            self.buffer.line_of(primary.head),
-            actions.iter().any(is_quick_fix),
-        ));
+        self.code_actions.lightbulb = (!actions.is_empty()).then(|| {
+            (
+                self.buffer.line_of(primary.head),
+                actions.iter().any(is_quick_fix),
+            )
+        });
         self.code_actions.menu = Some(CodeActionMenu {
             anchor: primary.head,
+            spell,
             actions,
             selected: 0,
             scroll: UniformListScrollHandle::new(),
@@ -352,7 +428,7 @@ impl Editor {
         let Some(menu) = &mut self.code_actions.menu else {
             return;
         };
-        let len = menu.actions.len() as isize;
+        let len = menu.len() as isize;
         menu.selected = (menu.selected as isize + delta).rem_euclid(len) as usize;
         menu.scroll
             .scroll_to_item(menu.selected, ScrollStrategy::Center);
@@ -402,16 +478,22 @@ impl Editor {
     /// Resolves the action if needed, then applies its edit across the
     /// project (through the workspace) and runs its command.
     fn apply_code_action(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(menu) = self.code_actions.menu.take() else {
+        let Some(mut menu) = self.code_actions.menu.take() else {
             return;
         };
         cx.notify();
-        let Some(action) = menu.actions.get(index).cloned() else {
+        if index < menu.spell.len() {
+            let fix = menu.spell.swap_remove(index);
+            return self.apply_spell_fix(fix, cx);
+        }
+        let Some(action) = menu.actions.get(index - menu.spell.len()).cloned() else {
+            return;
+        };
+        let Some(server) = menu.server else {
             return;
         };
         // The text is about to change; ask again afterwards.
         self.code_actions.cached = None;
-        let server = menu.server;
         self.code_actions._apply = Some(cx.spawn(async move |this, cx| {
             let result = match action {
                 CodeActionOrCommand::Command(command) => {
@@ -463,6 +545,15 @@ impl Editor {
         }));
     }
 
+    /// The lightbulb's line and whether it offers a quick fix: the
+    /// server's, else an unknown word at the cursor.
+    fn lightbulb(&self) -> Option<(usize, bool)> {
+        self.code_actions.lightbulb.or_else(|| {
+            let word = self.spell_target()?;
+            Some((self.buffer.line_of(word.start), true))
+        })
+    }
+
     /// Left edge and width of the lightbulb column (before the numbers).
     pub(super) fn lightbulb_column(layout: &EditorLayout) -> (Pixels, Pixels) {
         (layout.bulb_left, layout.em_width * LIGHTBULB_COLUMNS)
@@ -474,7 +565,7 @@ impl Editor {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let (Some(layout), Some((line, _))) = (&self.layout, self.code_actions.lightbulb) else {
+        let (Some(layout), Some((line, _))) = (&self.layout, self.lightbulb()) else {
             return false;
         };
         let (left, width) = Self::lightbulb_column(layout);
@@ -485,16 +576,7 @@ impl Editor {
         if !on_bulb {
             return false;
         }
-        let Some(server) = self.server() else {
-            return false;
-        };
-        let actions = self
-            .code_actions
-            .cached
-            .as_ref()
-            .map(|(_, _, actions)| actions.clone())
-            .unwrap_or_default();
-        self.open_code_actions(actions, server, cx);
+        self.open_quick_fixes(cx);
         true
     }
 
@@ -506,7 +588,7 @@ impl Editor {
         top: Pixels,
         window: &mut Window,
     ) {
-        let Some((bulb_line, quick_fix)) = self.code_actions.lightbulb else {
+        let Some((bulb_line, quick_fix)) = self.lightbulb() else {
             return;
         };
         if bulb_line != line {
@@ -545,6 +627,21 @@ impl Editor {
         );
     }
 
+    /// The open menu's rows, for tests.
+    #[cfg(test)]
+    pub(super) fn code_action_titles(&self) -> Option<Vec<String>> {
+        let menu = self.code_actions.menu.as_ref()?;
+        let spell = menu.spell.iter().map(SpellFix::title);
+        let actions = menu.actions.iter().map(|action| title(action).to_owned());
+        Some(spell.chain(actions).collect())
+    }
+
+    /// Runs row `index` of the open menu, for tests.
+    #[cfg(test)]
+    pub(super) fn run_code_action(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.apply_code_action(index, cx);
+    }
+
     pub(super) fn render_code_actions(
         &self,
         cx: &mut Context<Self>,
@@ -554,10 +651,10 @@ impl Editor {
         let (x, line_top) = self.screen_position(menu.anchor)?;
         let bounds = layout.bounds;
         let below = line_top < bounds.size.height * 0.6;
-        let rows = menu.actions.len().min(MAX_ROWS);
+        let rows = menu.len().min(MAX_ROWS);
         let list = uniform_list(
             "code-actions",
-            menu.actions.len(),
+            menu.len(),
             cx.processor(|this, range: Range<usize>, _, cx| {
                 let Some(menu) = &this.code_actions.menu else {
                     return Vec::new();
@@ -569,26 +666,37 @@ impl Editor {
         )
         .track_scroll(menu.scroll.clone())
         .size_full();
-        Some(
-            div()
-                .absolute()
-                .left((x - bounds.left()).max(px(0.)))
-                .when(below, |menu| menu.top(line_top + layout.line_height))
-                .when(!below, |menu| menu.bottom(bounds.size.height - line_top))
-                .w(px(440.))
-                .h(px(ROW_HEIGHT * rows as f32 + 2.))
-                .bg(theme::panel())
-                .border_1()
-                .border_color(theme::border())
-                .rounded_md()
-                .shadow_md()
-                .font_family(theme::UI_FONT)
-                .text_sm()
-                .cursor_default()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_mouse_move(|_, _, cx| cx.stop_propagation())
-                .child(list),
-        )
+        // Deferred so that small text areas (the commit message) don't
+        // clip it.
+        let x = x.max(bounds.left());
+        let line_top = bounds.top() + line_top;
+        let position = if below {
+            anchored().position(point(x, line_top + layout.line_height))
+        } else {
+            anchored()
+                .anchor(Corner::BottomLeft)
+                .position(point(x, line_top))
+        };
+        Some(deferred(
+            position.snap_to_window().child(
+                div()
+                    .id("code-actions-menu")
+                    .occlude()
+                    .w(px(440.))
+                    .h(px(ROW_HEIGHT * rows as f32 + 2.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::border())
+                    .rounded_md()
+                    .shadow_md()
+                    .font_family(theme::UI_FONT)
+                    .text_sm()
+                    .cursor_default()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                    .child(list),
+            ),
+        ))
     }
 }
 
@@ -600,17 +708,27 @@ fn code_action_row(
     row: usize,
     cx: &mut Context<Editor>,
 ) -> impl IntoElement + use<> {
-    let action = &menu.actions[row];
-    let (badge, color) = if is_quick_fix(action) {
-        ("fix", theme::warning())
-    } else {
-        match kind(action).and_then(|kind| kind.split('.').next()) {
-            Some("refactor") => ("refactor", theme::accent_text()),
-            Some("source") => ("source", theme::muted()),
-            _ => ("", theme::muted()),
+    let (badge, color, label, preferred) = match menu.spell.get(row) {
+        Some(fix) => (
+            "spelling",
+            theme::accent_text(),
+            fix.title(),
+            matches!(fix, SpellFix::Replace { .. }) && row == 0,
+        ),
+        None => {
+            let action = &menu.actions[row - menu.spell.len()];
+            let (badge, color) = if is_quick_fix(action) {
+                ("fix", theme::warning())
+            } else {
+                match kind(action).and_then(|kind| kind.split('.').next()) {
+                    Some("refactor") => ("refactor", theme::accent_text()),
+                    Some("source") => ("source", theme::muted()),
+                    _ => ("", theme::muted()),
+                }
+            };
+            (badge, color, title(action).to_owned(), is_preferred(action))
         }
     };
-    let preferred = is_preferred(action);
     div()
         .id(row)
         .h(px(ROW_HEIGHT))
@@ -643,7 +761,7 @@ fn code_action_row(
                     theme::text()
                 })
                 .when(preferred, |title| title.font_weight(FontWeight::BOLD))
-                .child(SharedString::from(title(action).to_owned())),
+                .child(SharedString::from(label)),
         )
 }
 

@@ -18,6 +18,7 @@ Native, AI-first IDE written in Rust on [gpui](https://crates.io/crates/gpui).
 | `crates/devcontainer` | `devcontainer.json` (JSONC) and bringing dev containers up with the docker CLI |
 | `crates/python` | `pyproject.toml` / `uv.lock`, uv command lines, pytest node ids |
 | `crates/git` | Git through its CLI: porcelain v2 status, stage/unstage/discard/commit, hunk patches, branches, worktrees, fetch/pull/push, history, diffs |
+| `crates/spell` | Spell checking: Hunspell dictionaries through `spellbook` (bundled en_US), word lists, word splitting, which parts of a document are prose |
 | `crates/ui` | `next_code` binary: editor, docks, LSP, terminal, search, problems, git and Python panels, diffs, fuzzy file finder (`Ctrl+P`) |
 
 ## Build and run
@@ -831,9 +832,11 @@ asks about unsaved files first.
 - **File > Open Project…** (`Ctrl+O`) picks a folder (a
   `\\wsl.localhost\...` folder opens through WSL) and opens it in a new
   tab; **Open Project in New Window…** does the same in its own window.
-- **File > Recent Projects** lists recent projects; **Open Recent…**
-  (`Ctrl+R`) also accepts a typed location such as `Ubuntu:~/project` or
-  `devcontainer:C:\src\app`.
+- **File > Recent Projects** lists recent projects and workspaces; **Open
+  Recent…** (`Ctrl+R`) also accepts a typed location such as
+  `Ubuntu:~/project`, `devcontainer:C:\src\app` or a workspace file.
+- **File > Open Workspace from File…**, **Add Folder to Workspace…** and
+  **Save Workspace As…**: see [multi-root workspaces](#multi-root-workspaces).
 - Opening a project that is already open (in any window) switches to its
   tab. `Ctrl+Alt+]` / `Ctrl+Alt+[` cycle the tabs.
 - The command bar (`Ctrl+Shift+P` or `F1`) lists every command available
@@ -894,6 +897,114 @@ double-click does something (Commit window and Git log files, branches,
 Tests, Call Hierarchy, debugger values) a double-click on the text still
 does it instead of selecting a word; dragging still selects. A selection
 stays within one message.
+
+## Multi-root workspaces
+
+A project tab can hold several folders, like a VS Code `.code-workspace`
+window. The folders live on one machine: all local, or all in one WSL
+distro (a dev container project has a single folder; adding one, saving it
+as a workspace or opening a workspace in a container is refused with a
+message).
+
+- **File > Add Folder to Workspace…** adds folders (the system folder
+  dialog for local projects; a typed path for WSL projects, or where there
+  is no dialog). A folder on another machine is refused. The Files tree's
+  folder rows have **Add Folder to Workspace…** and **Remove Folder from
+  Workspace** (disabled for the last folder; also in the command palette
+  while the tree has focus).
+- **File > Save Workspace As…** writes a `*.next_code-workspace` file
+  (the extension is added when missing) and reopens the tab from it; the
+  tab is then named after the file (`all (Workspace)`). Adding or removing
+  folders later rewrites that file.
+- **File > Open Workspace from File…**, `Ctrl+R` with a typed path, a
+  Recent entry or the command line open `*.next_code-workspace` and VS Code
+  `*.code-workspace` files (`Ubuntu:/home/me/all.code-workspace` for one in
+  WSL). VS Code files are read, never written: changing the folders of one
+  turns the tab into an untitled workspace (save it as a next_code file to
+  keep it).
+- Unsaved workspaces are kept too: Recent and window restore reopen them
+  with their folders (and each folder's session).
+
+The project's folders are fixed for the life of its workspace: adding or
+removing one saves the session (open editors, splits, layout) for the new
+set and reopens the project in the same tab, as VS Code reloads its window
+when a folder becomes a workspace. Files with unsaved changes must be saved
+or closed first (a notice says so).
+
+```jsonc
+{
+  "folders": [
+    { "path": "." },                          // relative to the file
+    { "path": "../api", "name": "API" },      // shown as "API"
+    { "path": "/srv/shared/lib" }             // absolute
+  ],
+  "settings": { "format_on_save": true, "languages": { "python": { "word_wrap": true } } }
+}
+```
+
+Comments and trailing commas are allowed. VS Code files may list folders
+as `path` or `file:` `uri` (other URIs are skipped); of their `settings`,
+`editor.wordWrap`, `editor.formatOnSave`, `editor.inlayHints.enabled`,
+`editor.autoClosingBrackets`, `editor.minimap.enabled`,
+`editor.stickyScroll.enabled`, `git.blame.editorDecoration.enabled`,
+`python.analysis.typeCheckingMode` and per-language blocks
+(`"[python]": { "editor.formatOnSave": … }`) are translated; the rest is
+ignored.
+
+**Settings layering.** A file's settings are the user's `settings.json`,
+under the workspace file's `settings`, under its folder's own
+`.next_code/settings.json` (any folder, also single-folder projects; same
+schema as `settings.json`). They apply to word wrap, inlay hints, format on
+save and formatters, language servers and tests; app-wide settings (theme,
+window restore, menus) stay the user's. A broken workspace or folder file
+shows a notice and is skipped; changes to a folder file apply when it is
+saved.
+
+**Across folders.** With more than one folder, lists label paths with their
+folder, `api › src/main.rs`:
+
+- **Files tree**: one bold row per folder, in the workspace's order (the
+  first expanded). Folder rows cannot be renamed, moved or deleted; files
+  can be dragged or pasted between folders. Copy Relative Path is relative
+  to the item's folder.
+- **Go to File** (`Ctrl+P`) lists every folder's files; typing a folder's
+  name narrows to it (`web main`). **Find/Replace in Files** searches every
+  folder (a file inside two nested folders counts once); include/exclude
+  globs apply relative to each folder. Replace notices, references, Go to
+  Symbol in Workspace and the breadcrumb file browser (whose `..` at a
+  folder's top lists the folders) use the same labels.
+- **Git** (PyCharm's multi-repository mode): each folder's repository is
+  found (folders in one repository share it; folders outside git are
+  skipped; a refused repository gets its own Trust banner). The Commit
+  window shows one collapsible header per repository (`name`, branch, file
+  count, checkbox); **Commit** commits each repository that has checked
+  files with the same message and reports per repository; Commit and Push
+  opens a Push dialog per repository; Fetch, Pull and Update Project act
+  on all of them. The Shelf tab and the Git log have a repository
+  selector; the log follows the active editor's repository until one is
+  picked. The title-bar branch widget shows the active file's repository
+  (`api: main`), and the branches popup has a row of repositories to
+  switch between. Change markers, blame, Stage Hunk and Show Diff use each
+  file's own repository.
+- **Language servers** start with every folder in `workspaceFolders`
+  (`rootUri` is the first) and answer `workspace/workspaceFolders` with all
+  of them; folders never change while a server runs, so
+  `didChangeWorkspaceFolders` is not needed. A server that does not
+  advertise workspace folder support gets one instance per folder (in the
+  folder, with its settings and interpreter; logs `lsp-<lang>-<n>.log`),
+  and each document goes to its folder's server. **Problems** are grouped
+  under a header per folder.
+- **Terminal**: New Terminal starts in the active file's folder and
+  activates that folder's `.venv`; tab titles end with `(folder)`.
+- **Run configurations** come from every folder (`.next_code/run.json`,
+  `.vscode/launch.json`, pyproject/Cargo) as `name (folder)`, resolve
+  `${workspaceFolder}` to their folder and run there; Edit Configurations
+  opens the active file's folder's `run.json`. The **Tests** panel has a
+  node per folder (test ids `folder › id`), each run in its folder.
+
+Limits: the Python panel shows the first folder's uv project; a folder
+nested in another shows both under its parent and as its own row;
+`exec` and most `python_*` headless commands run in the first folder.
 
 ## Files tree
 
@@ -1044,6 +1155,111 @@ Folds are saved with the session.
 | Toggle fold at the cursor | `Ctrl+K Ctrl+L` |
 | Fold / unfold recursively | `Ctrl+K Ctrl+[` / `Ctrl+K Ctrl+]` |
 | Fold all / unfold all | `Ctrl+K Ctrl+0` / `Ctrl+K Ctrl+J` |
+
+**Minimap.** File editors show the whole document scaled down in a column
+beside the scrollbar (VS Code): one 2 px row per screen row (wrapped rows
+and folds follow the text), each run of same-coloured characters a block
+in its syntax colour, up to `max_columns` columns. A translucent slider
+marks the visible part; a click centres the text on the clicked row and
+dragging the slider scrolls. When the document is taller than the column,
+the minimap scrolls with the text so their tops and ends meet. Git change
+markers (left edge), errors and warnings, selections and find matches show
+over it. It is hidden in editors narrower than 500 px, input fields, text
+areas and diff tabs.
+
+**Sticky scroll.** The opening lines of the scopes around the first visible
+line (the foldable regions above: definitions, blocks, bracketed and
+indented regions; a multi-line signature shows its `def`/`fn` line, never
+a decorator, comment or docstring) stay pinned at the top of the text, outermost first,
+with their line numbers and syntax colours over a subtle shadow; each
+pinned header covers the line below it, so nested headers stack up to
+`max_lines` (and at most half the view). The innermost one is pushed up as
+its scope's last row scrolls under it. Clicking one scrolls its line back
+to where it was pinned and puts the cursor there; the cursor never stays
+hidden under the pinned lines when it moves. Folded scopes and wrapped
+rows are followed.
+
+```json
+{ "editor": {
+    "minimap": { "enabled": true, "max_columns": 120, "side": "right" },
+    "sticky_scroll": { "enabled": true, "max_lines": 5 } } }
+```
+
+`"side": "left"` puts the minimap before the gutter. Both apply live and per
+workspace/folder like other settings.
+
+## Vim mode
+
+Optional Vim emulation in file editors, like VS Code Vim / IdeaVim: turn it
+on with `"vim_mode": true` in `settings.json`, or **Toggle Vim Mode**
+(command palette, View > Vim Mode; until the editor exits). The status bar
+shows the mode (`NORMAL`, `INSERT`, `VISUAL`, `V-LINE`, `V-BLOCK`,
+`REPLACE`), keys typed so far (`2d`) and `recording @q`; the cursor is a
+block in normal and visual mode, a half block while an operator waits for
+its motion, an underline in replace mode and the usual bar in insert mode.
+
+Keys reach Vim before the IDE's shortcuts, but Vim only takes what it uses:
+insert mode leaves everything but Escape to the editor (completion,
+snippets, auto-closing, multi-cursor typing work as usual), and in normal
+and visual mode Alt and function keys and Ctrl keys Vim has no meaning for
+(`Ctrl+S`, `Ctrl+P`, `Ctrl+Shift+…`) stay the IDE's. Escape first closes an
+open completion, parameter-hint, code-action or change popup; Escape in
+normal mode with nothing pending goes to the IDE (collapse cursors, close
+the find bar). Input fields, the terminal and diff tabs never use Vim; the
+Commit message does with `"vim": { "in_commit_message": true }`.
+
+| | |
+|---|---|
+| Modes | `i a I A o O gi gI`, `v V Ctrl+V` (`Ctrl+Q`), `gv`, `R`, Escape / `Ctrl+[` |
+| Motions (with counts) | `h j k l` (arrows, Backspace, Space), `w W b B e E ge gE`, `0 ^ $ g_ \|`, `gg G {n}G`, `+ - Enter`, `f F t T ; ,`, `%` (`{n}%`), `{ }`, `H M L`, `Ctrl+D/U/F/B` (PageUp/Down), `gj gk`, `* #`, `/ ? n N`, marks `'a` `` `a `` `''` `'<` `'>` `'.` `'^` |
+| Operators | `d c y > < = g~ gu gU` with a motion, a text object or doubled for lines (`dd`, `>>`, `gUU`); counts multiply (`2d3w`) |
+| Text objects | `iw aw iW aW`, `i" a" i' a'`, ``i` a` ``, `i( a( ib ab i[ a[ i{ a{ iB aB i< a<`, `it at`, `ip ap` (with counts) |
+| Commands | `x X s S D C Y p P`, `u Ctrl+R`, `.`, `J gJ`, `r{c}`, `~`, `Ctrl+A / Ctrl+X` (decimal and `0x` hex), `m{a-z}`, `q{a-z}` … `q`, `@{a-z}`, `@@`, `zz zt zb`, `Ctrl+E / Ctrl+Y`, `zc zo za zM zR` (folds), `gd` (go to definition) |
+| Visual | motions and objects extend; `d x X D c s S C R y Y > < = ~ u U J r{c} p P o`; block `I`/`A` type on every line (`$A` appends to each line's end) |
+| Registers | unnamed, `"a`-`"z` (`"A` appends), `"0` last yank, `"1`-`"9` deletes of lines, `"-` small deletes, `"_`, `"+`/`"*` system clipboard, `".` `":` `"/` read-only |
+
+**Command line.** `:` opens it in the status bar (with `'<,'>` from visual
+mode, `.,.+n` after a count); `/` and `?` search (also as operator motions,
+`d/foo`). Up/Down browse the history, `Ctrl+U` clears, `Ctrl+W` deletes a
+word, `Ctrl+V` pastes, Backspace on an empty line or Escape cancels.
+
+| Ex command | |
+|---|---|
+| `:w`, `:wa`, `:q`, `:q!`, `:wq`, `:x` | save (formats on save like `Ctrl+S`), save all, close the tab (asks about unsaved changes; `!` discards), save and close |
+| `:e {file}`, `:e`, `:e!` | open a file (relative to the project folder), reload from disk (`!` drops edits) |
+| `:{n}`, `:$`, `:.+3` | go to line |
+| `:[range]s/pat/rep/[giI]`, `:%s/…` | substitute; `&` and `\1`…`\9` in the replacement, empty pattern = last search |
+| `:[range]d [x]`, `:[range]y [x]`, `:[range]>`, `:[range]<`, `:[range]j` | delete, yank, shift, join lines |
+| `:noh`, `:set hls` / `:set nohls` | hide / show search highlights |
+| `:sp`, `:vs` | split the editor down / right |
+
+Ranges: `%`, `n`, `.`, `$`, `'x` marks, `+n`/`-n` offsets, `a,b`.
+Search patterns use Rust regex syntax plus Vim's `\<` `\>`, with smartcase
+(case-sensitive only with an uppercase letter; `\c` / `\C` force it); `*` and
+`#` match whole words, case-sensitively. Matches of the last search are
+highlighted until `:noh` (only the lines on screen are searched for that).
+
+**Undo and repeat.** A command and the insert mode it opens are one undo
+step (`ciwfoo<Esc>` undoes with one `u`), and `.` repeats it with the typed
+text (`3.` replaces the count); visual-mode commands repeat on the same
+amount of text. Insert counts repeat the text (`3ix<Esc>`, `2oline<Esc>`).
+
+**Several cursors.** Normal-mode commands act on the primary cursor and
+drop the others, except `i` and `a`, which insert at every cursor. A
+selection made outside Vim (mouse drag, `Ctrl+D`, Select All) is visual
+mode, and visual operators act on every selection (`Ctrl+D Ctrl+D c` changes
+all occurrences).
+
+```json
+{ "vim_mode": true,
+  "vim": { "ctrl_keys": true, "in_commit_message": false } }
+```
+
+`"ctrl_keys": false` gives `Ctrl+D/U/F/B/E/Y/R/A/X/V/Q` (and `Ctrl+[`) back to
+the IDE. Not supported: sentence objects (`is`/`as`), `:s` confirm (`c`),
+`Ctrl+O`/`Ctrl+I` jumps, `Ctrl+O` in insert mode, uppercase (file) marks,
+`:w {file}`, Vim regex syntax beyond `\<` `\>` `\c` `\C`, `:normal`,
+key remapping and `.vimrc`.
 
 ## Code navigation
 
@@ -1223,6 +1439,62 @@ next / previous placeholder, the last `Tab` goes to the snippet's end
 position; `Escape` or moving the cursor out of the snippet ends it. Choices
 (`${1|a,b|}`) insert the first option; snippet variables (`$TM_FILENAME`,
 `$TM_SELECTED_TEXT`, …) are filled where known.
+
+## Spell checking
+
+Like VS Code's Code Spell Checker and PyCharm's typo inspection, unknown
+words get a dotted underline (not the wavy one of diagnostics):
+
+- in code, only comments, docstrings and strings (from the syntax tree;
+  identifiers are never checked);
+- in Markdown, everything except code blocks, link targets and fence info
+  strings; in plain text (`.txt`, `.rst`, `.adoc`, `.org`, git's
+  `COMMIT_EDITMSG`…) and the Commit window's message, everything.
+
+Words are split at camelCase humps, `_`, `-` and `.` (`parseHTTPRequest` →
+parse, HTTP, Request). Skipped: URLs, e-mail addresses, paths, `@tags`,
+`$variables`, `%formats`, `#hex` colors, hashes, text in backticks, words
+shorter than 3 letters, all-caps words up to 4 letters (`TODO`, `JSON`),
+words with digits (`utf8`, `x86`) and non-Latin scripts. A built-in list of
+programming words (`async`, `regex`, `stdout`, `kwargs`, `json`, …) is
+accepted.
+
+**Quick fixes.** On an unknown word, `Alt+Enter` / `Ctrl+.` (or the
+lightbulb) lists, before any language-server actions: up to 5 corrections,
+*Add to user dictionary* (`<config>/next_code/words.txt`), *Add to project
+dictionary* (`.next_code/words.txt` in the file's project folder, written
+where the project lives), *Ignore in this file* (in this editor tab, until
+it closes). Dictionary files have one word per line (`#` comments; any case
+matches). Editing them reloads them: the user's file when the editor saves
+a file or a window regains focus, the project's through the file watcher.
+
+Only the visible lines and 100 lines around them are checked, on a
+background thread, 300 ms after typing stops (scrolling to unchecked lines
+checks at once); results are cached per line text. Dictionaries load on
+first use, off the UI thread (en_US: ~10 ms in a release build; checking
+300 lines of comments takes about 1.5 ms).
+
+Settings (`settings.json`, workspace or folder settings):
+
+```json
+{ "spell": {
+    "enabled": true,
+    "languages": ["en_US"],
+    "check_code": true,
+    "in_problems": false },
+  "languages": { "json": { "spell": false } } }
+```
+
+`languages` lists Hunspell dictionaries: `en_US` is built in (SCOWL, see
+`crates/spell/dictionaries/README_en_US.txt` for its licence); others are
+read from `<config>/next_code/dictionaries/<language>.aff` and `.dic`
+(also replacing the built-in one). A word passes if any dictionary knows
+it. `check_code: false` limits checking to Markdown, plain text and commit
+messages. `languages.<id>.spell` turns checking on or off for one language.
+`in_problems: true` also lists the unknown words of open files in the
+Problems panel (information level, source `spelling`; the whole file is
+checked a second after it settles). The checker is
+[spellbook](https://github.com/helix-editor/spellbook) (MPL-2.0).
 
 ## Split editor and session restore
 
@@ -1435,7 +1707,8 @@ Commands: `info`, `list_dir`, `list_files`, `read`, `write`, `stat`,
 `paths`; per-file counts, skipped and failed files), `watch`/`unwatch`,
 `open`/`close` (language server documents),
 `diagnostics`, `definition`/`declaration`/`type_definition`/`implementation`,
-`signature_help` (with the highlighted parameter), `inlay_hints` (a line
+`signature_help` (with the highlighted parameter), `spell_check` (`path`
+and/or `text`: unknown words with corrections), `inlay_hints` (a line
 range), `incoming_calls`/`outgoing_calls` (call
 hierarchy at a position), `document_symbols`, `workspace_symbols`,
 `semantic_tokens` (decoded as the editor draws
@@ -1470,6 +1743,16 @@ the project lives), `git_status`, `git_diff`, `git_apply_hunk`,
 `ports_forward`, `ports_stop` (with `port_forwarded`, `port_released`,
 `port_available` events), `shutdown`;
 `--devcontainer` opens the folder's container (with `progress` events).
+`--workspace FILE` (or a `*.next_code-workspace` / `*.code-workspace` path
+as the project) opens a [multi-root workspace](#multi-root-workspaces):
+`info` adds `roots` (`[{index, name, path}]`) and `workspace_file`; every
+command takes an optional `root` (index or name) that relative paths are
+resolved against (absolute paths work anywhere; an unknown root is an
+error); `list_files` without `root` returns `[{root, path}]` for several
+folders (the plain list for one); `search`/`replace` results carry `root`
+and `relative`; git commands use the `root` folder's repository (default
+the first; an absolute path selects its folder's), and `git_status` with
+`all: true` returns `[{root, repository_root, status}]`.
 Parameters and
 results are documented in
 `crates/ui/src/headless.rs`.

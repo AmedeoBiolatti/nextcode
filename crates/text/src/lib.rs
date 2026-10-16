@@ -149,6 +149,9 @@ struct Document {
     undo: Vec<Transaction>,
     redo: Vec<Transaction>,
     next_transaction: u64,
+    /// Undo-stack depth at which the last step was sealed: the next edit
+    /// starts a new step even if it continues typing.
+    sealed_at: Option<usize>,
     /// Undo-stack depth matching the file on disk; `None` if that state is unreachable.
     saved_at: Option<usize>,
     /// Per view: changes made through other views it has not synced yet.
@@ -176,6 +179,7 @@ impl Buffer {
                 redo: Vec::new(),
                 next_transaction: 0,
                 saved_at: Some(0),
+                sealed_at: None,
                 views: vec![(0, Vec::new())],
                 next_view: 1,
             })),
@@ -567,6 +571,7 @@ impl Buffer {
             document.saved_at = None;
         }
         let coalesce = Some(document.undo.len()) != document.saved_at
+            && Some(document.undo.len()) != document.sealed_at
             && document
                 .undo
                 .last()
@@ -655,6 +660,66 @@ impl Buffer {
         document.undo.push(transaction);
         self.publish(&mut document, first_change);
         Some(inserted)
+    }
+
+    /// Number of undo steps; a mark for [`Buffer::group_undo`].
+    pub fn undo_depth(&self) -> usize {
+        lock(&self.document).undo.len()
+    }
+
+    /// Ends the latest undo step: the next edit starts a new one even when
+    /// it continues typing there.
+    pub fn seal_undo(&mut self) {
+        let mut document = lock(&self.document);
+        document.sealed_at = Some(document.undo.len());
+    }
+
+    /// Merges the undo steps from `depth` on into one, which keeps the id
+    /// of the last of them. Returns the id of the first merged step and
+    /// the kept id, or `None` when fewer than two steps are there.
+    pub fn group_undo(&mut self, depth: usize) -> Option<(u64, u64)> {
+        let mut document = lock(&self.document);
+        let len = document.undo.len();
+        if len < depth + 2 {
+            return None;
+        }
+        let merged: Vec<Transaction> = document.undo.drain(depth..).collect();
+        let first = merged[0].id;
+        let id = merged[merged.len() - 1].id;
+        // Applied oldest step first, each back to front: undo walks the
+        // concatenation backwards.
+        let edits = merged.into_iter().flat_map(|t| t.edits).collect();
+        document.undo.push(Transaction { id, edits });
+        document.saved_at = match document.saved_at {
+            Some(saved) if saved == len => Some(depth + 1),
+            Some(saved) if saved > depth => None,
+            other => other,
+        };
+        document.sealed_at = Some(depth + 1);
+        Some((first, id))
+    }
+
+    /// Chars from `offset` on, with their offsets.
+    pub fn chars_from(&self, offset: usize) -> impl Iterator<Item = (usize, char)> + '_ {
+        let mut chars = self.rope.chars_at(self.rope.byte_to_char(offset));
+        let mut at = offset;
+        std::iter::from_fn(move || {
+            let c = chars.next()?;
+            let item = (at, c);
+            at += c.len_utf8();
+            Some(item)
+        })
+    }
+
+    /// Chars before `offset`, nearest first, with their offsets.
+    pub fn chars_before(&self, offset: usize) -> impl Iterator<Item = (usize, char)> + '_ {
+        let mut chars = self.rope.chars_at(self.rope.byte_to_char(offset));
+        let mut at = offset;
+        std::iter::from_fn(move || {
+            let c = chars.prev()?;
+            at -= c.len_utf8();
+            Some((at, c))
+        })
     }
 
     fn replace(&mut self, range: Range<usize>, text: &str) {
@@ -995,5 +1060,66 @@ mod tests {
         left.edit(0..0, "x");
         assert_eq!(lock(&left.document).views.len(), 1);
         assert!(!left.is_linked_to(&Buffer::new("")));
+    }
+
+    #[test]
+    fn grouped_steps_undo_and_redo_as_one() {
+        let mut buffer = Buffer::new("one two\n");
+        buffer.edit(0..0, "a");
+        let depth = buffer.undo_depth();
+        buffer.edit(4..8, "");
+        buffer.edit(4..4, "x");
+        buffer.edit(5..5, "y");
+        assert_eq!(buffer.slice(0..buffer.len()), "aonexy\n");
+        let (first, kept) = buffer.group_undo(depth).unwrap();
+        assert!(first < kept);
+        assert_eq!(buffer.undo_depth(), depth + 1);
+        assert_eq!(buffer.transaction_id(), Some(kept));
+        buffer.undo();
+        assert_eq!(buffer.slice(0..buffer.len()), "aone two\n");
+        buffer.redo();
+        assert_eq!(buffer.slice(0..buffer.len()), "aonexy\n");
+        buffer.undo();
+        buffer.undo();
+        assert_eq!(buffer.slice(0..buffer.len()), "one two\n");
+        assert!(!buffer.is_dirty());
+        assert_eq!(buffer.group_undo(0), None, "one step left at most");
+    }
+
+    #[test]
+    fn sealed_steps_do_not_coalesce_with_typing() {
+        let mut buffer = Buffer::new("");
+        buffer.edit(0..0, "a");
+        buffer.edit(1..1, "b");
+        assert_eq!(buffer.undo_depth(), 1, "typing coalesces");
+        buffer.seal_undo();
+        buffer.edit(2..2, "c");
+        assert_eq!(buffer.undo_depth(), 2);
+        buffer.edit(3..3, "d");
+        assert_eq!(buffer.undo_depth(), 2, "coalesces after the seal");
+    }
+
+    #[test]
+    fn grouping_over_the_saved_state_keeps_dirtiness_right() {
+        let mut buffer = Buffer::new("x");
+        buffer.edit(0..0, "a");
+        buffer.edit(0..2, "");
+        buffer.mark_saved();
+        buffer.group_undo(0);
+        assert!(
+            !buffer.is_dirty(),
+            "the saved state is the merged step's end"
+        );
+        buffer.undo();
+        assert!(buffer.is_dirty());
+    }
+
+    #[test]
+    fn char_iterators_report_offsets_both_ways() {
+        let buffer = Buffer::new("aé\nb");
+        let forward: Vec<_> = buffer.chars_from(1).collect();
+        assert_eq!(forward, [(1, 'é'), (3, '\n'), (4, 'b')]);
+        let backward: Vec<_> = buffer.chars_before(4).collect();
+        assert_eq!(backward, [(3, '\n'), (1, 'é'), (0, 'a')]);
     }
 }

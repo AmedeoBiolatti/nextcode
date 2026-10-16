@@ -8,7 +8,7 @@ use super::{Drag, Editor, EditorLayout, Severity};
 use crate::theme;
 
 /// Width of the track.
-const WIDTH: Pixels = px(12.);
+pub(super) const WIDTH: Pixels = px(12.);
 /// Shortest thumb.
 const MIN_THUMB: Pixels = px(24.);
 /// Shortest mark.

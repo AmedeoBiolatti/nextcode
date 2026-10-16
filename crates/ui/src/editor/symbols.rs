@@ -232,8 +232,14 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement + use<>> {
         let path = self.buffer.path()?;
-        let root = self.project.as_ref().map(|project| project.root());
+        // The file's own folder (several in a multi-root workspace).
+        let project = self.project.as_ref();
+        let root = project.map(|project| project.root_for(path).path.as_path());
         let names = path_segments(root, path);
+        // Multi-root: the folder's name leads; it lists that folder.
+        let folder = project
+            .filter(|project| project.is_multi_root() && project.root_index_of(path).is_some())
+            .map(|project| project.root_for(path));
         let last = names.len().saturating_sub(1);
         let language = self.language();
         let separator = || div().flex_none().child("›");
@@ -252,6 +258,27 @@ impl Editor {
             .border_color(theme::border())
             .text_xs()
             .text_color(theme::muted());
+        if let Some(folder) = folder {
+            let dir = folder.path.clone();
+            bar = bar
+                .child(
+                    div()
+                        .id("crumb-folder")
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::hover_row()).text_color(theme::text()))
+                        .child(folder.name.clone())
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(EditorEvent::Pick(PickRequest::Directory {
+                                dir: dir.clone(),
+                                selected: None,
+                            }));
+                        })),
+                )
+                .child(separator());
+        }
         for (index, name) in names.iter().enumerate() {
             if index > 0 {
                 bar = bar.child(separator());

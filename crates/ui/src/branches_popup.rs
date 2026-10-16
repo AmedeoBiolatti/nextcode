@@ -1,7 +1,9 @@
 //! PyCharm's branches popup (from the title bar's branch widget): a search
 //! box, repository actions, then Recent / Local / Remote branches; each
-//! branch opens a submenu of what can be done with it. The workspace runs
-//! the chosen [`PopupCommand`].
+//! branch opens a submenu of what can be done with it. With several
+//! repositories a row of repository buttons leads the popup and chooses
+//! whose branches are listed and acted on. The workspace runs the chosen
+//! [`PopupCommand`] in that repository.
 
 use git::{BranchTracking, Ref, RefKind, Repository};
 use gpui::{
@@ -10,6 +12,7 @@ use gpui::{
 };
 
 use crate::{
+    commit_panel::repository_name,
     editor::{self, Editor, EditorEvent},
     project_picker,
     selectable::selectable,
@@ -17,6 +20,8 @@ use crate::{
 };
 
 const ROW_HEIGHT: f32 = 24.;
+/// The repository buttons' row (several repositories only).
+const REPOSITORIES_HEIGHT: f32 = 30.;
 const RECENT: usize = 5;
 
 /// What the user picked; the workspace carries it out.
@@ -47,7 +52,10 @@ pub enum PopupCommand {
 }
 
 pub enum BranchesPopupEvent {
-    Run(PopupCommand),
+    Run {
+        repository: Repository,
+        command: PopupCommand,
+    },
     Dismissed,
 }
 
@@ -201,7 +209,9 @@ fn build_items(
 }
 
 pub struct BranchesPopup {
-    repository: Repository,
+    /// Every repository of the project; `active` is the one listed.
+    repositories: Vec<Repository>,
+    active: usize,
     query: Entity<Editor>,
     refs: Vec<Ref>,
     tracking: Vec<BranchTracking>,
@@ -218,7 +228,14 @@ pub struct BranchesPopup {
 }
 
 impl BranchesPopup {
-    pub fn new(repository: Repository, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Lists `repositories[active]`'s branches (`repositories` must not be
+    /// empty).
+    pub fn new(
+        repositories: Vec<Repository>,
+        active: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let query = cx.new(Editor::single_line);
         window.focus(&query.focus_handle(cx));
         let subscription = cx.subscribe(&query, |this, _, event, cx| {
@@ -226,8 +243,10 @@ impl BranchesPopup {
                 this.filter(cx);
             }
         });
+        let active = active.min(repositories.len().saturating_sub(1));
         let mut popup = Self {
-            repository,
+            repositories,
+            active,
             query,
             refs: Vec::new(),
             tracking: Vec::new(),
@@ -245,8 +264,24 @@ impl BranchesPopup {
         popup
     }
 
+    /// Lists repository `index`'s branches.
+    fn select_repository(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index == self.active || index >= self.repositories.len() {
+            return;
+        }
+        self.active = index;
+        self.refs.clear();
+        self.tracking.clear();
+        self.recent.clear();
+        self.error = None;
+        self.filter(cx);
+        self.load(cx);
+    }
+
     fn load(&mut self, cx: &mut Context<Self>) {
-        let repository = self.repository.clone();
+        let Some(repository) = self.repositories.get(self.active).cloned() else {
+            return;
+        };
         self._load = cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
@@ -301,7 +336,12 @@ impl BranchesPopup {
     }
 
     fn run(&mut self, command: PopupCommand, cx: &mut Context<Self>) {
-        cx.emit(BranchesPopupEvent::Run(command));
+        if let Some(repository) = self.repositories.get(self.active).cloned() {
+            cx.emit(BranchesPopupEvent::Run {
+                repository,
+                command,
+            });
+        }
     }
 
     fn activate(&mut self, row: usize, cx: &mut Context<Self>) {
@@ -374,6 +414,61 @@ impl BranchesPopup {
             return cx.notify();
         }
         cx.emit(BranchesPopupEvent::Dismissed);
+    }
+
+    fn repositories_height(&self) -> f32 {
+        if self.repositories.len() > 1 {
+            REPOSITORIES_HEIGHT
+        } else {
+            0.
+        }
+    }
+
+    /// Several repositories: one button each; the listed one is
+    /// highlighted.
+    fn render_repositories(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        if self.repositories.len() < 2 {
+            return None;
+        }
+        Some(
+            div()
+                .h(px(REPOSITORIES_HEIGHT))
+                .px_1()
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .overflow_hidden()
+                .border_b_1()
+                .border_color(theme::border())
+                .children(
+                    self.repositories
+                        .iter()
+                        .enumerate()
+                        .map(|(index, repository)| {
+                            let active = index == self.active;
+                            div()
+                                .id(("branch-repository", index))
+                                .h(px(22.))
+                                .px_2()
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(if active {
+                                    theme::text()
+                                } else {
+                                    theme::muted()
+                                })
+                                .when(active, |button| button.bg(theme::active_row()))
+                                .hover(|style| style.bg(theme::hover_row()))
+                                .child(repository_name(repository).to_owned())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_repository(index, cx)
+                                }))
+                        }),
+                ),
+        )
     }
 
     fn render_branch_row(
@@ -467,9 +562,10 @@ impl BranchesPopup {
     fn render_submenu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let (row, highlighted) = self.submenu?;
         let commands = self.commands(row);
-        // Line the submenu up with its row (header and search box above).
+        // Line the submenu up with its row (header, repositories and
+        // search box above).
         let scroll = self.scroll.offset().y;
-        let top = px(42. + ROW_HEIGHT * row as f32) + scroll;
+        let top = px(42. + self.repositories_height() + ROW_HEIGHT * row as f32) + scroll;
         Some(
             div()
                 .id("branch-submenu")
@@ -574,6 +670,7 @@ impl Render for BranchesPopup {
             .border_color(theme::border())
             .rounded_md()
             .shadow_lg()
+            .children(self.render_repositories(cx))
             .child(
                 // A block container: inputs in flex rows can lay out zero
                 // wide.
@@ -747,5 +844,60 @@ mod tests {
         assert!(remote.contains(&"Merge 'origin/x' into 'main'".to_owned()));
         assert!(!remote.contains(&"Rename…".to_owned()));
         assert_eq!(remote.last().map(String::as_str), Some("Delete"));
+    }
+
+    #[gpui::test]
+    fn the_repository_row_chooses_whose_branches_are_listed_and_acted_on(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+
+        use crate::commit_panel::test_support;
+        let (dir, project) = test_support::three_folders("popup_repos");
+        test_support::git(&dir.join("web"), &["branch", "feature"]);
+        let repositories: Vec<Repository> = (0..2)
+            .map(|root| project.repository_in(root).unwrap().unwrap())
+            .collect();
+        let window = cx.add_window(|window, cx| BranchesPopup::new(repositories, 1, window, cx));
+        cx.run_until_parked();
+        let popup = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        let ran = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let ran = ran.clone();
+            cx.subscribe(&popup, move |_, event, _| {
+                if let BranchesPopupEvent::Run {
+                    repository,
+                    command,
+                } = event
+                {
+                    let name = repository_name(repository).to_owned();
+                    ran.borrow_mut().push((name, command.clone()));
+                }
+            })
+            .detach();
+        });
+        let branches = |popup: &BranchesPopup| -> Vec<String> {
+            popup
+                .refs
+                .iter()
+                .filter(|r| r.kind == RefKind::Branch)
+                .map(|r| r.name.clone())
+                .collect()
+        };
+        popup.update(cx, |popup, cx| {
+            assert_eq!(branches(popup), ["dev", "feature"]);
+            popup.select_repository(0, cx);
+            assert!(
+                popup.refs.is_empty(),
+                "the other repository's branches are gone"
+            );
+        });
+        cx.run_until_parked();
+        popup.update(cx, |popup, cx| {
+            assert_eq!(branches(popup), ["main"]);
+            popup.run(PopupCommand::Commit, cx);
+        });
+        assert_eq!(*ran.borrow(), [("api".to_owned(), PopupCommand::Commit)]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

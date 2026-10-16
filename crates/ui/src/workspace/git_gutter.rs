@@ -5,23 +5,26 @@
 //! Stage Hunk, Show Diff, show a blamed commit in the Git log.
 //!
 //! Git runs where the project lives (locally, in WSL, in a container).
-//! One refresh asks git for every open file's base object at once and
-//! reads only the blobs that changed.
+//! Each file uses the repository of its folder (the Commit window keeps
+//! one per folder of a multi-root project; files in a folder without one
+//! have no markers). One refresh asks each repository for its open files'
+//! base objects at once and reads only the blobs that changed.
 
 use std::{collections::HashMap, io};
 
-use git::BaseObject;
+use git::{BaseObject, Repository};
 use gpui::EntityId;
 
 use super::*;
-use crate::editor::GitBase;
+use crate::{commit_panel::repository_key, editor::GitBase};
 
 #[derive(Default)]
 pub(super) struct GitGutters {
     /// Per editor: the base object (and whether it is the index) it shows.
     shown: HashMap<EntityId, (BaseObject, bool)>,
-    /// HEAD when bases were last read: blame runs again when it moves.
-    head: Option<String>,
+    /// Per repository (by key), HEAD when bases were last read: blame runs
+    /// again when it moves.
+    heads: HashMap<String, Option<String>>,
     /// Drops results of a superseded refresh.
     generation: u64,
     refresh: Option<Task<()>>,
@@ -29,19 +32,71 @@ pub(super) struct GitGutters {
     operation: Option<Task<()>>,
 }
 
+/// One repository's part of a refresh: base object changes as
+/// `(position in the refresh's files, object, base)`, and HEAD.
+type RepositoryBases = (Vec<(usize, BaseObject, Option<GitBase>)>, Option<String>);
+
+/// A file whose base a refresh reads: `(position in the refresh's files,
+/// relative path, base object shown and whether it is the index)`.
+type BaseRequest = (usize, String, Option<(BaseObject, bool)>);
+
+/// Reads `files`' base objects in `repository`, and the blobs of those
+/// that changed. Blocks.
+fn read_bases(
+    repository: &Repository,
+    files: &[BaseRequest],
+    index: bool,
+) -> io::Result<RepositoryBases> {
+    let mut unique: Vec<String> = files.iter().map(|(_, path, _)| path.clone()).collect();
+    unique.sort();
+    unique.dedup();
+    let objects = repository.base_objects(&unique, index)?;
+    let head = repository.resolve("HEAD").ok();
+    let mut blobs: HashMap<String, Option<GitBase>> = HashMap::new();
+    let mut updates = Vec::new();
+    for (position, relative, known) in files {
+        let found = unique
+            .binary_search(relative)
+            .map_or(BaseObject::None, |i| {
+                objects.get(i).cloned().unwrap_or(BaseObject::None)
+            });
+        if known.as_ref() == Some(&(found.clone(), index)) {
+            continue;
+        }
+        let base = match &found {
+            BaseObject::Blob(id) => match blobs.get(id) {
+                Some(base) => base.clone(),
+                None => {
+                    let base = repository
+                        .blob(id)?
+                        .filter(|bytes| !bytes.contains(&0))
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .map(|text| GitBase {
+                            text: text.into(),
+                            new_file: false,
+                            index,
+                        });
+                    blobs.insert(id.clone(), base.clone());
+                    base
+                }
+            },
+            BaseObject::NewFile => Some(GitBase {
+                text: "".into(),
+                new_file: true,
+                index,
+            }),
+            BaseObject::None => None,
+        };
+        updates.push((*position, found, base));
+    }
+    Ok((updates, head))
+}
+
 impl Workspace {
-    /// `path`'s repository-relative path, if it is inside `repository`.
-    pub(super) fn repository_relative(
-        &self,
-        repository: &git::Repository,
-        path: &Path,
-    ) -> Option<String> {
-        let inside = path.strip_prefix(self.project.root()).ok()?;
-        let parts: Vec<String> = inside
-            .components()
-            .map(|part| part.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        (!parts.is_empty()).then(|| format!("{}{}", repository.prefix(), parts.join("/")))
+    /// `path`'s repository (its folder's) and its path there; `None`
+    /// outside every repository or before status is read.
+    pub(super) fn file_in_repository(&self, path: &Path, cx: &App) -> Option<(Repository, String)> {
+        self.commit.read(cx).file_in_repository(path)
     }
 
     /// Open editors with their files.
@@ -59,104 +114,88 @@ impl Workspace {
             .map(|tab| tab.path.clone())
     }
 
-    /// Re-reads the open files' bases (only changed blobs) and, when HEAD
-    /// moved, their blame.
+    /// Re-reads the open files' bases in every repository (only changed
+    /// blobs) and, where HEAD moved, their blame.
     pub(super) fn refresh_git_gutters(&mut self, cx: &mut Context<Self>) {
-        let Some(repository) = self.commit.read(cx).repository() else {
-            return;
-        };
         let index = crate::settings::current().git.staging_area;
-        let mut files: Vec<(Entity<Editor>, String)> = Vec::new();
+        // The repositories with open files, and per file its repository.
+        let mut repositories: Vec<Repository> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        let mut files: Vec<(Entity<Editor>, usize, String)> = Vec::new();
+        let mut outside = Vec::new();
         for (editor, path) in self.file_editors() {
-            match self.repository_relative(&repository, &path) {
-                Some(relative) => files.push((editor, relative)),
-                None => editor.update(cx, |editor, cx| {
-                    if editor.has_git_base() {
-                        editor.set_git_base(None, cx)
-                    }
-                }),
-            }
+            let Some((repository, relative)) = self.file_in_repository(&path, cx) else {
+                outside.push(editor);
+                continue;
+            };
+            let key = repository_key(repository.root());
+            let repo = match keys.iter().position(|known| *known == key) {
+                Some(repo) => repo,
+                None => {
+                    keys.push(key);
+                    repositories.push(repository);
+                    keys.len() - 1
+                }
+            };
+            files.push((editor, repo, relative));
         }
-        let open: HashSet<EntityId> = files.iter().map(|(e, _)| e.entity_id()).collect();
+        for editor in outside {
+            editor.update(cx, |editor, cx| {
+                if editor.has_git_base() {
+                    editor.set_git_base(None, cx)
+                }
+            });
+        }
+        let open: HashSet<EntityId> = files.iter().map(|(e, _, _)| e.entity_id()).collect();
         self.git_gutters.shown.retain(|id, _| open.contains(id));
         self.git_gutters.blame.retain(|id, _| open.contains(id));
-        let known: Vec<Option<(BaseObject, bool)>> = files
-            .iter()
-            .map(|(editor, _)| self.git_gutters.shown.get(&editor.entity_id()).cloned())
-            .collect();
-        let relative: Vec<String> = files.iter().map(|(_, relative)| relative.clone()).collect();
+        if files.is_empty() {
+            return;
+        }
+        // Per repository, the files it holds.
+        let mut requests: Vec<Vec<BaseRequest>> = vec![Vec::new(); repositories.len()];
+        for (position, (editor, repo, relative)) in files.iter().enumerate() {
+            let shown = self.git_gutters.shown.get(&editor.entity_id()).cloned();
+            requests[*repo].push((position, relative.clone(), shown));
+        }
         self.git_gutters.generation += 1;
         let generation = self.git_gutters.generation;
         self.git_gutters.refresh = Some(cx.spawn(async move |this, cx| {
-            let loaded = cx
+            // A repository failing to answer keeps its files as they are.
+            let loaded: Vec<Option<RepositoryBases>> = cx
                 .background_spawn(async move {
-                    let mut unique = relative.clone();
-                    unique.sort();
-                    unique.dedup();
-                    let objects = repository.base_objects(&unique, index)?;
-                    let head = repository.resolve("HEAD").ok();
-                    let mut blobs: HashMap<String, Option<GitBase>> = HashMap::new();
-                    let mut updates = Vec::new();
-                    for (position, relative) in relative.iter().enumerate() {
-                        let found = unique
-                            .binary_search(relative)
-                            .map_or(BaseObject::None, |i| {
-                                objects.get(i).cloned().unwrap_or(BaseObject::None)
-                            });
-                        if known[position].as_ref() == Some(&(found.clone(), index)) {
-                            continue;
-                        }
-                        let base = match &found {
-                            BaseObject::Blob(id) => match blobs.get(id) {
-                                Some(base) => base.clone(),
-                                None => {
-                                    let base = repository
-                                        .blob(id)?
-                                        .filter(|bytes| !bytes.contains(&0))
-                                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                                        .map(|text| GitBase {
-                                            text: text.into(),
-                                            new_file: false,
-                                            index,
-                                        });
-                                    blobs.insert(id.clone(), base.clone());
-                                    base
-                                }
-                            },
-                            BaseObject::NewFile => Some(GitBase {
-                                text: "".into(),
-                                new_file: true,
-                                index,
-                            }),
-                            BaseObject::None => None,
-                        };
-                        updates.push((position, found, base));
-                    }
-                    Ok::<_, io::Error>((updates, head))
+                    repositories
+                        .iter()
+                        .zip(&requests)
+                        .map(|(repository, files)| read_bases(repository, files, index).ok())
+                        .collect()
                 })
                 .await;
             this.update(cx, |this, cx| {
                 if this.git_gutters.generation != generation {
                     return;
                 }
-                let Ok((updates, head)) = loaded else {
-                    return;
-                };
-                for (position, object, base) in updates {
-                    let editor = &files[position].0;
-                    this.git_gutters
-                        .shown
-                        .insert(editor.entity_id(), (object, index));
-                    editor.update(cx, |editor, cx| editor.set_git_base(base, cx));
+                let mut moved = vec![false; loaded.len()];
+                for (repo, loaded) in loaded.into_iter().enumerate() {
+                    let Some((updates, head)) = loaded else {
+                        continue;
+                    };
+                    for (position, object, base) in updates {
+                        let editor = &files[position].0;
+                        this.git_gutters
+                            .shown
+                            .insert(editor.entity_id(), (object, index));
+                        editor.update(cx, |editor, cx| editor.set_git_base(base, cx));
+                    }
+                    moved[repo] = this.git_gutters.heads.get(&keys[repo]) != Some(&head);
+                    this.git_gutters.heads.insert(keys[repo].clone(), head);
                 }
-                let moved = head != this.git_gutters.head;
-                this.git_gutters.head = head;
-                for (editor, _) in &files {
+                for (editor, repo, _) in &files {
                     let (wanted, loaded) = {
                         let editor = editor.read(cx);
                         (editor.wants_blame(), editor.has_blame())
                     };
-                    if wanted && (moved || !loaded) {
+                    if wanted && (moved[*repo] || !loaded) {
                         this.load_blame(editor.clone(), cx);
                     }
                 }
@@ -165,21 +204,22 @@ impl Workspace {
         }));
     }
 
-    /// Runs blame on the editor's text and hands it over.
+    /// Runs blame on the editor's text (in its file's repository) and
+    /// hands it over.
     fn load_blame(&mut self, editor: Entity<Editor>, cx: &mut Context<Self>) {
         let failed = |editor: &Entity<Editor>, error: &str, cx: &mut Context<Self>| {
             editor.update(cx, |editor, cx| editor.blame_failed(error, cx));
         };
-        let Some(repository) = self.commit.read(cx).repository() else {
+        if self.commit.read(cx).repos().is_empty() {
             return failed(
                 &editor,
                 "no git repository here (or its status is still loading)",
                 cx,
             );
-        };
-        let Some(relative) = self
+        }
+        let Some((repository, relative)) = self
             .editor_path(&editor)
-            .and_then(|path| self.repository_relative(&repository, &path))
+            .and_then(|path| self.file_in_repository(&path, cx))
         else {
             return failed(&editor, "the file is outside the repository", cx);
         };
@@ -217,6 +257,14 @@ impl Workspace {
                 self.show_change_diff(editor, *line, window, cx)
             }
             EditorEvent::ShowCommit(id) => {
+                // The commit is in the editor's repository.
+                if let Some((repository, _)) = self
+                    .editor_path(editor)
+                    .and_then(|path| self.file_in_repository(&path, cx))
+                {
+                    self.git_log
+                        .update(cx, |log, cx| log.select_repository(&repository, cx));
+                }
                 let id = id.clone();
                 self.git_log.update(cx, |log, cx| log.reveal_commit(id, cx));
                 self.show_git_log(window, cx);
@@ -225,14 +273,27 @@ impl Workspace {
         }
     }
 
-    fn stage_hunk(&mut self, editor: &Entity<Editor>, contents: String, cx: &mut Context<Self>) {
-        let Some(repository) = self.repository_or_notice(cx) else {
-            return;
-        };
-        let Some(relative) = self
+    /// The editor's file in its repository, or a notice saying there is
+    /// none (yet).
+    fn editor_file_or_notice(
+        &mut self,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> Option<(Repository, String)> {
+        let found = self
             .editor_path(editor)
-            .and_then(|path| self.repository_relative(&repository, &path))
-        else {
+            .and_then(|path| self.file_in_repository(&path, cx));
+        if found.is_none() {
+            self.notice = Some(
+                "This file is not in a git repository (or its status is still loading)".into(),
+            );
+            cx.notify();
+        }
+        found
+    }
+
+    fn stage_hunk(&mut self, editor: &Entity<Editor>, contents: String, cx: &mut Context<Self>) {
+        let Some((repository, relative)) = self.editor_file_or_notice(editor, cx) else {
             return;
         };
         self.git_gutters.operation = Some(cx.spawn(async move |this, cx| {
@@ -264,20 +325,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(repository) = self.repository_or_notice(cx) else {
-            return;
-        };
-        let Some(relative) = self
-            .editor_path(editor)
-            .and_then(|path| self.repository_relative(&repository, &path))
-        else {
+        let Some((repository, relative)) = self.editor_file_or_notice(editor, cx) else {
             return;
         };
         let shown = self.git_gutters.shown.get(&editor.entity_id());
         let source = match shown {
             Some((_, true)) => {
-                let entry = self.commit.read(cx).status().and_then(|status| {
-                    status
+                let commit = self.commit.read(cx);
+                let entry = commit.repo_of(&repository).and_then(|repo| {
+                    repo.status()
                         .entries
                         .iter()
                         .find(|entry| entry.path == relative && entry.unstaged.is_some())

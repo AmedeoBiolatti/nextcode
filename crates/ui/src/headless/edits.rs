@@ -78,16 +78,15 @@ impl Documents for OpenDocuments<'_, '_> {
             } else {
                 self.session.project.join(to, &rest.to_string_lossy())
             };
-            let server = self.session.running(document.language, self.cx);
-            if let Some(server) = &server {
-                close(server, &document);
+            if let Some(server) = self.session.running(document.language, &old, self.cx) {
+                close(&server, &document);
             }
             let Some(uri) = lsp::path_to_uri(&new) else {
                 continue;
             };
             document.uri = uri;
-            if let Some(server) = &server {
-                did_open(server, &document);
+            if let Some(server) = self.session.running(document.language, &new, self.cx) {
+                did_open(&server, &document);
             }
             self.session.documents.insert(new, document);
         }
@@ -103,7 +102,7 @@ impl Documents for OpenDocuments<'_, '_> {
             .collect();
         for path in gone {
             if let Some(document) = self.session.documents.remove(&path)
-                && let Some(server) = self.session.running(document.language, self.cx)
+                && let Some(server) = self.session.running(document.language, &path, self.cx)
             {
                 close(&server, &document);
             }
@@ -201,7 +200,7 @@ impl Session {
         };
         let paths: Vec<PathBuf> = strings(request, "paths")
             .iter()
-            .map(|path| self.project.path(path))
+            .map(|path| self.path(request, path))
             .collect();
         let started = self.project.search(&query, SearchLimits::default());
         cx.spawn(async move |this, cx| {
@@ -254,10 +253,11 @@ impl Session {
                 this.out.reply(
                     &id,
                     Ok(json!({
-                        "files": report.replaced.iter().map(|(path, count)| json!({
-                            "path": path_json(path),
-                            "replacements": count,
-                        })).collect::<Vec<_>>(),
+                        "files": report.replaced.iter().map(|(path, count)| {
+                            let mut file = file_json(&project, path);
+                            file["replacements"] = json!(count);
+                            file
+                        }).collect::<Vec<_>>(),
                         "replacements": report.matches(),
                         "skipped": pairs(&report.skipped, "reason"),
                         "failed": pairs(&report.failed, "error"),
@@ -328,9 +328,7 @@ impl Session {
         let Some(document) = self.document(&id, request, cx) else {
             return;
         };
-        let path = self
-            .project
-            .path(request["path"].as_str().unwrap_or_default());
+        let path = self.path(request, request["path"].as_str().unwrap_or_default());
         let range = lsp::types::Range::new(start, end);
         let key = |position: &Position| (position.line, position.character);
         let diagnostics = self
@@ -429,7 +427,7 @@ impl Session {
     /// writes it and replies `{text, changed}`.
     pub(super) fn format(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
         let path = match param_str(request, "path") {
-            Ok(path) => self.project.path(path),
+            Ok(path) => self.path(request, path),
             Err(err) => return self.out.reply(&id, Err(err)),
         };
         let Some(language) = Language::from_path(&path) else {
@@ -441,8 +439,10 @@ impl Session {
             .documents
             .get(&path)
             .map(|document| (document.uri.clone(), document.text.clone()));
-        let server = open.as_ref().and_then(|_| self.running(language, cx));
-        let settings = self.store.read(cx).settings();
+        let server = open
+            .as_ref()
+            .and_then(|_| self.running(language, &path, cx));
+        let settings = self.project.settings_for(Some(&path));
         let plan = match format::plan(&settings, language, server) {
             Ok(plan) => plan,
             Err(err) => return self.out.reply(&id, Err(err)),

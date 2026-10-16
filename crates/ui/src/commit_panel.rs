@@ -5,8 +5,20 @@
 //! Unstaged groups with stage and unstage). A second tab lists the shelf
 //! (`shelf_view`). Git runs where the project lives (locally, in WSL or in
 //! a dev container).
+//!
+//! Each folder of a multi-root project may be in its own repository (or
+//! share one, or have none). With several repositories the changes are
+//! grouped under one collapsible header per repository (PyCharm's
+//! multi-repository Commit window); Commit commits every repository with
+//! chosen files using the same message, and Fetch/Pull act on all of them.
 
-use std::{collections::HashSet, io, ops::Range, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    io,
+    ops::Range,
+    path::Path,
+    time::Duration,
+};
 
 use git::{Change, Entry, FileChange, OperationState, Repository, Side, Status};
 use gpui::{
@@ -74,16 +86,23 @@ pub enum CommitPanelEvent {
     },
     /// Open a file (Jump to Source, or a conflicted file to resolve).
     OpenFile(std::path::PathBuf),
-    /// Commit and Push: the commit is done, confirm the push.
+    /// Commit and Push: the commit is done, confirm the push (one
+    /// repository at a time, see [`CommitPanel::next_push`]).
     Push(Repository),
-    /// Stash Changes… for these files (the Stash dialog asks for the
-    /// message).
+    /// Stash Changes… for these files of `repository` (the Stash dialog
+    /// asks for the message).
     Stash {
+        repository: Repository,
         paths: Vec<String>,
         include_untracked: bool,
     },
-    /// Shelve Changes… for these files; `name` prefills the dialog.
-    Shelve { paths: Vec<String>, name: String },
+    /// Shelve Changes… for these files of `repository`; `name` prefills
+    /// the dialog.
+    Shelve {
+        repository: Repository,
+        paths: Vec<String>,
+        name: String,
+    },
     /// Status was re-read; open diffs may be stale.
     Refreshed,
 }
@@ -211,6 +230,9 @@ impl Inclusion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
+    /// A repository's header, above its groups (only with several
+    /// repositories).
+    Repo { count: usize, collapsed: bool },
     Group {
         group: Group,
         count: usize,
@@ -235,20 +257,25 @@ pub enum Row {
 }
 
 impl Row {
-    fn group(&self) -> Group {
+    /// The group the row is in; `None` for a repository header.
+    fn group(&self) -> Option<Group> {
         match self {
+            Self::Repo { .. } => None,
             Self::Group { group, .. } | Self::Dir { group, .. } | Self::File { group, .. } => {
-                *group
+                Some(*group)
             }
         }
     }
 
-    /// What identifies the row across rebuilds.
-    fn key(&self, status: &Status) -> (Group, String, bool) {
+    /// What identifies the row across rebuilds (within its repository).
+    fn key(&self, status: &Status) -> (Option<Group>, String, bool) {
         match self {
-            Self::Group { group, .. } => (*group, String::new(), true),
-            Self::Dir { group, path, .. } => (*group, path.clone(), true),
-            Self::File { group, entry, .. } => (*group, status.entries[*entry].path.clone(), false),
+            Self::Repo { .. } => (None, String::new(), true),
+            Self::Group { group, .. } => (Some(*group), String::new(), true),
+            Self::Dir { group, path, .. } => (Some(*group), path.clone(), true),
+            Self::File { group, entry, .. } => {
+                (Some(*group), status.entries[*entry].path.clone(), false)
+            }
         }
     }
 }
@@ -345,18 +372,268 @@ fn all_folders(status: &Status, staging: bool) -> Collapsed {
     folders
 }
 
-enum State {
-    Loading,
-    /// The project is not inside a git repository.
-    NoRepository,
-    Ready {
-        repository: Repository,
-        status: Status,
-    },
-    /// Git refuses the repository at this path: its folder belongs to
-    /// another user.
-    Untrusted(SharedString),
-    Failed(SharedString),
+/// How a repository's top level (as git prints it) is compared: Windows
+/// drive paths (`C:/…`) case-insensitively, like `git worktree list`'s.
+pub fn repository_key(root: &str) -> String {
+    let root = root.trim_end_matches('/');
+    if root.as_bytes().get(1) == Some(&b':') {
+        root.to_lowercase()
+    } else {
+        root.to_owned()
+    }
+}
+
+/// A repository's folder name (what multi-repository lists show).
+pub fn repository_name(repository: &Repository) -> &str {
+    let root = repository.root().trim_end_matches('/');
+    root.rsplit(['/', '\\']).next().unwrap_or(root)
+}
+
+/// The branch, a short commit id when detached, else `HEAD`.
+pub fn branch_label(status: &Status) -> String {
+    match (&status.branch, &status.head) {
+        (Some(branch), _) => branch.clone(),
+        (None, Some(head)) => short_revision(head).to_owned(),
+        (None, None) => "HEAD".to_owned(),
+    }
+}
+
+/// Groups folders by repository: `keys[i]` is folder `i`'s
+/// [`repository_key`] (`None` without a repository). Returns per
+/// repository the folders inside it (in folder order), and per folder
+/// its repository's index; folders without one are left out.
+pub fn group_folders(keys: &[Option<String>]) -> (Vec<Vec<usize>>, Vec<Option<usize>>) {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut of_folder = vec![None; keys.len()];
+    for (folder, key) in keys.iter().enumerate() {
+        let Some(key) = key else {
+            continue;
+        };
+        let group = match groups
+            .iter()
+            .position(|group| keys[group[0]].as_ref() == Some(key))
+        {
+            Some(group) => group,
+            None => {
+                groups.push(Vec::new());
+                groups.len() - 1
+            }
+        };
+        groups[group].push(folder);
+        of_folder[folder] = Some(group);
+    }
+    (groups, of_folder)
+}
+
+/// One repository of the project: its status and what the panel shows of
+/// it (checkboxes and collapsed nodes survive refreshes).
+pub struct Repo {
+    key: String,
+    /// Discovered from its first folder.
+    repository: Repository,
+    status: Status,
+    /// The merge, rebase, cherry-pick or revert in progress.
+    operation: OperationState,
+    /// The project folders inside it, each with its own discovery (whose
+    /// prefix is that folder's place in the repository).
+    folders: Vec<(usize, Repository)>,
+    inclusion: Inclusion,
+    collapsed: Collapsed,
+    /// Its header is collapsed (several repositories only).
+    folded: bool,
+}
+
+impl Repo {
+    pub fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
+    pub fn status(&self) -> &Status {
+        &self.status
+    }
+
+    pub fn operation(&self) -> OperationState {
+        self.operation
+    }
+
+    pub fn name(&self) -> &str {
+        repository_name(&self.repository)
+    }
+
+    /// Whether `repository` is this one (any folder's discovery of it).
+    pub fn is(&self, repository: &Repository) -> bool {
+        self.key == repository_key(repository.root())
+    }
+
+    /// Entries Commit can take: changes and unversioned files
+    /// (conflicted files once resolved).
+    fn checked_entries(&self) -> Vec<Entry> {
+        self.status
+            .entries
+            .iter()
+            .filter(|entry| checkable(entry) && self.inclusion.includes(&entry.path))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Files with a checkbox: under Changes or Unversioned Files.
+fn checkable(entry: &Entry) -> bool {
+    Group::Changes.change(entry).is_some() || Group::Unversioned.change(entry).is_some()
+}
+
+/// What a folder's part of a refresh read.
+enum FolderRead {
+    /// Its repository (discovered, or known) with status and the
+    /// operation in progress.
+    Opened(io::Result<Option<(Repository, Status, OperationState)>>),
+    /// A known repository whose status an earlier folder reads.
+    Shares(Repository),
+}
+
+/// What a refresh read: repositories deduplicated in folder order, per
+/// folder its repository, and the folders git refused or failed on.
+#[derive(Default)]
+struct Loaded {
+    repos: Vec<Repo>,
+    roots: Vec<Option<usize>>,
+    untrusted: Vec<SharedString>,
+    errors: Vec<SharedString>,
+}
+
+/// A folder's repository and status, as [`Project::open_repository_in`]
+/// returns them.
+type Opened = io::Result<Option<(Repository, Status)>>;
+
+/// Reads every folder's repository where the project lives, all folders
+/// at once: status again for `known` repositories (once per repository),
+/// discovery for the others (`first` is folder 0's, already read).
+/// Blocks.
+fn load(
+    project: &Project,
+    known: &[Option<Repository>],
+    first: Option<Opened>,
+    operations: bool,
+) -> Loaded {
+    let operation = |repository: &Repository| {
+        if operations {
+            repository.operation_state().unwrap_or(OperationState::None)
+        } else {
+            OperationState::None
+        }
+    };
+    let opened = |result: Opened| {
+        FolderRead::Opened(result.map(|found| {
+            found.map(|(repository, status)| {
+                let operation = operation(&repository);
+                (repository, status, operation)
+            })
+        }))
+    };
+    let keys: Vec<Option<String>> = known
+        .iter()
+        .map(|repository| repository.as_ref().map(|r| repository_key(r.root())))
+        .collect();
+    let mut first = first;
+    let reads: Vec<FolderRead> = std::thread::scope(|scope| {
+        let mut pending = Vec::new();
+        for (index, folder) in known.iter().enumerate() {
+            let shared = keys[index]
+                .as_ref()
+                .is_some_and(|key| keys[..index].contains(&Some(key.clone())));
+            pending.push(match folder {
+                Some(repository) if shared => Err(FolderRead::Shares(repository.clone())),
+                _ if index == 0 && first.is_some() => Err(opened(first.take().unwrap_or(Ok(None)))),
+                Some(repository) => Ok(scope.spawn(move || {
+                    opened(
+                        repository
+                            .status()
+                            .map(|status| Some((repository.clone(), status))),
+                    )
+                })),
+                None => Ok(scope.spawn(move || opened(project.open_repository_in(index)))),
+            });
+        }
+        pending
+            .into_iter()
+            .map(|read| match read {
+                Err(read) => read,
+                Ok(thread) => thread.join().unwrap_or_else(|_| {
+                    FolderRead::Opened(Err(io::Error::other("git status panicked")))
+                }),
+            })
+            .collect()
+    });
+    assemble(project, reads)
+}
+
+/// A folder's repository, with its status unless another folder already
+/// read it.
+type FoundRepository = Option<(Repository, Option<(Status, OperationState)>)>;
+
+/// Groups the folders' reads by repository (see [`group_folders`]).
+fn assemble(project: &Project, reads: Vec<FolderRead>) -> Loaded {
+    let mut loaded = Loaded::default();
+    let mut found: Vec<FoundRepository> = Vec::new();
+    for (index, read) in reads.into_iter().enumerate() {
+        found.push(match read {
+            FolderRead::Shares(repository) => Some((repository, None)),
+            FolderRead::Opened(Ok(found)) => {
+                found.map(|(repository, status, operation)| (repository, Some((status, operation))))
+            }
+            FolderRead::Opened(Err(err)) => {
+                match git::unsafe_repository(&err) {
+                    Some(refusal) => {
+                        let path: SharedString = refusal.path.clone().into();
+                        if !loaded.untrusted.contains(&path) {
+                            loaded.untrusted.push(path);
+                        }
+                    }
+                    None if project.is_multi_root() => loaded
+                        .errors
+                        .push(format!("{}: {err}", project.roots()[index].name).into()),
+                    None => loaded.errors.push(err.to_string().into()),
+                }
+                None
+            }
+        });
+    }
+    let keys: Vec<Option<String>> = found
+        .iter()
+        .map(|found| found.as_ref().map(|(r, _)| repository_key(r.root())))
+        .collect();
+    let (groups, _) = group_folders(&keys);
+    loaded.roots = vec![None; found.len()];
+    for folders in groups {
+        // A folder sharing a known repository has no status of its own:
+        // the status is the first member's that read one (none if that
+        // read failed, which is reported above).
+        let Some((status, operation)) = folders
+            .iter()
+            .find_map(|&folder| found[folder].as_mut().and_then(|(_, read)| read.take()))
+        else {
+            continue;
+        };
+        let members: Vec<(usize, Repository)> = folders
+            .iter()
+            .filter_map(|&folder| Some((folder, found[folder].take()?.0)))
+            .collect();
+        for &(folder, _) in &members {
+            loaded.roots[folder] = Some(loaded.repos.len());
+        }
+        let repository = members[0].1.clone();
+        loaded.repos.push(Repo {
+            key: repository_key(repository.root()),
+            repository,
+            status,
+            operation,
+            folders: members,
+            inclusion: Inclusion::default(),
+            collapsed: Collapsed::new(),
+            folded: false,
+        });
+    }
+    loaded
 }
 
 /// The Commit window's tabs (PyCharm's Local Changes / Shelf).
@@ -366,9 +643,11 @@ pub enum Tab {
     Shelf,
 }
 
-/// The open right-click menu: where, and the files it acts on.
+/// The open right-click menu: where, and the files (of repository `repo`)
+/// it acts on.
 struct ContextMenu {
     position: Point<Pixels>,
+    repo: usize,
     entries: Vec<usize>,
 }
 
@@ -378,12 +657,30 @@ pub enum SyncAction {
     Pull,
 }
 
+/// A git operation on one repository, run off the main thread.
+type Job = Box<dyn FnOnce(&Repository) -> io::Result<Option<String>> + Send>;
+
+fn job(operation: impl FnOnce(&Repository) -> io::Result<Option<String>> + Send + 'static) -> Job {
+    Box::new(operation)
+}
+
+/// What identifies a row across refreshes: its repository's key and the
+/// row's key there.
+type RowKey = (String, Option<Group>, String, bool);
+
 pub struct CommitPanel {
     project: Project,
-    state: State,
-    /// The merge, rebase, cherry-pick or revert in progress.
-    operation: OperationState,
-    rows: Vec<Row>,
+    /// The first status read has finished.
+    loaded: bool,
+    repos: Vec<Repo>,
+    /// Per project folder: its repository (index into `repos`).
+    root_repos: Vec<Option<usize>>,
+    /// Repositories git refuses (their folder belongs to another user).
+    untrusted: Vec<SharedString>,
+    /// Folders whose repository could not be read.
+    errors: Vec<SharedString>,
+    /// Rows with their repository (index into `repos`).
+    rows: Vec<(usize, Row)>,
     /// The staging-area setting the rows were built for.
     staging: bool,
     message: Entity<Editor>,
@@ -394,12 +691,14 @@ pub struct CommitPanel {
     amend: bool,
     /// Files grouped in folders (else a flat list).
     by_directory: bool,
-    collapsed: Collapsed,
-    inclusion: Inclusion,
     selected: Option<usize>,
     menu: Option<ContextMenu>,
     tab: Tab,
     shelf: Entity<ShelfView>,
+    /// The repository whose shelves the Shelf tab lists.
+    shelf_repo: usize,
+    /// Commit and Push in several repositories: the pushes left to confirm.
+    pushes: VecDeque<Repository>,
     focus_handle: FocusHandle,
     _refresh: Task<()>,
     refresh_running: bool,
@@ -435,6 +734,20 @@ pub(crate) fn row_text(id: &'static str, text: impl Into<SharedString>) -> Selec
         .right_click_through()
 }
 
+/// A strip above the changes: an operation in progress, a refused
+/// repository.
+fn banner() -> gpui::Div {
+    div()
+        .px_2()
+        .py_1()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .bg(theme::active_row())
+}
+
 /// A checkbox drawn in the theme's colors (also the workflow inputs
 /// form's).
 pub(crate) fn checkbox(check: Check) -> gpui::Div {
@@ -465,7 +778,11 @@ impl CommitPanel {
         preloaded: Option<PreloadedRepository>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let message = cx.new(Editor::text_area);
+        let message = cx.new(|cx| {
+            let mut message = Editor::text_area(cx);
+            message.set_commit_message();
+            message
+        });
         let subscription = cx.subscribe(&message, |_, _, _: &editor::EditorEvent, cx| cx.notify());
         let shelf = cx.new(|cx| ShelfView::new(project.clone(), cx));
         let shelf_subscription = cx.subscribe(&shelf, |this, _, event, cx| match event {
@@ -489,9 +806,12 @@ impl CommitPanel {
             }
         });
         let mut panel = Self {
+            root_repos: vec![None; project.roots().len()],
             project,
-            state: State::Loading,
-            operation: OperationState::None,
+            loaded: false,
+            repos: Vec::new(),
+            untrusted: Vec::new(),
+            errors: Vec::new(),
             rows: Vec::new(),
             staging: settings::current().git.staging_area,
             message,
@@ -499,12 +819,12 @@ impl CommitPanel {
             busy: false,
             amend: false,
             by_directory: true,
-            collapsed: Collapsed::new(),
-            inclusion: Inclusion::default(),
             selected: None,
             menu: None,
             tab: Tab::Changes,
             shelf,
+            shelf_repo: 0,
+            pushes: VecDeque::new(),
             focus_handle: cx.focus_handle(),
             _refresh: Task::ready(()),
             refresh_running: false,
@@ -530,24 +850,54 @@ impl CommitPanel {
         self.focus_handle.contains_focused(window, cx)
     }
 
-    /// The repository, once its status has been read.
-    pub fn repository(&self) -> Option<Repository> {
-        match &self.state {
-            State::Ready { repository, .. } => Some(repository.clone()),
-            _ => None,
-        }
+    /// The project's repositories in folder order, once their status has
+    /// been read.
+    pub fn repos(&self) -> &[Repo] {
+        &self.repos
     }
 
-    /// The repository's last status.
-    pub fn status(&self) -> Option<&Status> {
-        match &self.state {
-            State::Ready { status, .. } => Some(status),
-            _ => None,
-        }
+    /// The repository of the folder holding `path`; `None` outside every
+    /// folder, or in a folder without one.
+    pub fn repo_index_for(&self, path: &Path) -> Option<usize> {
+        let root = self.project.root_index_of(path)?;
+        self.root_repos.get(root).copied().flatten()
     }
 
-    pub fn operation(&self) -> OperationState {
-        self.operation
+    /// The repository git commands act on (PyCharm's): `active`'s (the
+    /// active editor's file), else the first one.
+    pub fn active_repo(&self, active: Option<&Path>) -> Option<&Repo> {
+        let index = active.and_then(|path| self.repo_index_for(path));
+        self.repos.get(index.unwrap_or(0))
+    }
+
+    /// The repository `repository` is (whichever folder discovered it).
+    pub fn repo_of(&self, repository: &Repository) -> Option<&Repo> {
+        self.repos.iter().find(|repo| repo.is(repository))
+    }
+
+    /// `path`'s repository and its `/`-separated path there, when its
+    /// folder is in one.
+    pub fn file_in_repository(&self, path: &Path) -> Option<(Repository, String)> {
+        let root = self.project.root_index_of(path)?;
+        let repo = &self.repos[self.root_repos.get(root).copied().flatten()?];
+        let (_, folder) = repo.folders.iter().find(|(index, _)| *index == root)?;
+        let inside = path.strip_prefix(&self.project.roots()[root].path).ok()?;
+        let parts: Vec<String> = inside
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        (!parts.is_empty()).then(|| {
+            (
+                repo.repository.clone(),
+                format!("{}{}", folder.prefix(), parts.join("/")),
+            )
+        })
+    }
+
+    /// Commit and Push in several repositories: the next push to confirm
+    /// (after the previous Push dialog closed).
+    pub fn next_push(&mut self) -> Option<Repository> {
+        self.pushes.pop_front()
     }
 
     /// Refreshes after [`REFRESH_DEBOUNCE`], coalescing bursts of changes.
@@ -568,8 +918,8 @@ impl CommitPanel {
         });
     }
 
-    /// Re-reads the repository status (discovering the repository first)
-    /// and the operation in progress.
+    /// Re-reads every repository's status (discovering repositories of
+    /// folders without a known one first) and the operations in progress.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         // Dropping a running task discards its result even though the
         // background git process continues. Let it finish and queue one
@@ -581,39 +931,38 @@ impl CommitPanel {
         self.refresh_scheduled = false;
         self.refresh_running = true;
         let project = self.project.clone();
-        let known = self.repository();
+        let known = self.known_repositories();
         self._refresh = cx.spawn(async move |this, cx| {
-            let (opened, operation) = cx
-                .background_spawn(async move {
-                    let opened = match known {
-                        Some(repository) => {
-                            repository.status().map(|status| Some((repository, status)))
-                        }
-                        None => project.open_repository(),
-                    };
-                    let operation = match &opened {
-                        Ok(Some((repository, _))) => {
-                            repository.operation_state().unwrap_or(OperationState::None)
-                        }
-                        _ => OperationState::None,
-                    };
-                    (opened, operation)
-                })
+            let loaded = cx
+                .background_spawn(async move { load(&project, &known, None, true) })
                 .await;
             this.update(cx, |this, cx| {
-                this.operation = operation;
-                this.show(opened, cx);
+                this.show(loaded, cx);
                 this.finish_refresh(cx);
             })
             .ok();
         });
     }
 
+    /// Per folder, its repository as last read (`None`: discover again).
+    fn known_repositories(&self) -> Vec<Option<Repository>> {
+        let mut known = vec![None; self.project.roots().len()];
+        for repo in &self.repos {
+            for (folder, repository) in &repo.folders {
+                if let Some(slot) = known.get_mut(*folder) {
+                    *slot = Some(repository.clone());
+                }
+            }
+        }
+        known
+    }
+
     /// Shows a repository read before the panel existed (at startup); reads
-    /// it now if that read was abandoned. The operation in progress is read
-    /// afterwards, off the startup path.
+    /// it now if that read was abandoned. The operations in progress are
+    /// read afterwards, off the startup path.
     fn show_preloaded(&mut self, preloaded: PreloadedRepository, cx: &mut Context<Self>) {
         self.refresh_running = true;
+        let project = self.project.clone();
         self._refresh = cx.spawn(async move |this, cx| {
             let opened = match preloaded.await {
                 Ok(opened) => opened,
@@ -627,29 +976,45 @@ impl CommitPanel {
                     return;
                 }
             };
-            let repository = this
+            let loaded = cx
+                .background_spawn(async move {
+                    let known = vec![None; project.roots().len()];
+                    load(&project, &known, Some(opened), false)
+                })
+                .await;
+            let repositories: Vec<Repository> = this
                 .update(cx, |this, cx| {
-                    this.show(opened, cx);
-                    this.repository()
+                    this.show(loaded, cx);
+                    this.repos
+                        .iter()
+                        .map(|repo| repo.repository.clone())
+                        .collect()
                 })
-                .ok()
-                .flatten();
-            if let Some(repository) = repository {
-                let operation = cx
-                    .background_spawn(async move { repository.operation_state() })
-                    .await;
-                this.update(cx, |this, cx| {
-                    this.operation = operation.unwrap_or(OperationState::None);
-                    this.finish_refresh(cx);
-                    cx.notify();
+                .unwrap_or_default();
+            let operations: Vec<(String, OperationState)> = cx
+                .background_spawn(async move {
+                    repositories
+                        .iter()
+                        .map(|repository| {
+                            let operation = repository.operation_state();
+                            (
+                                repository_key(repository.root()),
+                                operation.unwrap_or(OperationState::None),
+                            )
+                        })
+                        .collect()
                 })
-                .ok();
-            } else {
-                this.update(cx, |this, cx| {
-                    this.finish_refresh(cx);
-                })
-                .ok();
-            }
+                .await;
+            this.update(cx, |this, cx| {
+                for (key, operation) in operations {
+                    if let Some(repo) = this.repos.iter_mut().find(|repo| repo.key == key) {
+                        repo.operation = operation;
+                    }
+                }
+                this.finish_refresh(cx);
+                cx.notify();
+            })
+            .ok();
         });
     }
 
@@ -660,43 +1025,77 @@ impl CommitPanel {
         }
     }
 
-    fn show(&mut self, opened: io::Result<Option<(Repository, Status)>>, cx: &mut Context<Self>) {
+    fn show(&mut self, loaded: Loaded, cx: &mut Context<Self>) {
         crate::startup::mark_once("git status shown");
         let selected = self.selected_key();
-        self.state = match opened {
-            Ok(Some((repository, status))) => {
-                let present: HashSet<&str> =
-                    status.entries.iter().map(|e| e.path.as_str()).collect();
-                self.inclusion.retain(&present);
-                State::Ready { repository, status }
+        let mut previous = std::mem::take(&mut self.repos);
+        self.repos = loaded.repos;
+        for repo in &mut self.repos {
+            if let Some(old) = previous.iter_mut().find(|old| old.key == repo.key) {
+                repo.inclusion = std::mem::take(&mut old.inclusion);
+                repo.collapsed = std::mem::take(&mut old.collapsed);
+                repo.folded = old.folded;
             }
-            Ok(None) => State::NoRepository,
-            Err(err) => match git::unsafe_repository(&err) {
-                Some(refusal) => State::Untrusted(refusal.path.clone().into()),
-                None => State::Failed(err.to_string().into()),
-            },
-        };
+            let present: HashSet<&str> = repo
+                .status
+                .entries
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect();
+            repo.inclusion.retain(&present);
+        }
+        self.root_repos = loaded.roots;
+        self.untrusted = loaded.untrusted;
+        self.errors = loaded.errors;
+        self.loaded = true;
         self.rebuild_rows();
         self.selected = selected.and_then(|key| self.find_row(&key));
-        let (repository, shelf_visible) = (self.repository(), self.tab == Tab::Shelf);
+        if self.shelf_repo >= self.repos.len() {
+            self.shelf_repo = 0;
+        }
+        self.update_shelf(cx);
+        cx.emit(CommitPanelEvent::Refreshed);
+        cx.notify();
+    }
+
+    /// Points the Shelf tab at its repository (reading the shelves again
+    /// when the tab shows).
+    fn update_shelf(&mut self, cx: &mut Context<Self>) {
+        let repository = self
+            .repos
+            .get(self.shelf_repo)
+            .map(|repo| repo.repository.clone());
+        let shelf_visible = self.tab == Tab::Shelf;
         self.shelf.update(cx, |shelf, cx| {
             shelf.set_repository(repository);
             if shelf_visible {
                 shelf.refresh(cx);
             }
         });
-        cx.emit(CommitPanelEvent::Refreshed);
+    }
+
+    /// The Shelf tab lists repository `repo`'s shelves.
+    fn select_shelf_repo(&mut self, repo: usize, cx: &mut Context<Self>) {
+        self.shelf_repo = repo;
+        self.update_shelf(cx);
         cx.notify();
     }
 
-    fn selected_key(&self) -> Option<(Group, String, bool)> {
-        let status = self.status()?;
-        Some(self.rows.get(self.selected?)?.key(status))
+    fn selected_key(&self) -> Option<RowKey> {
+        let (repo, row) = self.rows.get(self.selected?)?;
+        let repo = self.repos.get(*repo)?;
+        let (group, path, dir) = row.key(&repo.status);
+        Some((repo.key.clone(), group, path, dir))
     }
 
-    fn find_row(&self, key: &(Group, String, bool)) -> Option<usize> {
-        let status = self.status()?;
-        self.rows.iter().position(|row| row.key(status) == *key)
+    fn find_row(&self, key: &RowKey) -> Option<usize> {
+        self.rows.iter().position(|(repo, row)| {
+            let repo = &self.repos[*repo];
+            repo.key == key.0 && {
+                let (group, path, dir) = row.key(&repo.status);
+                group == key.1 && path == key.2 && dir == key.3
+            }
+        })
     }
 
     /// Shows the Changes or Shelf tab (reading the shelves again).
@@ -709,24 +1108,24 @@ impl CommitPanel {
         cx.notify();
     }
 
-    /// Files for Shelve/Stash from the Git menu: the selected changes,
-    /// else the checked ones.
-    pub fn chosen_entries(&self) -> Vec<Entry> {
-        let entries = self.selected_entries();
-        if entries.is_empty() {
-            self.checked_entries()
-        } else {
-            entries
+    /// Files for Shelve/Stash from the Git menu, with their repository:
+    /// the selected changes, else the checked ones of the first repository
+    /// with any (a shelf or stash belongs to one repository).
+    pub fn chosen_entries(&self) -> Option<(usize, Vec<Entry>)> {
+        match self.selected_entries() {
+            Some((repo, entries)) if !entries.is_empty() => Some((repo, entries)),
+            _ => self.checked_entries().into_iter().next(),
         }
     }
 
-    /// Shelve Changes… for `entries`: the dialog's name is the commit
-    /// message's first line, else the file names.
-    pub fn request_shelve(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
-        if entries.is_empty() {
+    /// Shelve Changes… for `entries` of repository `repo`: the dialog's
+    /// name is the commit message's first line, else the file names.
+    pub fn request_shelve(&mut self, repo: usize, entries: Vec<Entry>, cx: &mut Context<Self>) {
+        let repository = self.repos.get(repo).map(|repo| repo.repository.clone());
+        let Some(repository) = repository.filter(|_| !entries.is_empty()) else {
             self.feedback = Some(("Select the changes to shelve".into(), theme::error));
             return cx.notify();
-        }
+        };
         let message = self.message.read(cx).text();
         let name = match message.lines().next().map(str::trim) {
             Some(line) if !line.is_empty() => line.to_owned(),
@@ -744,16 +1143,21 @@ impl CommitPanel {
             }
         };
         let paths = entries.into_iter().map(|entry| entry.path).collect();
-        cx.emit(CommitPanelEvent::Shelve { paths, name });
+        cx.emit(CommitPanelEvent::Shelve {
+            repository,
+            paths,
+            name,
+        });
     }
 
-    /// Stash Changes… for `entries` (untracked files included when any
-    /// is untracked).
-    pub fn request_stash(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
-        if entries.is_empty() {
+    /// Stash Changes… for `entries` of repository `repo` (untracked files
+    /// included when any is untracked).
+    pub fn request_stash(&mut self, repo: usize, entries: Vec<Entry>, cx: &mut Context<Self>) {
+        let repository = self.repos.get(repo).map(|repo| repo.repository.clone());
+        let Some(repository) = repository.filter(|_| !entries.is_empty()) else {
             self.feedback = Some(("Select the changes to stash".into(), theme::error));
             return cx.notify();
-        }
+        };
         let include_untracked = entries
             .iter()
             .any(|entry| entry.unstaged == Some(Change::Untracked));
@@ -763,6 +1167,7 @@ impl CommitPanel {
             paths.push(entry.path);
         }
         cx.emit(CommitPanelEvent::Stash {
+            repository,
             paths,
             include_untracked,
         });
@@ -804,128 +1209,175 @@ impl CommitPanel {
         });
     }
 
+    /// Rows of every repository: with several, each under its header.
     fn rebuild_rows(&mut self) {
-        self.rows = match &self.state {
-            State::Ready { status, .. } => {
-                build_rows(status, self.staging, self.by_directory, &self.collapsed)
+        let several = self.repos.len() > 1;
+        self.rows.clear();
+        for (index, repo) in self.repos.iter().enumerate() {
+            if several {
+                self.rows.push((
+                    index,
+                    Row::Repo {
+                        count: repo.status.entries.len(),
+                        collapsed: repo.folded,
+                    },
+                ));
+                if repo.folded {
+                    continue;
+                }
             }
-            _ => Vec::new(),
-        };
+            let rows = build_rows(
+                &repo.status,
+                self.staging,
+                self.by_directory,
+                &repo.collapsed,
+            );
+            self.rows.extend(rows.into_iter().map(|row| (index, row)));
+        }
         if self.selected.is_some_and(|row| row >= self.rows.len()) {
             self.selected = None;
         }
     }
 
-    /// Status entries of the files at or under `row`.
+    /// Status entries (of the row's repository) of the files at or under
+    /// `row`.
     fn entries_under(&self, row: usize) -> Vec<usize> {
-        let (Some(status), Some(target)) = (self.status(), self.rows.get(row)) else {
+        let Some((repo, target)) = self.rows.get(row) else {
             return Vec::new();
         };
-        let group = target.group();
-        let in_group = |entry: &&Entry| group.change(entry).is_some();
+        let entries = &self.repos[*repo].status.entries;
+        let indices = 0..entries.len();
         match target {
+            Row::Repo { .. } => indices.collect(),
             Row::File { entry, .. } => vec![*entry],
-            Row::Group { .. } => status
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| in_group(entry))
-                .map(|(index, _)| index)
+            Row::Group { group, .. } => indices
+                .filter(|&index| group.change(&entries[index]).is_some())
                 .collect(),
-            Row::Dir { path, .. } => {
+            Row::Dir { group, path, .. } => {
                 let prefix = format!("{path}/");
-                status
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, entry)| in_group(entry) && entry.path.starts_with(&prefix))
-                    .map(|(index, _)| index)
+                indices
+                    .filter(|&index| {
+                        let entry = &entries[index];
+                        group.change(entry).is_some() && entry.path.starts_with(&prefix)
+                    })
                     .collect()
             }
         }
     }
 
     fn check_state(&self, row: usize) -> Check {
-        let Some(status) = self.status() else {
+        let Some((repo, _)) = self.rows.get(row) else {
             return Check::Unchecked;
         };
-        self.inclusion.state(
+        let repo = &self.repos[*repo];
+        repo.inclusion.state(
             self.entries_under(row)
                 .into_iter()
-                .map(|entry| status.entries[entry].path.as_str()),
+                .map(|entry| &repo.status.entries[entry])
+                .filter(|entry| checkable(entry))
+                .map(|entry| entry.path.as_str()),
         )
     }
 
     fn toggle_checked(&mut self, row: usize, cx: &mut Context<Self>) {
         let entries = self.entries_under(row);
-        let Some(status) = self.status() else {
+        let Some(&(repo, _)) = self.rows.get(row) else {
             return;
         };
+        let repo = &mut self.repos[repo];
         let paths: Vec<&str> = entries
             .iter()
-            .map(|&entry| status.entries[entry].path.as_str())
+            .map(|&entry| &repo.status.entries[entry])
+            .filter(|entry| checkable(entry))
+            .map(|entry| entry.path.as_str())
             .collect();
-        let mut inclusion = self.inclusion.clone();
-        inclusion.toggle(&paths);
-        self.inclusion = inclusion;
+        repo.inclusion.toggle(&paths);
         cx.notify();
     }
 
-    /// The checked entries Commit takes (conflicted files count once
-    /// resolved, i.e. when they show under Changes).
-    fn checked_entries(&self) -> Vec<Entry> {
-        let Some(status) = self.status() else {
-            return Vec::new();
-        };
-        status
-            .entries
+    /// The checked entries Commit takes, per repository with any
+    /// (conflicted files count once resolved, i.e. under Changes).
+    fn checked_entries(&self) -> Vec<(usize, Vec<Entry>)> {
+        self.repos
             .iter()
-            .filter(|entry| {
-                (Group::Changes.change(entry).is_some()
-                    || Group::Unversioned.change(entry).is_some())
-                    && self.inclusion.includes(&entry.path)
-            })
-            .cloned()
+            .enumerate()
+            .map(|(index, repo)| (index, repo.checked_entries()))
+            .filter(|(_, entries)| !entries.is_empty())
             .collect()
     }
 
-    /// Entries of the selected row (all files under a group or folder).
-    fn selected_entries(&self) -> Vec<Entry> {
-        let (Some(row), Some(status)) = (self.selected, self.status()) else {
-            return Vec::new();
-        };
-        self.entries_under(row)
-            .into_iter()
-            .map(|entry| status.entries[entry].clone())
-            .collect()
+    /// Entries of the selected row (all files under a repository, group
+    /// or folder), with their repository.
+    fn selected_entries(&self) -> Option<(usize, Vec<Entry>)> {
+        let row = self.selected?;
+        let &(repo, _) = self.rows.get(row)?;
+        let status = &self.repos[repo].status;
+        let entries = self.entries_under(row);
+        Some((
+            repo,
+            entries
+                .into_iter()
+                .map(|entry| status.entries[entry].clone())
+                .collect(),
+        ))
     }
 
-    /// Runs a git operation off the main thread, then refreshes. `Ok(Some)`
-    /// is shown as a confirmation.
+    /// Runs git operations off the main thread, one after another, then
+    /// refreshes. `Ok(Some)` messages are shown as confirmations (each
+    /// prefixed with its repository's name when several ran);
+    /// `on_success` gets the repositories once every operation succeeded.
     fn operate(
         &mut self,
+        jobs: Vec<(usize, Job)>,
+        on_success: impl FnOnce(&mut Self, Vec<Repository>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
-        operation: impl FnOnce(&Repository) -> io::Result<Option<String>> + Send + 'static,
-        on_success: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
     ) {
-        let Some(repository) = self.repository() else {
+        let jobs: Vec<(Repository, Job)> = jobs
+            .into_iter()
+            .filter_map(|(repo, job)| Some((self.repos.get(repo)?.repository.clone(), job)))
+            .collect();
+        if jobs.is_empty() {
             return;
-        };
+        }
         self.busy = true;
         self.feedback = None;
         cx.notify();
         self._operation = cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { operation(&repository) })
+            let results: Vec<(Repository, io::Result<Option<String>>)> = cx
+                .background_spawn(async move {
+                    jobs.into_iter()
+                        .map(|(repository, job)| {
+                            let result = job(&repository);
+                            (repository, result)
+                        })
+                        .collect()
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.busy = false;
-                match result {
-                    Ok(message) => {
-                        this.feedback = message.map(|m| (m.into(), theme::muted as fn() -> Hsla));
-                        on_success(this, cx);
-                    }
-                    Err(err) => this.feedback = Some((err.to_string().into(), theme::error)),
+                let several = results.len() > 1;
+                let mut failed = false;
+                let mut lines = Vec::new();
+                for (repository, result) in &results {
+                    let text = match result {
+                        Ok(Some(message)) => message.clone(),
+                        Ok(None) => continue,
+                        Err(err) => {
+                            failed = true;
+                            err.to_string()
+                        }
+                    };
+                    lines.push(if several {
+                        format!("{}: {text}", repository_name(repository))
+                    } else {
+                        text
+                    });
+                }
+                let color: fn() -> Hsla = if failed { theme::error } else { theme::muted };
+                this.feedback = (!lines.is_empty()).then(|| (lines.join("; ").into(), color));
+                if !failed {
+                    let repositories = results.into_iter().map(|(r, _)| r).collect();
+                    on_success(this, repositories, cx);
                 }
                 this.refresh(cx);
             })
@@ -933,43 +1385,53 @@ impl CommitPanel {
         });
     }
 
-    fn stage(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
+    fn stage(&mut self, repo: usize, entries: Vec<Entry>, cx: &mut Context<Self>) {
         let paths: Vec<String> = entries.into_iter().map(|entry| entry.path).collect();
-        self.operate(cx, move |repo| repo.stage(&paths).map(|()| None), |_, _| {});
+        let stage = job(move |repo| repo.stage(&paths).map(|()| None));
+        self.operate(vec![(repo, stage)], |_, _, _| {}, cx);
     }
 
-    fn unstage(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
+    fn unstage(&mut self, repo: usize, entries: Vec<Entry>, cx: &mut Context<Self>) {
         let paths: Vec<String> = entries.into_iter().map(|entry| entry.path).collect();
-        self.operate(
-            cx,
-            move |repo| repo.unstage(&paths).map(|()| None),
-            |_, _| {},
-        );
+        let unstage = job(move |repo| repo.unstage(&paths).map(|()| None));
+        self.operate(vec![(repo, unstage)], |_, _, _| {}, cx);
     }
 
     /// PyCharm's Add to VCS for untracked files.
-    fn add_to_vcs(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
+    fn add_to_vcs(&mut self, repo: usize, entries: Vec<Entry>, cx: &mut Context<Self>) {
         let paths: Vec<String> = entries
             .into_iter()
             .filter(|entry| entry.unstaged == Some(Change::Untracked))
             .map(|entry| entry.path)
             .collect();
-        self.operate(cx, move |repo| repo.add(&paths).map(|()| None), |_, _| {});
+        let add = job(move |repo| repo.add(&paths).map(|()| None));
+        self.operate(vec![(repo, add)], |_, _, _| {}, cx);
     }
 
-    /// Asks, then reverts `entries` to HEAD (see [`Repository::rollback`]).
-    pub fn rollback(&mut self, entries: Vec<Entry>, window: &mut Window, cx: &mut Context<Self>) {
-        if entries.is_empty() {
+    /// Asks, then reverts the entries (per repository) to HEAD (see
+    /// [`Repository::rollback`]).
+    pub fn rollback(
+        &mut self,
+        groups: Vec<(usize, Vec<Entry>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let groups: Vec<(usize, Vec<Entry>)> = groups
+            .into_iter()
+            .filter(|(_, entries)| !entries.is_empty())
+            .collect();
+        if groups.is_empty() {
             self.feedback = Some(("Select the changes to roll back".into(), theme::error));
             return cx.notify();
         }
-        let untracked = entries
+        let all: Vec<&Entry> = groups.iter().flat_map(|(_, entries)| entries).collect();
+        let untracked = all
             .iter()
             .filter(|entry| entry.unstaged == Some(Change::Untracked))
             .count();
-        let what = match entries.as_slice() {
+        let what = match all.as_slice() {
             [entry] => entry.path.clone(),
-            _ => format!("{} files", entries.len()),
+            _ => format!("{} files", all.len()),
         };
         let detail = if untracked > 0 {
             format!(
@@ -993,15 +1455,18 @@ impl CommitPanel {
                 return;
             }
             this.update(cx, |this, cx| {
-                let count = entries.len();
-                this.operate(
-                    cx,
-                    move |repo| {
-                        repo.rollback(&entries)
-                            .map(|()| Some(format!("Rolled back {count} file(s)")))
-                    },
-                    |_, _| {},
-                );
+                let jobs = groups
+                    .into_iter()
+                    .map(|(repo, entries)| {
+                        let count = entries.len();
+                        let rollback = job(move |repo| {
+                            repo.rollback(&entries)
+                                .map(|()| Some(format!("Rolled back {count} file(s)")))
+                        });
+                        (repo, rollback)
+                    })
+                    .collect();
+                this.operate(jobs, |_, _, _| {}, cx);
             })
             .ok();
         })
@@ -1009,18 +1474,24 @@ impl CommitPanel {
     }
 
     /// Rollback from the toolbar or the Git menu: the selected changes,
-    /// else the checked ones.
+    /// else the checked ones (of every repository).
     pub fn rollback_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut entries = self.selected_entries();
-        if entries.is_empty() {
-            entries = self.checked_entries();
-        }
-        self.rollback(entries, window, cx);
+        let groups = match self.selected_entries() {
+            Some((repo, entries)) if !entries.is_empty() => vec![(repo, entries)],
+            _ => self.checked_entries(),
+        };
+        self.rollback(groups, window, cx);
     }
 
     /// Deletes files from disk (asks first).
-    fn delete(&mut self, entries: Vec<Entry>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(repository) = self.repository() else {
+    fn delete(
+        &mut self,
+        repo: usize,
+        entries: Vec<Entry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.repos.get(repo).map(|repo| repo.repository.clone()) else {
             return;
         };
         let what = match entries.as_slice() {
@@ -1040,17 +1511,14 @@ impl CommitPanel {
                 return;
             }
             this.update(cx, |this, cx| {
-                this.operate(
-                    cx,
-                    move |_| {
-                        for entry in &entries {
-                            let path = project.repository_path(&repository, &entry.path);
-                            project.remove(&path, false)?;
-                        }
-                        Ok(Some(format!("Deleted {what}")))
-                    },
-                    |_, _| {},
-                );
+                let delete = job(move |_| {
+                    for entry in &entries {
+                        let path = project.repository_path(&repository, &entry.path);
+                        project.remove(&path, false)?;
+                    }
+                    Ok(Some(format!("Deleted {what}")))
+                });
+                this.operate(vec![(repo, delete)], |_, _, _| {}, cx);
             })
             .ok();
         })
@@ -1059,8 +1527,8 @@ impl CommitPanel {
 
     /// Adds root-anchored patterns for unversioned files to the
     /// repository's `.gitignore`.
-    fn ignore(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
-        let Some(repository) = self.repository() else {
+    fn ignore(&mut self, repo: usize, entries: Vec<Entry>, cx: &mut Context<Self>) {
+        let Some(repository) = self.repos.get(repo).map(|repo| repo.repository.clone()) else {
             return;
         };
         let paths: Vec<String> = entries
@@ -1069,35 +1537,32 @@ impl CommitPanel {
             .map(|entry| entry.path)
             .collect();
         let project = self.project.clone();
-        self.operate(
-            cx,
-            move |_| {
-                let file = project.repository_path(&repository, ".gitignore");
-                let existing = match project.read_text(&file) {
-                    Ok(text) => text,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
-                    Err(err) => return Err(err),
-                };
-                let text = git::ignore_entries(&existing, &paths);
-                project.write(&file, text.into_bytes())?;
-                Ok(Some(format!(
-                    "Added {} pattern(s) to .gitignore",
-                    paths.len()
-                )))
-            },
-            |_, _| {},
-        );
+        let ignore = job(move |_| {
+            let file = project.repository_path(&repository, ".gitignore");
+            let existing = match project.read_text(&file) {
+                Ok(text) => text,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(err) => return Err(err),
+            };
+            let text = git::ignore_entries(&existing, &paths);
+            project.write(&file, text.into_bytes())?;
+            Ok(Some(format!(
+                "Added {} pattern(s) to .gitignore",
+                paths.len()
+            )))
+        });
+        self.operate(vec![(repo, ignore)], |_, _, _| {}, cx);
     }
 
-    fn copy_paths(&self, entries: &[Entry], cx: &mut Context<Self>) {
-        let Some(repository) = self.repository() else {
+    fn copy_paths(&self, repo: usize, entries: &[Entry], cx: &mut Context<Self>) {
+        let Some(repo) = self.repos.get(repo) else {
             return;
         };
         let text = entries
             .iter()
             .map(|entry| {
                 self.project
-                    .repository_path(&repository, &entry.path)
+                    .repository_path(&repo.repository, &entry.path)
                     .to_string_lossy()
                     .into_owned()
             })
@@ -1106,8 +1571,15 @@ impl CommitPanel {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
-    /// Commits the checked files (or, in staging mode, what is staged); with
-    /// `push`, asks to push afterwards.
+    /// The selected row's repository.
+    fn selected_repo(&self) -> Option<usize> {
+        let row = self.selected?;
+        self.rows.get(row).map(|(repo, _)| *repo)
+    }
+
+    /// Commits the checked files (or, in staging mode, what is staged) of
+    /// every repository having some, with the same message; with `push`,
+    /// asks to push each afterwards.
     pub fn commit(&mut self, push: bool, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -1119,40 +1591,71 @@ impl CommitPanel {
             return cx.notify();
         }
         let staging = self.staging;
-        let entries = self.checked_entries();
-        let staged = self
-            .status()
-            .is_some_and(|status| status.entries.iter().any(|entry| entry.staged.is_some()));
-        if staging && !staged && !amend {
-            self.feedback = Some((
-                "Nothing is staged; stage changes first".into(),
-                theme::error,
-            ));
+        let mut chosen: Vec<(usize, Vec<Entry>)> = if staging {
+            self.repos
+                .iter()
+                .enumerate()
+                .filter(|(_, repo)| repo.status.entries.iter().any(|e| e.staged.is_some()))
+                .map(|(index, _)| (index, Vec::new()))
+                .collect()
+        } else {
+            self.checked_entries()
+        };
+        if chosen.is_empty() && amend {
+            // Only the message changes: the repository is the only one,
+            // else the selected row's.
+            let repo = match self.repos.len() {
+                1 => Some(0),
+                _ => self.selected_repo(),
+            };
+            let Some(repo) = repo else {
+                self.feedback = Some((
+                    "Select a row of the repository whose last commit to amend".into(),
+                    theme::error,
+                ));
+                return cx.notify();
+            };
+            chosen.push((repo, Vec::new()));
+        }
+        if chosen.is_empty() {
+            let error = if staging {
+                "Nothing is staged; stage changes first"
+            } else {
+                "No changes are checked for the commit"
+            };
+            self.feedback = Some((error.into(), theme::error));
             return cx.notify();
         }
-        if !staging && entries.is_empty() && !amend {
-            self.feedback = Some(("No changes are checked for the commit".into(), theme::error));
-            return cx.notify();
-        }
+        let jobs = chosen
+            .into_iter()
+            .map(|(repo, entries)| {
+                let message = message.clone();
+                let commit = job(move |repo| {
+                    let summary = if staging {
+                        repo.commit(&message, amend)?
+                    } else {
+                        repo.commit_entries(&message, &entries, amend)?
+                    };
+                    let verb = if amend { "Amended" } else { "Committed" };
+                    Ok(Some(format!("{verb} {summary}")))
+                });
+                (repo, commit)
+            })
+            .collect();
         self.operate(
-            cx,
-            move |repo| {
-                let summary = if staging {
-                    repo.commit(&message, amend)?
-                } else {
-                    repo.commit_entries(&message, &entries, amend)?
-                };
-                let verb = if amend { "Amended" } else { "Committed" };
-                Ok(Some(format!("{verb} {summary}")))
-            },
-            move |this, cx| {
+            jobs,
+            move |this, committed, cx| {
                 this.amend = false;
                 this.message
                     .update(cx, |editor, cx| editor.set_text("", cx));
-                if push && let Some(repository) = this.repository() {
-                    cx.emit(CommitPanelEvent::Push(repository));
+                if push {
+                    this.pushes = committed.into();
+                    if let Some(repository) = this.pushes.pop_front() {
+                        cx.emit(CommitPanelEvent::Push(repository));
+                    }
                 }
             },
+            cx,
         );
     }
 
@@ -1160,14 +1663,21 @@ impl CommitPanel {
         self.commit(false, cx);
     }
 
-    /// Amend toggled on with an empty message: start from the last one.
+    /// Amend toggled on with an empty message: start from the last one (of
+    /// the first repository with checked files, else the selected row's).
     fn toggle_amend(&mut self, cx: &mut Context<Self>) {
         self.amend = !self.amend;
         cx.notify();
         if !self.amend || !self.message.read(cx).text().trim().is_empty() {
             return;
         }
-        let Some(repository) = self.repository() else {
+        let repo = self
+            .checked_entries()
+            .first()
+            .map(|(repo, _)| *repo)
+            .or_else(|| self.selected_repo())
+            .unwrap_or(0);
+        let Some(repository) = self.repos.get(repo).map(|repo| repo.repository.clone()) else {
             return;
         };
         let message = self.message.clone();
@@ -1188,61 +1698,66 @@ impl CommitPanel {
         .detach();
     }
 
-    /// Fetch or fast-forward pull, off the main thread.
+    /// Fetch or fast-forward pull of every repository, off the main
+    /// thread.
     pub fn sync(&mut self, action: SyncAction, cx: &mut Context<Self>) {
-        self.operate(
-            cx,
-            move |repo| {
-                Ok(Some(match action {
-                    SyncAction::Fetch => {
-                        repo.fetch()?;
-                        "Fetched".into()
-                    }
-                    SyncAction::Pull => {
-                        repo.pull()?;
-                        "Pulled".into()
-                    }
-                }))
-            },
-            |_, _| {},
-        );
+        let jobs = (0..self.repos.len())
+            .map(|repo| {
+                let sync = job(move |repo| {
+                    Ok(Some(match action {
+                        SyncAction::Fetch => {
+                            repo.fetch()?;
+                            "Fetched".into()
+                        }
+                        SyncAction::Pull => {
+                            repo.pull()?;
+                            "Pulled".into()
+                        }
+                    }))
+                });
+                (repo, sync)
+            })
+            .collect();
+        self.operate(jobs, |_, _, _| {}, cx);
     }
 
-    /// Abort or continue the operation in progress.
-    fn finish_operation(&mut self, abort: bool, cx: &mut Context<Self>) {
-        let state = self.operation;
-        self.operate(
-            cx,
-            move |repo| {
-                if abort {
-                    repo.abort(state)?;
-                    return Ok(Some("Aborted".into()));
-                }
-                Ok(Some(match repo.continue_rebase()? {
-                    git::Outcome::Done => "Rebase finished".into(),
-                    git::Outcome::Conflicts => "The next commit conflicts: resolve it below".into(),
-                }))
-            },
-            |_, _| {},
-        );
+    /// Abort or continue the operation in progress in repository `repo`.
+    fn finish_operation(&mut self, repo: usize, abort: bool, cx: &mut Context<Self>) {
+        let Some(state) = self.repos.get(repo).map(|repo| repo.operation) else {
+            return;
+        };
+        let finish = job(move |repo| {
+            if abort {
+                repo.abort(state)?;
+                return Ok(Some("Aborted".into()));
+            }
+            Ok(Some(match repo.continue_rebase()? {
+                git::Outcome::Done => "Rebase finished".into(),
+                git::Outcome::Conflicts => "The next commit conflicts: resolve it below".into(),
+            }))
+        });
+        self.operate(vec![(repo, finish)], |_, _, _| {}, cx);
     }
 
     /// Opens a file's diff: HEAD ↔ working tree without a staging area,
     /// else the index side of its group. Conflicted files open in the
     /// editor to resolve.
     fn show_diff(&mut self, row: usize, cx: &mut Context<Self>) {
-        let (
-            Some(Row::File {
+        let Some((
+            repo,
+            Row::File {
                 group,
                 entry,
                 change,
                 ..
-            }),
-            State::Ready { repository, status },
-        ) = (self.rows.get(row), &self.state)
+            },
+        )) = self.rows.get(row)
         else {
             return;
         };
+        let Repo {
+            repository, status, ..
+        } = &self.repos[*repo];
         let entry = status.entries[*entry].clone();
         let event = match group {
             Group::Conflicts => {
@@ -1279,41 +1794,56 @@ impl CommitPanel {
     }
 
     fn jump_to_source(&mut self, row: usize, cx: &mut Context<Self>) {
-        let (Some(Row::File { entry, change, .. }), State::Ready { repository, status }) =
-            (self.rows.get(row), &self.state)
-        else {
+        let Some((repo, Row::File { entry, change, .. })) = self.rows.get(row) else {
             return;
         };
         if *change != Change::Deleted {
-            let path = &status.entries[*entry].path;
+            let repo = &self.repos[*repo];
+            let path = &repo.status.entries[*entry].path;
             cx.emit(CommitPanelEvent::OpenFile(
-                self.project.repository_path(repository, path),
+                self.project.repository_path(&repo.repository, path),
             ));
         }
     }
 
     fn toggle_collapsed(&mut self, row: usize, cx: &mut Context<Self>) {
-        let key = match self.rows.get(row) {
-            Some(Row::Group { group, .. }) => (*group, String::new()),
-            Some(Row::Dir { group, path, .. }) => (*group, path.clone()),
-            _ => return,
+        let Some((repo, row)) = self.rows.get(row) else {
+            return;
         };
-        if !self.collapsed.remove(&key) {
-            self.collapsed.insert(key);
+        let repo = *repo;
+        let key = match row {
+            Row::Repo { .. } => None,
+            Row::Group { group, .. } => Some((*group, String::new())),
+            Row::Dir { group, path, .. } => Some((*group, path.clone())),
+            Row::File { .. } => return,
+        };
+        let repo = &mut self.repos[repo];
+        match key {
+            None => repo.folded = !repo.folded,
+            Some(key) => {
+                if !repo.collapsed.remove(&key) {
+                    repo.collapsed.insert(key);
+                }
+            }
         }
         self.rebuild_rows();
         cx.notify();
     }
 
     fn expand_all(&mut self, cx: &mut Context<Self>) {
-        self.collapsed.clear();
+        for repo in &mut self.repos {
+            repo.collapsed.clear();
+            repo.folded = false;
+        }
         self.rebuild_rows();
         cx.notify();
     }
 
+    /// Collapses every group and folder (repository headers stay open, so
+    /// their groups show).
     fn collapse_all(&mut self, cx: &mut Context<Self>) {
-        if let Some(status) = self.status() {
-            self.collapsed = all_folders(status, self.staging);
+        for repo in &mut self.repos {
+            repo.collapsed = all_folders(&repo.status, self.staging);
         }
         self.selected = None;
         self.rebuild_rows();
@@ -1332,7 +1862,7 @@ impl CommitPanel {
         window.focus(&self.focus_handle);
         if event.click_count() >= 2 {
             match self.rows.get(row) {
-                Some(Row::File { .. }) => self.show_diff(row, cx),
+                Some((_, Row::File { .. })) => self.show_diff(row, cx),
                 Some(_) => self.toggle_collapsed(row, cx),
                 None => {}
             }
@@ -1350,9 +1880,12 @@ impl CommitPanel {
         self.selected = Some(row);
         window.focus(&self.focus_handle);
         let entries = self.entries_under(row);
-        if !entries.is_empty() {
+        if let Some(&(repo, _)) = self.rows.get(row)
+            && !entries.is_empty()
+        {
             self.menu = Some(ContextMenu {
                 position: event.position,
+                repo,
                 entries,
             });
         }
@@ -1379,7 +1912,7 @@ impl CommitPanel {
             && self
                 .rows
                 .get(row)
-                .is_some_and(|row| row.group().checkable())
+                .is_some_and(|(_, row)| row.group().is_none_or(Group::checkable))
             && !self.staging
         {
             self.toggle_checked(row, cx);
@@ -1388,7 +1921,7 @@ impl CommitPanel {
 
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
         match self.selected.and_then(|row| self.rows.get(row)) {
-            Some(Row::File { .. }) => self.show_diff(self.selected.unwrap_or_default(), cx),
+            Some((_, Row::File { .. })) => self.show_diff(self.selected.unwrap_or_default(), cx),
             Some(_) => self.toggle_collapsed(self.selected.unwrap_or_default(), cx),
             None => {}
         }
@@ -1475,7 +2008,7 @@ impl CommitPanel {
         };
         let selected_file = self
             .selected
-            .is_some_and(|row| matches!(self.rows.get(row), Some(Row::File { .. })));
+            .is_some_and(|row| matches!(self.rows.get(row), Some((_, Row::File { .. }))));
         div()
             .h(px(28.))
             .px_1()
@@ -1528,18 +2061,22 @@ impl CommitPanel {
     }
 
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let State::Ready { status, .. } = &self.state else {
+        let Some((repo_index, row)) = self.rows.get(index) else {
             return div().into_any_element();
         };
-        let row = &self.rows[index];
+        let repo = &self.repos[*repo_index];
+        let status = &repo.status;
         let group = row.group();
+        // Under a repository header with several repositories.
+        let nested = usize::from(self.repos.len() > 1);
         let depth = match row {
-            Row::Group { .. } => 0,
-            Row::Dir { depth, .. } | Row::File { depth, .. } => *depth,
+            Row::Repo { .. } => 0,
+            Row::Group { .. } => nested,
+            Row::Dir { depth, .. } | Row::File { depth, .. } => *depth + nested,
         };
         let selected = self.selected == Some(index);
-        let actions = self.row_actions(index, group, cx);
-        let checkbox = (!self.staging && group.checkable()).then(|| {
+        let actions = group.and_then(|group| self.row_actions(index, group, cx));
+        let checkbox = (!self.staging && group.is_none_or(Group::checkable)).then(|| {
             checkbox(self.check_state(index))
                 .id(("commit-check", index))
                 .cursor_pointer()
@@ -1548,6 +2085,10 @@ impl CommitPanel {
                     this.toggle_checked(index, cx)
                 }))
         });
+        let files = |count: usize| match count {
+            1 => "1 file".to_owned(),
+            n => format!("{n} files"),
+        };
         let chevron = |collapsed: bool| {
             div()
                 .id(("commit-chevron", index))
@@ -1584,7 +2125,37 @@ impl CommitPanel {
                     this.open_menu(index, event, window, cx)
                 }),
             );
+        let Some(group) = group else {
+            let Row::Repo { count, collapsed } = row else {
+                return base.into_any_element();
+            };
+            return base
+                .child(chevron(*collapsed))
+                .children(checkbox)
+                .child(div().flex_none().text_color(theme::muted()).child("⎇"))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::text())
+                        .child(row_text("repo", repo.name().to_owned())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(row_text(
+                            "repo-detail",
+                            format!("{} · {}", branch_label(status), files(*count)),
+                        )),
+                )
+                .into_any_element();
+        };
         match row {
+            Row::Repo { .. } => base.into_any_element(),
             Row::Group {
                 count, collapsed, ..
             } => base
@@ -1608,13 +2179,7 @@ impl CommitPanel {
                         .truncate()
                         .text_xs()
                         .text_color(theme::muted())
-                        .child(row_text(
-                            "count",
-                            match count {
-                                1 => "1 file".to_owned(),
-                                n => format!("{n} files"),
-                            },
-                        )),
+                        .child(row_text("count", files(*count))),
                 )
                 .children(actions)
                 .into_any_element(),
@@ -1704,18 +2269,19 @@ impl CommitPanel {
                 .child(glyph)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    let Some(status) = this.status() else {
+                    let Some(&(repo, _)) = this.rows.get(index) else {
                         return;
                     };
+                    let status = &this.repos[repo].status;
                     let entries: Vec<Entry> = this
                         .entries_under(index)
                         .into_iter()
                         .map(|entry| status.entries[entry].clone())
                         .collect();
                     if stage {
-                        this.stage(entries, cx)
+                        this.stage(repo, entries, cx)
                     } else {
-                        this.unstage(entries, cx)
+                        this.unstage(repo, entries, cx)
                     }
                 })),
         )
@@ -1723,7 +2289,8 @@ impl CommitPanel {
 
     fn render_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let menu = self.menu.as_ref()?;
-        let status = self.status()?;
+        let repo = menu.repo;
+        let status = &self.repos.get(repo)?.status;
         let entries: Vec<Entry> = menu
             .entries
             .iter()
@@ -1734,20 +2301,25 @@ impl CommitPanel {
             .all(|entry| entry.unstaged == Some(Change::Untracked));
         let single_file = matches!(
             self.selected.and_then(|row| self.rows.get(row)),
-            Some(Row::File { .. })
+            Some((_, Row::File { .. }))
         );
-        type Handler =
-            Box<dyn Fn(&mut CommitPanel, Vec<Entry>, &mut Window, &mut Context<CommitPanel>)>;
+        type Handler = Box<
+            dyn Fn(&mut CommitPanel, usize, Vec<Entry>, &mut Window, &mut Context<CommitPanel>),
+        >;
         let mut items: Vec<(&'static str, Handler)> = Vec::new();
         if !self.staging {
             items.push((
                 "Commit File…",
-                Box::new(|this, entries, window, cx| {
-                    if let Some(status) = this.status() {
-                        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
-                        let mut inclusion = this.inclusion.clone();
-                        inclusion.only(status.entries.iter().map(|e| e.path.as_str()), &paths);
-                        this.inclusion = inclusion;
+                Box::new(|this, repo, entries, window, cx| {
+                    // Exactly these files: other repositories' are unchecked.
+                    for (index, other) in this.repos.iter_mut().enumerate() {
+                        let paths: Vec<&str> = if index == repo {
+                            entries.iter().map(|e| e.path.as_str()).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let all = other.status.entries.iter().map(|e| e.path.as_str());
+                        other.inclusion.only(all, &paths);
                     }
                     this.focus(window, cx);
                 }),
@@ -1755,20 +2327,22 @@ impl CommitPanel {
         }
         items.push((
             "Rollback…",
-            Box::new(|this, entries, window, cx| this.rollback(entries, window, cx)),
+            Box::new(|this, repo, entries, window, cx| {
+                this.rollback(vec![(repo, entries)], window, cx)
+            }),
         ));
         items.push((
             "Shelve Changes…",
-            Box::new(|this, entries, _, cx| this.request_shelve(entries, cx)),
+            Box::new(|this, repo, entries, _, cx| this.request_shelve(repo, entries, cx)),
         ));
         items.push((
             "Stash Changes…",
-            Box::new(|this, entries, _, cx| this.request_stash(entries, cx)),
+            Box::new(|this, repo, entries, _, cx| this.request_stash(repo, entries, cx)),
         ));
         if single_file {
             items.push((
                 "Show Diff",
-                Box::new(|this, _, _, cx| {
+                Box::new(|this, _, _, _, cx| {
                     if let Some(row) = this.selected {
                         this.show_diff(row, cx)
                     }
@@ -1776,7 +2350,7 @@ impl CommitPanel {
             ));
             items.push((
                 "Jump to Source",
-                Box::new(|this, _, _, cx| {
+                Box::new(|this, _, _, _, cx| {
                     if let Some(row) = this.selected {
                         this.jump_to_source(row, cx)
                     }
@@ -1786,30 +2360,30 @@ impl CommitPanel {
         if self.staging {
             items.push((
                 "Stage",
-                Box::new(|this, entries, _, cx| this.stage(entries, cx)),
+                Box::new(|this, repo, entries, _, cx| this.stage(repo, entries, cx)),
             ));
             items.push((
                 "Unstage",
-                Box::new(|this, entries, _, cx| this.unstage(entries, cx)),
+                Box::new(|this, repo, entries, _, cx| this.unstage(repo, entries, cx)),
             ));
         }
         if untracked {
             items.push((
                 "Add to VCS",
-                Box::new(|this, entries, _, cx| this.add_to_vcs(entries, cx)),
+                Box::new(|this, repo, entries, _, cx| this.add_to_vcs(repo, entries, cx)),
             ));
             items.push((
                 "Ignore (add to .gitignore)",
-                Box::new(|this, entries, _, cx| this.ignore(entries, cx)),
+                Box::new(|this, repo, entries, _, cx| this.ignore(repo, entries, cx)),
             ));
         }
         items.push((
             "Delete…",
-            Box::new(|this, entries, window, cx| this.delete(entries, window, cx)),
+            Box::new(|this, repo, entries, window, cx| this.delete(repo, entries, window, cx)),
         ));
         items.push((
             "Copy Path",
-            Box::new(|this, entries, _, cx| this.copy_paths(&entries, cx)),
+            Box::new(|this, repo, entries, _, cx| this.copy_paths(repo, &entries, cx)),
         ));
         let rows = items
             .into_iter()
@@ -1826,7 +2400,7 @@ impl CommitPanel {
                     .child(label)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.menu = None;
-                        handler(this, entries.clone(), window, cx);
+                        handler(this, repo, entries.clone(), window, cx);
                         cx.notify();
                     }))
             });
@@ -1855,16 +2429,11 @@ impl CommitPanel {
         ))
     }
 
-    /// Merge/rebase banner: what is in progress and how to finish it.
-    fn render_operation(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let text = match self.operation {
-            OperationState::None => return None,
-            OperationState::Merging => "Merging: resolve conflicts, then Commit",
-            OperationState::Rebasing => "Rebasing: resolve conflicts, then Continue",
-            OperationState::CherryPicking => "Cherry-picking: resolve conflicts, then Commit",
-            OperationState::Reverting => "Reverting: resolve conflicts, then Commit",
-        };
-        let button = |id: &'static str, label: &'static str| {
+    /// Merge/rebase banners, one per repository with an operation in
+    /// progress: what it is and how to finish it.
+    fn render_operations(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let several = self.repos.len() > 1;
+        let button = |id: (&'static str, usize), label: &'static str| {
             div()
                 .id(id)
                 .px_2()
@@ -1875,34 +2444,135 @@ impl CommitPanel {
                 .hover(|style| style.bg(theme::hover_row()))
                 .child(label)
         };
-        let rebasing = self.operation == OperationState::Rebasing;
+        let mut banners = Vec::new();
+        for (index, repo) in self.repos.iter().enumerate() {
+            let text = match repo.operation {
+                OperationState::None => continue,
+                OperationState::Merging => "Merging: resolve conflicts, then Commit",
+                OperationState::Rebasing => "Rebasing: resolve conflicts, then Continue",
+                OperationState::CherryPicking => "Cherry-picking: resolve conflicts, then Commit",
+                OperationState::Reverting => "Reverting: resolve conflicts, then Commit",
+            };
+            let text = if several {
+                format!("{}: {text}", repo.name())
+            } else {
+                text.to_owned()
+            };
+            let rebasing = repo.operation == OperationState::Rebasing;
+            banners.push(
+                banner()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(theme::warning())
+                            .child(selectable(("operation", index), text)),
+                    )
+                    .when(rebasing, |banner| {
+                        banner.child(button(("operation-continue", index), "Continue").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.finish_operation(index, false, cx)
+                            }),
+                        ))
+                    })
+                    .child(button(("operation-abort", index), "Abort").on_click(
+                        cx.listener(move |this, _, _, cx| this.finish_operation(index, true, cx)),
+                    ))
+                    .into_any_element(),
+            );
+        }
+        banners
+    }
+
+    /// Beside the repositories that could be read: the ones git refuses
+    /// (with Trust) and the folders that failed.
+    fn render_problems(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        if self.repos.is_empty() {
+            return Vec::new();
+        }
+        let mut banners: Vec<gpui::AnyElement> = Vec::new();
+        for (index, path) in self.untrusted.iter().enumerate() {
+            let trusted = path.clone();
+            banners.push(
+                banner()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(theme::warning())
+                            .child(selectable(
+                                ("untrusted", index),
+                                format!("Git refuses {path}: its folder belongs to another user."),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id(("trust-repository", index))
+                            .px_2()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme::border())
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::hover_row()))
+                            .child("Trust This Folder")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.trust(trusted.to_string(), cx)
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        for (index, error) in self.errors.iter().enumerate() {
+            banners.push(
+                banner()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(theme::error())
+                            .child(selectable(("repository-error", index), error.clone())),
+                    )
+                    .into_any_element(),
+            );
+        }
+        banners
+    }
+
+    /// Several repositories: which one's shelves the Shelf tab lists.
+    fn render_shelf_repos(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        if self.repos.len() < 2 {
+            return None;
+        }
         Some(
             div()
-                .px_2()
-                .py_1()
+                .h(px(28.))
+                .px_1()
                 .flex()
-                .flex_wrap()
+                .flex_none()
                 .items_center()
-                .gap_2()
-                .text_xs()
-                .bg(theme::active_row())
-                .child(
+                .gap_0p5()
+                .border_b_1()
+                .border_color(theme::border())
+                .text_sm()
+                .children(self.repos.iter().enumerate().map(|(index, repo)| {
+                    let active = index == self.shelf_repo;
                     div()
-                        .flex_1()
-                        .text_color(theme::warning())
-                        .child(selectable("operation", text)),
-                )
-                .when(rebasing, |banner| {
-                    banner.child(
-                        button("operation-continue", "Continue").on_click(
-                            cx.listener(|this, _, _, cx| this.finish_operation(false, cx)),
-                        ),
-                    )
-                })
-                .child(
-                    button("operation-abort", "Abort")
-                        .on_click(cx.listener(|this, _, _, cx| this.finish_operation(true, cx))),
-                ),
+                        .id(("shelf-repo", index))
+                        .px_2()
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(if active {
+                            theme::text()
+                        } else {
+                            theme::muted()
+                        })
+                        .when(active, |button| button.bg(theme::active_row()))
+                        .hover(|style| style.bg(theme::hover_row()))
+                        .child(repo.name().to_owned())
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.select_shelf_repo(index, cx)),
+                        )
+                })),
         )
     }
 
@@ -2030,7 +2700,9 @@ impl Render for CommitPanel {
         let staging = settings::current().git.staging_area;
         if staging != self.staging {
             self.staging = staging;
-            self.collapsed.clear();
+            for repo in &mut self.repos {
+                repo.collapsed.clear();
+            }
             self.rebuild_rows();
         }
         let message = |text: SharedString, color: Hsla| {
@@ -2041,8 +2713,13 @@ impl Render for CommitPanel {
                 .child(selectable("message", text))
                 .into_any_element()
         };
-        let body = match &self.state {
-            State::Ready { status, .. } if status.entries.is_empty() => div()
+        let ready = !self.repos.is_empty();
+        let clean = self.repos.iter().all(|repo| repo.status.entries.is_empty());
+        let body = if !self.loaded {
+            div().flex_1().into_any_element()
+        } else if ready && clean {
+            let unborn = self.repos.iter().all(|repo| repo.status.unborn);
+            div()
                 .flex_1()
                 .flex()
                 .flex_col()
@@ -2054,14 +2731,15 @@ impl Render for CommitPanel {
                 .child(selectable("empty", "No local changes"))
                 .child(div().text_xs().child(selectable(
                     "empty-detail",
-                    if status.unborn {
+                    if unborn {
                         "No commits yet"
                     } else {
                         "Everything is committed"
                     },
                 )))
-                .into_any_element(),
-            State::Ready { .. } => uniform_list(
+                .into_any_element()
+        } else if ready {
+            uniform_list(
                 "commit-rows",
                 self.rows.len(),
                 cx.processor(|this, range: Range<usize>, _, cx| {
@@ -2070,53 +2748,63 @@ impl Render for CommitPanel {
             )
             .flex_1()
             .w_full()
-            .into_any_element(),
-            State::NoRepository => message(
+            .into_any_element()
+        } else if !self.untrusted.is_empty() {
+            div()
+                .flex()
+                .flex_col()
+                .children(self.untrusted.iter().enumerate().map(|(index, path)| {
+                    let trusted = path.clone();
+                    div()
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .text_sm()
+                        .child(selectable(
+                            ("untrusted", index),
+                            format!(
+                                "Git refuses this repository because its folder ({path}) \
+                                 belongs to another user than the one running git. This is \
+                                 common for folders on another drive, shared folders, or \
+                                 folders mounted into WSL."
+                            ),
+                        ))
+                        .child(div().text_color(theme::muted()).child(selectable(
+                            ("untrusted-hint", index),
+                            "Trusting it adds the folder to git's safe.directory list.",
+                        )))
+                        .child(
+                            div()
+                                .id(("trust-repository", index))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(theme::border())
+                                .hover(|style| style.bg(theme::hover_row()))
+                                .cursor_pointer()
+                                .child("Trust This Folder")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.trust(trusted.to_string(), cx)
+                                })),
+                        )
+                }))
+                .into_any_element()
+        } else if !self.errors.is_empty() {
+            let errors: Vec<&str> = self.errors.iter().map(SharedString::as_ref).collect();
+            message(errors.join("\n").into(), theme::error())
+        } else if self.project.is_multi_root() {
+            message(
+                "No folder of this workspace is in a git repository.".into(),
+                theme::muted(),
+            )
+        } else {
+            message(
                 "This project is not in a git repository.".into(),
                 theme::muted(),
-            ),
-            State::Untrusted(path) => {
-                let trusted = path.clone();
-                div()
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .text_sm()
-                    .child(selectable(
-                        "untrusted",
-                        format!(
-                            "Git refuses this repository because its folder ({path}) belongs \
-                             to another user than the one running git. This is common for \
-                             folders on another drive, shared folders, or folders mounted \
-                             into WSL."
-                        ),
-                    ))
-                    .child(div().text_color(theme::muted()).child(selectable(
-                        "untrusted-hint",
-                        "Trusting it adds the folder to git's safe.directory list.",
-                    )))
-                    .child(
-                        div()
-                            .id("trust-repository")
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(theme::border())
-                            .hover(|style| style.bg(theme::hover_row()))
-                            .cursor_pointer()
-                            .child("Trust This Folder")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.trust(trusted.to_string(), cx)
-                            })),
-                    )
-                    .into_any_element()
-            }
-            State::Failed(error) => message(error.clone(), theme::error()),
-            State::Loading => div().flex_1().into_any_element(),
+            )
         };
-        let ready = matches!(self.state, State::Ready { .. });
         let changes = !ready || self.tab == Tab::Changes;
         // Below the shelf (or the error), where there is no commit area.
         let feedback = (!changes || !ready)
@@ -2148,12 +2836,13 @@ impl Render for CommitPanel {
             .when(ready && changes, |panel| {
                 panel.child(self.render_toolbar(cx))
             })
-            .children(self.render_operation(cx))
+            .children(self.render_operations(cx))
+            .children(self.render_problems(cx))
             .when(changes, |panel| {
                 panel.child(div().flex_1().min_h_0().flex().flex_col().child(body))
             })
             .when(!changes, |panel| {
-                panel.child(
+                panel.children(self.render_shelf_repos(cx)).child(
                     div()
                         .flex_1()
                         .min_h_0()
@@ -2173,6 +2862,79 @@ impl Render for CommitPanel {
 /// Re-reading status after file events is cheap but not free; batches
 /// closer together than this share one refresh.
 pub const REFRESH_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Repositories on disk for tests (also the workspace's).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
+    use crate::{
+        project::{Location, Project},
+        workspace_file::Folder,
+    };
+
+    /// Runs git in `dir` (it must succeed); returns its output.
+    pub fn git(dir: &Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        remote::launch::no_window(&mut command);
+        let output = command
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A repository at `dir` with `a.txt` committed on `branch`.
+    pub fn repository(dir: &Path, branch: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", branch]);
+        for (key, value) in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+            ("core.autocrlf", "false"),
+        ] {
+            git(dir, &["config", key, value]);
+        }
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "first"]);
+    }
+
+    /// A fresh temp dir holding repositories `api` (branch `main`) and
+    /// `web` (branch `dev`) and a folder `docs` outside any repository;
+    /// the project's folders are api, web, docs.
+    pub fn three_folders(name: &str) -> (PathBuf, Project) {
+        let dir = std::env::temp_dir().join(format!("next_code_{name}_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        repository(&dir.join("api"), "main");
+        repository(&dir.join("web"), "dev");
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/notes.txt"), "notes\n").unwrap();
+        let folders = ["api", "web", "docs"]
+            .map(|folder| Folder {
+                path: dir.join(folder).to_string_lossy().into_owned(),
+                name: None,
+            })
+            .to_vec();
+        let location = Location::Workspace {
+            distro: None,
+            file: None,
+            folders,
+        };
+        let project = Project::open(&location, &mut |_| {}).unwrap();
+        (dir, project)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2198,7 +2960,7 @@ mod tests {
         assert!(sender.send(Ok(None)).is_ok(), "status read was cancelled");
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert!(matches!(panel.state, State::NoRepository));
+            assert!(panel.loaded && panel.repos.is_empty(), "no repository");
             assert!(!panel.refresh_running);
             assert!(!panel.refresh_requested);
             assert!(panel.refresh_scheduled, "missing follow-up status read");
@@ -2254,6 +3016,7 @@ mod tests {
     fn summary(rows: &[Row], status: &Status) -> Vec<String> {
         rows.iter()
             .map(|row| match row {
+                Row::Repo { count, .. } => format!("repo ({count})"),
                 Row::Group { group, count, .. } => format!("{} ({count})", group.title()),
                 Row::Dir { label, depth, .. } => format!("{}{label}/", "  ".repeat(*depth)),
                 Row::File {
@@ -2425,12 +3188,13 @@ mod tests {
         cx.update(|cx| {
             let requests = requests.clone();
             cx.subscribe(&panel, move |_, event, _| match event {
-                CommitPanelEvent::Shelve { paths, name } => {
+                CommitPanelEvent::Shelve { paths, name, .. } => {
                     requests.borrow_mut().push((paths.clone(), name.clone()))
                 }
                 CommitPanelEvent::Stash {
                     paths,
                     include_untracked,
+                    ..
                 } => requests
                     .borrow_mut()
                     .push((paths.clone(), format!("untracked: {include_untracked}"))),
@@ -2439,17 +3203,17 @@ mod tests {
             .detach();
         });
         panel.update(cx, |panel, cx| {
-            let entries = panel.status().unwrap().entries.clone();
+            let entries = panel.repos[0].status.entries.clone();
             assert_eq!(entries.len(), 4);
-            panel.request_shelve(entries[..2].to_vec(), cx);
-            panel.request_shelve(entries.clone(), cx);
+            panel.request_shelve(0, entries[..2].to_vec(), cx);
+            panel.request_shelve(0, entries.clone(), cx);
             panel.message.update(cx, |message, cx| {
                 message.set_text("Fix login\n\nDetails", cx)
             });
-            panel.request_shelve(entries[..1].to_vec(), cx);
-            panel.request_stash(entries[..1].to_vec(), cx);
-            panel.request_stash(entries[..2].to_vec(), cx);
-            panel.request_shelve(Vec::new(), cx);
+            panel.request_shelve(0, entries[..1].to_vec(), cx);
+            panel.request_stash(0, entries[..1].to_vec(), cx);
+            panel.request_stash(0, entries[..2].to_vec(), cx);
+            panel.request_shelve(0, Vec::new(), cx);
         });
         cx.run_until_parked();
         let strings = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
@@ -2468,6 +3232,148 @@ mod tests {
         );
         panel.read_with(cx, |panel, _| {
             assert!(panel.feedback.is_some(), "an empty selection is reported");
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn folders_group_by_repository_case_insensitively_on_windows_drives() {
+        assert_eq!(
+            repository_key("C:/Work/App/"),
+            repository_key("c:/work/app")
+        );
+        assert_ne!(
+            repository_key("/home/me/App"),
+            repository_key("/home/me/app")
+        );
+        let keys = [
+            Some(repository_key("C:/Work/App")),
+            None,
+            Some(repository_key("/srv/web")),
+            Some(repository_key("c:/work/app")),
+        ];
+        assert_eq!(
+            group_folders(&keys),
+            (
+                vec![vec![0, 3], vec![2]],
+                vec![Some(0), None, Some(1), Some(0)]
+            )
+        );
+    }
+
+    /// `(repository, file)` of each file row, in order.
+    fn file_rows(panel: &CommitPanel) -> Vec<(String, String)> {
+        panel
+            .rows
+            .iter()
+            .filter_map(|(repo, row)| match row {
+                Row::File { entry, .. } => {
+                    let repo = &panel.repos[*repo];
+                    Some((
+                        repo.name().to_owned(),
+                        repo.status.entries[*entry].path.clone(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn each_repository_groups_its_changes_and_commits_on_its_own(cx: &mut gpui::TestAppContext) {
+        use test_support::git;
+        let (dir, project) = test_support::three_folders("commit_repos");
+        let (api, web) = (dir.join("api"), dir.join("web"));
+        std::fs::write(api.join("a.txt"), "a2\n").unwrap();
+        std::fs::write(web.join("w.txt"), "new\n").unwrap();
+        std::fs::write(web.join("a.txt"), "a3\n").unwrap();
+        let panel = cx.new(|cx| CommitPanel::new(project, None, cx));
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            // docs has no repository: skipped, not an error.
+            let names: Vec<&str> = panel.repos.iter().map(Repo::name).collect();
+            assert_eq!(names, ["api", "web"]);
+            assert_eq!(panel.root_repos, [Some(0), Some(1), None]);
+            assert!(panel.errors.is_empty() && panel.untrusted.is_empty());
+            let headers: Vec<usize> = panel
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, row))| matches!(row, Row::Repo { .. }))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(headers.len(), 2);
+            assert_eq!(
+                file_rows(panel),
+                [
+                    ("api".to_owned(), "a.txt".to_owned()),
+                    ("web".to_owned(), "a.txt".to_owned()),
+                    ("web".to_owned(), "w.txt".to_owned()),
+                ]
+            );
+
+            // Files map to their own repository.
+            let (repository, path) = panel.file_in_repository(&web.join("w.txt")).unwrap();
+            assert!(panel.repos[1].is(&repository));
+            assert_eq!(path, "w.txt");
+            assert_eq!(panel.repo_index_for(&dir.join("docs/notes.txt")), None);
+            let fallback = panel
+                .active_repo(Some(&dir.join("docs/notes.txt")))
+                .unwrap();
+            assert_eq!(fallback.name(), "api");
+            assert_eq!(
+                panel.active_repo(Some(&web.join("a.txt"))).unwrap().name(),
+                "web"
+            );
+
+            // A repository's header checks or unchecks its files only.
+            panel.toggle_checked(headers[1], cx);
+            let checked: Vec<usize> = panel.checked_entries().iter().map(|(r, _)| *r).collect();
+            assert_eq!(checked, [0]);
+            assert_eq!(panel.check_state(headers[0]), Check::Checked);
+            assert_eq!(panel.check_state(headers[1]), Check::Unchecked);
+            panel.toggle_checked(headers[1], cx);
+
+            panel
+                .message
+                .update(cx, |message, cx| message.set_text("Both sides", cx));
+            panel.commit(false, cx);
+        });
+        cx.run_until_parked();
+
+        for repo in [&api, &web] {
+            assert_eq!(git(repo, &["log", "-1", "--format=%s"]), "Both sides");
+            assert_eq!(git(repo, &["rev-list", "--count", "HEAD"]), "2");
+            assert_eq!(git(repo, &["status", "--porcelain"]), "");
+        }
+        panel.read_with(cx, |panel, _| {
+            let (feedback, _) = panel.feedback.clone().unwrap();
+            assert!(feedback.contains("api: Committed"), "{feedback}");
+            assert!(feedback.contains("web: Committed"), "{feedback}");
+            assert!(
+                panel
+                    .repos
+                    .iter()
+                    .all(|repo| repo.status.entries.is_empty())
+            );
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    fn a_single_repository_has_no_repository_header(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("next_code_single_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        test_support::repository(&dir, "main");
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        let panel = cx.new(|cx| CommitPanel::new(Project::local(dir.clone()), None, cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let status = &panel.repos[0].status;
+            let rows: Vec<Row> = panel.rows.iter().map(|(_, row)| row.clone()).collect();
+            assert_eq!(summary(&rows, status), ["Changes (1)", "  a.txt M"]);
         });
         std::fs::remove_dir_all(&dir).ok();
     }

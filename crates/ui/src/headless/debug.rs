@@ -206,7 +206,7 @@ impl Session {
         request: &Value,
         cx: &mut Context<Self>,
     ) -> Result<Value, String> {
-        let path = self.project.path(param_str(request, "path")?);
+        let path = self.path(request, param_str(request, "path")?);
         let breakpoints: Vec<Breakpoint> =
             serde_json::from_value(request["breakpoints"].clone())
                 .map_err(|err| format!("invalid `breakpoints`: {err}"))?;

@@ -23,8 +23,13 @@ impl Workspace {
             .on_action(cx.listener(Self::show_file_history))
     }
 
-    /// Shows the Git window and focuses its log.
+    /// Shows the Git window and focuses its log, showing the active
+    /// editor's repository when there are several.
     pub(super) fn show_git_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(repository) = self.active_repository(cx) {
+            self.git_log
+                .update(cx, |log, cx| log.prefer_repository(&repository, cx));
+        }
         self.show_panel(PanelId::GitLog, cx);
         self.git_log.read(cx).focus(window);
     }
@@ -51,26 +56,28 @@ impl Workspace {
         self.show_git_log(window, cx);
     }
 
-    /// The log filtered to the active tab's file.
+    /// The log filtered to the active tab's file (in its repository).
     fn show_file_history(
         &mut self,
         _: &git_commands::ShowFileHistory,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(repository) = self.repository_or_notice(cx) else {
+        if self.repository_or_notice(cx).is_none() {
             return;
-        };
-        let relative = self
+        }
+        let found = self
             .active_tab()
-            .and_then(|tab| self.repository_relative(&repository, &tab.path));
-        let Some(path) = relative else {
+            .and_then(|tab| self.file_in_repository(&tab.path, cx));
+        let Some((repository, path)) = found else {
             self.notice = Some("Open a file to see its history".into());
             cx.notify();
             return;
         };
-        self.git_log
-            .update(cx, |log, cx| log.show_path_history(path, cx));
+        self.git_log.update(cx, |log, cx| {
+            log.select_repository(&repository, cx);
+            log.show_path_history(path, cx)
+        });
         self.show_git_log(window, cx);
     }
 

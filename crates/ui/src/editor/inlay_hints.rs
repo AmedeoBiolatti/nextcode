@@ -54,7 +54,7 @@ impl Editor {
         !self.single_line
             && cx
                 .try_global::<InlayHintsOverride>()
-                .map_or_else(|| theme::inlay_hints(self.language()), |o| o.0)
+                .map_or_else(|| self.inlay_hints_setting(), |o| o.0)
     }
 
     fn serves_inlay_hints(server: &RunningServer) -> bool {

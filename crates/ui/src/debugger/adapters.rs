@@ -2,10 +2,11 @@
 //! launch defaults each adapter needs.
 //!
 //! - Python: debugpy's adapter (`python -m debugpy.adapter`) from the
-//!   project's virtualenv when it has debugpy, else an ephemeral uv
-//!   environment (`uv run --no-project --with debugpy`), else a `python3`
-//!   with debugpy on `PATH`. The program runs with the project's
-//!   interpreter (`python` in the launch arguments), not the adapter's.
+//!   virtualenv of the project folder holding the launch `cwd` when it has
+//!   debugpy, else an ephemeral uv environment (`uv run --no-project
+//!   --with debugpy`), else a `python3` with debugpy on `PATH`. The
+//!   program runs with that folder's interpreter (`python` in the launch
+//!   arguments), not the adapter's.
 //! - LLDB: CodeLLDB (`codelldb`, on `PATH` or downloaded into next_code's
 //!   data directory where the project lives), else `lldb-dap`.
 //! - Custom: the request's command.
@@ -88,6 +89,11 @@ pub fn prepare(
     if configuration.get("cwd").is_none() {
         configuration["cwd"] = root.into();
     }
+    // The folder the program runs in: its virtualenv and tools.
+    let folder = project
+        .root_for(&project.path(configuration["cwd"].as_str().unwrap_or_default()))
+        .path
+        .clone();
     let request_kind = match request.request {
         DebugRequestKind::Launch => "launch",
         DebugRequestKind::Attach => "attach",
@@ -99,13 +105,13 @@ pub fn prepare(
     match &request.adapter {
         DebugAdapterKind::Python => {
             let (program, args, description) =
-                python_adapter(project, settings.adapters.get("python"))?;
+                python_adapter(project, &folder, settings.adapters.get("python"))?;
             configuration["type"] = "debugpy".into();
             set_default(&mut configuration, "console", "internalConsole".into());
             set_default(&mut configuration, "justMyCode", true.into());
             if request.request == DebugRequestKind::Launch
                 && configuration.get("python").is_none()
-                && let Some(python) = program_interpreter(project)?
+                && let Some(python) = program_interpreter(project, &folder)?
             {
                 configuration["python"] = python.into();
             }
@@ -153,7 +159,7 @@ pub fn prepare(
         }
         DebugAdapterKind::Custom { command, args } => {
             let program = project
-                .find_executable(command)?
+                .find_executable_in(command, &folder)?
                 .map(|path| path.to_string_lossy().into_owned())
                 .ok_or_else(|| PrepareError::Missing {
                     message: format!("The debug adapter `{command}` was not found"),
@@ -178,6 +184,7 @@ fn set_default(configuration: &mut Value, key: &str, value: Value) {
 
 fn python_adapter(
     project: &Project,
+    folder: &Path,
     setting: Option<&crate::settings::AdapterCommandSetting>,
 ) -> Result<(String, Vec<String>, String), PrepareError> {
     if let Some(setting) = setting {
@@ -188,7 +195,7 @@ fn python_adapter(
         ));
     }
     let adapter_args = || ["-m", "debugpy.adapter"].map(str::to_owned).to_vec();
-    if let Some(python) = project.python_interpreter()? {
+    if let Some(python) = project.python_interpreter_in(folder)? {
         let python = python.to_string_lossy().into_owned();
         if has_debugpy(project, &python) {
             return Ok((
@@ -198,7 +205,7 @@ fn python_adapter(
             ));
         }
     }
-    if let Some(uv) = project.find_executable("uv")? {
+    if let Some(uv) = project.find_executable_in("uv", folder)? {
         let args = [
             "run",
             "--quiet",
@@ -218,7 +225,7 @@ fn python_adapter(
         ));
     }
     for name in python_names(project) {
-        if let Some(python) = project.find_executable(name)? {
+        if let Some(python) = project.find_executable_in(name, folder)? {
             let python = python.to_string_lossy().into_owned();
             if has_debugpy(project, &python) {
                 return Ok((
@@ -255,14 +262,14 @@ fn has_debugpy(project: &Project, python: &str) -> bool {
         .is_ok_and(|output| output.code == Some(0))
 }
 
-/// The interpreter the program runs with: the project's virtualenv, else
-/// Python on `PATH` (`None`: debugpy uses its own).
-fn program_interpreter(project: &Project) -> Result<Option<String>, PrepareError> {
-    if let Some(python) = project.python_interpreter()? {
+/// The interpreter the program runs with: the virtualenv of its folder,
+/// else Python on `PATH` (`None`: debugpy uses its own).
+fn program_interpreter(project: &Project, folder: &Path) -> Result<Option<String>, PrepareError> {
+    if let Some(python) = project.python_interpreter_in(folder)? {
         return Ok(Some(python.to_string_lossy().into_owned()));
     }
     for name in python_names(project) {
-        if let Some(python) = project.find_executable(name)? {
+        if let Some(python) = project.find_executable_in(name, folder)? {
             return Ok(Some(python.to_string_lossy().into_owned()));
         }
     }

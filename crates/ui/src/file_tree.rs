@@ -8,6 +8,12 @@
 //! Terminal, and drag and drop onto folders (moves; Ctrl copies; Escape
 //! cancels; more than [`CONFIRM_MOVE_OVER`] items ask first).
 //!
+//! A workspace (several folders, or a workspace file) shows one row per
+//! folder, in workspace order, with Add Folder to Workspace… / Remove
+//! Folder from Workspace in its menu; the folders themselves are never
+//! renamed, moved or deleted from here. A plain folder lists its entries
+//! at the top level under a header with its name.
+//!
 //! The tree creates and copies files itself (off the UI thread). Renames,
 //! moves and deletes go to the workspace as [`FileTreeEvent`]s, so open
 //! editors and language servers follow; it reports back through
@@ -23,9 +29,9 @@ use std::{
 
 use gpui::{
     App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    KeyBinding, Modifiers, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy,
-    SharedString, Subscription, UniformListScrollHandle, Window, actions, anchored, deferred, div,
-    point, prelude::*, px, uniform_list,
+    FontWeight, KeyBinding, Modifiers, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel,
+    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, actions, anchored,
+    deferred, div, point, prelude::*, px, uniform_list,
 };
 use worktree::FileKind;
 
@@ -37,6 +43,7 @@ use crate::{
     project::Project,
     selectable::selectable,
     theme,
+    workspace::AddFolderToWorkspace,
 };
 
 const INDENT: f32 = 14.;
@@ -65,6 +72,7 @@ actions!(
         CopyRelativePath,
         RevealInFileManager,
         OpenInTerminal,
+        RemoveFolderFromWorkspace,
         SelectPrevious,
         SelectNext,
         ExtendSelectionUp,
@@ -129,6 +137,8 @@ pub enum FileTreeEvent {
     Delete(Vec<PathBuf>),
     /// Start a terminal in this folder.
     OpenInTerminal(PathBuf),
+    /// Remove the project's folder with this index from the workspace.
+    RemoveFolder(usize),
     /// An operation failed: show this.
     Notice(String),
 }
@@ -151,6 +161,8 @@ struct Row {
     depth: usize,
     /// The name editor of New…, not an entry.
     new_entry: bool,
+    /// A workspace folder's own row.
+    root: bool,
 }
 
 enum EditKind {
@@ -214,7 +226,11 @@ impl Render for DragPreview {
 
 pub struct FileTree {
     project: Project,
-    root_name: SharedString,
+    /// The header: the folder's name, or the workspace's.
+    header: SharedString,
+    /// One row per folder (workspaces), else the folder's entries at the
+    /// top level.
+    root_rows: bool,
     expanded: HashSet<PathBuf>,
     /// Directory listings, read once per directory on first expand.
     children: HashMap<PathBuf, Vec<Entry>>,
@@ -237,16 +253,21 @@ pub struct FileTree {
 
 impl FileTree {
     pub fn new(project: Project, cx: &mut Context<Self>) -> Self {
-        let root = project.root();
-        let root_name = root
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.display().to_string())
-            .into();
+        let root_rows = project.is_multi_root() || project.is_workspace();
+        let header = if root_rows {
+            crate::shell::tab_title(&project.location())
+        } else {
+            let root = project.root();
+            root.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.display().to_string())
+        };
         let mut tree = Self {
-            expanded: HashSet::from([root.to_path_buf()]),
+            // Workspaces start with their first folder open.
+            expanded: HashSet::from([project.root().to_path_buf()]),
             project,
-            root_name,
+            header: header.into(),
+            root_rows,
             children: HashMap::new(),
             rows: Vec::new(),
             selection: Vec::new(),
@@ -320,7 +341,10 @@ impl FileTree {
 
     /// Expands the folders down to `path`, so its row shows.
     fn reveal(&mut self, path: &Path) {
-        let root = self.project.root().to_path_buf();
+        let Some(index) = self.project.root_index_of(path) else {
+            return;
+        };
+        let root = self.project.roots()[index].path.clone();
         let mut dir = path.parent();
         while let Some(current) = dir {
             if !current.starts_with(&root) {
@@ -409,10 +433,11 @@ impl FileTree {
         self.expect_changes(paths.iter().cloned());
         for path in paths {
             // Every new folder on the way (`a/b/c.py`) needs its listing read.
+            let root = self.project.root_for(path).path.clone();
             let mut current = path.as_path();
             while let Some(parent) = current.parent() {
                 self.children.remove(parent);
-                if parent == self.project.root() || !parent.starts_with(self.project.root()) {
+                if parent == root || !parent.starts_with(&root) {
                     break;
                 }
                 current = parent;
@@ -428,15 +453,39 @@ impl FileTree {
 
     fn rebuild_rows(&mut self) {
         self.rows.clear();
-        let root = self.project.root().to_path_buf();
-        push_rows(
-            &self.project,
-            &mut self.children,
-            &self.expanded,
-            &root,
-            0,
-            &mut self.rows,
-        );
+        if self.root_rows {
+            for root in self.project.roots() {
+                self.rows.push(Row {
+                    path: root.path.clone(),
+                    name: root.name.clone().into(),
+                    is_dir: true,
+                    package: false,
+                    depth: 0,
+                    new_entry: false,
+                    root: true,
+                });
+                if self.expanded.contains(&root.path) {
+                    push_rows(
+                        &self.project,
+                        &mut self.children,
+                        &self.expanded,
+                        &root.path,
+                        1,
+                        &mut self.rows,
+                    );
+                }
+            }
+        } else {
+            let root = self.project.root().to_path_buf();
+            push_rows(
+                &self.project,
+                &mut self.children,
+                &self.expanded,
+                &root,
+                0,
+                &mut self.rows,
+            );
+        }
         if let Some(Editing {
             kind: EditKind::New { dir, kind },
             ..
@@ -460,6 +509,7 @@ impl FileTree {
                     package: *kind == NewKind::PythonPackage,
                     depth,
                     new_entry: true,
+                    root: false,
                 },
             );
         }
@@ -494,8 +544,14 @@ impl FileTree {
     fn is_dir(&self, path: &Path) -> bool {
         match self.row_index(path) {
             Some(index) => self.rows[index].is_dir,
-            None => path == self.project.root(),
+            None => self.is_root(path),
         }
+    }
+
+    /// Whether `path` is one of the project's folders: never renamed,
+    /// moved or deleted from the tree.
+    fn is_root(&self, path: &Path) -> bool {
+        self.project.roots().iter().any(|root| root.path == path)
     }
 
     /// Where New…/Paste/Open in Terminal act: the folder of `target` (a
@@ -533,6 +589,16 @@ impl FileTree {
             && let Some(target) = self.target()
         {
             subjects.push(target);
+        }
+        subjects
+    }
+
+    /// The subjects for Cut, Rename, Duplicate and Delete: none when they
+    /// include a project folder.
+    fn movable_subjects(&self) -> Vec<PathBuf> {
+        let subjects = self.subjects();
+        if subjects.iter().any(|path| self.is_root(path)) {
+            return Vec::new();
         }
         subjects
     }
@@ -845,9 +911,7 @@ impl FileTree {
     fn start_new(&mut self, kind: NewKind, window: &mut Window, cx: &mut Context<Self>) {
         let dir = self.folder_of(self.target().as_deref());
         self.menu = None;
-        if dir != self.project.root() {
-            self.reveal(&self.project.join(&dir, "x"));
-        }
+        self.reveal(&self.project.join(&dir, "x"));
         self.start_editing(EditKind::New { dir, kind }, "", window, cx);
     }
 
@@ -873,7 +937,7 @@ impl FileTree {
     }
 
     fn rename(&mut self, _: &Rename, window: &mut Window, cx: &mut Context<Self>) {
-        let subjects = self.subjects();
+        let subjects = self.movable_subjects();
         self.menu = None;
         let [path] = subjects.as_slice() else {
             cx.notify();
@@ -1086,7 +1150,7 @@ impl FileTree {
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
-        let subjects = self.subjects();
+        let subjects = self.movable_subjects();
         self.menu = None;
         if !subjects.is_empty() {
             cx.emit(FileTreeEvent::Delete(subjects));
@@ -1095,7 +1159,10 @@ impl FileTree {
     }
 
     fn set_clipboard(&mut self, mode: ClipboardMode, cx: &mut Context<Self>) {
-        let subjects = self.subjects();
+        let subjects = match mode {
+            ClipboardMode::Cut => self.movable_subjects(),
+            ClipboardMode::Copy => self.subjects(),
+        };
         self.menu = None;
         if !subjects.is_empty() {
             // The paths as text too, for pasting into a terminal or a chat.
@@ -1153,7 +1220,7 @@ impl FileTree {
     }
 
     fn duplicate(&mut self, _: &Duplicate, _: &mut Window, cx: &mut Context<Self>) {
-        let subjects = self.subjects();
+        let subjects = self.movable_subjects();
         self.menu = None;
         cx.notify();
         if subjects.is_empty() {
@@ -1179,13 +1246,16 @@ impl FileTree {
         if subjects.is_empty() {
             return;
         }
-        let root = self.project.root();
+        // Relative to the path's own folder (`.` for the folder itself).
         let text = subjects
             .iter()
-            .map(|path| match path.strip_prefix(root) {
-                Ok(rest) if relative => rest.display().to_string(),
-                _ => path.display().to_string(),
-            })
+            .map(
+                |path| match path.strip_prefix(&self.project.root_for(path).path) {
+                    Ok(rest) if relative && rest.as_os_str().is_empty() => ".".to_owned(),
+                    Ok(rest) if relative => rest.display().to_string(),
+                    _ => path.display().to_string(),
+                },
+            )
             .collect::<Vec<_>>()
             .join("\n");
         cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -1227,6 +1297,30 @@ impl FileTree {
         cx.emit(FileTreeEvent::OpenInTerminal(dir));
     }
 
+    /// A folder row's Remove Folder from Workspace (the workspace reopens
+    /// without it).
+    fn remove_folder_from_workspace(
+        &mut self,
+        _: &RemoveFolderFromWorkspace,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.target();
+        self.menu = None;
+        cx.notify();
+        let index = target.and_then(|path| {
+            self.project
+                .roots()
+                .iter()
+                .position(|root| root.path == path)
+        });
+        if self.root_rows
+            && let Some(index) = index
+        {
+            cx.emit(FileTreeEvent::RemoveFolder(index));
+        }
+    }
+
     /// Dragged entries dropped on `dir`: moved there (Ctrl: copied). More
     /// than [`CONFIRM_MOVE_OVER`] items ask first; dropping a folder into
     /// itself does nothing.
@@ -1255,12 +1349,12 @@ impl FileTree {
             }
             return;
         }
-        let name = if dir == self.project.root() {
-            self.root_name.to_string()
-        } else {
-            dir.file_name()
+        let name = match self.project.roots().iter().find(|root| root.path == dir) {
+            Some(root) => root.name.clone(),
+            None => dir
+                .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default()
+                .unwrap_or_default(),
         };
         let answer = window.prompt(
             PromptLevel::Info,
@@ -1327,6 +1421,8 @@ impl FileTree {
         let subjects = self.subjects();
         let single = subjects.len() == 1;
         let any = !subjects.is_empty();
+        // Folders of the project are never moved, renamed or deleted here.
+        let movable = any && !subjects.iter().any(|path| self.is_root(path));
         let paste = self.clipboard.is_some();
         let reveal_label = if cfg!(windows) {
             "Reveal in File Explorer"
@@ -1344,22 +1440,43 @@ impl FileTree {
         if !menu.new_only {
             items.extend([
                 None,
-                Some(("Cut", Box::new(Cut) as Box<dyn gpui::Action>, any)),
+                Some(("Cut", Box::new(Cut) as Box<dyn gpui::Action>, movable)),
                 Some(("Copy", Box::new(Copy), any)),
                 Some(("Paste", Box::new(Paste), paste)),
-                Some(("Duplicate", Box::new(Duplicate), any)),
+                Some(("Duplicate", Box::new(Duplicate), movable)),
                 None,
                 Some(("Copy Path", Box::new(CopyPath), any)),
                 Some(("Copy Relative Path", Box::new(CopyRelativePath), any)),
                 None,
-                Some(("Rename…", Box::new(Rename), single)),
-                Some(("Delete…", Box::new(Delete), any)),
+                Some(("Rename…", Box::new(Rename), single && movable)),
+                Some(("Delete…", Box::new(Delete), movable)),
                 None,
             ]);
             if !self.project.is_remote() {
                 items.push(Some((reveal_label, Box::new(RevealInFileManager), true)));
             }
             items.push(Some(("Open in Terminal", Box::new(OpenInTerminal), true)));
+            if self.root_rows
+                && menu
+                    .target
+                    .as_deref()
+                    .is_some_and(|path| self.is_root(path))
+            {
+                items.extend([
+                    None,
+                    Some((
+                        "Add Folder to Workspace…",
+                        Box::new(AddFolderToWorkspace) as Box<dyn gpui::Action>,
+                        true,
+                    )),
+                    // The workspace refuses to remove its last folder.
+                    Some((
+                        "Remove Folder from Workspace",
+                        Box::new(RemoveFolderFromWorkspace),
+                        self.project.roots().len() > 1,
+                    )),
+                ]);
+            }
         }
         items
     }
@@ -1478,6 +1595,7 @@ fn push_rows(
             package: entry.package,
             depth,
             new_entry: false,
+            root: false,
         });
         if recurse {
             let path = entry.path.clone();
@@ -1496,10 +1614,14 @@ impl Render for FileTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tree = cx.entity_id();
         let root = self.project.root().to_path_buf();
+        // Workspaces take drops on folder rows only: empty space belongs
+        // to no folder.
+        let drops_on_root = !self.root_rows;
         let accepts = move |value: &dyn Any, _: &mut Window, _: &mut App| {
-            value
-                .downcast_ref::<DraggedPaths>()
-                .is_some_and(|dragged| dragged.tree == tree)
+            drops_on_root
+                && value
+                    .downcast_ref::<DraggedPaths>()
+                    .is_some_and(|dragged| dragged.tree == tree)
         };
         let root_drop = root.clone();
         let header_drop = root.clone();
@@ -1521,6 +1643,7 @@ impl Render for FileTree {
             .on_action(cx.listener(Self::copy_relative_path))
             .on_action(cx.listener(Self::reveal_in_file_manager))
             .on_action(cx.listener(Self::open_in_terminal))
+            .on_action(cx.listener(Self::remove_folder_from_workspace))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::extend_up))
@@ -1557,7 +1680,7 @@ impl Render for FileTree {
                     .py_2()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(self.root_name.to_uppercase())
+                    .child(self.header.to_uppercase())
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -1674,14 +1797,18 @@ impl FileTree {
                 .unwrap_or(self.project.root())
                 .to_path_buf()
         };
+        // Folders of the project stay where they are.
         let dragged = DraggedPaths {
             tree,
             paths: if selected {
-                self.subjects_in_order()
+                let mut paths = self.subjects_in_order();
+                paths.retain(|path| !self.is_root(path));
+                paths
             } else {
                 vec![row.path.clone()]
             },
         };
+        let draggable = !row.root;
         let path = row.path.clone();
         let name = row.name.clone();
         div()
@@ -1718,7 +1845,13 @@ impl FileTree {
             .child(icon)
             .map(|element| match renaming {
                 Some(editing) => element.child(self.render_input(editing)),
-                None => element.child(div().min_w_0().truncate().child(row.name.clone())),
+                None => element.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .when(row.root, |name| name.font_weight(FontWeight::SEMIBOLD))
+                        .child(row.name.clone()),
+                ),
             })
             .when(renaming.is_none(), |element| {
                 element
@@ -1733,16 +1866,18 @@ impl FileTree {
                             this.open_menu(Some(path.clone()), event.position, window, cx);
                         }),
                     )
-                    .on_drag(dragged, |dragged: &DraggedPaths, _, _, cx| {
-                        let label = match dragged.paths.as_slice() {
-                            [path] => path
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                            paths => format!("{} items", paths.len()),
-                        };
-                        cx.new(|_| DragPreview {
-                            label: label.into(),
+                    .when(draggable, |element| {
+                        element.on_drag(dragged, |dragged: &DraggedPaths, _, _, cx| {
+                            let label = match dragged.paths.as_slice() {
+                                [path] => path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                                paths => format!("{} items", paths.len()),
+                            };
+                            cx.new(|_| DragPreview {
+                                label: label.into(),
+                            })
                         })
                     })
             })
@@ -1795,7 +1930,7 @@ mod tests {
         root
     }
 
-    /// A focused tree in a window, and the events it emitted.
+    /// A focused tree over a local folder in a window, and its events.
     fn open_tree<'a>(
         root: &Path,
         cx: &'a mut TestAppContext,
@@ -1804,11 +1939,38 @@ mod tests {
         &'a mut VisualTestContext,
         std::rc::Rc<std::cell::RefCell<Vec<FileTreeEvent>>>,
     ) {
+        open_project_tree(Project::local(root.to_path_buf()), cx)
+    }
+
+    /// A local workspace of `(folder, name)`s, without a file.
+    fn workspace(folders: &[(&Path, &str)]) -> Project {
+        let location = crate::project::Location::Workspace {
+            distro: None,
+            file: None,
+            folders: folders
+                .iter()
+                .map(|(path, name)| crate::workspace_file::Folder {
+                    path: path.to_string_lossy().into_owned(),
+                    name: Some((*name).to_owned()),
+                })
+                .collect(),
+        };
+        Project::open(&location, &mut |_| {}).unwrap()
+    }
+
+    /// A focused tree in a window, and the events it emitted.
+    fn open_project_tree(
+        project: Project,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<FileTree>,
+        &mut VisualTestContext,
+        std::rc::Rc<std::cell::RefCell<Vec<FileTreeEvent>>>,
+    ) {
         cx.update(|cx| {
             crate::editor::bind_keys(cx);
             bind_keys(cx);
         });
-        let project = Project::local(root.to_path_buf());
         let (tree, cx) = cx.add_window_view(|_, cx| FileTree::new(project, cx));
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let sink = events.clone();
@@ -2073,5 +2235,176 @@ mod tests {
         assert_eq!(names(&tree, cx), ["docs", "src", "a.py", "b.py"]);
         assert_eq!(selection(&tree, cx), ["docs"]);
         fs::remove_dir_all(&root).ok();
+    }
+
+    fn clipboard(cx: &mut VisualTestContext) -> Option<String> {
+        cx.read_from_clipboard().and_then(|item| item.text())
+    }
+
+    #[gpui::test]
+    fn workspace_shows_a_row_per_folder_and_reveals_into_the_second(cx: &mut TestAppContext) {
+        let api = project_dir("ws-api");
+        let web = project_dir("ws-web");
+        let (tree, cx, events) = open_project_tree(workspace(&[(&api, "api"), (&web, "web")]), cx);
+        // The first folder starts open; same-named folders stay apart.
+        assert_eq!(
+            names(&tree, cx),
+            ["api", "  src", "  a.py", "  b.py", "web"]
+        );
+        assert_eq!(
+            tree.read_with(cx, |tree, _| tree.header.clone()),
+            "api, web"
+        );
+
+        let main = web.join("src").join("main.py");
+        tree.update(cx, |tree, cx| {
+            tree.reveal(&main);
+            tree.rebuild_rows();
+            tree.select(&main, cx);
+        });
+        assert_eq!(
+            names(&tree, cx),
+            [
+                "api",
+                "  src",
+                "  a.py",
+                "  b.py",
+                "web",
+                "  src",
+                "    main.py",
+                "  a.py",
+                "  b.py"
+            ]
+        );
+
+        // Relative paths are relative to the file's own folder.
+        tree.update(cx, |tree, cx| tree.copy_paths(true, cx));
+        assert_eq!(
+            clipboard(cx),
+            Some(Path::new("src").join("main.py").display().to_string())
+        );
+
+        // Left climbs to the folder row, which is never renamed or deleted.
+        cx.simulate_keystrokes("left left left");
+        assert_eq!(
+            tree.read_with(cx, |tree, _| tree.selection.clone()),
+            std::slice::from_ref(&web)
+        );
+        assert_eq!(
+            names(&tree, cx),
+            [
+                "api", "  src", "  a.py", "  b.py", "web", "  src", "  a.py", "  b.py"
+            ]
+        );
+        cx.simulate_keystrokes("f2 delete ctrl-x ctrl-d");
+        cx.run_until_parked();
+        assert!(tree.read_with(cx, |tree, _| tree.editing.is_none()
+            && tree.clipboard.is_none()));
+        assert!(events.borrow().is_empty());
+        tree.update(cx, |tree, cx| tree.copy_paths(true, cx));
+        assert_eq!(clipboard(cx).as_deref(), Some("."));
+        fs::remove_dir_all(&api).ok();
+        fs::remove_dir_all(&web).ok();
+    }
+
+    #[gpui::test]
+    fn new_entries_in_the_second_folder_land_there(cx: &mut TestAppContext) {
+        let api = project_dir("ws-new-api");
+        let web = project_dir("ws-new-web");
+        let (tree, cx, events) = open_project_tree(workspace(&[(&api, "api"), (&web, "web")]), cx);
+        // A file selected in the second folder: New File goes next to it.
+        tree.update(cx, |tree, cx| {
+            tree.click_row(4, Modifiers::none(), 1, cx);
+            let a = tree.row_index(&web.join("a.py")).unwrap();
+            tree.click_row(a, Modifiers::none(), 1, cx);
+        });
+        events.borrow_mut().clear();
+        tree.update_in(cx, |tree, window, cx| tree.new_file(&NewFile, window, cx));
+        cx.simulate_input("new.py");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(web.join("new.py").is_file());
+        assert!(!api.join("new.py").exists());
+        assert_eq!(
+            *events.borrow(),
+            [FileTreeEvent::Created(web.join("new.py"))]
+        );
+
+        // The folder row's menu: New Folder goes into that folder.
+        tree.update_in(cx, |tree, window, cx| {
+            tree.open_menu(Some(web.clone()), point(px(0.), px(0.)), window, cx);
+            tree.new_folder(&NewFolder, window, cx);
+        });
+        assert_eq!(names(&tree, cx)[4..6], ["web", "  <new>"]);
+        cx.simulate_input("docs");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(web.join("docs").is_dir());
+        assert!(!api.join("docs").exists());
+        fs::remove_dir_all(&api).ok();
+        fs::remove_dir_all(&web).ok();
+    }
+
+    #[gpui::test]
+    fn folder_rows_offer_workspace_items_and_take_drops_from_other_folders(
+        cx: &mut TestAppContext,
+    ) {
+        let api = project_dir("ws-menu-api");
+        let web = project_dir("ws-menu-web");
+        fs::write(api.join("only.py"), "").unwrap();
+        let (tree, cx, events) = open_project_tree(workspace(&[(&api, "api"), (&web, "web")]), cx);
+        let items = |tree: &Entity<FileTree>, cx: &mut VisualTestContext| {
+            tree.read_with(cx, |tree, _| {
+                tree.menu_items()
+                    .into_iter()
+                    .flatten()
+                    .map(|(label, _, enabled)| (label, enabled))
+                    .collect::<Vec<_>>()
+            })
+        };
+        tree.update_in(cx, |tree, window, cx| {
+            tree.open_menu(Some(web.clone()), point(px(0.), px(0.)), window, cx)
+        });
+        let folder_items = items(&tree, cx);
+        for item in [
+            ("Cut", false),
+            ("Copy", true),
+            ("Rename…", false),
+            ("Delete…", false),
+            ("Add Folder to Workspace…", true),
+            ("Remove Folder from Workspace", true),
+        ] {
+            assert!(folder_items.contains(&item), "{item:?} in {folder_items:?}");
+        }
+        tree.update_in(cx, |tree, window, cx| {
+            tree.remove_folder_from_workspace(&RemoveFolderFromWorkspace, window, cx)
+        });
+        assert_eq!(*events.borrow(), [FileTreeEvent::RemoveFolder(1)]);
+
+        // A file's menu has no workspace items.
+        tree.update_in(cx, |tree, window, cx| {
+            tree.open_menu(Some(api.join("a.py")), point(px(0.), px(0.)), window, cx)
+        });
+        assert!(
+            !items(&tree, cx)
+                .iter()
+                .any(|(label, _)| label.contains("Workspace"))
+        );
+
+        // Dropped on another folder's row: moved there.
+        events.borrow_mut().clear();
+        tree.update_in(cx, |tree, window, cx| {
+            tree.menu = None;
+            tree.drop_paths(vec![api.join("only.py")], web.clone(), window, cx)
+        });
+        assert_eq!(
+            *events.borrow(),
+            [FileTreeEvent::Move(vec![(
+                api.join("only.py"),
+                web.join("only.py")
+            )])]
+        );
+        fs::remove_dir_all(&api).ok();
+        fs::remove_dir_all(&web).ok();
     }
 }

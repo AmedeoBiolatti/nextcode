@@ -355,6 +355,52 @@ impl TestTree {
         }
     }
 
+    /// Adds `other` (one folder's tests in a multi-root workspace) under a
+    /// new top-level `Folder` node `id`/`label`, prefixing its nodes' ids
+    /// with `prefix` and mapping their file paths with `path`. The folder
+    /// node's run spec is a placeholder: such trees are run per folder,
+    /// planning with each folder's own tree.
+    pub fn graft(
+        &mut self,
+        id: &str,
+        label: &str,
+        prefix: &str,
+        other: &TestTree,
+        path: impl Fn(&Node, &str) -> String,
+    ) {
+        let tool = other
+            .roots
+            .first()
+            .map_or(Tool::Pytest, |&root| other.nodes[root].tool);
+        let folder = self.add(
+            None,
+            Self::node(
+                id.to_owned(),
+                label.to_owned(),
+                NodeKind::Folder,
+                tool,
+                RunSpec::Pytest {
+                    target: String::new(),
+                },
+            ),
+        );
+        // Parents come before their children, children in index order.
+        let mut placed = Vec::with_capacity(other.nodes.len());
+        for node in &other.nodes {
+            let parent = node.parent.map_or(folder, |parent| placed[parent]);
+            let index = self.add(
+                Some(parent),
+                Node {
+                    id: format!("{prefix}{}", node.id),
+                    children: Vec::new(),
+                    path: node.path.as_deref().map(|file| path(node, file)),
+                    ..node.clone()
+                },
+            );
+            placed.push(index);
+        }
+    }
+
     /// The tests (leaves) under `index`, itself included.
     pub fn leaves(&self, index: usize) -> Vec<usize> {
         let mut out = Vec::new();
@@ -948,5 +994,41 @@ mod tests {
         let all = tree.plan(&pick(&["cargo", "demo/lib::top"]));
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].1.len(), 5);
+    }
+
+    #[test]
+    fn grafted_folders_keep_their_shape_under_prefixed_ids() {
+        let folder = pytest_tree();
+        let mut tree = TestTree::default();
+        tree.graft("api", "api", "api › ", &folder, |_, file| {
+            format!("/w/api/{file}")
+        });
+        tree.graft("web", "web", "web › ", &folder, |_, file| {
+            format!("/w/web/{file}")
+        });
+        assert_eq!(tree.roots.len(), 2);
+        let shown = labels(&tree);
+        assert_eq!(shown[0], "api");
+        let inner: Vec<String> = labels(&folder)
+            .into_iter()
+            .map(|label| format!("  {label}"))
+            .collect();
+        assert_eq!(shown[1..=folder.nodes.len()], inner[..]);
+        let test = tree.get("web › tests/test_a.py::test_pass").unwrap();
+        let node = &tree.nodes[test];
+        assert_eq!(node.path.as_deref(), Some("/w/web/tests/test_a.py"));
+        // The run spec stays the folder's own.
+        assert_eq!(
+            node.run,
+            RunSpec::Pytest {
+                target: "tests/test_a.py::test_pass".into()
+            }
+        );
+        assert_eq!(tree.nodes[tree.roots[1]].id, "web");
+        assert!(tree.get("tests/test_a.py::test_pass").is_none());
+        assert_eq!(
+            tree.leaves(tree.roots[0]).len(),
+            folder.leaves(folder.roots[0]).len()
+        );
     }
 }

@@ -53,6 +53,7 @@ mod debug;
 mod docks;
 mod edits;
 mod files;
+mod folders;
 mod git_flows;
 mod git_gutter;
 mod log_window;
@@ -75,7 +76,9 @@ actions!(
         GoForward,
         SaveAll,
         NewTerminal,
-        ReopenInContainer
+        ReopenInContainer,
+        AddFolderToWorkspace,
+        SaveWorkspaceAs
     ]
 );
 
@@ -318,6 +321,10 @@ pub enum WorkspaceEvent {
     /// Show this project another way (inside its dev container): open
     /// that, and close this one unless it has unsaved edits.
     ReplaceWith(project::Location),
+    /// The same project with other folders (added, removed, or saved as a
+    /// workspace file): open it in this tab instead. Its session was
+    /// saved for it.
+    Reopen(project::Location),
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -331,7 +338,6 @@ impl Workspace {
     ) -> Self {
         crate::startup::mark("workspace start");
         window.on_next_frame(|_, _| crate::startup::mark("first frame"));
-        let root = project.root().to_path_buf();
         let file_tree = cx.new(|cx| FileTree::new(project.clone(), cx));
         let tree_subscription = cx.subscribe_in(
             &file_tree,
@@ -352,7 +358,7 @@ impl Workspace {
         let lsp_subscription = cx.subscribe(&lsp_store, |this, _, event, cx| {
             this.on_lsp_event(event, cx);
         });
-        let problems = cx.new(|cx| ProblemsPanel::new(root.clone(), lsp_store.clone(), cx));
+        let problems = cx.new(|cx| ProblemsPanel::new(project.clone(), lsp_store.clone(), cx));
         let terminal = cx.new(|cx| TerminalPanel::new(project.clone(), cx));
         let search = cx.new(|cx| SearchPanel::new(project.clone(), cx));
         let workspace = cx.entity().downgrade();
@@ -375,11 +381,22 @@ impl Workspace {
                     this.open_push_dialog(repository.clone(), window, cx)
                 }
                 CommitPanelEvent::Stash {
+                    repository,
                     paths,
                     include_untracked,
-                } => this.stash_dialog(Some(paths.clone()), *include_untracked, window, cx),
-                CommitPanelEvent::Shelve { paths, name } => {
-                    this.shelve_dialog(paths.clone(), name.clone(), window, cx)
+                } => this.stash_dialog(
+                    repository.clone(),
+                    Some(paths.clone()),
+                    *include_untracked,
+                    window,
+                    cx,
+                ),
+                CommitPanelEvent::Shelve {
+                    repository,
+                    paths,
+                    name,
+                } => {
+                    this.shelve_dialog(repository.clone(), paths.clone(), name.clone(), window, cx)
                 }
                 CommitPanelEvent::Refreshed => {
                     this.reload_diffs(cx);
@@ -524,6 +541,7 @@ impl Workspace {
         })
         .detach();
         recent::record(&project.location());
+        cx.defer_in(window, |this, _, cx| this.load_folder_settings(cx));
         // The session is written when the project closes (its tab or
         // window, or the app quits) and restored once the workspace exists.
         let release_subscription = cx.on_release(|this, cx| {
@@ -667,6 +685,18 @@ impl Workspace {
                 .update(cx, |log, cx| log.repository_changed(cx));
         }
         self.run_files_changed(&batch, cx);
+        // An edited `.next_code/words.txt` (project dictionary).
+        crate::editor::spell::files_changed(
+            batch.events.iter().map(|event| event.path.as_path()),
+            batch.rescan,
+            cx,
+        );
+        if self
+            .project
+            .folder_settings_changed(batch.events.iter().map(|event| event.path.as_path()))
+        {
+            self.load_folder_settings(cx);
+        }
 
         // One view per file: views of a file share its buffer.
         let mut seen = HashSet::new();
@@ -1001,26 +1031,30 @@ impl Workspace {
 
     fn on_lsp_event(&mut self, event: &LspStoreEvent, cx: &mut Context<Self>) {
         match event {
-            &LspStoreEvent::ServerStarted(language) => {
-                let Some(server) = self
-                    .lsp_store
-                    .update(cx, |store, cx| store.server(language, cx))
-                else {
-                    return;
-                };
-                for editor in self.editors_for(language, true, cx) {
-                    editor.update(cx, |editor, cx| editor.attach_server(server.clone(), cx));
-                }
-            }
+            &LspStoreEvent::ServerStarted(language, _) => self.attach_servers(language, cx),
             &LspStoreEvent::ServerStopped(language) => {
                 for editor in self.editors_for(language, true, cx) {
-                    editor.update(cx, |editor, _| editor.detach_server(false));
+                    let exited = editor
+                        .read(cx)
+                        .server()
+                        .is_some_and(|server| server.connection.has_exited());
+                    if exited {
+                        editor.update(cx, |editor, _| editor.detach_server(false));
+                    }
                 }
             }
             &LspStoreEvent::StatusChanged(language) => {
-                let status = self.lsp_status(language, cx);
+                // A folder whose first server failed to start tries its own.
+                if self.project.is_multi_root() {
+                    self.attach_servers(language, cx);
+                }
                 for editor in self.editors_for(language, false, cx) {
-                    editor.update(cx, |editor, cx| editor.set_lsp_status(status.clone(), cx));
+                    let status = editor
+                        .read(cx)
+                        .buffer()
+                        .path()
+                        .and_then(|path| self.lsp_status(language, path, cx));
+                    editor.update(cx, |editor, cx| editor.set_lsp_status(status, cx));
                 }
             }
             LspStoreEvent::DiagnosticsUpdated(path) => self.refresh_diagnostics(path, cx),
@@ -1066,9 +1100,31 @@ impl Workspace {
             .collect()
     }
 
-    /// Status-bar text and color for `language`'s server.
-    fn lsp_status(&self, language: Language, cx: &App) -> Option<(SharedString, fn() -> Hsla)> {
-        let (name, status) = self.lsp_store.read(cx).status(language)?;
+    /// Opens the documents of `language` on the server serving each (one
+    /// per folder when a multi-root project's server cannot serve them
+    /// all), starting it if needed.
+    fn attach_servers(&mut self, language: Language, cx: &mut Context<Self>) {
+        for editor in self.editors_for(language, true, cx) {
+            let Some(path) = editor.read(cx).buffer().path().map(Path::to_path_buf) else {
+                continue;
+            };
+            let server = self
+                .lsp_store
+                .update(cx, |store, cx| store.server(language, &path, cx));
+            if let Some(server) = server {
+                editor.update(cx, |editor, cx| editor.attach_server(server, cx));
+            }
+        }
+    }
+
+    /// Status-bar text and color for the `language` server serving `path`.
+    fn lsp_status(
+        &self,
+        language: Language,
+        path: &Path,
+        cx: &App,
+    ) -> Option<(SharedString, fn() -> Hsla)> {
+        let (name, status) = self.lsp_store.read(cx).status(language, path)?;
         Some(match status {
             ServerStatus::Starting => (format!("{name}: starting…").into(), theme::muted),
             ServerStatus::Ready => (name, theme::muted),
@@ -1182,6 +1238,21 @@ impl Workspace {
                     | EditorEvent::ShowCommit(_) => {
                         this.on_editor_git_event(editor, event, window, cx)
                     }
+                    EditorEvent::Spelling(problems) => {
+                        if let Some(path) = editor.read(cx).buffer().path().map(Path::to_path_buf) {
+                            this.problems
+                                .update(cx, |panel, cx| panel.set_spelling(&path, problems, cx));
+                        }
+                    }
+                    EditorEvent::Close { discard } => {
+                        if let Some((pane, index)) = this.find_view(editor.entity_id()) {
+                            if *discard {
+                                this.remove_tab(pane, index, window, cx);
+                            } else {
+                                this.close_tab(pane, index, window, cx);
+                            }
+                        }
+                    }
                 },
             );
         if let Some(language) = editor.read(cx).language() {
@@ -1190,9 +1261,9 @@ impl Workspace {
                 Some(_) => None,
                 None => self
                     .lsp_store
-                    .update(cx, |store, cx| store.server(language, cx)),
+                    .update(cx, |store, cx| store.server(language, path, cx)),
             };
-            let status = self.lsp_status(language, cx);
+            let status = self.lsp_status(language, path, cx);
             editor.update(cx, |editor, cx| {
                 if let Some(server) = server {
                     editor.attach_server(server, cx);
@@ -1447,13 +1518,16 @@ impl Workspace {
 
     fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
         self.show_panel(PanelId::Terminal, cx);
-        self.terminal
-            .update(cx, |terminal, cx| terminal.new_terminal(window, cx));
+        let near = self.active_tab().map(|tab| tab.path.clone());
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.new_terminal(near.as_deref(), window, cx)
+        });
     }
 
-    /// The project's repository, or a notice saying there is none (yet).
+    /// The repository git commands act on (the active editor's file's,
+    /// else the first one), or a notice saying there is none (yet).
     fn repository_or_notice(&mut self, cx: &mut Context<Self>) -> Option<git::Repository> {
-        let repository = self.commit.read(cx).repository();
+        let repository = self.active_repository(cx);
         if repository.is_none() {
             self.notice = Some("No git repository here (or its status is still loading)".into());
             cx.notify();
@@ -1757,6 +1831,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_all))
             .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(Self::reopen_in_container))
+            .on_action(cx.listener(Self::add_folder_to_workspace))
+            .on_action(cx.listener(Self::save_workspace_as))
             .on_action(cx.listener(Self::git_branches))
             .on_action(cx.listener(Self::git_worktrees))
             .on_action(cx.listener(Self::git_compare))
