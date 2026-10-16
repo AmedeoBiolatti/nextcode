@@ -1792,3 +1792,221 @@ fn headless_mode_forwards_dev_container_ports() {
     drop(containers);
     fs::remove_dir_all(&root).ok();
 }
+
+/// The next `workflow_event` about step `step` reaching `status`.
+fn step_event(headless: &mut Headless, step: &str, status: &str) -> Value {
+    headless.next(|line| {
+        line["event"] == "workflow_event"
+            && line["type"] == "step"
+            && line["step"] == step
+            && (line["status"] == status || line["status"] == "failed")
+    })
+}
+
+/// A workflow over two local projects: a check on this machine, a server
+/// in the other project (output readiness, a printed URL), a manual gate,
+/// a port readiness, and a last step in the headless project; then
+/// status, Stop All, and a check failing with `onFail` until Retry.
+#[test]
+fn headless_mode_runs_a_workflow_across_projects() {
+    let root = std::env::temp_dir().join(format!("next_code_workflow_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    for dir in ["main/.next_code/workflows", "other", "config"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let root = root.canonicalize().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let flag = root.join("vpn-up");
+    // `echo`, `sleep`, `exit` and `''` read the same in sh and PowerShell.
+    let vpn_check = if cfg!(windows) {
+        format!(
+            "if (Test-Path {}) {{ exit 0 }} else {{ exit 1 }}",
+            flag.display()
+        )
+    } else {
+        format!("test -e '{}'", flag.display())
+    };
+    let workflow = json!({
+        "name": "Dev environment",
+        "steps": [
+            { "id": "check", "check": "exit 0" },
+            { "id": "vpn", "check": vpn_check, "onFail": "Connect the VPN" },
+            {
+                "id": "server", "title": "Server", "needs": ["check"],
+                "project": { "local": root.join("other") },
+                "run": "echo http://localhost:1234/login; echo serv''ing; sleep 60",
+                "ready": { "output": "serving" },
+                "openUrls": true
+            },
+            { "id": "gate", "needs": ["server"], "ready": { "manual": "Log in" } },
+            { "id": "port", "needs": ["gate"], "ready": { "port": port } },
+            {
+                "id": "last", "needs": ["port", "vpn"],
+                "project": { "local": root.join("main") },
+                "run": "echo ${env:WORKFLOW_WORD}-done", "cwd": ".next_code",
+                "env": { "UNUSED": "1" }
+            }
+        ]
+    });
+    fs::write(
+        root.join("main/.next_code/workflows/dev.jsonc"),
+        format!("// Started by the test.\n{workflow:#}\n"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("main/.next_code/workflows/broken.json"),
+        r#"{"steps": [{"id": "a", "needs": ["a"], "run": "x"}]}"#,
+    )
+    .unwrap();
+
+    let config = root.join("config");
+    let mut headless = Headless::launch(
+        &[root.join("main").as_os_str()],
+        &[
+            ("XDG_CONFIG_HOME", &config),
+            ("WORKFLOW_WORD", std::path::Path::new("all")),
+        ],
+    );
+    let ready = headless.next(|line| line["event"].is_string());
+    assert_eq!(ready["event"], "ready", "{ready}");
+
+    let list = headless.call(json!({ "cmd": "workflows_list" }));
+    let list = list["result"].as_array().unwrap().clone();
+    let broken = list.iter().find(|w| w["name"] == "broken").unwrap();
+    assert_eq!(broken["error"], "dependency cycle: a → a", "{broken}");
+    let dev = list
+        .iter()
+        .find(|w| w["name"] == "Dev environment")
+        .unwrap();
+    assert_eq!(dev["steps"].as_array().unwrap().len(), 6, "{dev}");
+    assert_eq!(dev["steps"][4]["ready"]["port"], port);
+    let refused = headless.call(json!({ "cmd": "workflow_run", "name": "broken" }));
+    assert!(
+        refused["error"].as_str().unwrap().contains("cannot run"),
+        "{refused}"
+    );
+
+    let run = headless.call(json!({ "cmd": "workflow_run", "path": "dev.jsonc" }));
+    assert_eq!(run["ok"], true, "{run}");
+    let vpn = step_event(&mut headless, "vpn", "failed");
+    assert_eq!(vpn["reason"], "Connect the VPN", "{vpn}");
+    let url = headless.next(|line| line["event"] == "workflow_event" && line["type"] == "url");
+    assert_eq!(url["url"], "http://localhost:1234/login", "{url}");
+    assert_eq!(url["step"], "server");
+    let server = step_event(&mut headless, "server", "ready");
+    assert_eq!(server["status"], "ready", "{server}");
+    let gate = step_event(&mut headless, "gate", "running");
+    assert_eq!(gate["detail"], "Log in", "{gate}");
+    let early = headless
+        .call(json!({ "cmd": "workflow_continue", "name": "Dev environment", "step": "port" }));
+    assert_eq!(early["ok"], false, "{early}");
+    let resumed = headless
+        .call(json!({ "cmd": "workflow_continue", "name": "Dev environment", "step": "gate" }));
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    let waiting = step_event(&mut headless, "port", "running");
+    assert_eq!(waiting["detail"], format!("waiting for port {port}"));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    step_event(&mut headless, "port", "ready");
+
+    // `last` waits for the VPN: Retry once it is up.
+    let status = headless.call(json!({ "cmd": "workflow_status", "name": "Dev environment" }));
+    let steps = status["result"]["steps"].as_array().unwrap().clone();
+    assert_eq!(steps[5]["status"], "waiting", "{status}");
+    assert_eq!(steps[5]["detail"], "blocked: vpn did not get ready");
+    fs::write(&flag, "").unwrap();
+    let retried = headless.call(json!({ "cmd": "workflow_retry", "name": "Dev environment" }));
+    assert_eq!(retried["result"], true, "{retried}");
+    let last = step_event(&mut headless, "last", "ready");
+    assert_eq!(last["status"], "ready", "{last}");
+    let outcome = headless.next(|line| line["type"] == "outcome" && line["outcome"] == "ready");
+    assert_eq!(outcome["workflow"], "Dev environment");
+
+    let status = headless.call(json!({ "cmd": "workflow_status", "name": "Dev environment" }));
+    let result = &status["result"];
+    assert_eq!(result["outcome"], "ready", "{status}");
+    let steps = result["steps"].as_array().unwrap();
+    assert_eq!(steps[2]["last_line"], "serving", "{status}");
+    assert_eq!(steps[2]["terminal"], "Server");
+    assert_eq!(steps[5]["last_line"], "all-done", "{status}");
+    assert_eq!(steps[5]["exit_code"], 0);
+    assert!(
+        steps[2]["location"].as_str().unwrap().ends_with("other"),
+        "{status}"
+    );
+
+    // Stop All interrupts the server (still running after it got ready).
+    let stop = headless.call(json!({ "cmd": "workflow_stop", "name": "Dev environment" }));
+    assert_eq!(stop["result"], true, "{stop}");
+    step_event(&mut headless, "server", "stopped");
+    headless.next(|line| line["type"] == "outcome" && line["outcome"] == "stopped");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    drop(listener);
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A workflow step in a dev container: the container is brought up for
+/// the step, its command runs in a pty inside, and its port is seen
+/// through the agent.
+#[test]
+#[ignore = "needs Docker (python:3.12-slim) and a built Linux agent (NEXT_CODE_WSL_AGENT)"]
+fn headless_mode_runs_a_workflow_step_in_a_dev_container() {
+    let root = std::env::temp_dir().join(format!("next_code_wf_dc_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    for dir in ["main/.next_code/workflows", "web/.devcontainer"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let root = root.canonicalize().unwrap();
+    fs::write(
+        root.join("web/.devcontainer/devcontainer.json"),
+        r#"{ "image": "python:3.12-slim" }"#,
+    )
+    .unwrap();
+    fs::write(root.join("web/index.html"), "workflow web\n").unwrap();
+    let containers = DevContainers(root.join("web").to_string_lossy().into_owned());
+    let workflow = json!({
+        "name": "Container",
+        "steps": [
+            {
+                "id": "web", "project": { "devcontainer": root.join("web") },
+                "run": "python3 -m http.server 8765", "ready": { "port": 8765 },
+                "timeout_s": 300
+            },
+            {
+                "id": "home", "needs": ["web"], "project": { "devcontainer": root.join("web") },
+                "check": "test \"${userHome}\" = \"$HOME\" && test -f index.html"
+            }
+        ]
+    });
+    fs::write(
+        root.join("main/.next_code/workflows/container.json"),
+        workflow.to_string(),
+    )
+    .unwrap();
+    let state = root.join("state");
+    let mut headless = Headless::launch(
+        &[root.join("main").as_os_str()],
+        &[("XDG_DATA_HOME", &state)],
+    );
+    let ready = headless.next(|line| line["event"].is_string());
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let run = headless.call(json!({ "cmd": "workflow_run", "name": "Container" }));
+    assert_eq!(run["ok"], true, "{run}");
+    let web = step_event(&mut headless, "web", "ready");
+    assert_eq!(web["status"], "ready", "{web}");
+    let home = step_event(&mut headless, "home", "ready");
+    assert_eq!(home["status"], "ready", "{home}");
+    let status = headless.call(json!({ "cmd": "workflow_status", "name": "Container" }));
+    let location = status["result"]["steps"][0]["location"].as_str().unwrap();
+    assert!(location.ends_with("[Dev Container]"), "{status}");
+    let stop = headless.call(json!({ "cmd": "workflow_stop", "name": "Container" }));
+    assert_eq!(stop["result"], true, "{stop}");
+    step_event(&mut headless, "web", "stopped");
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    drop(containers);
+    fs::remove_dir_all(&root).ok();
+}

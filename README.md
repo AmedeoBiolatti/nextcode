@@ -288,6 +288,98 @@ Settings (`settings.json`): `"tests": { "discover_on_save": true,
 "pytest_args": [], "cargo_test_args": [] }` (extra arguments for discovery
 and runs).
 
+## Workflows
+
+A workflow is one JSONC file that starts a multi-project development
+environment: preconditions, commands in the terminals of several projects
+(opened as needed, dev containers included), ordering with readiness
+conditions, browser links and manual gates. Files are found in
+`<config>/next_code/workflows/*.json[c]` (next to `settings.json`;
+`%APPDATA%\next_code\workflows` on Windows) and in each open project's
+`.next_code/workflows/*.json[c]`. They are read again before every Run All.
+
+```jsonc
+{
+  "name": "Fleet dev",
+  "steps": [
+    // A process on this machine (PowerShell on Windows); exit 0 passes.
+    { "id": "vpn", "title": "VPN", "check": "if (-not (Test-Connection -Count 1 -Quiet intranet.corp)) { exit 1 }",
+      "onFail": "Connect the VPN, then press Retry." },
+    { "id": "api", "needs": ["vpn"], "project": { "devcontainer": "C:/src/api" },
+      "run": "uv run uvicorn app:app --port 8000", "terminal": "API",
+      "ready": { "port": 8000 }, "timeout_s": 600 },
+    { "id": "worker", "needs": ["vpn"],
+      "project": { "devcontainer": { "wsl": "Ubuntu", "path": "~/src/worker" } },
+      "run": "uv run worker", "ready": { "output": "worker started" } },
+    { "id": "web", "needs": ["api"], "project": { "devcontainer": "C:/src/web" },
+      "run": "npm run dev", "ready": { "output": "ready in \\d+ ms" }, "openUrls": true },
+    { "id": "login", "needs": ["web"], "ready": { "manual": "Log in in the browser, then Continue." } },
+    { "id": "tools", "needs": ["login", "worker"], "project": { "wsl": "Ubuntu", "path": "~/src/tools" },
+      "run": "./sync.sh --env dev", "env": { "TOKEN": "${env:FLEET_TOKEN}" }, "cwd": "scripts" }
+  ]
+}
+```
+
+Step fields: `id` (required, unique), `title`, `needs` (ids; a step starts
+when they are all ready, independent steps run in parallel), `project`,
+`run`, `terminal`, `check`, `onFail`, `ready`, `timeout_s`, `openUrls`,
+`env`, `cwd`. Unknown keys, unknown `needs`, duplicate ids and cycles make
+the workflow invalid: it is listed with the error and cannot run.
+
+- `project`: `{ "local": "C:/src/p" }`, `{ "wsl": "Ubuntu", "path": "~/p" }`,
+  `{ "devcontainer": <folder>, "config"?: "<devcontainer.json>" }` (folder: a
+  path string or the `wsl` shape), a typed location (`"Ubuntu:~/p"`,
+  `"devcontainer:C:\\src\\p"`), or the editor's own shape from
+  `recent.json` (`{"Local": ...}`, `{"Wsl": {...}}`, `{"DevContainer": {...}}`).
+  Without it the step runs on the editor's machine, with no project tab.
+- `run`: runs as the program of a terminal tab (named `terminal`, else the
+  title, else the id) in the project's Terminal panel, after the project
+  tab is opened in the workflow's window (an open tab for the same location
+  is reused; new tabs open in the background). Local Windows:
+  `powershell.exe -NoLogo -Command <line>`; WSL, containers, Linux: the
+  user's login shell, `-lic <line>`. The tab stays when the command exits,
+  showing its exit code. Without a project the terminal is shown by the
+  Workflows panel (Terminal button). `.venv` is not activated (use `uv run`).
+- `check`: a process where the step runs (PowerShell `-NoProfile` on
+  Windows, `sh -c` elsewhere), before `run`; exit 0 passes. Failing with
+  `onFail`: the step shows Failed with that message and Retry; without it
+  the workflow fails and everything it started is stopped.
+- `ready`: `{ "exit": true }` (the default with `run`: exit code 0; without
+  `run`, the check passing), `{ "output": "<regex>" }` (the command's output,
+  ANSI codes stripped, across chunks and lines), `{ "port": N }` (listening
+  where the step runs: the agent's listening sockets for WSL/containers, a
+  TCP connect to localhost otherwise), `{ "manual": "<prompt>" }` (a
+  Continue button), `{ "delay_ms": N }`. A command that exits before it is
+  ready fails the step. `timeout_s` (from the step's start) fails it too.
+- `openUrls`: http(s) URLs on complete output lines open in the browser
+  (each once) until the step is ready plus 3 s.
+- `env`, `cwd` (relative to the project; the home folder without one) and
+  the command lines expand `${workspaceFolder}` (the home folder without a
+  project), `${userHome}` and `${env:NAME}` (the environment where the step
+  runs; read with `env` for WSL/containers).
+
+States: pending → waiting (needs) → starting (opening the project, the
+check) → running → ready | failed | stopped. A failed step blocks its
+dependents (shown as blocked); others keep going. Restart reruns one step
+(its terminal tab is replaced; dependents that already run are left
+alone); Retry Failed reruns failed steps; Stop All sends Ctrl+C to every
+command the run started and kills what still runs 3 s later (project tabs
+and containers stay); Run All starts afresh.
+
+UI: the Workflows panel (bottom dock next to the Terminal; View >
+Workflows, Run > Workflows…) lists the workflows (source: User or the
+project) and the selected one's steps with status, elapsed time, where it
+runs, its wait reason / failure / last output line, and Terminal, Continue,
+Restart/Retry buttons; Run All, Stop All, Retry Failed, Open File, ⟳, New….
+Run > New Workflow… writes a commented template to the user folder and
+opens it. The command palette has "Run Workflow: <name>" per workflow.
+Workflows run in the window that started them.
+
+Headless: `workflows_list`, `workflow_run`, `workflow_status`,
+`workflow_stop`, `workflow_continue`, `workflow_restart`, `workflow_retry`
+and `workflow_event` notifications (see `crates/ui/src/headless.rs`).
+Other projects open without a window and URLs are reported, not opened.
+
 ## Debugging
 
 Debugging speaks the Debug Adapter Protocol to an adapter started where

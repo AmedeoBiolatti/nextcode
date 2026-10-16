@@ -677,26 +677,30 @@ impl Project {
         }
     }
 
-    /// Starts the user's login shell inside the WSL distro, in the project
-    /// root. Local projects pick their shell from the terminal profiles.
-    pub fn spawn_remote_shell(
+    /// Starts `program` (else the user's login shell) in a pty inside the
+    /// WSL distro or container, in the project root; `tap` follows its
+    /// output. Local projects start their terminals directly.
+    pub fn spawn_remote_terminal(
         &self,
-        columns: u16,
-        rows: u16,
-        scrollback: usize,
+        program: Option<(&str, &[String])>,
+        size: (u16, u16, usize),
         palette: Palette,
+        tap: Option<terminal::OutputTap>,
     ) -> io::Result<(Terminal, UnboundedReceiver<TerminalEvent>)> {
+        let (columns, rows, scrollback) = size;
         match &self.0.backend {
             Backend::Local => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "local projects start shells directly",
+                "local projects start terminals directly",
             )),
             Backend::Remote { client, .. } => client.spawn_terminal(
                 agent_path(&self.0.root)?,
+                program,
                 columns,
                 rows,
                 scrollback,
                 palette,
+                tap,
             ),
         }
     }

@@ -9,7 +9,7 @@ mod links;
 use std::{
     borrow::Cow,
     collections::HashMap,
-    io,
+    io::{self, Read},
     ops::Range,
     path::PathBuf,
     sync::{
@@ -27,7 +27,7 @@ use alacritty_terminal::{
     grid::{Dimensions, Scroll},
     sync::FairMutex,
     term::{Config, Term, TermMode, cell::Flags, color::Colors},
-    tty::{self, Shell},
+    tty::{self, EventedPty, EventedReadWrite, Shell},
     vte::ansi::{Color, CursorShape, NamedColor, Processor, StdSyncHandler},
 };
 use futures::channel::mpsc;
@@ -44,6 +44,19 @@ pub enum TerminalEvent {
     /// The shell exited (with its exit code when known).
     Exited(Option<i32>),
 }
+
+/// What a terminal's process printed, as raw bytes, then its end; for
+/// callers that follow the output (e.g. to wait for a line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Output<'a> {
+    Data(&'a [u8]),
+    /// The process exited (with its exit code when known); all its output
+    /// was reported before.
+    Exited(Option<i32>),
+}
+
+/// Receives a terminal's [`Output`], on its reader thread: never block.
+pub type OutputTap = Arc<dyn Fn(Output<'_>) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct TerminalOptions {
@@ -399,6 +412,10 @@ struct Listener {
     window_size: Arc<Mutex<WindowSize>>,
     palette: Palette,
     exited: Arc<AtomicBool>,
+    tap: Option<OutputTap>,
+    /// The child's exit code, reported to `tap` once its output is drained.
+    exit_code: Arc<Mutex<Option<i32>>>,
+    tap_exited: Arc<AtomicBool>,
 }
 
 impl Listener {
@@ -409,8 +426,17 @@ impl Listener {
     }
 
     fn exited(&self, code: Option<i32>) {
+        self.tap_exit(code);
         if !self.exited.swap(true, Ordering::SeqCst) {
             self.events.unbounded_send(TerminalEvent::Exited(code)).ok();
+        }
+    }
+
+    fn tap_exit(&self, code: Option<i32>) {
+        if let Some(tap) = &self.tap
+            && !self.tap_exited.swap(true, Ordering::SeqCst)
+        {
+            tap(Output::Exited(code));
         }
     }
 }
@@ -431,13 +457,88 @@ impl EventListener for Listener {
                 return self.reply(format(*self.window_size.lock()));
             }
             Event::ChildExit(status) => {
+                *self.exit_code.lock() = status.code();
                 self.exited.store(true, Ordering::SeqCst);
                 TerminalEvent::Exited(status.code())
             }
-            Event::Exit if !self.exited.swap(true, Ordering::SeqCst) => TerminalEvent::Exited(None),
+            // After the exited child's output was drained.
+            Event::Exit => {
+                self.tap_exit(*self.exit_code.lock());
+                if self.exited.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                TerminalEvent::Exited(None)
+            }
             _ => return,
         };
         self.events.unbounded_send(event).ok();
+    }
+}
+
+/// The local pty, with what is read from it also passed to the tap.
+struct TappedPty {
+    pty: tty::Pty,
+    tap: Option<OutputTap>,
+}
+
+impl Read for TappedPty {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.pty.reader().read(buffer)?;
+        if let Some(tap) = &self.tap
+            && read > 0
+        {
+            tap(Output::Data(&buffer[..read]));
+        }
+        Ok(read)
+    }
+}
+
+impl EventedReadWrite for TappedPty {
+    type Reader = Self;
+    type Writer = <tty::Pty as EventedReadWrite>::Writer;
+
+    unsafe fn register(
+        &mut self,
+        poller: &Arc<polling::Poller>,
+        interest: polling::Event,
+        mode: polling::PollMode,
+    ) -> io::Result<()> {
+        // SAFETY: the pty lives as long as this wrapper, which the event
+        // loop deregisters before dropping.
+        unsafe { self.pty.register(poller, interest, mode) }
+    }
+
+    fn reregister(
+        &mut self,
+        poller: &Arc<polling::Poller>,
+        interest: polling::Event,
+        mode: polling::PollMode,
+    ) -> io::Result<()> {
+        self.pty.reregister(poller, interest, mode)
+    }
+
+    fn deregister(&mut self, poller: &Arc<polling::Poller>) -> io::Result<()> {
+        self.pty.deregister(poller)
+    }
+
+    fn reader(&mut self) -> &mut Self {
+        self
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.pty.writer()
+    }
+}
+
+impl EventedPty for TappedPty {
+    fn next_child_event(&mut self) -> Option<tty::ChildEvent> {
+        self.pty.next_child_event()
+    }
+}
+
+impl alacritty_terminal::event::OnResize for TappedPty {
+    fn on_resize(&mut self, size: WindowSize) {
+        self.pty.on_resize(size);
     }
 }
 
@@ -449,12 +550,20 @@ pub struct Terminal {
 }
 
 impl Terminal {
+    /// Starts `options.program` in a local pty; `tap` (if any) gets its
+    /// output and exit.
     pub fn spawn(
         options: TerminalOptions,
         palette: Palette,
+        tap: Option<OutputTap>,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<TerminalEvent>)> {
-        let (term, listener, events) =
-            Self::emulator(options.columns, options.rows, options.scrollback, palette);
+        let (term, listener, events) = Self::emulator(
+            options.columns,
+            options.rows,
+            options.scrollback,
+            palette,
+            tap.clone(),
+        );
 
         let mut env = options.env;
         env.entry("TERM".into())
@@ -468,7 +577,10 @@ impl Terminal {
             env,
             ..tty::Options::default()
         };
-        let pty = tty::new(&pty_options, *listener.window_size.lock(), 0)?;
+        let pty = TappedPty {
+            pty: tty::new(&pty_options, *listener.window_size.lock(), 0)?,
+            tap,
+        };
         let event_loop = EventLoop::new(term.clone(), listener.clone(), pty, true, false)?;
         let io = Io::Local(event_loop.channel());
         listener.writer.set(io.clone()).ok();
@@ -484,7 +596,8 @@ impl Terminal {
     }
 
     /// Emulates a terminal for a process running behind `pty`, whose output
-    /// arrives on `output`. A closed `output` counts as an exit.
+    /// arrives on `output`. A closed `output` counts as an exit. `tap` (if
+    /// any) gets the output and the exit.
     pub fn attach(
         columns: u16,
         rows: u16,
@@ -492,8 +605,10 @@ impl Terminal {
         palette: Palette,
         pty: Arc<dyn RemotePty>,
         output: std_mpsc::Receiver<PtyOutput>,
+        tap: Option<OutputTap>,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<TerminalEvent>)> {
-        let (term, listener, events) = Self::emulator(columns, rows, scrollback, palette);
+        let (term, listener, events) =
+            Self::emulator(columns, rows, scrollback, palette, tap.clone());
         let io = Io::Remote(pty);
         listener.writer.set(io.clone()).ok();
         let reader_term = term.clone();
@@ -506,6 +621,9 @@ impl Terminal {
                 for chunk in output {
                     match chunk {
                         PtyOutput::Data(data) => {
+                            if let Some(tap) = &tap {
+                                tap(Output::Data(&data));
+                            }
                             parser.advance(&mut *reader_term.lock(), &data);
                             reader_listener.send_event(Event::Wakeup);
                         }
@@ -532,6 +650,7 @@ impl Terminal {
         rows: u16,
         scrollback: usize,
         palette: Palette,
+        tap: Option<OutputTap>,
     ) -> (
         Arc<FairMutex<Term<Listener>>>,
         Listener,
@@ -544,6 +663,9 @@ impl Terminal {
             window_size: Arc::new(Mutex::new(window_size(columns, rows))),
             palette,
             exited: Arc::default(),
+            tap,
+            exit_code: Arc::default(),
+            tap_exited: Arc::default(),
         };
         let config = Config {
             scrolling_history: scrollback,
@@ -560,6 +682,12 @@ impl Terminal {
     /// Sends input bytes to the shell.
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
         self.io.input(bytes.into());
+    }
+
+    /// Ends the process now (as dropping the terminal does) while keeping
+    /// what it printed on screen.
+    pub fn kill(&self) {
+        self.io.shutdown();
     }
 
     pub fn resize(&self, columns: u16, rows: u16) {
@@ -750,7 +878,7 @@ mod tests {
     #[test]
     fn runs_commands_resizes_and_reports_exit() {
         let (options, command) = test_shell();
-        let (terminal, mut events) = Terminal::spawn(options, Palette::default()).unwrap();
+        let (terminal, mut events) = Terminal::spawn(options, Palette::default(), None).unwrap();
         terminal.write(command.as_bytes().to_vec());
         // The command's own text never contains `abcd` contiguously.
         let ran = wait_for(&mut events, |_| terminal.snapshot().text().contains("abcd"));
@@ -777,6 +905,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn taps_see_a_programs_output_then_its_exit_code() {
+        let mut options = TerminalOptions::default_shell();
+        if cfg!(windows) {
+            options.program = "powershell.exe".into();
+            options.args = [
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "echo ('ta' + 'pped'); exit 3",
+            ]
+            .map(String::from)
+            .to_vec();
+        } else {
+            options.program = "/bin/sh".into();
+            options.args = ["-c", "echo ta''pped; exit 3"].map(String::from).to_vec();
+        }
+        let (tx, rx) = std_mpsc::channel();
+        let tx = Mutex::new(tx);
+        let tap: OutputTap = Arc::new(move |output| {
+            let event = match output {
+                Output::Data(data) => Ok(data.to_vec()),
+                Output::Exited(code) => Err(code),
+            };
+            tx.lock().send(event).ok();
+        });
+        let (_terminal, _events) = Terminal::spawn(options, Palette::default(), Some(tap)).unwrap();
+        let mut text = Vec::new();
+        let exit = loop {
+            match rx.recv_timeout(Duration::from_secs(30)).expect("no exit") {
+                Ok(data) => text.extend(data),
+                Err(code) => break code,
+            }
+        };
+        assert!(
+            String::from_utf8_lossy(&text).contains("tapped"),
+            "{}",
+            String::from_utf8_lossy(&text)
+        );
+        assert_eq!(exit, Some(3));
+        // Nothing after the exit.
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
     #[derive(Default)]
     struct FakePty {
         written: Mutex<Vec<u8>>,
@@ -801,7 +973,7 @@ mod tests {
         let pty = Arc::new(FakePty::default());
         let (output, output_rx) = std_mpsc::channel();
         let (terminal, mut events) =
-            Terminal::attach(30, 5, 100, Palette::default(), pty.clone(), output_rx).unwrap();
+            Terminal::attach(30, 5, 100, Palette::default(), pty.clone(), output_rx, None).unwrap();
 
         // Text plus a cursor-position query, which the emulator must answer.
         output
@@ -861,7 +1033,7 @@ mod screen_links {
     fn screen(output: &[u8], last: &str) -> Snapshot {
         let (tx, rx) = std_mpsc::channel();
         let (terminal, _events) =
-            Terminal::attach(20, 4, 10, Palette::default(), Arc::new(Sink), rx).unwrap();
+            Terminal::attach(20, 4, 10, Palette::default(), Arc::new(Sink), rx, None).unwrap();
         tx.send(PtyOutput::Data(output.to_vec())).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {

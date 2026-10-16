@@ -32,6 +32,7 @@ git.workspace = true
 devcontainer.workspace = true
 python.workspace = true
 run.workspace = true
+workflow.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

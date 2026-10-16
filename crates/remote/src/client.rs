@@ -24,7 +24,7 @@ use proto::{
     PROTOCOL_VERSION, PtySize, Request, RequestId, Response, SearchEvent, SearchLimits,
     SearchQuery, SpawnRequest, TUNNEL_WINDOW,
 };
-use terminal::{Palette, PtyOutput, RemotePty, Terminal, TerminalEvent};
+use terminal::{OutputTap, Palette, PtyOutput, RemotePty, Terminal, TerminalEvent};
 
 /// How long one request may take before it fails.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -749,19 +749,24 @@ impl AgentClient {
         }
     }
 
-    /// Starts the user's login shell in a pty on the agent's machine.
+    /// Starts a program in a pty on the agent's machine: `program` with
+    /// its arguments, else the user's login shell. `tap` (if any) gets the
+    /// output and the exit.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_terminal(
         self: &Arc<Self>,
         cwd: &str,
+        program: Option<(&str, &[String])>,
         columns: u16,
         rows: u16,
         scrollback: usize,
         palette: Palette,
+        tap: Option<OutputTap>,
     ) -> io::Result<(Terminal, async_mpsc::UnboundedReceiver<TerminalEvent>)> {
         let (output_tx, output_rx) = std_mpsc::channel();
         let request = Request::Spawn(SpawnRequest {
-            program: None,
-            args: Vec::new(),
+            program: program.map(|(program, _)| program.into()),
+            args: program.map(|(_, args)| args.to_vec()).unwrap_or_default(),
             cwd: cwd.into(),
             env: vec![
                 ("TERM".into(), "xterm-256color".into()),
@@ -785,6 +790,7 @@ impl AgentClient {
             palette,
             Arc::new(AgentPty(handle)),
             output_rx,
+            tap,
         )
     }
 }

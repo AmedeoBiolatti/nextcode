@@ -391,6 +391,9 @@ pub struct CommitPanel {
     menu: Option<ContextMenu>,
     focus_handle: FocusHandle,
     _refresh: Task<()>,
+    refresh_running: bool,
+    refresh_requested: bool,
+    refresh_scheduled: bool,
     _operation: Task<()>,
     _subscription: Subscription,
 }
@@ -460,6 +463,9 @@ impl CommitPanel {
             menu: None,
             focus_handle: cx.focus_handle(),
             _refresh: Task::ready(()),
+            refresh_running: false,
+            refresh_requested: false,
+            refresh_scheduled: false,
             _operation: Task::ready(()),
             _subscription: subscription,
         };
@@ -501,6 +507,16 @@ impl CommitPanel {
 
     /// Refreshes after [`REFRESH_DEBOUNCE`], coalescing bursts of changes.
     pub fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.refresh_running {
+            self.refresh_requested = true;
+            return;
+        }
+        // Keep the first deadline: continuous file activity must not
+        // postpone the next status read indefinitely.
+        if self.refresh_scheduled {
+            return;
+        }
+        self.refresh_scheduled = true;
         self._refresh = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(REFRESH_DEBOUNCE).await;
             this.update(cx, |this, cx| this.refresh(cx)).ok();
@@ -510,6 +526,15 @@ impl CommitPanel {
     /// Re-reads the repository status (discovering the repository first)
     /// and the operation in progress.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        // Dropping a running task discards its result even though the
+        // background git process continues. Let it finish and queue one
+        // follow-up read for notifications received while it was running.
+        if self.refresh_running {
+            self.refresh_requested = true;
+            return;
+        }
+        self.refresh_scheduled = false;
+        self.refresh_running = true;
         let project = self.project.clone();
         let known = self.repository();
         self._refresh = cx.spawn(async move |this, cx| {
@@ -532,7 +557,8 @@ impl CommitPanel {
                 .await;
             this.update(cx, |this, cx| {
                 this.operation = operation;
-                this.show(opened, cx)
+                this.show(opened, cx);
+                this.finish_refresh(cx);
             })
             .ok();
         });
@@ -542,14 +568,23 @@ impl CommitPanel {
     /// it now if that read was abandoned. The operation in progress is read
     /// afterwards, off the startup path.
     fn show_preloaded(&mut self, preloaded: PreloadedRepository, cx: &mut Context<Self>) {
+        self.refresh_running = true;
         self._refresh = cx.spawn(async move |this, cx| {
-            let opened = preloaded.await;
+            let opened = match preloaded.await {
+                Ok(opened) => opened,
+                Err(_) => {
+                    this.update(cx, |this, cx| {
+                        this.refresh_running = false;
+                        this.refresh_requested = false;
+                        this.refresh(cx);
+                    })
+                    .ok();
+                    return;
+                }
+            };
             let repository = this
                 .update(cx, |this, cx| {
-                    match opened {
-                        Ok(opened) => this.show(opened, cx),
-                        Err(_) => this.refresh(cx),
-                    }
+                    this.show(opened, cx);
                     this.repository()
                 })
                 .ok()
@@ -560,11 +595,24 @@ impl CommitPanel {
                     .await;
                 this.update(cx, |this, cx| {
                     this.operation = operation.unwrap_or(OperationState::None);
+                    this.finish_refresh(cx);
                     cx.notify();
+                })
+                .ok();
+            } else {
+                this.update(cx, |this, cx| {
+                    this.finish_refresh(cx);
                 })
                 .ok();
             }
         });
+    }
+
+    fn finish_refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_running = false;
+        if std::mem::take(&mut self.refresh_requested) {
+            self.schedule_refresh(cx);
+        }
     }
 
     fn show(&mut self, opened: io::Result<Option<(Repository, Status)>>, cx: &mut Context<Self>) {
@@ -1917,6 +1965,51 @@ pub const REFRESH_DEBOUNCE: Duration = Duration::from_millis(300);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn file_events_do_not_cancel_an_in_flight_status_read(cx: &mut gpui::TestAppContext) {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let panel =
+            cx.new(|cx| CommitPanel::new(Project::local(std::env::temp_dir()), Some(receiver), cx));
+        cx.run_until_parked();
+
+        // The startup status is slow; file events and explicit refreshes
+        // must leave its receiver alive and request just one later read.
+        for _ in 0..5 {
+            panel.update(cx, |panel, cx| {
+                panel.schedule_refresh(cx);
+                panel.refresh(cx);
+            });
+            cx.executor().advance_clock(REFRESH_DEBOUNCE);
+            cx.run_until_parked();
+        }
+        assert!(sender.send(Ok(None)).is_ok(), "status read was cancelled");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(matches!(panel.state, State::NoRepository));
+            assert!(!panel.refresh_running);
+            assert!(!panel.refresh_requested);
+            assert!(panel.refresh_scheduled, "missing follow-up status read");
+        });
+    }
+
+    #[gpui::test]
+    fn continuous_file_events_keep_the_first_refresh_deadline(cx: &mut gpui::TestAppContext) {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let panel =
+            cx.new(|cx| CommitPanel::new(Project::local(std::env::temp_dir()), Some(receiver), cx));
+        assert!(sender.send(Ok(None)).is_ok());
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| panel.schedule_refresh(cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(REFRESH_DEBOUNCE / 2);
+        panel.update(cx, |panel, cx| panel.schedule_refresh(cx));
+        cx.executor().advance_clock(REFRESH_DEBOUNCE / 2);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.refresh_scheduled, "file activity postponed the read");
+        });
+    }
 
     fn entry(path: &str, staged: Option<Change>, unstaged: Option<Change>) -> Entry {
         Entry {

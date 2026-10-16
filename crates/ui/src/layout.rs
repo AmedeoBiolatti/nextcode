@@ -16,6 +16,8 @@ pub enum PanelId {
     Commit,
     Python,
     Terminal,
+    /// Workflows (bottom dock, next to the Terminal).
+    Workflows,
     Problems,
     /// PyCharm's Git tool window (the Log).
     GitLog,
@@ -28,12 +30,13 @@ pub enum PanelId {
 }
 
 impl PanelId {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Files,
         Self::Search,
         Self::Commit,
         Self::Python,
         Self::Terminal,
+        Self::Workflows,
         Self::Problems,
         Self::GitLog,
         Self::Ports,
@@ -51,6 +54,7 @@ impl PanelId {
             Self::Commit => "Commit",
             Self::Python => "Python",
             Self::Terminal => "Terminal",
+            Self::Workflows => "Workflows",
             Self::Problems => "Problems",
             Self::GitLog => "Git",
             Self::Ports => "Ports",
@@ -69,6 +73,7 @@ impl PanelId {
             }
             Self::Outline | Self::Debug => DockPosition::Right,
             Self::Terminal
+            | Self::Workflows
             | Self::Problems
             | Self::Ports
             | Self::GitLog
@@ -155,6 +160,7 @@ impl Default for Layout {
             bottom: DockLayout {
                 panels: vec![
                     PanelId::Terminal,
+                    PanelId::Workflows,
                     PanelId::Problems,
                     PanelId::GitLog,
                     PanelId::Ports,
@@ -393,6 +399,7 @@ mod tests {
             [
                 PanelId::Search,
                 PanelId::Terminal,
+                PanelId::Workflows,
                 PanelId::Problems,
                 PanelId::GitLog,
                 PanelId::Ports,
@@ -417,6 +424,7 @@ mod tests {
             [
                 PanelId::Problems,
                 PanelId::Terminal,
+                PanelId::Workflows,
                 PanelId::GitLog,
                 PanelId::Ports,
                 PanelId::CallHierarchy,
@@ -428,6 +436,7 @@ mod tests {
             layout.bottom.panels,
             [
                 PanelId::Terminal,
+                PanelId::Workflows,
                 PanelId::GitLog,
                 PanelId::Ports,
                 PanelId::CallHierarchy,
@@ -492,6 +501,11 @@ mod tests {
         // Missing panels return to their default docks.
         assert_eq!(
             layout.position_of(PanelId::Problems),
+            Some(DockPosition::Bottom)
+        );
+        // Saved before the Workflows panel existed: bottom, like the Terminal.
+        assert_eq!(
+            layout.position_of(PanelId::Workflows),
             Some(DockPosition::Bottom)
         );
     }

@@ -69,4 +69,5 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
 watcher = { path = "crates/watcher" }
+workflow = { path = "crates/workflow" }
 worktree = { path = "crates/worktree" }

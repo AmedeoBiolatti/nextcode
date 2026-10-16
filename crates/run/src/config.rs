@@ -567,6 +567,8 @@ pub struct Context<'a> {
     pub separator: char,
     /// Environment of the machine where the project lives, if known.
     pub env: &'a dyn Fn(&str) -> Option<String>,
+    /// The home folder there, if known.
+    pub user_home: Option<&'a str>,
 }
 
 impl Context<'_> {
@@ -599,6 +601,10 @@ impl Context<'_> {
         };
         Ok(match name {
             "workspaceFolder" | "workspaceRoot" | "cwd" => folder.to_owned(),
+            "userHome" => self
+                .user_home
+                .ok_or_else(|| "${userHome} is unknown here".to_owned())?
+                .to_owned(),
             "workspaceFolderBasename" => base_name(folder).to_owned(),
             "pathSeparator" | "/" => self.separator.to_string(),
             "file" => file()?.to_owned(),
@@ -1193,6 +1199,7 @@ mod tests {
             line: Some(12),
             separator: '/',
             env,
+            user_home: Some("/home/me"),
         }
     }
 
@@ -1411,6 +1418,7 @@ mod tests {
             "unsupported variable ${input:port}"
         );
         assert_eq!(without.substitute("plain $HOME").unwrap(), "plain $HOME");
+        assert_eq!(without.substitute("${userHome}/x").unwrap(), "/home/me/x");
     }
 
     #[test]
@@ -1437,12 +1445,17 @@ mod tests {
             line: None,
             separator: '\\',
             env: &env,
+            user_home: None,
         };
         assert_eq!(
             relative.resolve(&windows).unwrap().cwd,
             r"C:\src\proj\sub\dir"
         );
         assert_eq!(windows.substitute("${relativeFile}").unwrap(), "main.py");
+        assert_eq!(
+            windows.substitute("${userHome}").unwrap_err(),
+            "${userHome} is unknown here"
+        );
         assert_eq!(windows.absolute(r"D:\other"), r"D:\other");
     }
 

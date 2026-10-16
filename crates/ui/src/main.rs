@@ -41,6 +41,7 @@ mod terminal_panel;
 mod test_explorer;
 mod theme;
 mod theme_picker;
+mod workflows;
 mod workspace;
 mod workspace_edit;
 mod worktree_picker;

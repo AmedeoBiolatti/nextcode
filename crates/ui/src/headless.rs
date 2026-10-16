@@ -98,7 +98,14 @@
 //! | `ports_list` | | `{available, listening: [{port, addresses, pid, command}], forwarded: [{port, host, local_port, address, url, origin, label, connections, process}], error}` after a fresh scan (`origin`: `auto` \| `user` \| `dev_container`; `available` false for local projects) |
 //! | `ports_forward` | `port` (number or `"host:port"`), `host`?, `local_port`? (required when given; default: the same port, else the next free one) | `{local_port, url}`; a user port, saved for the project |
 //! | `ports_stop` | `port`, `host`? | `null`; an automatically forwarded port stays unforwarded while it keeps listening |
-//! | `shutdown` | | stops language servers and exits |
+//! | `workflows_list` | | `[{id, name, path, source, error, steps: [{id, title, needs, project, run, check, ready}], outcome}]`: the user's workflows (`<config>/next_code/workflows/`) and the project's (`.next_code/workflows/`), read again for every workflow command |
+//! | `workflow_run` | `name`, `path` (or its end) or `id` | `{run, id}`; starts it afresh (a run of it going is stopped first); progress comes as `workflow_event`s |
+//! | `workflow_status` | `name`/`path`/`id` | `{run, workflow, outcome, steps: [{id, title, status, reason, detail, last_line, check_output, exit_code, exited, elapsed_ms, location, terminal}]}` |
+//! | `workflow_stop` | `name`/`path`/`id` | `true` if it had run: Stop All (Ctrl+C, then kill after 3 s) |
+//! | `workflow_continue` | `name`/`path`/`id`, `step` (id) | `null`; an error if the step does not wait for Continue |
+//! | `workflow_restart` | `name`/`path`/`id`, `step` | `true`: the step starts again (its command replaced) |
+//! | `workflow_retry` | `name`/`path`/`id` | `true` if it had run: failed steps start again |
+//! | `shutdown` | | stops language servers and workflow commands, and exits |
 //!
 //! Events: `progress` (while a dev container opens), `ready` (after
 //! connecting), `files_changed`, `diagnostics`, `server_status`,
@@ -110,7 +117,14 @@
 //! `port_forwarded` (`port`, `host`, `local_port`, `origin`; also automatic
 //! and `forwardPorts` ones), `port_released` (`port`, `host`),
 //! `port_available` (`port`, `url`, `label`, `action`: what the GUI does
-//! as `onAutoForward` says: `notify`, `openBrowser`, `silent`).
+//! as `onAutoForward` says: `notify`, `openBrowser`, `silent`),
+//! `workflow_event` (`type`: `step` with `run`, `workflow`, `step`,
+//! `status` (`pending`, `waiting`, `starting`, `running`, `ready`,
+//! `failed`, `stopped`), `reason`, `detail`; `outcome` with `outcome`
+//! (`running`, `ready`, `failed`, `stopped`); `url` with `step`, `url`:
+//! an `openUrls` URL, which headless mode does not open). Workflow steps
+//! for other projects open them without a window; commands run in
+//! terminals nobody sees.
 use std::{
     collections::{HashMap, HashSet},
     io::{self, BufRead, Write},
@@ -154,6 +168,7 @@ mod debug;
 mod edits;
 mod ports;
 mod runs;
+mod workflows;
 
 const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a server must be idle before waited-for diagnostics count as final.
@@ -258,8 +273,12 @@ async fn serve(
         }
     }
 
-    // Stdin closed or `shutdown`: stop language servers, then exit.
+    // Stdin closed or `shutdown`: end workflow commands, stop language
+    // servers, then exit.
     if let Ok(stopping) = session.update(cx, |session, cx| {
+        session
+            .workflows
+            .update(cx, |workflows, cx| workflows.kill_all(cx));
         session.watch = None;
         session
             .store
@@ -321,8 +340,11 @@ struct Session {
     debug: debug::HeadlessDebug,
     /// Forwarded ports (WSL and container projects).
     ports: Entity<crate::ports::Ports>,
+    /// Workflows (the same model as a window's).
+    workflows: Entity<crate::workflows::Workflows>,
     _subscription: Subscription,
     _ports_subscription: Subscription,
+    _workflows_subscription: Subscription,
 }
 
 fn param_str<'a>(request: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -372,6 +394,17 @@ impl Session {
             this.on_ports_event(event);
         });
         let store = cx.new(|_| LspStore::new(project.clone(), Arc::new(settings)));
+        let workflows = cx.new(|cx| {
+            crate::workflows::Workflows::new(
+                Box::new(workflows::HeadlessHost::new(project.clone())),
+                crate::workflows::user_dir(),
+                cx,
+            )
+        });
+        let forward = out.clone();
+        let workflows_subscription = cx.subscribe(&workflows, move |_, _, event, _| {
+            workflows::forward(&forward, event);
+        });
         let subscription = cx.subscribe(&store, |this, store, event, cx| {
             this.on_lsp_event(&store, event, cx)
         });
@@ -394,8 +427,10 @@ impl Session {
             code_actions: None,
             debug: debug::HeadlessDebug::new(cx),
             ports,
+            workflows,
             _subscription: subscription,
             _ports_subscription: ports_subscription,
+            _workflows_subscription: workflows_subscription,
         }
     }
 
@@ -565,6 +600,7 @@ impl Session {
             }
             command if command.starts_with("debug_") => self.debug(id, command, &request, cx),
             command if command.starts_with("ports_") => self.ports(id, command, &request, cx),
+            command if command.starts_with("workflow") => self.workflows(id, command, &request, cx),
             "shutdown" => {
                 self.out.reply(&id, Ok(Value::Null));
                 return true;

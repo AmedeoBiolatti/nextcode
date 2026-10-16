@@ -27,8 +27,10 @@ use crate::{
     project_picker::{ProjectPicker, ProjectPickerEvent},
     recent,
     settings::Settings,
+    terminal_panel::TerminalView,
     theme::{self, Theme},
     theme_picker::{ThemePicker, ThemePickerEvent},
+    workflows::{self, NewWorkflow, RunWorkflow, Workflows},
     workspace::{Preload, Workspace, WorkspaceEvent},
 };
 
@@ -179,12 +181,14 @@ pub struct Shell {
     /// Windows' icon font for the caption buttons (Segoe Fluent Icons on
     /// Windows 11, Segoe MDL2 Assets on 10; same code points).
     caption_font: SharedString,
+    /// The window's workflows (they open project tabs here).
+    workflows: Entity<Workflows>,
     _activation: Subscription,
     _bounds: Subscription,
 }
 
 /// A short name for a project tab.
-fn tab_title(location: &Location) -> String {
+pub(crate) fn tab_title(location: &Location) -> String {
     /// The last component of a Linux path.
     fn linux_name(path: &str) -> &str {
         match path.trim_end_matches('/').rsplit('/').next() {
@@ -354,12 +358,18 @@ impl Shell {
                 app_state::focused(window.window_handle().window_id(), cx);
                 this.refresh_menus(cx);
                 theme::refresh(cx);
+                if let Some(tab) = this.tabs.get(this.active)
+                    && let Content::Workspace(workspace) = &tab.content
+                {
+                    workspace.update(cx, |workspace, cx| workspace.refresh_git_status(cx));
+                }
             }
         });
         let bounds = cx.observe_window_bounds(window, |this, window, cx| this.remember(window, cx));
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
         theme::refresh(cx);
+        let workflows = workflows::for_window(window, cx);
         let mut shell = Self {
             focus_handle,
             tabs: Vec::new(),
@@ -385,6 +395,7 @@ impl Shell {
             },
             _activation: activation,
             _bounds: bounds,
+            workflows,
         };
         shell.refresh_menus(cx);
         shell
@@ -488,6 +499,18 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Subscription> {
+        // A project tab is ready: its `.next_code/workflows` join the list
+        // (and the palette's "Run Workflow:" entries). Later, not now: a
+        // running workflow opens tabs while it is being updated itself.
+        if let Content::Workspace(_) = content {
+            let workflows = self.workflows.clone();
+            cx.spawn(async move |_, cx| {
+                workflows
+                    .update(cx, |workflows, cx| workflows.refresh(cx).detach())
+                    .ok();
+            })
+            .detach();
+        }
         Some(match content {
             Content::Unloaded => return None,
             Content::Connecting(connecting) => cx.subscribe_in(
@@ -540,6 +563,8 @@ impl Shell {
             return;
         };
         let location = project.location();
+        // A new workspace takes focus: a background tab gives it back.
+        let focused = window.focused(cx);
         let content = Content::Workspace(cx.new(|cx| Workspace::new(project, None, window, cx)));
         let subscription = self.subscribe(&content, window, cx);
         self.tabs[index] = ProjectTab {
@@ -549,6 +574,8 @@ impl Shell {
         };
         if index == self.active {
             self.activate(index, window, cx);
+        } else if let Some(focused) = focused {
+            window.focus(&focused);
         }
         self.remember(window, cx);
         cx.notify();
@@ -563,9 +590,10 @@ impl Shell {
         let tab = &self.tabs[index];
         window.set_window_title(&window_title(Some(&tab.location)));
         match &tab.content {
-            Content::Workspace(workspace) => {
-                workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx))
-            }
+            Content::Workspace(workspace) => workspace.update(cx, |workspace, cx| {
+                workspace.refresh_git_status(cx);
+                workspace.focus_active(window, cx);
+            }),
             Content::Unloaded | Content::Connecting(_) => window.focus(&self.focus_handle),
         }
         self.remember(window, cx);
@@ -771,7 +799,7 @@ impl Shell {
         }
         theme::refresh(cx);
         let focus = window.focused(cx);
-        let commands: Vec<Command> = window
+        let mut commands: Vec<Command> = window
             .available_actions(cx)
             .into_iter()
             .filter(|action| commands::in_palette(action.name()))
@@ -784,6 +812,18 @@ impl Shell {
                 Command::new(action, keys)
             })
             .collect();
+        // One entry per workflow found (as last read).
+        commands.extend(self.workflows.read(cx).discovered().iter().map(|found| {
+            Command::labeled(
+                Box::new(RunWorkflow {
+                    id: found.id.clone(),
+                }),
+                format!("Run Workflow: {}", found.name),
+                "Workflows",
+            )
+        }));
+        self.workflows
+            .update(cx, |workflows, cx| workflows.refresh(cx).detach());
         let palette = cx.new(|cx| CommandPalette::new(commands, cx));
         let subscription = cx.subscribe_in(&palette, window, |this, _, event, window, cx| {
             let focus = this.palette.take().and_then(|(_, _, focus)| focus);
@@ -931,6 +971,193 @@ impl Shell {
         let answer = window.prompt(PromptLevel::Info, "next_code", Some(&detail), &["OK"], cx);
         cx.background_spawn(async move { answer.await.ok() })
             .detach();
+    }
+
+    /// Run Workflow: <name> (palette): starts it and shows the Workflows
+    /// panel.
+    fn run_workflow(&mut self, action: &RunWorkflow, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ProjectTab {
+            content: Content::Workspace(workspace),
+            ..
+        }) = self.tabs.get(self.active)
+        {
+            workspace.update(cx, |workspace, cx| workspace.show_workflows(cx));
+        }
+        let started = self.workflows.update(cx, |workflows, cx| {
+            workflows.run_workflow(action.id.clone(), cx)
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(err) = started.await {
+                this.update(cx, |this, cx| {
+                    this.notice = Some(err.into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// New Workflow…: a commented template in the user's workflows folder.
+    fn new_workflow(&mut self, _: &NewWorkflow, window: &mut Window, cx: &mut Context<Self>) {
+        let created = self
+            .workflows
+            .read(cx)
+            .user_dir()
+            .ok_or_else(|| std::io::Error::other("no config directory"))
+            .and_then(workflows::create_template);
+        match created {
+            Ok(path) => {
+                self.open_config(path, window, cx);
+                self.workflows
+                    .update(cx, |workflows, cx| workflows.refresh(cx).detach());
+            }
+            Err(err) => {
+                self.notice = Some(format!("Could not create a workflow file: {err}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// The project at `location` for a workflow step: its tab here, else a
+    /// new background tab (`Ok(None)` while it connects).
+    pub(crate) fn workflow_project(
+        &mut self,
+        location: &Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<Project>, String> {
+        // Opening a project focuses its workspace: keep focus where it is.
+        let focused = window.focused(cx);
+        let index = match self.position_of(location) {
+            Some(index) => index,
+            None => {
+                if let Location::Local(root) = location
+                    && !root.is_dir()
+                {
+                    return Err(format!("{} is not a folder", root.display()));
+                }
+                self.tabs.push(ProjectTab::unloaded(location.clone()));
+                let index = self.tabs.len() - 1;
+                if self.tabs.len() == 1 {
+                    self.activate(index, window, cx);
+                } else {
+                    self.load(index, None, window, cx);
+                    self.remember(window, cx);
+                }
+                cx.notify();
+                index
+            }
+        };
+        if matches!(self.tabs[index].content, Content::Unloaded) {
+            self.load(index, None, window, cx);
+        }
+        if index != self.active
+            && let Some(focused) = focused
+        {
+            window.focus(&focused);
+        }
+        match &self.tabs[index].content {
+            Content::Workspace(workspace) => Ok(Some(workspace.read(cx).project().clone())),
+            Content::Connecting(connecting) => match connecting.read(cx).error() {
+                Some(error) => Err(error.to_string()),
+                None => Ok(None),
+            },
+            Content::Unloaded => Ok(None),
+        }
+    }
+
+    /// The projects open in this window's tabs.
+    pub(crate) fn workflow_projects(&self, cx: &App) -> Vec<(Location, Project)> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| match &tab.content {
+                Content::Workspace(workspace) => {
+                    Some((tab.location.clone(), workspace.read(cx).project().clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn workspace_at(&self, location: &Location) -> Option<(usize, Entity<Workspace>)> {
+        let index = self.position_of(location)?;
+        match &self.tabs[index].content {
+            Content::Workspace(workspace) => Some((index, workspace.clone())),
+            _ => None,
+        }
+    }
+
+    /// Starts a workflow step's command in a terminal tab of the project at
+    /// `location`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn workflow_terminal(
+        &mut self,
+        location: &Location,
+        title: &str,
+        program: &str,
+        args: &[String],
+        tap: terminal::OutputTap,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Entity<TerminalView>, String> {
+        let (_, workspace) = self
+            .workspace_at(location)
+            .ok_or_else(|| format!("{location} is not open"))?;
+        let terminal = workspace.read(cx).terminal_panel();
+        terminal.update(cx, |terminal, cx| {
+            terminal.run_program(title, program, args, Some(tap), window, cx)
+        })
+    }
+
+    /// Show Terminal: the step's project tab, its Terminal panel and tab.
+    pub(crate) fn workflow_show(
+        &mut self,
+        location: &Location,
+        view: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((index, workspace)) = self.workspace_at(location) else {
+            return;
+        };
+        self.activate(index, window, cx);
+        window.activate_window();
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_terminal_view(view, window, cx)
+        });
+    }
+
+    /// Opens a workflow file: a user one like the settings, a project one
+    /// in its project tab.
+    pub(crate) fn workflow_open_file(
+        &mut self,
+        source: &workflows::Source,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match source {
+            workflows::Source::User => self.open_config(path.to_path_buf(), window, cx),
+            workflows::Source::Project(location) => {
+                if let Some((index, workspace)) = self.workspace_at(location) {
+                    self.activate(index, window, cx);
+                    workspace.update(cx, |workspace, cx| workspace.open(path, window, cx));
+                }
+            }
+        }
+    }
+
+    /// The workspaces of loaded tabs, in tab order (tests).
+    #[cfg(test)]
+    pub(crate) fn workspace_entities(&self) -> Vec<Entity<Workspace>> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| match &tab.content {
+                Content::Workspace(workspace) => Some(workspace.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Opens menu `index`, resolving its rows for where focus is now.
@@ -1680,6 +1907,8 @@ impl Render for Shell {
             .on_action(cx.listener(Self::customize_theme))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::about))
+            .on_action(cx.listener(Self::run_workflow))
+            .on_action(cx.listener(Self::new_workflow))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if this.menu.is_some() && event.keystroke.key == "escape" {
                     this.close_menu(cx);

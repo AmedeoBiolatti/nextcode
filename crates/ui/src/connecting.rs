@@ -70,6 +70,11 @@ impl Connecting {
         this
     }
 
+    /// Why the last attempt failed (until Retry).
+    pub fn error(&self) -> Option<&SharedString> {
+        self.error.as_ref()
+    }
+
     /// Connects, or takes over a connection already under way.
     fn connect(
         &mut self,

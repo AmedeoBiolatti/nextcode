@@ -30,6 +30,9 @@ const LABELS: &[(&str, &str)] = &[
     ("workspace::ToggleFiles", "Files Panel"),
     ("workspace::ToggleSearch", "Find in Files"),
     ("workspace::ToggleTerminal", "Terminal Panel"),
+    ("workspace::ToggleWorkflows", "Workflows Panel"),
+    ("workflows::ShowWorkflows", "Workflows…"),
+    ("workflows::NewWorkflow", "New Workflow…"),
     ("workspace::ToggleCommit", "Commit Tool Window"),
     ("workspace::ToggleGitLog", "Git Tool Window"),
     ("workspace::ToggleProblems", "Problems Panel"),
@@ -203,6 +206,8 @@ const HIDDEN: &[&str] = &[
     "ports::ConfirmInput",
     "ports::CancelInput",
     "app::OpenRecentProject",
+    // Listed once per workflow as "Run Workflow: <name>".
+    "workflows::RunWorkflow",
 ];
 
 /// Whether the command palette lists the action.

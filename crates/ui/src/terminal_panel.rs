@@ -13,8 +13,8 @@ use gpui::{
     UnderlineStyle, Window, div, fill, outline, point, prelude::*, px, relative, rgb, size,
 };
 use terminal::{
-    Key, LinkTarget, Modifiers, Palette, Rgb, ScreenLink, Snapshot, Terminal, TerminalEvent,
-    TerminalOptions,
+    Key, LinkTarget, Modifiers, OutputTap, Palette, Rgb, ScreenLink, Snapshot, Terminal,
+    TerminalEvent, TerminalOptions,
 };
 use worktree::FileKind;
 
@@ -92,6 +92,44 @@ pub fn profiles(project: &Project) -> Vec<Profile> {
     }
 }
 
+/// Starts `program` in a pty where `project` lives (in its root), or on
+/// this machine in the home folder without one, as a view named `title`
+/// that stays when the program exits. `tap` follows its output.
+pub fn spawn_program(
+    project: Option<&Project>,
+    title: &str,
+    program: &str,
+    args: &[String],
+    tap: Option<OutputTap>,
+    cx: &mut App,
+) -> std::io::Result<Entity<TerminalView>> {
+    let mut options = TerminalOptions::default_shell();
+    let palette = theme::current().terminal;
+    let (terminal, events) = match project {
+        Some(project) if project.is_remote() => project.spawn_remote_terminal(
+            Some((program, args)),
+            (options.columns, options.rows, options.scrollback),
+            palette,
+            tap,
+        )?,
+        _ => {
+            options.program = program.into();
+            options.args = args.to_vec();
+            options.cwd = match project {
+                Some(project) => Some(project.root().to_path_buf()),
+                None => dirs::home_dir(),
+            };
+            Terminal::spawn(options, palette, tap)?
+        }
+    };
+    Ok(cx.new(|cx| {
+        let mut view = TerminalView::new(terminal, events, "Command", palette, cx);
+        view.run_name = Some(title.to_owned().into());
+        view.keep_on_exit = true;
+        view
+    }))
+}
+
 fn to_hsla(color: Rgb) -> Hsla {
     rgb((u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)).into()
 }
@@ -121,9 +159,15 @@ pub struct TerminalView {
     terminal: Terminal,
     profile: &'static str,
     title: SharedString,
-    /// Set by `TerminalPanel::run_command`: the tab keeps this name (shell
-    /// titles don't replace it) and running it again replaces the tab.
+    /// Set by `TerminalPanel::run_command`/`run_program`: the tab keeps
+    /// this name (shell titles don't replace it) and running it again
+    /// replaces the tab.
     run_name: Option<SharedString>,
+    /// A program's tab (workflows) stays when the program exits, showing
+    /// its exit code; a shell's tab closes.
+    keep_on_exit: bool,
+    /// Set once the process exited (with its code when known).
+    exit: Option<Option<i32>>,
     focus_handle: FocusHandle,
     palette: Palette,
     /// Grid size last sent to the pty.
@@ -166,7 +210,12 @@ impl TerminalView {
                         cx.emit(TerminalViewEvent::TitleChanged);
                     }
                     TerminalEvent::Bell => {}
-                    TerminalEvent::Exited(_) => cx.emit(TerminalViewEvent::Exited),
+                    TerminalEvent::Exited(code) => {
+                        if this.exit.is_none() {
+                            this.exit = Some(code);
+                            cx.emit(TerminalViewEvent::Exited);
+                        }
+                    }
                 });
                 if alive.is_err() {
                     break;
@@ -178,6 +227,8 @@ impl TerminalView {
             profile,
             title: SharedString::default(),
             run_name: None,
+            keep_on_exit: false,
+            exit: None,
             focus_handle: cx.focus_handle(),
             palette,
             grid: (0, 0),
@@ -201,15 +252,49 @@ impl TerminalView {
             Some(name) => name.trim(),
             None => self.title.trim(),
         };
-        if title.is_empty() {
-            return self.profile.into();
-        }
+        let title = if title.is_empty() {
+            self.profile
+        } else {
+            title
+        };
         // Long titles are usually paths; keep the end.
         let chars: Vec<char> = title.chars().collect();
-        if chars.len() > 28 {
-            format!("…{}", chars[chars.len() - 27..].iter().collect::<String>()).into()
+        let title = if chars.len() > 28 {
+            format!("…{}", chars[chars.len() - 27..].iter().collect::<String>())
         } else {
-            title.to_owned().into()
+            title.to_owned()
+        };
+        match self.exit {
+            Some(Some(code)) if self.keep_on_exit => format!("{title} (exit {code})").into(),
+            Some(None) if self.keep_on_exit => format!("{title} (ended)").into(),
+            _ => title.into(),
+        }
+    }
+
+    /// The tab's run name (`run_command`/`run_program`).
+    pub fn run_name(&self) -> Option<&str> {
+        self.run_name.as_ref().map(|name| name.as_ref())
+    }
+
+    /// Whether the process exited, and its exit code when known (tests).
+    #[cfg(test)]
+    pub fn exit(&self) -> Option<Option<i32>> {
+        self.exit
+    }
+
+    /// Ctrl+C, as typed.
+    pub fn interrupt(&mut self, cx: &mut Context<Self>) {
+        if self.exit.is_none() {
+            self.write(vec![0x03], cx);
+        }
+    }
+
+    /// Ends the process, keeping its output on screen.
+    pub fn kill(&mut self, cx: &mut Context<Self>) {
+        if self.exit.is_none() {
+            self.terminal.kill();
+            self.exit = Some(None);
+            cx.notify();
         }
     }
 
@@ -826,6 +911,66 @@ impl TerminalPanel {
         }
     }
 
+    /// Runs `program` (with `args`, in the project root where the project
+    /// lives) in a tab named `title` that stays when it exits, showing the
+    /// exit code; running the same title again replaces that tab (ending
+    /// what still runs there) in place. Focus stays where it is. `tap`
+    /// follows the output.
+    pub fn run_program(
+        &mut self,
+        title: &str,
+        program: &str,
+        args: &[String],
+        tap: Option<OutputTap>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Entity<TerminalView>, String> {
+        let view = spawn_program(Some(&self.project), title, program, args, tap, cx)
+            .map_err(|err| format!("could not start {program}: {err}"))?;
+        let subscription = self.subscribe_view(&view, window, cx);
+        let previous = self
+            .tabs
+            .iter()
+            .position(|(tab, _)| tab.read(cx).run_name() == Some(title));
+        match previous {
+            Some(index) => {
+                // Dropping the old view ends its process.
+                self.tabs[index] = (view.clone(), subscription);
+                self.active = index;
+            }
+            None => {
+                self.tabs.push((view.clone(), subscription));
+                self.active = self.tabs.len() - 1;
+            }
+        }
+        self.started = true;
+        self.error = None;
+        cx.notify();
+        Ok(view)
+    }
+
+    /// Shows and focuses `view`'s tab; false if it is not one of ours.
+    pub fn show(
+        &mut self,
+        view: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(index) = self.tabs.iter().position(|(tab, _)| tab == view) else {
+            return false;
+        };
+        self.active = index;
+        window.focus(&view.focus_handle(cx));
+        cx.notify();
+        true
+    }
+
+    /// The tabs' views (tests).
+    #[cfg(test)]
+    pub fn views(&self) -> Vec<Entity<TerminalView>> {
+        self.tabs.iter().map(|(view, _)| view.clone()).collect()
+    }
+
     /// Starts the default shell in a new tab and focuses it.
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(profile) = profiles(&self.project).into_iter().next() {
@@ -858,11 +1003,11 @@ impl TerminalPanel {
         let palette = theme::current().terminal;
         let venv = self.venv();
         let started = if profile.remote {
-            self.project.spawn_remote_shell(
-                options.columns,
-                options.rows,
-                options.scrollback,
+            self.project.spawn_remote_terminal(
+                None,
+                (options.columns, options.rows, options.scrollback),
                 palette,
+                None,
             )
         } else {
             if !profile.program.is_empty() {
@@ -884,7 +1029,7 @@ impl TerminalPanel {
                     .env
                     .insert("PATH".into(), path.to_string_lossy().into_owned());
             }
-            Terminal::spawn(options, palette)
+            Terminal::spawn(options, palette, None)
         };
         let (terminal, events) = match started {
             Ok(started) => started,
@@ -903,32 +1048,43 @@ impl TerminalPanel {
                 view.write(b". .venv/bin/activate\r".to_vec(), cx)
             });
         }
-        let subscription =
-            cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
-                TerminalViewEvent::TitleChanged => cx.notify(),
-                // Like VS Code: a shell that exits takes its tab with it.
-                TerminalViewEvent::Exited => {
-                    if let Some(index) = this.tabs.iter().position(|(tab, _)| tab == view) {
-                        this.close(index, window, cx);
-                    }
-                }
-                TerminalViewEvent::OpenLocation { path, line, column } => {
-                    let path = this.project.path(path);
-                    let position = line.map(|line| {
-                        (
-                            (line as usize).saturating_sub(1),
-                            column.map_or(0, |column| (column as usize).saturating_sub(1)),
-                        )
-                    });
-                    cx.emit(TerminalPanelEvent::OpenFile { path, position });
-                }
-            });
+        let subscription = self.subscribe_view(&view, window, cx);
         self.started = true;
         window.focus(&view.focus_handle(cx));
         self.tabs.push((view.clone(), subscription));
         self.active = self.tabs.len() - 1;
         cx.notify();
         Some(view)
+    }
+
+    fn subscribe_view(
+        &mut self,
+        view: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(view, window, |this, view, event, window, cx| match event {
+            TerminalViewEvent::TitleChanged => cx.notify(),
+            // Like VS Code: a shell that exits takes its tab with it; a
+            // program's tab stays to show its output.
+            TerminalViewEvent::Exited => {
+                if view.read(cx).keep_on_exit {
+                    cx.notify();
+                } else if let Some(index) = this.tabs.iter().position(|(tab, _)| tab == view) {
+                    this.close(index, window, cx);
+                }
+            }
+            TerminalViewEvent::OpenLocation { path, line, column } => {
+                let path = this.project.path(path);
+                let position = line.map(|line| {
+                    (
+                        (line as usize).saturating_sub(1),
+                        column.map_or(0, |column| (column as usize).saturating_sub(1)),
+                    )
+                });
+                cx.emit(TerminalPanelEvent::OpenFile { path, position });
+            }
+        })
     }
 
     fn close(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {

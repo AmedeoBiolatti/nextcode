@@ -8,3 +8,6 @@ publish.workspace = true
 alacritty_terminal.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
+# Already in the tree (alacritty_terminal's event loop): the tapped pty
+# implements its registration trait.
+polling = "3"

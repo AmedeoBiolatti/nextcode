@@ -46,6 +46,18 @@ impl Command {
             haystack,
         }
     }
+
+    /// A command with its own label (e.g. one per workflow).
+    pub fn labeled(action: Box<dyn Action>, label: String, category: &str) -> Self {
+        let haystack = format!("{category} {label}").to_lowercase();
+        Self {
+            action,
+            label: label.into(),
+            category: category.to_owned().into(),
+            keys: None,
+            haystack,
+        }
+    }
 }
 
 pub enum CommandPaletteEvent {

@@ -23,6 +23,7 @@ actions!(
         TogglePython,
         ToggleProblems,
         TogglePorts,
+        ToggleWorkflows,
         ToggleCallHierarchy,
         ToggleOutline,
         ToggleBottomDock,
@@ -90,6 +91,7 @@ impl Workspace {
             PanelId::Problems => Some(self.problems.clone().into()),
             PanelId::Ports => Some(self.ports_panel.clone().into()),
             PanelId::Terminal => Some(self.terminal.clone().into()),
+            PanelId::Workflows => Some(self.workflows.clone().into()),
             PanelId::Search => Some(self.search.clone().into()),
             PanelId::Commit => Some(self.commit.clone().into()),
             PanelId::GitLog => Some(self.git_log.clone().into()),
@@ -112,6 +114,9 @@ impl Workspace {
 
     pub(super) fn show_panel(&mut self, panel: PanelId, cx: &mut Context<Self>) {
         self.layout.activate(panel);
+        if panel == PanelId::Commit {
+            self.refresh_git_status(cx);
+        }
         self.layout_changed(cx);
     }
 
@@ -170,7 +175,6 @@ impl Workspace {
         }
         self.show_panel(PanelId::Commit, cx);
         self.commit.update(cx, |commit, cx| {
-            commit.refresh(cx);
             commit.focus(window, cx);
         });
     }
@@ -210,6 +214,57 @@ impl Workspace {
 
     pub(super) fn toggle_ports(&mut self, _: &TogglePorts, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_panel(PanelId::Ports, cx);
+    }
+
+    pub(super) fn toggle_workflows(
+        &mut self,
+        _: &ToggleWorkflows,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel(PanelId::Workflows, cx);
+    }
+
+    /// Run > Workflows…: shows the panel (it lists every workflow).
+    pub(super) fn show_workflows_action(
+        &mut self,
+        _: &crate::workflows::ShowWorkflows,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_workflows(cx);
+    }
+
+    pub(crate) fn show_workflows(&mut self, cx: &mut Context<Self>) {
+        self.show_panel(PanelId::Workflows, cx);
+    }
+
+    /// Shows `view` in the Terminal panel (a workflow step's terminal).
+    pub(crate) fn show_terminal_view(
+        &mut self,
+        view: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .terminal
+            .update(cx, |terminal, cx| terminal.show(view, window, cx))
+        {
+            self.show_panel(PanelId::Terminal, cx);
+        }
+    }
+
+    pub(crate) fn project(&self) -> &Project {
+        &self.project
+    }
+
+    pub(crate) fn terminal_panel(&self) -> Entity<TerminalPanel> {
+        self.terminal.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workflows_panel(&self) -> Entity<WorkflowsPanel> {
+        self.workflows.clone()
     }
 
     /// Forward a Port…: shows the Ports panel with its input focused.

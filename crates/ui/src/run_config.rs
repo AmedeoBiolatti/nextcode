@@ -185,12 +185,17 @@ pub fn resolve(
     let local = !project.is_remote();
     // The project's environment is only known for local projects.
     let env = move |name: &str| local.then(|| std::env::var(name).ok()).flatten();
+    let home = local
+        .then(dirs::home_dir)
+        .flatten()
+        .map(|home| home.to_string_lossy().into_owned());
     let context = run::Context {
         workspace_folder: &folder,
         file: active.file.as_deref(),
         line: active.line,
         separator: separator(project),
         env: &env,
+        user_home: home.as_deref(),
     };
     config.resolve(&context)
 }
