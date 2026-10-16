@@ -285,22 +285,48 @@ fn args<const N: usize>(fixed: [&str; N]) -> Vec<String> {
     fixed.map(str::to_owned).to_vec()
 }
 
-/// Containers matching all `labels`, as `(id, running)`.
-fn find_containers(host: &dyn Host, labels: &[String]) -> io::Result<Vec<(String, bool)>> {
-    // Full ids, as `docker run` prints them.
-    let mut command = args(["ps", "-a", "--no-trunc", "--format", "{{.ID}}\t{{.State}}"]);
+/// A container `docker ps` listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Found {
+    /// Full id, as `docker run` prints it.
+    id: String,
+    running: bool,
+    name: String,
+}
+
+/// Containers matching all `labels`.
+fn find_containers(host: &dyn Host, labels: &[String]) -> io::Result<Vec<Found>> {
+    let mut command = args([
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--format",
+        "{{.ID}}\t{{.State}}\t{{.Names}}",
+    ]);
     for label in labels {
         command.push("--filter".into());
         command.push(format!("label={label}"));
     }
     let output = docker(host, &command, SHORT, "Looking for the dev container")?;
-    Ok(output
+    Ok(parse_found(&output))
+}
+
+fn parse_found(output: &str) -> Vec<Found> {
+    output
         .lines()
         .filter_map(|line| {
-            let (id, state) = line.split_once('\t')?;
-            Some((id.trim().to_owned(), state.trim() == "running"))
+            let mut fields = line.split('\t');
+            let id = fields.next()?.trim();
+            let state = fields.next()?.trim();
+            // Several names are comma-separated (legacy links).
+            let name = fields.next().unwrap_or_default().split(',').next();
+            (!id.is_empty()).then(|| Found {
+                id: id.to_owned(),
+                running: state == "running",
+                name: name.unwrap_or_default().trim().to_owned(),
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// The compose project name VS Code gives a dev container: the folder name
@@ -469,14 +495,16 @@ pub fn up(
                 base.extend(["-f".into(), file.clone()]);
             }
             let found = find_containers(host, &compose_labels)?;
+            // Each docker call costs a few hundred milliseconds (on Windows
+            // especially): a container found is used as listed.
             let reused = match found.first() {
-                Some((_, true)) => Some((false, false)),
-                Some((_, false)) => {
+                Some(container) if container.running => Some((container.clone(), false)),
+                Some(container) => {
                     progress(&format!("Starting compose project {project}"));
                     let mut start = base.clone();
                     start.push("start".into());
                     match docker(host, &start, LONG, "docker compose start") {
-                        Ok(_) => Some((false, true)),
+                        Ok(_) => Some((container.clone(), true)),
                         // E.g. a mount from a former VS Code session is gone.
                         Err(err) => {
                             progress(&format!("{}; recreating it", first_line(&err)));
@@ -486,8 +514,8 @@ pub fn up(
                 }
                 None => None,
             };
-            let (created, started) = match reused {
-                Some(state) => state,
+            let (container, created, started) = match reused {
+                Some((container, started)) => (container, false, started),
                 None => {
                     let override_path = join(
                         host,
@@ -534,21 +562,20 @@ pub fn up(
                     for line in output.lines() {
                         progress(line);
                     }
-                    (true, true)
+                    let container = find_containers(host, &compose_labels)?
+                        .into_iter()
+                        .find(|container| container.running)
+                        .ok_or_else(|| {
+                            io::Error::other(format!(
+                                "service {service} of compose project {project} is not running"
+                            ))
+                        })?;
+                    (container, true, true)
                 }
             };
-            let container = find_containers(host, &compose_labels)?
-                .into_iter()
-                .find(|(_, running)| *running)
-                .map(|(id, _)| id)
-                .ok_or_else(|| {
-                    io::Error::other(format!(
-                        "service {service} of compose project {project} is not running"
-                    ))
-                })?;
             let shutdown = match config.shutdown_action {
                 Some(ShutdownAction::None) => Shutdown::None,
-                Some(ShutdownAction::StopContainer) => Shutdown::Container(container.clone()),
+                Some(ShutdownAction::StopContainer) => Shutdown::Container(container.id.clone()),
                 Some(ShutdownAction::StopCompose) | None => Shutdown::Compose { project, files },
             };
             (container, created, started, shutdown)
@@ -556,12 +583,12 @@ pub fn up(
         Kind::Image(_) | Kind::Dockerfile { .. } => {
             let found = find_containers(host, &labels)?;
             let reused = match found.first() {
-                Some((container, true)) => Some((container.clone(), false, false)),
-                Some((container, false)) => {
+                Some(container) if container.running => Some((container.clone(), false, false)),
+                Some(container) => {
                     progress("Starting the dev container");
                     match docker(
                         host,
-                        &["start".into(), container.clone()],
+                        &["start".into(), container.id.clone()],
                         SHORT,
                         "docker start",
                     ) {
@@ -570,7 +597,7 @@ pub fn up(
                             progress(&format!("{}; recreating it", first_line(&err)));
                             docker(
                                 host,
-                                &["rm".into(), "-f".into(), container.clone()],
+                                &["rm".into(), "-f".into(), container.id.clone()],
                                 SHORT,
                                 "docker rm",
                             )?;
@@ -666,32 +693,58 @@ pub fn up(
                     }
                     progress("Creating the dev container");
                     let id = docker(host, &run, LONG, "docker run")?.trim().to_owned();
-                    (id, true, true)
+                    // Its name is read below if needed.
+                    let container = Found {
+                        id,
+                        running: true,
+                        name: String::new(),
+                    };
+                    (container, true, true)
                 }
             };
             let shutdown = match config.shutdown_action {
                 Some(ShutdownAction::None) => Shutdown::None,
-                _ => Shutdown::Container(container.clone()),
+                _ => Shutdown::Container(container.id.clone()),
             };
             (container, created, started, shutdown)
         }
     };
 
-    let inspect = docker(
-        host,
-        &args(["inspect", "-f", "{{.Name}}\t{{.Config.User}}", &container]),
-        SHORT,
-        "docker inspect",
-    )?;
-    let (container_name, image_user) = inspect
-        .trim()
-        .split_once('\t')
-        .unwrap_or((inspect.trim(), ""));
-    let user = config
+    let Found {
+        id: container,
+        name: listed_name,
+        ..
+    } = container;
+    let configured_user = config
         .remote_user
         .clone()
-        .or_else(|| config.container_user.clone())
-        .or_else(|| (!image_user.is_empty()).then(|| image_user.to_owned()));
+        .or_else(|| config.container_user.clone());
+    let known_name = config
+        .name
+        .clone()
+        .or_else(|| (!listed_name.is_empty()).then_some(listed_name));
+    // `docker inspect` only for what neither the configuration nor
+    // `docker ps` said: the image's user, or the name of a new container.
+    let (name, user) = match (known_name, configured_user) {
+        (Some(name), Some(user)) => (name, Some(user)),
+        (known_name, configured_user) => {
+            let inspect = docker(
+                host,
+                &args(["inspect", "-f", "{{.Name}}\t{{.Config.User}}", &container]),
+                SHORT,
+                "docker inspect",
+            )?;
+            let (container_name, image_user) = inspect
+                .trim()
+                .split_once('\t')
+                .unwrap_or((inspect.trim(), ""));
+            let name = known_name
+                .unwrap_or_else(|| container_name.trim_start_matches('/').to_owned());
+            let user = configured_user
+                .or_else(|| (!image_user.is_empty()).then(|| image_user.to_owned()));
+            (name, user)
+        }
+    };
 
     // `${containerEnv:…}` needs the container's environment, as that user.
     let mut env_args = args(["exec"]);
@@ -725,10 +778,7 @@ pub fn up(
 
     let started_container = Started {
         id: container,
-        name: config
-            .name
-            .clone()
-            .unwrap_or_else(|| container_name.trim_start_matches('/').to_owned()),
+        name,
         user,
         workspace_folder,
         remote_env,
@@ -900,6 +950,25 @@ mod tests {
         assert_eq!(
             compose_project(&Posix, "/p", "/p/compose/docker-compose.yml").unwrap(),
             "compose"
+        );
+    }
+
+    #[test]
+    fn listed_containers_carry_their_state_and_first_name() {
+        let found = parse_found(
+            "abc\trunning\tproj-dev-1\ndef\texited\tone,two\n\nghi\tcreated\n",
+        );
+        let summary: Vec<_> = found
+            .iter()
+            .map(|found| (found.id.as_str(), found.running, found.name.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("abc", true, "proj-dev-1"),
+                ("def", false, "one"),
+                ("ghi", false, "")
+            ]
         );
     }
 }

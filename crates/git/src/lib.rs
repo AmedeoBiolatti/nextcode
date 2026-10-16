@@ -116,6 +116,11 @@ impl Repository {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return if stderr.contains("not a git repository") {
                 Ok(None)
+            } else if let Some(path) = dubious_ownership(&stderr) {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    UnsafeRepository { path },
+                ))
             } else {
                 Err(failure("rev-parse", &output))
             };
@@ -524,11 +529,125 @@ fn failure(command: &str, output: &Output) -> io::Error {
     io::Error::other(format!("git {command} failed: {details}"))
 }
 
+/// Git refused a repository whose folder belongs to another user than the
+/// one running git ("detected dubious ownership"), e.g. a folder mounted
+/// into a container or WSL, or on another drive. Inside the `io::Error`
+/// returned by [`Repository::discover`] and [`Repository::open`]; see
+/// [`unsafe_repository`] and [`trust`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsafeRepository {
+    /// The repository as git names it in the refusal.
+    pub path: String,
+}
+
+impl std::fmt::Display for UnsafeRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "git refuses the repository at {}: the folder belongs to another user",
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for UnsafeRepository {}
+
+/// The refusal inside `err`, if git refused the repository's owner.
+pub fn unsafe_repository(err: &io::Error) -> Option<&UnsafeRepository> {
+    err.get_ref()?.downcast_ref()
+}
+
+/// Marks `path` safe in the user's global git config
+/// (`safe.directory`), where the runner runs git: what git's own message
+/// suggests, and what VS Code's "Manage Unsafe Repositories" does.
+pub fn trust(runner: &dyn Runner, path: &str) -> io::Result<()> {
+    let args = ["config", "--global", "--add", "safe.directory", path].map(String::from);
+    let output = runner.run_git(&args, None)?;
+    if output.code != Some(0) {
+        return Err(failure("config", &output));
+    }
+    Ok(())
+}
+
+/// The repository path in git's "dubious ownership" refusal.
+fn dubious_ownership(stderr: &str) -> Option<String> {
+    let rest = stderr
+        .split("detected dubious ownership in repository at '")
+        .nth(1)?;
+    Some(rest.split('\'').next()?.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf, process::Command};
 
     use super::*;
+
+    /// Answers every run with `output`, recording the arguments.
+    struct Scripted {
+        output: Output,
+        calls: parking_lot::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Runner for Scripted {
+        fn run_git(&self, args: &[String], _: Option<&[u8]>) -> io::Result<Output> {
+            self.calls.lock().push(args.to_vec());
+            Ok(self.output.clone())
+        }
+    }
+
+    #[test]
+    fn a_repository_owned_by_another_user_is_reported_as_untrusted() {
+        // git 2.50's refusal, verbatim.
+        let stderr = "fatal: detected dubious ownership in repository at \
+                      '/home/developer/git/My Repo'\nTo add an exception for this \
+                      directory, call:\n\n\tgit config --global --add safe.directory \
+                      '/home/developer/git/My Repo'\n";
+        let runner = Arc::new(Scripted {
+            output: Output {
+                code: Some(128),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            },
+            calls: Default::default(),
+        });
+        let err = Repository::open(runner, "/home/developer/git/My Repo")
+            .err()
+            .expect("refused");
+        assert_eq!(
+            unsafe_repository(&err),
+            Some(&UnsafeRepository {
+                path: "/home/developer/git/My Repo".into()
+            })
+        );
+        // Other failures stay plain errors.
+        let other = io::Error::other("git status failed: boom");
+        assert_eq!(unsafe_repository(&other), None);
+    }
+
+    #[test]
+    fn trusting_adds_the_path_to_the_global_safe_directory_list() {
+        let runner = Scripted {
+            output: Output {
+                code: Some(0),
+                ..Output::default()
+            },
+            calls: Default::default(),
+        };
+        trust(&runner, "C:/repos/My Repo").unwrap();
+        assert_eq!(
+            runner.calls.lock().as_slice(),
+            [[
+                "config",
+                "--global",
+                "--add",
+                "safe.directory",
+                "C:/repos/My Repo"
+            ]
+            .map(String::from)
+            .to_vec()]
+        );
+    }
 
     struct LocalGit;
 

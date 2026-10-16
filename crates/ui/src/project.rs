@@ -807,6 +807,12 @@ impl Project {
         git::Repository::open(Arc::new(GitRunner(self.clone())), &root)
     }
 
+    /// Marks the repository at `path` safe for git where the project lives
+    /// (global `safe.directory`). Blocks.
+    pub fn trust_repository(&self, path: &str) -> io::Result<()> {
+        git::trust(&GitRunner(self.clone()), path)
+    }
+
     /// A root-relative repository path (`/`-separated) as a project path.
     /// Paths inside the project are built from the project root, so they
     /// match the editor's paths even where git spells the root differently
@@ -841,6 +847,22 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl git::Runner for GitRunner {
     fn run_git(&self, args: &[String], input: Option<&[u8]>) -> io::Result<git::Output> {
+        // A dev container's workspace is a bind mount usually owned by
+        // another user than the container's, which git refuses ("dubious
+        // ownership"); the container is a sandbox the user chose to open,
+        // so its folders are trusted for the editor's own git runs (the
+        // config is untouched; command-line config counts as protected).
+        let trusted;
+        let args = if self.0.in_container() {
+            trusted = ["-c", "safe.directory=*"]
+                .into_iter()
+                .map(String::from)
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>();
+            &trusted[..]
+        } else {
+            args
+        };
         let output = self.0.run_program(
             "git",
             args,

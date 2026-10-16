@@ -98,6 +98,9 @@ enum State {
         repository: Repository,
         status: Status,
     },
+    /// Git refuses the repository at this path: its folder belongs to
+    /// another user.
+    Untrusted(SharedString),
     Failed(SharedString),
 }
 
@@ -246,7 +249,10 @@ impl GitPanel {
         self.state = match opened {
             Ok(Some((repository, status))) => State::Ready { repository, status },
             Ok(None) => State::NoRepository,
-            Err(err) => State::Failed(err.to_string().into()),
+            Err(err) => match git::unsafe_repository(&err) {
+                Some(refusal) => State::Untrusted(refusal.path.clone().into()),
+                None => State::Failed(err.to_string().into()),
+            },
         };
         self.rebuild_rows();
         cx.emit(GitPanelEvent::Refreshed);
@@ -257,6 +263,30 @@ impl GitPanel {
     pub fn report(&mut self, message: String, cx: &mut Context<Self>) {
         self.feedback = Some((message.into(), theme::muted));
         cx.notify();
+    }
+
+    /// Adds the refused repository to git's `safe.directory` where the
+    /// project lives, then reads it again.
+    fn trust(&mut self, path: String, cx: &mut Context<Self>) {
+        let project = self.project.clone();
+        self.busy = true;
+        cx.notify();
+        self._operation = cx.spawn(async move |this, cx| {
+            let trusted = cx
+                .background_spawn(async move { project.trust_repository(&path) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                match trusted {
+                    Ok(()) => this.refresh(cx),
+                    Err(err) => {
+                        this.feedback = Some((err.to_string().into(), theme::error));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        });
     }
 
     fn rebuild_rows(&mut self) {
@@ -643,6 +673,7 @@ impl GitPanel {
         };
         div()
             .id(("git-row", index))
+            .w_full()
             .h(px(ROW_HEIGHT))
             .pl(px(30. + 14. * depth as f32))
             .pr_2()
@@ -700,6 +731,7 @@ impl GitPanel {
             }
             State::Loading => ("Reading repository…".into(), 0, 0),
             State::NoRepository => ("No git repository".into(), 0, 0),
+            State::Untrusted(_) => ("Untrusted repository".into(), 0, 0),
             State::Failed(_) => ("Git unavailable".into(), 0, 0),
         };
         let repository = match &self.state {
@@ -717,13 +749,16 @@ impl GitPanel {
                 .child(label)
         };
         let busy = self.busy;
-        let tools = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .when_some(repository.clone(), |tools, repository| {
+        let tools =
+            repository.clone().map(|repository| {
                 let (compare, worktrees) = (repository.clone(), repository.clone());
-                tools
+                div()
+                    .px_1()
+                    .pb_1()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
                     .child(tool("git-history", "History".into()).on_click(cx.listener(
                         move |_, _, _, cx| cx.emit(GitPanelEvent::OpenHistory(repository.clone())),
                     )))
@@ -746,11 +781,7 @@ impl GitPanel {
                             cx.notify();
                         })),
                     )
-            })
-            .child(
-                tool("git-refresh", "⟳".into())
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-            );
+            });
         let branch = div()
             .id("git-branch")
             .min_w_0()
@@ -801,21 +832,27 @@ impl GitPanel {
                 }),
             )
         });
+        // Branch on its own row (never squeezed by the tools); the tools wrap
+        // in a narrow dock.
         div()
             .flex()
             .flex_col()
             .child(
                 div()
                     .px_2()
-                    .py_1()
+                    .pt_1()
                     .flex()
                     .items_center()
-                    .justify_between()
                     .gap_2()
                     .text_sm()
-                    .child(branch)
-                    .child(tools),
+                    .child(branch.flex_1())
+                    .child(
+                        tool("git-refresh", "⟳".into())
+                            .flex_none()
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    ),
             )
+            .children(tools)
             .children(sync)
     }
 }
@@ -843,6 +880,7 @@ impl Render for GitPanel {
                 }),
             )
             .flex_1()
+            .w_full()
             .into_any_element(),
             State::NoRepository => div()
                 .p_3()
@@ -850,6 +888,42 @@ impl Render for GitPanel {
                 .text_color(theme::muted())
                 .child("This project is not in a git repository.")
                 .into_any_element(),
+            State::Untrusted(path) => {
+                let trusted = path.clone();
+                div()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .text_sm()
+                    .child(format!(
+                        "Git refuses this repository because its folder ({path}) belongs \
+                         to another user than the one running git. This is common for \
+                         folders on another drive, shared folders, or folders mounted \
+                         into WSL."
+                    ))
+                    .child(
+                        div()
+                            .text_color(theme::muted())
+                            .child("Trusting it adds the folder to git's safe.directory list."),
+                    )
+                    .child(
+                        div()
+                            .id("trust-repository")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme::border())
+                            .hover(|style| style.bg(theme::hover_row()))
+                            .cursor_pointer()
+                            .child("Trust This Folder")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.trust(trusted.to_string(), cx)
+                            })),
+                    )
+                    .into_any_element()
+            }
             State::Failed(error) => div()
                 .p_3()
                 .text_sm()
@@ -874,11 +948,10 @@ impl Render for GitPanel {
                         .px_2()
                         .pb_2()
                         .flex()
-                        .gap_2()
+                        .flex_col()
+                        .gap_1()
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
                                 .h(px(28.))
                                 .px_2()
                                 .py_1()
@@ -890,43 +963,50 @@ impl Render for GitPanel {
                         )
                         .child(
                             div()
-                                .id("git-amend")
-                                .flex_none()
-                                .px_1()
-                                .py_1()
-                                .text_xs()
-                                .text_color(if self.amend {
-                                    theme::text()
-                                } else {
-                                    theme::muted()
-                                })
-                                .cursor_pointer()
-                                .child(if self.amend { "☑ Amend" } else { "☐ Amend" })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.amend = !this.amend;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("git-commit")
-                                .px_3()
-                                .py_1()
-                                .rounded_sm()
-                                .text_sm()
-                                .bg(if self.busy {
-                                    theme::border()
-                                } else {
-                                    theme::accent()
-                                })
-                                .text_color(theme::on_accent())
-                                .cursor_pointer()
-                                .child(match (self.busy, self.amend) {
-                                    (true, _) => "…",
-                                    (false, true) => "Amend",
-                                    (false, false) => "Commit",
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| this.commit(cx))),
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("git-commit")
+                                        .flex_1()
+                                        .flex()
+                                        .justify_center()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .text_sm()
+                                        .bg(if self.busy {
+                                            theme::border()
+                                        } else {
+                                            theme::accent()
+                                        })
+                                        .text_color(theme::on_accent())
+                                        .cursor_pointer()
+                                        .child(match (self.busy, self.amend) {
+                                            (true, _) => "…",
+                                            (false, true) => "Amend",
+                                            (false, false) => "Commit",
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| this.commit(cx))),
+                                )
+                                .child(
+                                    div()
+                                        .id("git-amend")
+                                        .flex_none()
+                                        .px_1()
+                                        .text_xs()
+                                        .text_color(if self.amend {
+                                            theme::text()
+                                        } else {
+                                            theme::muted()
+                                        })
+                                        .cursor_pointer()
+                                        .child(if self.amend { "☑ Amend" } else { "☐ Amend" })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.amend = !this.amend;
+                                            cx.notify();
+                                        })),
+                                ),
                         ),
                 )
             })

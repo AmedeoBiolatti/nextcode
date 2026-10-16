@@ -7,3 +7,6 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 similar.workspace = true
+
+[dev-dependencies]
+parking_lot.workspace = true

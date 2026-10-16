@@ -386,6 +386,15 @@ commit instead (with what is staged, or just its message). Git runs where the
 project lives (inside WSL for WSL projects), and the panel refreshes on file
 changes and on index/ref changes (commits or checkouts from a terminal).
 
+When git refuses a repository whose folder belongs to another user ("dubious
+ownership": a folder on another drive, a shared folder, a folder mounted into
+WSL), the panel says so and offers **Trust This Folder**, which adds it to
+git's global `safe.directory` list where the project lives (what git's own
+message and VS Code suggest). Inside a dev container, where the bind-mounted
+workspace usually belongs to another user than the container's, the editor
+runs its own git commands with `-c safe.directory=*` and leaves the config
+as it is.
+
 Diffs show unified or side by side, and changed hunks only or the whole
 file; the last choice sticks for new diffs. Diffs of changes in the index
 or working tree come from `git diff` itself and act per hunk: "Stage hunk"
