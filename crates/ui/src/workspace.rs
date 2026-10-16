@@ -36,7 +36,7 @@ use crate::{
     outline_panel::OutlinePanel,
     ports::{Ports, PortsEvent, panel::PortsPanel},
     problems::{ProblemsEvent, ProblemsPanel},
-    project::{self, Project, WatchHandle},
+    project::{self, Project},
     python_panel::{PythonPanel, PythonPanelEvent, RunRequest},
     recent,
     revision_picker::{RevisionPicker, RevisionPickerEvent},
@@ -299,7 +299,8 @@ pub struct Workspace {
     connection_error: Option<SharedString>,
     /// Files with an open "changed on disk" prompt, so it is asked once.
     reload_prompts: HashSet<PathBuf>,
-    _watcher: Option<(WatchHandle, Task<()>)>,
+    /// Owns the watch: dropping it stops watching.
+    _watcher: Task<()>,
     _disconnects: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -425,28 +426,36 @@ impl Workspace {
         window.focus(&focus_handle);
         let layout = Layout::load(&project.state_key());
         let debug = debug::DebugState::new(window, cx);
-        let mut notice = settings_error.map(|error| format!("Settings ignored: {error}").into());
-        let watcher = match project.watch(Duration::from_millis(150)) {
-            Ok((watcher, mut batches)) => {
-                let task = cx.spawn_in(window, async move |this, cx| {
-                    while let Some(batch) = batches.next().await {
-                        if this
-                            .update_in(cx, |this, window, cx| {
-                                this.on_files_changed(batch, window, cx)
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                });
-                Some((watcher, task))
+        let notice = settings_error.map(|error| format!("Settings ignored: {error}").into());
+        // Starting the watcher can take seconds (a container's bind mount
+        // from a Windows folder, a large tree): never on the UI thread.
+        let watch_project = project.clone();
+        let watcher = cx.spawn_in(window, async move |this, cx| {
+            let started = cx
+                .background_spawn(async move { watch_project.watch(Duration::from_millis(150)) })
+                .await;
+            let (_handle, mut batches) = match started {
+                Ok(started) => started,
+                Err(err) => {
+                    this.update(cx, |this, cx| {
+                        this.notice = Some(format!("File watching unavailable: {err}").into());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            while let Some(batch) = batches.next().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.on_files_changed(batch, window, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            Err(err) => {
-                notice = Some(format!("File watching unavailable: {err}").into());
-                None
-            }
-        };
+        });
         let disconnects = project.disconnects().map(|mut reasons| {
             cx.spawn(async move |this, cx| {
                 if let Some(reason) = reasons.next().await {

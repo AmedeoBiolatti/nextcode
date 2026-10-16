@@ -10,7 +10,7 @@ use git::{
 };
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, Global, PromptLevel, SharedString, Task,
-    Window, div, prelude::*, px, uniform_list,
+    Window, div, prelude::*, px, relative, uniform_list,
 };
 
 use crate::{commit_panel::short_revision, project::Project, theme};
@@ -260,6 +260,7 @@ impl DiffView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         div()
+            .w_full()
             .h(px(ROW_HEIGHT))
             .px_2()
             .flex()
@@ -328,11 +329,17 @@ impl DiffView {
             .child(number(numbers[0]))
             .when(show_both, |row| row.child(number(numbers[1])))
             .child(div().w(px(16.)).flex_none().child(sign))
-            .child(div().whitespace_nowrap().child(text.replace('\t', "    ")))
+            .child(
+                div()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .child(text.replace('\t', "    ")),
+            )
     }
 
     fn skipped(lines: usize) -> gpui::AnyElement {
         div()
+            .w_full()
             .h(px(ROW_HEIGHT))
             .px_2()
             .flex()
@@ -371,6 +378,7 @@ impl DiffView {
             } => {
                 let target = new.or(*old);
                 Self::line_cells(*kind, [*old, *new], true, text)
+                    .w_full()
                     .id(index)
                     .hover(|style| style.bg(theme::hover_row()))
                     .cursor_pointer()
@@ -396,6 +404,7 @@ impl DiffView {
                             Self::line_cells(line.kind, [Some(line.line), None], false, &line.text)
                                 .id((id, index))
                                 .flex_1()
+                                .flex_basis(relative(0.))
                                 .min_w_0()
                                 .when(clickable, |cell| {
                                     cell.cursor_pointer()
@@ -408,16 +417,26 @@ impl DiffView {
                         }
                         None => div()
                             .flex_1()
+                            .flex_basis(relative(0.))
                             .min_w_0()
                             .h(px(ROW_HEIGHT))
                             .bg(theme::panel())
                             .into_any_element(),
                     }
                 };
+                // Two equal halves whatever their text: the row spans the
+                // pane and each side gets half of it.
                 div()
+                    .w_full()
                     .flex()
                     .child(half(left, "left"))
-                    .child(div().w(px(1.)).flex_none().bg(theme::border()))
+                    .child(
+                        div()
+                            .w(px(1.))
+                            .h(px(ROW_HEIGHT))
+                            .flex_none()
+                            .bg(theme::border()),
+                    )
                     .child(half(right, "right"))
                     .into_any_element()
             }
@@ -532,6 +551,7 @@ impl Render for DiffView {
                 }),
             )
             .flex_1()
+            .w_full()
             .into_any_element(),
             (None, Some(diff)) => uniform_list(
                 "diff-rows",
@@ -541,6 +561,7 @@ impl Render for DiffView {
                 }),
             )
             .flex_1()
+            .w_full()
             .into_any_element(),
             (None, None) => div().into_any_element(),
         };
