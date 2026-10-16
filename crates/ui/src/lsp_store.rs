@@ -720,6 +720,8 @@ fn client_capabilities() -> ClientCapabilities {
             "semanticTokens": { "refreshSupport": true },
             "inlayHint": { "refreshSupport": true },
             "symbol": { "symbolKind": { "valueSet": (1..=26).collect::<Vec<u32>>() } },
+            // Renames and moves from the Files tree (`file_ops`).
+            "fileOperations": { "willRename": true, "didRename": true },
         },
         "window": { "workDoneProgress": true },
     }))

@@ -28,7 +28,7 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-fn frame() -> gpui::Div {
+pub(crate) fn frame() -> gpui::Div {
     div()
         .w(px(520.))
         .flex()
@@ -85,6 +85,8 @@ pub struct InputDialog {
     /// An option under the input (e.g. "Checkout branch") and its state.
     checkbox: Option<(&'static str, bool)>,
     error: Option<SharedString>,
+    /// An empty answer is fine (e.g. a stash message).
+    allow_empty: bool,
     _subscription: Subscription,
 }
 
@@ -122,8 +124,15 @@ impl InputDialog {
             confirm_label,
             checkbox,
             error: None,
+            allow_empty: false,
             _subscription: subscription,
         }
+    }
+
+    /// Accepts an empty value.
+    pub fn allow_empty(mut self) -> Self {
+        self.allow_empty = true;
+        self
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
@@ -133,7 +142,7 @@ impl InputDialog {
         } else {
             text.trim().to_owned()
         };
-        if text.is_empty() {
+        if text.is_empty() && !self.allow_empty {
             self.error = Some("Enter a value".into());
             return cx.notify();
         }

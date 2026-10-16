@@ -13,7 +13,7 @@ use super::*;
 use crate::{
     editor::{execute_command, format, resolve_code_action},
     lsp_store::ApplyEditRequest,
-    workspace_edit::{self, Documents, Failure, Report},
+    workspace_edit::{self, Documents, Failure, FileTargets, Report},
 };
 
 /// The session's open documents as targets of a workspace edit: their
@@ -29,6 +29,13 @@ impl Documents for OpenDocuments<'_, '_> {
             .documents
             .get(path)
             .map(|document| document.version)
+    }
+
+    fn text(&mut self, path: &Path) -> Option<String> {
+        self.session
+            .documents
+            .get(path)
+            .map(|document| document.text.clone())
     }
 
     fn edit(
@@ -112,7 +119,7 @@ fn close(server: &RunningServer, document: &Document) {
         });
 }
 
-fn report_json(report: &Report) -> Value {
+pub(super) fn report_json(report: &Report) -> Value {
     json!({
         "applied": report.failure.is_none(),
         "changed": report.changed.iter().map(|path| path_json(path)).collect::<Vec<_>>(),
@@ -131,7 +138,18 @@ fn action_json(index: usize, action: &CodeActionOrCommand) -> Value {
 }
 
 impl Session {
-    fn apply_edit(
+    /// Open documents of `from` (or inside it) now live at `to`: reopened
+    /// under the new URI with their servers.
+    pub(super) fn documents_renamed(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+        OpenDocuments { session: self, cx }.renamed(from, to);
+    }
+
+    /// Open documents of `path` (or inside it) are gone: closed.
+    pub(super) fn documents_deleted(&mut self, path: &Path, cx: &mut Context<Self>) {
+        OpenDocuments { session: self, cx }.deleted(path);
+    }
+
+    pub(super) fn apply_edit(
         &mut self,
         edit: WorkspaceEdit,
         encoding: Encoding,
@@ -167,6 +185,89 @@ impl Session {
         let mut event = report_json(&report);
         event["label"] = json!(request.label);
         self.out.event("applied_edit", event);
+    }
+
+    /// `replace`: searches like `search` (only files under `paths`, when
+    /// given) and replaces every match with `replacement`; open documents
+    /// are edited from their text and synced, files changed meanwhile are
+    /// skipped.
+    pub(super) fn replace(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
+        let query = search_query(request);
+        let replacer = match param_str(request, "replacement")
+            .and_then(|text| search::Replacer::new(&query, text).map_err(|err| err.to_string()))
+        {
+            Ok(replacer) => replacer,
+            Err(err) => return self.out.reply(&id, Err(err)),
+        };
+        let paths: Vec<PathBuf> = strings(request, "paths")
+            .iter()
+            .map(|path| self.project.path(path))
+            .collect();
+        let started = self.project.search(&query, SearchLimits::default());
+        cx.spawn(async move |this, cx| {
+            let (_handle, mut events) = match started {
+                Ok(started) => started,
+                Err(err) => {
+                    this.update(cx, |this, _| this.out.reply(&id, Err(err)))
+                        .ok();
+                    return;
+                }
+            };
+            let mut files = Vec::new();
+            let mut limit_hit = None;
+            while let Some(event) = events.next().await {
+                match event {
+                    SearchEvent::File(file) => {
+                        if paths.is_empty() || paths.iter().any(|dir| file.path.starts_with(dir)) {
+                            files.push(FileTargets {
+                                targets: file
+                                    .lines
+                                    .iter()
+                                    .flat_map(search::Target::of_line)
+                                    .map(|(_, target)| target)
+                                    .collect(),
+                                path: file.path,
+                            });
+                        }
+                    }
+                    SearchEvent::Done { limit_hit: hit, .. } => {
+                        limit_hit = Some(hit);
+                        break;
+                    }
+                }
+            }
+            this.update(cx, |this, cx| {
+                let Some(limit_hit) = limit_hit else {
+                    return this.out.reply(
+                        &id,
+                        Err("the search ended early (agent disconnected?)".into()),
+                    );
+                };
+                let project = this.project.clone();
+                let mut documents = OpenDocuments { session: this, cx };
+                let report = workspace_edit::replace(&project, &replacer, &files, &mut documents);
+                let pairs = |list: &[(PathBuf, String)], key: &str| -> Vec<Value> {
+                    list.iter()
+                        .map(|(path, text)| json!({ "path": path_json(path), key: text }))
+                        .collect()
+                };
+                this.out.reply(
+                    &id,
+                    Ok(json!({
+                        "files": report.replaced.iter().map(|(path, count)| json!({
+                            "path": path_json(path),
+                            "replacements": count,
+                        })).collect::<Vec<_>>(),
+                        "replacements": report.matches(),
+                        "skipped": pairs(&report.skipped, "reason"),
+                        "failed": pairs(&report.failed, "error"),
+                        "limit_hit": limit_hit,
+                    })),
+                );
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// `rename`: `path`, `line`, `character`, `new_name`.

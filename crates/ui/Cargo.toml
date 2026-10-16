@@ -44,8 +44,10 @@ next_code_agent = { path = "../agent" }
 embed-resource = "3.0"
 
 [target.'cfg(windows)'.dependencies]
-# The version gpui uses (no second copy): startup warm-up (`startup::prewarm`).
+# The version gpui uses (no second copy): startup warm-up (`startup::prewarm`),
+# Recycle Bin deletes (`project::trash_local`).
 windows = { version = "0.61", features = [
+    "Win32_Foundation",
     "Win32_Graphics_DirectWrite",
     "Win32_System_Com",
     "Win32_System_Ole",

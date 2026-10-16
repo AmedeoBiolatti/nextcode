@@ -24,7 +24,7 @@ impl Workspace {
     }
 
     /// Shows the Git window and focuses its log.
-    fn show_git_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn show_git_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_panel(PanelId::GitLog, cx);
         self.git_log.read(cx).focus(window);
     }
@@ -61,14 +61,9 @@ impl Workspace {
         let Some(repository) = self.repository_or_notice(cx) else {
             return;
         };
-        let relative = self.active_tab().and_then(|tab| {
-            let inside = tab.path.strip_prefix(self.project.root()).ok()?;
-            let parts: Vec<String> = inside
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                .collect();
-            (!parts.is_empty()).then(|| format!("{}{}", repository.prefix(), parts.join("/")))
-        });
+        let relative = self
+            .active_tab()
+            .and_then(|tab| self.repository_relative(&repository, &tab.path));
         let Some(path) = relative else {
             self.notice = Some("Open a file to see its history".into());
             cx.notify();

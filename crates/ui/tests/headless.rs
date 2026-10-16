@@ -21,6 +21,19 @@ fn background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// Removes a temp project a language server worked in. On Windows the
+/// server's own children (rust-analyzer's `cargo check`) can hold files in
+/// it for a moment after the editor exits.
+fn remove_project_dir(root: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while let Err(err) = fs::remove_dir_all(root) {
+        if Instant::now() >= deadline {
+            panic!("cannot remove {}: {err}", root.display());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 struct Headless {
     child: Child,
     stdin: ChildStdin,
@@ -152,6 +165,220 @@ fn headless_mode_serves_files_search_watch_and_commands() {
     assert_eq!(missing["ok"], false);
     let unknown = headless.call(json!({ "cmd": "frobnicate" }));
     assert!(unknown["error"].as_str().unwrap().contains("frobnicate"));
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// The Files tree's operations over headless: create (with parents), copy
+/// names, rename/move refusals, delete.
+#[test]
+fn headless_mode_creates_renames_copies_and_deletes_files() {
+    let root = std::env::temp_dir().join(format!("next_code_headless_ops_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let mut ok = |request: Value| {
+        let reply = headless.call(request.clone());
+        assert_eq!(reply["ok"], true, "{request} → {reply}");
+        reply["result"].clone()
+    };
+
+    let created = ok(json!({ "cmd": "create_file", "path": "pkg/sub/mod.py" }));
+    let module = root.join("pkg").join("sub").join("mod.py");
+    assert_eq!(created["path"], module.to_string_lossy().as_ref());
+    assert!(module.is_file());
+    ok(json!({ "cmd": "create_dir", "path": "empty" }));
+    assert!(root.join("empty").is_dir());
+    fs::write(&module, "x = 1\n").unwrap();
+
+    // Copies keep the name where it is free, else ` copy`, ` copy 2`.
+    let copy = ok(json!({ "cmd": "copy_path", "path": "pkg/sub/mod.py" }));
+    assert_eq!(
+        copy["path"],
+        root.join("pkg/sub/mod copy.py").to_string_lossy().as_ref()
+    );
+    let copy = ok(json!({ "cmd": "copy_path", "path": "pkg/sub/mod.py" }));
+    assert_eq!(
+        copy["path"],
+        root.join("pkg/sub/mod copy 2.py")
+            .to_string_lossy()
+            .as_ref()
+    );
+    let copy = ok(json!({ "cmd": "copy_path", "path": "pkg", "dir": "empty" }));
+    assert_eq!(
+        copy["path"],
+        root.join("empty").join("pkg").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("empty/pkg/sub/mod.py")).unwrap(),
+        "x = 1\n"
+    );
+
+    // Rename and move; taken targets and moves into itself are refused.
+    let renamed = ok(
+        json!({ "cmd": "rename_path", "path": "pkg/sub/mod.py", "new_path": "pkg/sub/main.py" }),
+    );
+    assert_eq!(
+        renamed["path"],
+        root.join("pkg/sub/main.py").to_string_lossy().as_ref()
+    );
+    assert_eq!(renamed["edits"], json!([]));
+    assert!(!module.exists());
+    let mut fails = |request: Value| {
+        let reply = headless.call(request.clone());
+        assert_eq!(reply["ok"], false, "{request} → {reply}");
+        reply["error"].as_str().unwrap().to_owned()
+    };
+    let taken = fails(
+        json!({ "cmd": "rename_path", "path": "pkg/sub/main.py", "new_path": "pkg/sub/mod copy.py" }),
+    );
+    assert!(taken.contains("`mod copy.py` already exists"), "{taken}");
+    let into_itself =
+        fails(json!({ "cmd": "rename_path", "path": "pkg", "new_path": "pkg/sub/pkg" }));
+    assert_eq!(into_itself, "Cannot move `pkg` into itself");
+    let exists = fails(json!({ "cmd": "create_file", "path": "pkg/sub/main.py" }));
+    assert!(exists.contains("already exists"), "{exists}");
+    let empty = fails(json!({ "cmd": "create_dir", "path": "a/.." }));
+    assert!(!empty.is_empty());
+    let moved =
+        headless.call(json!({ "cmd": "rename_path", "path": "pkg", "new_path": "empty/moved" }));
+    assert_eq!(moved["ok"], true, "{moved}");
+    assert!(root.join("empty/moved/sub/main.py").is_file());
+
+    // Delete files and folders (with contents); missing paths fail.
+    let deleted = headless
+        .call(json!({ "cmd": "delete_path", "paths": ["empty/moved/sub/main.py", "empty"] }));
+    assert_eq!(deleted["ok"], true, "{deleted}");
+    assert!(!root.join("empty").exists());
+    let missing = headless.call(json!({ "cmd": "delete_path", "path": "empty" }));
+    assert_eq!(missing["ok"], false, "{missing}");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// Renaming a module asks rust-analyzer (`workspace/willRenameFiles`) for
+/// its edits: `mod util;` and `util::` follow the new name.
+#[test]
+fn headless_mode_renames_a_rust_module_with_the_servers_edits() {
+    if background_command("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("skipped: rust-analyzer is not on PATH");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("next_code_headless_mv_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"moves\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("main.rs"),
+        "mod util;\n\nfn main() {\n    util::helper();\n}\n",
+    )
+    .unwrap();
+    fs::write(root.join("src").join("util.rs"), "pub fn helper() {}\n").unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let open =
+        headless.call(json!({ "cmd": "open", "path": "src/main.rs", "timeout_ms": 120_000 }));
+    assert_eq!(open["ok"], true, "{open}");
+    // Until rust-analyzer has loaded the crate, it has no module to rename.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let reply = headless.call(
+            json!({ "cmd": "definition", "path": "src/main.rs", "line": 3, "character": 10 }),
+        );
+        if reply["result"].as_array().is_some_and(|l| !l.is_empty()) || Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let renamed = headless
+        .call(json!({ "cmd": "rename_path", "path": "src/util.rs", "new_path": "src/tools.rs" }));
+    assert_eq!(renamed["ok"], true, "{renamed}");
+    let edits = renamed["result"]["edits"].as_array().unwrap();
+    assert_eq!(edits.len(), 1, "{renamed}");
+    assert_eq!(edits[0]["applied"], true, "{renamed}");
+    assert_eq!(
+        fs::read_to_string(root.join("src").join("main.rs")).unwrap(),
+        "mod tools;\n\nfn main() {\n    tools::helper();\n}\n"
+    );
+    assert!(root.join("src").join("tools.rs").is_file());
+    assert!(!root.join("src").join("util.rs").exists());
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    remove_project_dir(&root);
+}
+
+#[test]
+fn headless_mode_replaces_in_files() {
+    let root = std::env::temp_dir().join(format!("next_code_headless_rp_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("other")).unwrap();
+    fs::write(root.join("src/a.py"), "name = 'old'\r\nold_value = old\r\n").unwrap();
+    fs::write(root.join("src/b.py"), "OLD old é old\n").unwrap();
+    fs::write(root.join("other/c.py"), "old\n").unwrap();
+    let root = root.canonicalize().unwrap();
+    let read = |rel: &str| fs::read_to_string(root.join(rel)).unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+
+    // Whole words, case-sensitive, only under `src`.
+    let reply = headless.call(json!({
+        "cmd": "replace", "pattern": "old", "replacement": "new",
+        "whole_word": true, "case_sensitive": true, "paths": ["src"],
+    }));
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["result"]["replacements"], 4, "{reply}");
+    let mut counts: Vec<(String, u64)> = reply["result"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            let path = PathBuf::from(file["path"].as_str().unwrap());
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, file["replacements"].as_u64().unwrap())
+        })
+        .collect();
+    counts.sort();
+    assert_eq!(counts, [("a.py".into(), 2), ("b.py".into(), 2)]);
+    assert_eq!(read("src/a.py"), "name = 'new'\r\nold_value = new\r\n");
+    assert_eq!(read("src/b.py"), "OLD new é new\n");
+    assert_eq!(read("other/c.py"), "old\n");
+
+    // Regex with numbered and named groups.
+    let reply = headless.call(json!({
+        "cmd": "replace", "pattern": r"(?P<word>\w+)_(value)", "replacement": "${word}.$2",
+        "regex": true, "case_sensitive": true,
+    }));
+    assert_eq!(reply["result"]["replacements"], 1, "{reply}");
+    assert_eq!(read("src/a.py"), "name = 'new'\r\nold.value = new\r\n");
+
+    // Errors: no replacement, a bad pattern.
+    let missing = headless.call(json!({ "cmd": "replace", "pattern": "x" }));
+    assert_eq!(missing["ok"], false, "{missing}");
+    let bad = headless.call(json!({
+        "cmd": "replace", "pattern": "(", "replacement": "", "regex": true,
+    }));
+    assert_eq!(bad["ok"], false, "{bad}");
+    let none = headless.call(json!({ "cmd": "replace", "pattern": "zzz", "replacement": "y" }));
+    assert_eq!(none["result"]["replacements"], 0, "{none}");
 
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
     assert!(headless.child.wait().unwrap().success());
@@ -368,6 +595,161 @@ fn headless_mode_stages_diffs_and_commits_with_git() {
     fs::remove_dir_all(&root).unwrap();
 }
 
+/// The editor's change markers, Stage Hunk and blame over headless.
+#[test]
+fn headless_mode_reports_line_changes_stages_one_and_blames() {
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_blame_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let git = |args: &[&str]| {
+        let output = background_command("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    git(&["config", "core.autocrlf", "false"]);
+    fs::write(root.join("f.txt"), "one\ntwo\nthree\n").unwrap();
+    git(&["add", "f.txt"]);
+    git(&["commit", "-q", "-m", "first\n\nthe body"]);
+    let first = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    fs::write(root.join("f.txt"), "one\nTWO\nthree\n").unwrap();
+    git(&["commit", "-q", "-am", "second"]);
+    let second = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    fs::write(root.join("f.txt"), "zero\none\nTWO\nthree\nfour\n").unwrap();
+    fs::write(root.join("free.txt"), "untracked\n").unwrap();
+    fs::write(root.join("added.txt"), "a\nb\n").unwrap();
+    git(&["add", "added.txt"]);
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let changes = |headless: &mut Headless, request: Value| -> Value {
+        let reply = headless.call(request);
+        assert_eq!(reply["ok"], true, "{reply}");
+        reply["result"].clone()
+    };
+
+    // The working-tree file against HEAD: lines added at both ends.
+    let result = changes(
+        &mut headless,
+        json!({ "cmd": "git_line_changes", "path": "f.txt" }),
+    );
+    assert_eq!(
+        result,
+        json!({ "base": "blob", "changes": [
+            { "kind": "added", "new": { "start": 0, "end": 1 }, "old": { "start": 0, "end": 0 } },
+            { "kind": "added", "new": { "start": 4, "end": 5 }, "old": { "start": 3, "end": 3 } },
+        ] })
+    );
+    // Unsaved text: a deleted last line; CRLF of the same lines changes nothing.
+    let result = changes(
+        &mut headless,
+        json!({ "cmd": "git_line_changes", "path": "f.txt", "contents": "one\nTWO" }),
+    );
+    assert_eq!(
+        result["changes"],
+        json!([{ "kind": "deleted", "new": { "start": 2, "end": 2 }, "old": { "start": 2, "end": 4 } }])
+    );
+    let result = changes(
+        &mut headless,
+        json!({ "cmd": "git_line_changes", "path": "f.txt", "contents": "one\r\nTWO\r\nthree\r\n" }),
+    );
+    assert_eq!(result["changes"], json!([]));
+    // Untracked: no markers; staged but never committed: all added.
+    let result = changes(
+        &mut headless,
+        json!({ "cmd": "git_line_changes", "path": "free.txt" }),
+    );
+    assert_eq!(result, json!({ "base": "none", "changes": [] }));
+    let result = changes(
+        &mut headless,
+        json!({ "cmd": "git_line_changes", "path": "added.txt" }),
+    );
+    assert_eq!(result["base"], "new_file");
+    assert_eq!(result["changes"][0]["new"], json!({ "start": 0, "end": 3 }));
+
+    // Stage only the second change (the added last line).
+    let staged = headless.call(json!({
+        "cmd": "git_stage_line_change", "path": "f.txt", "index": true, "change": 1,
+    }));
+    assert_eq!(staged["ok"], true, "{staged}");
+    assert_eq!(git(&["show", ":f.txt"]), "one\nTWO\nthree\nfour\n");
+    assert_eq!(
+        fs::read_to_string(root.join("f.txt")).unwrap(),
+        "zero\none\nTWO\nthree\nfour\n"
+    );
+    let result = changes(
+        &mut headless,
+        json!({ "cmd": "git_line_changes", "path": "f.txt", "index": true }),
+    );
+    assert_eq!(
+        result["changes"],
+        json!([{ "kind": "added", "new": { "start": 0, "end": 1 }, "old": { "start": 0, "end": 0 } }])
+    );
+    let refused = headless.call(json!({
+        "cmd": "git_stage_line_change", "path": "f.txt", "change": 0,
+    }));
+    assert_eq!(refused["ok"], false, "{refused}");
+
+    // Blame of the working tree: uncommitted lines are null.
+    let blame = changes(
+        &mut headless,
+        json!({ "cmd": "git_blame", "path": "f.txt" }),
+    );
+    let ids: Vec<Value> = blame["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| match line.as_u64() {
+            Some(index) => blame["commits"][index as usize]["id"].clone(),
+            None => Value::Null,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            Value::Null,
+            json!(first),
+            json!(second),
+            json!(first),
+            Value::Null
+        ]
+    );
+    let oldest = blame["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|commit| commit["id"] == json!(first))
+        .unwrap();
+    assert_eq!(oldest["author"], "Test");
+    assert_eq!(oldest["message"], "first\n\nthe body");
+    // Unsaved text with an edited line.
+    let blame = changes(
+        &mut headless,
+        json!({ "cmd": "git_blame", "path": "f.txt", "contents": "one\nTWO!\nthree\n" }),
+    );
+    assert_eq!(blame["lines"][1], Value::Null);
+    assert!(
+        blame["lines"][0].is_u64() && blame["lines"][2].is_u64(),
+        "{blame}"
+    );
+    let untracked = headless.call(json!({ "cmd": "git_blame", "path": "free.txt" }));
+    assert_eq!(untracked["ok"], false, "{untracked}");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).unwrap();
+}
+
 /// PyCharm's workflow over headless: commit a checked subset, roll back,
 /// ignore, merge with a conflict, rename, push to a bare remote.
 #[test]
@@ -479,6 +861,163 @@ fn headless_mode_commits_chosen_files_merges_and_pushes() {
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
     assert!(headless.child.wait().unwrap().success());
     fs::remove_dir_all(&base).unwrap();
+}
+
+/// Stash (untracked files, a pop that conflicts and keeps the stash, drop)
+/// and the shelf (shelve modified/new/deleted files, view, unshelve keeping
+/// then removing the shelf, a conflicting unshelve, delete).
+#[test]
+fn headless_mode_stashes_and_shelves_changes() {
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_stash_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let status = background_command("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    git(&["config", "core.autocrlf", "false"]);
+    fs::write(root.join("a.txt"), "a\n").unwrap();
+    fs::write(root.join("b.txt"), "b\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let ok = |reply: &Value| assert_eq!(reply["ok"], true, "{reply}");
+    let read = |name: &str| fs::read_to_string(root.join(name)).ok();
+
+    // Stash a modified file and an untracked one.
+    fs::write(root.join("a.txt"), "a2\n").unwrap();
+    fs::write(root.join("new.txt"), "new\n").unwrap();
+    ok(&headless.call(json!({
+        "cmd": "git_stash_push", "message": "wip", "include_untracked": true,
+    })));
+    let status = headless.call(json!({ "cmd": "git_status" }));
+    assert_eq!(status["result"]["entries"], json!([]), "{status}");
+    let list = headless.call(json!({ "cmd": "git_stash_list" }));
+    let stash = &list["result"][0];
+    assert_eq!(
+        (&stash["index"], &stash["message"], &stash["branch"]),
+        (&json!(0), &json!("wip"), &json!("main")),
+        "{list}"
+    );
+    let changes = headless.call(json!({ "cmd": "git_stash_changes", "index": 0 }));
+    let files: Vec<(&str, &str, &Value)> = changes["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap(),
+                file["change"].as_str().unwrap(),
+                &file["old"],
+            )
+        })
+        .collect();
+    assert_eq!(files.len(), 2, "{changes}");
+    assert_eq!((files[0].0, files[0].1), ("a.txt", "modified"));
+    assert_eq!(
+        (files[1].0, files[1].1, files[1].2),
+        ("new.txt", "untracked", &json!("empty"))
+    );
+
+    // A commit to a.txt makes the pop conflict: the stash stays.
+    fs::write(root.join("a.txt"), "committed\n").unwrap();
+    git(&["commit", "-q", "-am", "a"]);
+    let pop = headless.call(json!({ "cmd": "git_stash_apply", "index": 0, "pop": true }));
+    assert_eq!(
+        pop["result"],
+        json!({ "result": "conflicts", "paths": ["a.txt"] }),
+        "{pop}"
+    );
+    let list = headless.call(json!({ "cmd": "git_stash_list" }));
+    assert_eq!(list["result"].as_array().unwrap().len(), 1, "{list}");
+    git(&["reset", "-q", "--hard"]);
+    git(&["clean", "-q", "-f"]);
+    ok(&headless.call(json!({ "cmd": "git_stash_drop", "index": 0 })));
+    let list = headless.call(json!({ "cmd": "git_stash_list" }));
+    assert_eq!(list["result"], json!([]), "{list}");
+    let drop = headless.call(json!({ "cmd": "git_stash_drop", "index": 0 }));
+    assert_eq!(drop["ok"], false, "{drop}");
+
+    // Shelve a deletion, a modification and a new file: all rolled back.
+    fs::remove_file(root.join("a.txt")).unwrap();
+    fs::write(root.join("b.txt"), "b2\n").unwrap();
+    fs::write(root.join("n.txt"), "n\n").unwrap();
+    let shelve = headless.call(json!({
+        "cmd": "git_shelve", "paths": ["a.txt", "b.txt", "n.txt"], "message": "my shelf",
+    }));
+    ok(&shelve);
+    let id = shelve["result"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(shelve["result"]["files"].as_array().unwrap().len(), 3);
+    let status = headless.call(json!({ "cmd": "git_status" }));
+    assert_eq!(status["result"]["entries"], json!([]), "{status}");
+    assert_eq!(read("a.txt").as_deref(), Some("committed\n"));
+    assert_eq!(read("b.txt").as_deref(), Some("b\n"));
+    assert_eq!(read("n.txt"), None);
+    assert!(
+        root.join(".next_code/shelf")
+            .join(&id)
+            .join("shelf.patch")
+            .exists()
+    );
+    let list = headless.call(json!({ "cmd": "git_shelf_list" }));
+    assert_eq!(list["result"][0]["message"], "my shelf", "{list}");
+    let diff = headless.call(json!({ "cmd": "git_shelf_diff", "shelf": id, "path": "b.txt" }));
+    assert_eq!(
+        (&diff["result"]["added"], &diff["result"]["removed"]),
+        (&json!(1), &json!(1)),
+        "{diff}"
+    );
+
+    // Unshelve keeping the shelf, roll back, unshelve removing it.
+    let unshelve = headless.call(json!({ "cmd": "git_unshelve", "shelf": id }));
+    assert_eq!(unshelve["result"]["result"], "done", "{unshelve}");
+    assert_eq!(read("a.txt"), None);
+    assert_eq!(read("b.txt").as_deref(), Some("b2\n"));
+    assert_eq!(read("n.txt").as_deref(), Some("n\n"));
+    let list = headless.call(json!({ "cmd": "git_shelf_list" }));
+    assert_eq!(list["result"].as_array().unwrap().len(), 1, "{list}");
+    ok(&headless.call(json!({ "cmd": "git_rollback", "paths": ["a.txt", "b.txt", "n.txt"] })));
+    let unshelve = headless.call(json!({ "cmd": "git_unshelve", "shelf": id, "remove": true }));
+    assert_eq!(unshelve["result"]["result"], "done", "{unshelve}");
+    assert_eq!(read("b.txt").as_deref(), Some("b2\n"));
+    let list = headless.call(json!({ "cmd": "git_shelf_list" }));
+    assert_eq!(list["result"], json!([]), "{list}");
+
+    // b.txt changes again after shelving: unshelving conflicts, the shelf stays.
+    let shelve = headless.call(json!({
+        "cmd": "git_shelve", "paths": ["b.txt"], "message": "conflicting",
+    }));
+    let id = shelve["result"]["id"].as_str().unwrap().to_owned();
+    fs::write(root.join("b.txt"), "b3\n").unwrap();
+    git(&["commit", "-q", "-am", "b3"]);
+    let unshelve = headless.call(json!({ "cmd": "git_unshelve", "shelf": id, "remove": true }));
+    assert_eq!(
+        unshelve["result"],
+        json!({ "result": "conflicts", "paths": ["b.txt"] }),
+        "{unshelve}"
+    );
+    let list = headless.call(json!({ "cmd": "git_shelf_list" }));
+    assert_eq!(list["result"].as_array().unwrap().len(), 1, "{list}");
+    ok(&headless.call(json!({ "cmd": "git_shelf_delete", "shelf": id })));
+    let list = headless.call(json!({ "cmd": "git_shelf_list" }));
+    assert_eq!(list["result"], json!([]), "{list}");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).unwrap();
 }
 
 /// The Git window's commands: filtered and paged log, selection changes,

@@ -1,7 +1,9 @@
-//! UI-agnostic project-wide text search.
+//! UI-agnostic project-wide text search and replace.
 //!
 //! [`search`] walks a directory tree (honoring ignore files) on background
-//! threads and streams per-file results over a channel.
+//! threads and streams per-file results over a channel; [`search_text`]
+//! searches one in-memory text the same way. [`Replacer`] turns reported
+//! matches into edits, re-verified against the current text.
 
 use std::fmt;
 use std::ops::Range;
@@ -16,6 +18,10 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch}
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use serde::{Deserialize, Serialize};
+
+mod replace;
+
+pub use replace::{Replacement, Replacer, Stale, Target, apply_replacements};
 
 /// Lines longer than this many bytes are truncated around their first match.
 const MAX_LINE_LEN: usize = 400;
@@ -147,8 +153,7 @@ pub fn search(
     limits: SearchLimits,
 ) -> Result<(SearchHandle, UnboundedReceiver<SearchEvent>), QueryError> {
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-    let include = build_globs(&root, &query.include)?;
-    let exclude = build_globs(&root, &query.exclude)?;
+    let filter = PathFilter::new(&root, query)?;
     let matcher = if query.pattern.is_empty() {
         None
     } else {
@@ -166,9 +171,7 @@ pub fn search(
     };
 
     let state = Arc::new(SharedState {
-        root,
-        include,
-        exclude,
+        filter,
         matcher,
         limits,
         cancelled,
@@ -193,6 +196,97 @@ const EMPTY_DONE: SearchEvent = SearchEvent::Done {
     matches: 0,
     limit_hit: false,
 };
+
+/// Searches `text` (a file's contents, e.g. an unsaved editor buffer) like
+/// [`search`] searches a file: matching lines in order, without limits.
+pub fn search_text(query: &SearchQuery, text: &str) -> Result<Vec<LineMatch>, QueryError> {
+    if query.pattern.is_empty() {
+        return Ok(Vec::new());
+    }
+    let matcher = build_matcher(query)?;
+    Ok(text
+        .split_inclusive('\n')
+        .enumerate()
+        .filter_map(|(line, raw)| {
+            let mut ranges = Vec::new();
+            matcher
+                .find_iter(raw.as_bytes(), |m| {
+                    ranges.push(m.start()..m.end());
+                    true
+                })
+                .ok()?;
+            (!ranges.is_empty()).then(|| line_match(line, raw.as_bytes(), ranges))
+        })
+        .collect())
+}
+
+/// The include/exclude globs of a [`SearchQuery`] (and the `.git`
+/// directory, never searched), for paths under a root.
+#[derive(Debug)]
+pub struct PathFilter {
+    root: PathBuf,
+    include: Gitignore,
+    exclude: Gitignore,
+}
+
+impl PathFilter {
+    pub fn new(root: &Path, query: &SearchQuery) -> Result<Self, QueryError> {
+        Ok(Self {
+            root: root.to_path_buf(),
+            include: build_globs(root, &query.include)?,
+            exclude: build_globs(root, &query.exclude)?,
+        })
+    }
+
+    /// Whether a search would look at the file `path`: under the root, not
+    /// excluded (itself or a parent directory), and included. Ignore files
+    /// are not consulted.
+    pub fn matches(&self, path: &Path) -> bool {
+        let Some(rel) = self.relative(path) else {
+            return false;
+        };
+        let in_git = rel
+            .parent()
+            .is_some_and(|dir| dir.components().any(|c| c.as_os_str() == ".git"));
+        !in_git
+            && !self
+                .exclude
+                .matched_path_or_any_parents(rel, false)
+                .is_ignore()
+            && self.is_included(path)
+    }
+
+    /// Path relative to the root for glob matching; a root file matches by name.
+    fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        let rel = path.strip_prefix(&self.root).ok()?;
+        if rel.as_os_str().is_empty() {
+            path.file_name().map(Path::new)
+        } else {
+            Some(rel)
+        }
+    }
+
+    fn is_excluded(&self, entry: &DirEntry) -> bool {
+        if entry.depth() == 0 {
+            return false;
+        }
+        let is_dir = entry.file_type().is_some_and(|ty| ty.is_dir());
+        if is_dir && entry.file_name() == ".git" {
+            return true;
+        }
+        self.relative(entry.path())
+            .is_some_and(|rel| self.exclude.matched(rel, is_dir).is_ignore())
+    }
+
+    fn is_included(&self, path: &Path) -> bool {
+        self.include.is_empty()
+            || self.relative(path).is_some_and(|rel| {
+                self.include
+                    .matched_path_or_any_parents(rel, false)
+                    .is_ignore()
+            })
+    }
+}
 
 fn build_globs(root: &Path, globs: &[String]) -> Result<Gitignore, QueryError> {
     let mut builder = GitignoreBuilder::new(root);
@@ -226,9 +320,7 @@ fn build_matcher(query: &SearchQuery) -> Result<RegexMatcher, QueryError> {
 }
 
 struct SharedState {
-    root: PathBuf,
-    include: Gitignore,
-    exclude: Gitignore,
+    filter: PathFilter,
     matcher: RegexMatcher,
     limits: SearchLimits,
     cancelled: Arc<AtomicBool>,
@@ -246,37 +338,6 @@ impl SharedState {
         self.cancelled.load(Ordering::Relaxed) || self.limit_hit.load(Ordering::Relaxed)
     }
 
-    /// Path relative to the root for glob matching; a root file matches by name.
-    fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
-        let rel = path.strip_prefix(&self.root).ok()?;
-        if rel.as_os_str().is_empty() {
-            path.file_name().map(Path::new)
-        } else {
-            Some(rel)
-        }
-    }
-
-    fn is_excluded(&self, entry: &DirEntry) -> bool {
-        if entry.depth() == 0 {
-            return false;
-        }
-        let is_dir = entry.file_type().is_some_and(|ty| ty.is_dir());
-        if is_dir && entry.file_name() == ".git" {
-            return true;
-        }
-        self.relative(entry.path())
-            .is_some_and(|rel| self.exclude.matched(rel, is_dir).is_ignore())
-    }
-
-    fn is_included(&self, path: &Path) -> bool {
-        self.include.is_empty()
-            || self.relative(path).is_some_and(|rel| {
-                self.include
-                    .matched_path_or_any_parents(rel, false)
-                    .is_ignore()
-            })
-    }
-
     /// Claims up to `wanted` matches; returns how many may be reported.
     fn reserve(&self, wanted: usize) -> usize {
         let max = self.limits.max_matches;
@@ -289,7 +350,9 @@ impl SharedState {
     }
 
     fn search_file(&self, searcher: &mut Searcher, entry: DirEntry) {
-        if !entry.file_type().is_some_and(|ty| ty.is_file()) || !self.is_included(entry.path()) {
+        if !entry.file_type().is_some_and(|ty| ty.is_file())
+            || !self.filter.is_included(entry.path())
+        {
             return;
         }
         match entry.metadata() {
@@ -325,7 +388,7 @@ impl SharedState {
 }
 
 fn run(state: &Arc<SharedState>) {
-    let mut builder = WalkBuilder::new(&state.root);
+    let mut builder = WalkBuilder::new(&state.filter.root);
     builder
         .hidden(false)
         .require_git(false)
@@ -334,7 +397,7 @@ fn run(state: &Arc<SharedState>) {
         .git_exclude(true)
         .ignore(true);
     let filter_state = state.clone();
-    builder.filter_entry(move |entry| !filter_state.is_excluded(entry));
+    builder.filter_entry(move |entry| !filter_state.filter.is_excluded(entry));
     builder.build_parallel().run(|| {
         let state = state.clone();
         let mut searcher = SearcherBuilder::new()
@@ -411,8 +474,7 @@ impl Sink for FileSink<'_> {
 /// Builds a [`LineMatch`] from a raw line (terminator included) and the byte
 /// ranges of its matches.
 fn line_match(line: usize, raw: &[u8], ranges: Vec<Range<usize>>) -> LineMatch {
-    let mut content = raw.strip_suffix(b"\n").unwrap_or(raw);
-    content = content.strip_suffix(b"\r").unwrap_or(content);
+    let content = &raw[..content_len(raw)];
     let column = ranges.first().map_or(0, |range| range.start);
     let ranges = ranges
         .into_iter()
@@ -425,6 +487,12 @@ fn line_match(line: usize, raw: &[u8], ranges: Vec<Range<usize>>) -> LineMatch {
         ranges,
         column,
     }
+}
+
+/// Length of a raw line without its `\n` or `\r\n` terminator.
+fn content_len(raw: &[u8]) -> usize {
+    let content = raw.strip_suffix(b"\n").unwrap_or(raw);
+    content.strip_suffix(b"\r").unwrap_or(content).len()
 }
 
 /// Converts `bytes` to a `String`, replacing invalid UTF-8 and remapping

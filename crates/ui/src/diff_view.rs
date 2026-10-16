@@ -9,8 +9,9 @@ use git::{
     Row, Side, SideLine, SplitRow,
 };
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, Global, PromptLevel, SharedString, Task,
-    Window, div, prelude::*, px, relative, uniform_list,
+    App, Context, EventEmitter, FocusHandle, Focusable, Global, PromptLevel, ScrollStrategy,
+    SharedString, Task, UniformListScrollHandle, Window, div, prelude::*, px, relative,
+    uniform_list,
 };
 
 use crate::{commit_panel::short_revision, project::Project, selectable::selectable, theme};
@@ -31,6 +32,13 @@ pub enum DiffSource {
         new: Side,
         change: FileChange,
     },
+    /// A file of a shelf (see `git::Shelf`): the version it was shelved
+    /// against → the shelved one.
+    Shelved {
+        shelf: String,
+        name: String,
+        change: FileChange,
+    },
 }
 
 impl DiffSource {
@@ -38,14 +46,16 @@ impl DiffSource {
     pub fn path(&self) -> &str {
         match self {
             Self::Index { entry, .. } => &entry.path,
-            Self::Revisions { change, .. } => &change.path,
+            Self::Revisions { change, .. } | Self::Shelved { change, .. } => &change.path,
         }
     }
 
     fn orig_path(&self) -> Option<&str> {
         match self {
             Self::Index { entry, .. } => entry.orig_path.as_deref(),
-            Self::Revisions { change, .. } => change.orig_path.as_deref(),
+            Self::Revisions { change, .. } | Self::Shelved { change, .. } => {
+                change.orig_path.as_deref()
+            }
         }
     }
 
@@ -60,6 +70,7 @@ impl DiffSource {
             Self::Index { staged: true, .. } => "HEAD ↔ index".into(),
             Self::Index { staged: false, .. } => "index ↔ working tree".into(),
             Self::Revisions { old, new, .. } => format!("{} ↔ {}", side(old), side(new)),
+            Self::Shelved { name, .. } => format!("base ↔ shelf '{name}'"),
         }
     }
 
@@ -88,6 +99,13 @@ impl DiffSource {
                 repository.revision_diff(old, new, change, context, worktree)?,
                 None,
             )),
+            Self::Shelved { shelf, change, .. } => {
+                let files = crate::shelf_view::ProjectFiles::new(project, repository);
+                Ok((
+                    repository.shelved_file_diff(&files, shelf, &change.path, context)?,
+                    None,
+                ))
+            }
         }
     }
 }
@@ -127,6 +145,9 @@ pub struct DiffView {
     focus_handle: FocusHandle,
     _load: Task<()>,
     _apply: Task<()>,
+    scroll: UniformListScrollHandle,
+    /// Scroll to this 0-based line of the new side once the diff loads.
+    reveal: Option<usize>,
 }
 
 impl DiffView {
@@ -154,6 +175,8 @@ impl DiffView {
             focus_handle: cx.focus_handle(),
             _load: Task::ready(()),
             _apply: Task::ready(()),
+            scroll: UniformListScrollHandle::new(),
+            reveal: None,
         };
         view.reload(cx);
         view
@@ -163,6 +186,37 @@ impl DiffView {
         &self.source
     }
 
+    /// Scrolls to the row of new-side `line` (0-based), or the nearest one
+    /// shown, now or once the diff has loaded.
+    pub fn reveal_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        self.reveal = Some(line);
+        self.apply_reveal(cx);
+    }
+
+    fn apply_reveal(&mut self, cx: &mut Context<Self>) {
+        let (Some(line), Some(diff)) = (self.reveal, &self.diff) else {
+            return;
+        };
+        let line = line + 1;
+        let index = if self.options.side_by_side {
+            self.split.iter().position(|row| match row {
+                SplitRow::Pair { right: Some(side), .. } => side.line >= line,
+                SplitRow::Pair { left: Some(side), .. } => side.line >= line,
+                _ => false,
+            })
+        } else {
+            diff.rows.iter().position(|row| match row {
+                Row::Line { new: Some(new), .. } => *new >= line,
+                Row::Line { old: Some(old), .. } => *old >= line,
+                _ => false,
+            })
+        };
+        self.reveal = None;
+        let index = index.unwrap_or(diff.rows.len().saturating_sub(1));
+        self.scroll.scroll_to_item(index, ScrollStrategy::Center);
+        cx.notify();
+    }
+
     pub fn title(&self) -> SharedString {
         let path = self.source.path();
         let name = path.rsplit('/').next().unwrap_or(path);
@@ -170,6 +224,7 @@ impl DiffView {
             DiffSource::Index { staged: true, .. } => "staged".to_owned(),
             DiffSource::Index { staged: false, .. } => "changes".to_owned(),
             DiffSource::Revisions { .. } => self.source.sides(),
+            DiffSource::Shelved { .. } => "shelved".to_owned(),
         };
         format!("{name} ({suffix})").into()
     }
@@ -203,6 +258,7 @@ impl DiffView {
                         this.patch = patch;
                         this.highlights = highlights;
                         this.error = None;
+                        this.apply_reveal(cx);
                     }
                     Err(err) => this.error = Some(err.to_string().into()),
                 }
@@ -599,6 +655,7 @@ impl Render for DiffView {
                     range.map(|index| this.render_split(index, cx)).collect()
                 }),
             )
+            .track_scroll(self.scroll.clone())
             .flex_1()
             .w_full()
             .into_any_element(),
@@ -609,6 +666,7 @@ impl Render for DiffView {
                     range.map(|index| this.render_unified(index, cx)).collect()
                 }),
             )
+            .track_scroll(self.scroll.clone())
             .flex_1()
             .w_full()
             .into_any_element(),

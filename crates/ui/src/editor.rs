@@ -27,6 +27,7 @@ use crate::{
     theme::{self, SyntaxStyle},
 };
 
+mod blame;
 mod brackets;
 mod call_hierarchy;
 mod code_actions;
@@ -37,6 +38,7 @@ mod editing;
 mod find;
 mod folds;
 pub(crate) mod format;
+mod git_gutter;
 mod go_to_line;
 mod indent_guides;
 mod inlay_hints;
@@ -61,6 +63,7 @@ use inlay_hints::RowInlays;
 use lines::IndentStyle;
 use selections::{Selection, SelectionSet, is_whole_word, is_word_char};
 
+pub use git_gutter::{CloseHunkPopup, GitBase, NextChange, PreviousChange, RollbackLines};
 pub use brackets::JumpToBracket;
 pub use call_hierarchy::ShowCallHierarchy;
 pub use code_actions::{
@@ -264,7 +267,18 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-enter", QuickFix, Some("Editor && !find_open")),
         KeyBinding::new("shift-alt-f", FormatDocument, ctx),
         KeyBinding::new("secondary-k secondary-f", FormatSelection, ctx),
+        // Git changes: VS Code, then JetBrains (shown in menus).
+        KeyBinding::new("alt-f5", NextChange, ctx),
+        KeyBinding::new("shift-alt-f5", PreviousChange, ctx),
+        KeyBinding::new("ctrl-alt-shift-down", NextChange, ctx),
+        KeyBinding::new("ctrl-alt-shift-up", PreviousChange, ctx),
+        KeyBinding::new("ctrl-alt-z", RollbackLines, ctx),
     ]);
+    cx.bind_keys([KeyBinding::new(
+        "escape",
+        CloseHunkPopup,
+        Some("Editor && showing_hunk_popup"),
+    )]);
     // Find bar: from its inputs and from the text while it is open. Bound
     // after the plain editor keys so they win in the inputs.
     let pane = Some("EditorPane && find_open");
@@ -399,6 +413,14 @@ pub enum EditorEvent {
         line: usize,
         kind: GutterMarkerKind,
     },
+    /// Stage Hunk: the file's index entry becomes `contents`.
+    StageHunk { contents: String },
+    /// Show Diff from the hunk popup: the file's diff at current `line`.
+    ShowChangeDiff { line: usize },
+    /// Annotations were turned on: run blame (see `Editor::set_blame`).
+    LoadBlame,
+    /// A click on an annotation: show this commit.
+    ShowCommit(String),
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -493,6 +515,12 @@ pub struct Editor {
     snippet: Option<snippets::SnippetSession>,
     /// Breakpoints, run markers, the paused line, hover values.
     debug: debug_gutter::DebugGutterState,
+    /// Git change markers against a base version.
+    git: git_gutter::GitGutterState,
+    /// Annotate with Git Blame.
+    blame: blame::BlameState,
+    /// The gutter's right-click menu.
+    gutter_menu: Option<git_gutter::GutterMenu>,
 }
 
 /// A mouse drag in progress.
@@ -582,6 +610,12 @@ struct EditorLayout {
     bulb_left: Pixels,
     /// Left edge of the fold chevrons' column (it ends at the text).
     fold_left: Pixels,
+    /// Left edge of the change-marker column (file editors).
+    change_left: Option<Pixels>,
+    /// Left edge of the blame column, while annotations show.
+    blame_left: Option<Pixels>,
+    /// The cursor line's inline blame: index in `rows` and its text.
+    inline_blame: Option<(usize, ShapedLine)>,
     /// Screen row of `rows[0]`.
     first_row: usize,
     rows: Vec<RowLayout>,
@@ -614,6 +648,8 @@ struct RowLayout {
     folded: Option<usize>,
     /// Inlay hints spliced into `shaped`.
     inlays: RowInlays,
+    /// The blame annotation, on the first row of a group's first line.
+    blame: Option<ShapedLine>,
 }
 
 impl RowLayout {
@@ -748,6 +784,9 @@ impl Editor {
             format: format::FormatState::default(),
             snippet: None,
             debug: Default::default(),
+            git: Default::default(),
+            blame: Default::default(),
+            gutter_menu: None,
         }
     }
 
@@ -947,6 +986,14 @@ impl Editor {
     /// Selects all text, e.g. to replace an input's content by typing.
     pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
         let selection = Selection::new(0, self.buffer.len());
+        self.set_selections(SelectionSet::single(selection), cx);
+    }
+
+    /// Selects bytes `start..end` (clamped; on character boundaries), e.g.
+    /// a file name without its extension.
+    pub fn select_text_range(&mut self, start: usize, end: usize, cx: &mut Context<Self>) {
+        let end = end.min(self.buffer.len());
+        let selection = Selection::new(start.min(end), end);
         self.set_selections(SelectionSet::single(selection), cx);
     }
 
@@ -1214,6 +1261,7 @@ impl Editor {
             self.hover_word = None;
             self._hover_delay = None;
             self.notice = None;
+            self.git_text_edited(cx);
         }
         if let Some(syntax) = &mut self.syntax
             && edited
@@ -1434,9 +1482,14 @@ impl Editor {
         if self.scrollbar_mouse_down(event.position, cx) {
             return;
         }
+        if !self.single_line && !self.text_area && self.gutter_menu.take().is_some() {
+            cx.notify();
+        }
         if !self.single_line
             && !self.text_area
-            && (self.debug_gutter_click(event.position, cx)
+            && (self.change_marker_click(event.position, cx)
+                || self.blame_click(event.position, cx)
+                || self.debug_gutter_click(event.position, cx)
                 || self.lightbulb_click(event.position, cx)
                 || self.fold_click(event.position, cx))
         {
@@ -1548,6 +1601,7 @@ impl Editor {
                     cx.notify();
                 }
                 self.mouse_position = Some(event.position);
+                self.blame_mouse_moved(event.position, cx);
                 self.update_link(Some(event.position), event.modifiers.secondary(), cx);
                 self.update_hover(event.position, cx)
             }
@@ -1624,6 +1678,7 @@ impl Editor {
             cx.notify();
         }
         if !hovered {
+            self.clear_blame_hover(cx);
             self.mouse_position = None;
             if self.link.take().is_some() {
                 cx.notify();
@@ -1790,7 +1845,10 @@ impl Editor {
         let line_count = self.buffer.line_count();
         let digits = line_count.to_string().len().max(3);
         // Gutter: breakpoints (and run markers), the code-action
-        // lightbulb, line numbers, then the fold chevrons' column.
+        // lightbulb, blame annotations, line numbers, change markers, then
+        // the fold chevrons' column.
+        let mut change_left = None;
+        let mut blame_left = None;
         let (numbers_right, fold_left, gutter_width, breakpoint_left, marker_left, bulb_left) =
             if self.single_line || self.text_area {
                 let left = bounds.left();
@@ -1799,8 +1857,22 @@ impl Editor {
                 let (breakpoint_left, marker_left, debug_width) =
                     self.debug_columns(bounds.left(), em_width);
                 let bulb = em_width * code_actions::LIGHTBULB_COLUMNS;
-                let numbers = debug_width + bulb + GUTTER_PADDING / 2. + em_width * digits as f32;
-                let fold_left = numbers + GUTTER_PADDING / 2.;
+                let blame = self.blame_width(em_width);
+                if blame > px(0.) {
+                    blame_left = Some(bounds.left() + debug_width + bulb);
+                }
+                let numbers = debug_width
+                    + bulb
+                    + blame
+                    + GUTTER_PADDING / 2.
+                    + em_width * digits as f32;
+                let changes = if self.project.is_some() || self.git.base.is_some() {
+                    change_left = Some(bounds.left() + numbers + px(2.));
+                    git_gutter::CHANGE_COLUMN
+                } else {
+                    px(0.)
+                };
+                let fold_left = numbers + changes + GUTTER_PADDING / 2.;
                 let gutter = fold_left + em_width * 1.5 + GUTTER_PADDING / 2.;
                 (
                     bounds.left() + numbers,
@@ -1971,6 +2043,10 @@ impl Editor {
             } else {
                 foldable.binary_search(&line).is_ok().then_some(false)
             };
+            let blame = (gutter && blame_left.is_some())
+                .then(|| self.blame_label(line))
+                .flatten()
+                .map(|(label, color)| shape(label.clone(), &[run(label.len(), color)]));
             rows.push(RowLayout {
                 indent: em_width * row.indent as f32,
                 folded: (row.last && folded_header).then(|| self.buffer.line_end(line)),
@@ -1980,8 +2056,17 @@ impl Editor {
                 mark,
                 chevron,
                 inlays,
+                blame,
             });
         }
+        let inline_blame = self.inline_blame_text().and_then(|text| {
+            let line = self.buffer.line_of(primary_head);
+            let index = rows
+                .iter()
+                .position(|row| row.row.line == line && row.row.last)?;
+            let color = theme::muted().opacity(0.8);
+            Some((index, shape(text.clone(), &[run(text.len(), color)])))
+        });
 
         if self.autoscroll
             && columns.is_none()
@@ -2038,6 +2123,9 @@ impl Editor {
             marker_left,
             bulb_left,
             fold_left,
+            change_left,
+            blame_left,
+            inline_blame,
             first_row,
             rows,
             placeholder: glyph("⋯"),
@@ -2115,6 +2203,19 @@ impl Editor {
                 self.paint_lightbulb(layout, row.row.line, top, window);
                 self.paint_debug_gutter(layout, row.row.line, top, window, cx);
             }
+            if let (Some(label), Some(left)) = (&row.blame, layout.blame_left) {
+                label
+                    .paint(point(left + layout.em_width / 2., top), line_height, window, cx)
+                    .ok();
+            }
+            self.paint_change_marker(layout, row, top, window);
+        }
+        if let Some(left) = layout.blame_left {
+            let right = left + layout.em_width * blame::BLAME_COLUMNS - px(1.);
+            window.paint_quad(fill(
+                Bounds::from_corners(point(right, bounds.top()), point(right + px(1.), bounds.bottom())),
+                theme::border(),
+            ));
         }
 
         window.with_content_mask(
@@ -2189,6 +2290,12 @@ impl Editor {
                     shaped
                         .paint(point(text_left, top), line_height, window, cx)
                         .ok();
+                    if let Some((index, inline)) = &layout.inline_blame
+                        && *index == i
+                    {
+                        let x = text_left + shaped.width + layout.em_width * 3.;
+                        inline.paint(point(x, top), line_height, window, cx).ok();
+                    }
 
                     // The Ctrl+hover link to a definition.
                     if let Some(link) = &self.link
@@ -2672,6 +2779,9 @@ impl Render for Editor {
                 if self.in_snippet() {
                     context.add("in_snippet");
                 }
+                if self.hunk_popup_open() {
+                    context.add("showing_hunk_popup");
+                }
                 context
             })
             .track_focus(&self.focus_handle)
@@ -2736,6 +2846,14 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::unfold_all))
                     .on_action(cx.listener(Self::fold_recursively))
                     .on_action(cx.listener(Self::unfold_recursively))
+            })
+            .when(!self.single_line && !self.text_area, |editor| {
+                editor
+                    .on_action(cx.listener(Self::next_change))
+                    .on_action(cx.listener(Self::previous_change))
+                    .on_action(cx.listener(Self::rollback_lines))
+                    .on_action(cx.listener(Self::close_hunk_popup))
+                    .on_action(cx.listener(Self::toggle_blame))
             })
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy))
@@ -2810,7 +2928,8 @@ impl Render for Editor {
                         text.children(self.render_signature_help(cx))
                     })
                     .children(self.render_completions(cx))
-                    .children(self.render_code_actions(cx)),
+                    .children(self.render_code_actions(cx))
+                    .when(focused, |text| text.children(self.render_blame_hover())),
             )
             .when(!self.single_line && !self.text_area, |editor| {
                 editor.child(
@@ -2922,6 +3041,8 @@ impl Render for Editor {
             .children(self.render_go_to_line(cx))
             .children(self.render_rename())
             .children(self.render_breakpoint_editor(cx))
+            .children(self.render_hunk_popup(cx))
+            .children(self.render_gutter_menu(cx))
             .into_any_element()
     }
 }

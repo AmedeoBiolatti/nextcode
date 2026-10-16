@@ -44,6 +44,8 @@ const MAX_LANES: usize = 16;
 /// within [`PREFETCH`] rows of the end.
 const PAGE: usize = 1000;
 const PREFETCH: usize = 200;
+/// Pages loaded at most to find a commit to reveal.
+const REVEAL_PAGES: usize = 20;
 const BRANCHES_WIDTH: f32 = 220.;
 const DETAILS_WIDTH: f32 = 380.;
 /// Typing in the text filter reloads the log after this pause.
@@ -199,6 +201,10 @@ pub struct GitLogPanel {
     /// The last operation's outcome; `conflict` offers Abort.
     report: Option<(SharedString, bool)>,
     conflict: bool,
+    /// Select this commit once it is loaded (Show in Git Log from blame),
+    /// loading up to `REVEAL_PAGES` pages for it.
+    reveal: Option<String>,
+    reveal_pages: usize,
 
     _load: Task<()>,
     _refs: Task<()>,
@@ -208,7 +214,7 @@ pub struct GitLogPanel {
 }
 
 /// "3 hours ago", "2 days ago", …
-fn relative_time(time: i64) -> String {
+pub(crate) fn relative_time(time: i64) -> String {
     let seconds = (now() - time).max(0);
     let (value, unit) = match seconds {
         0..60 => return "just now".into(),
@@ -221,14 +227,14 @@ fn relative_time(time: i64) -> String {
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// `2026-10-16 14:03 UTC`.
-fn absolute_time(time: i64) -> String {
+pub(crate) fn absolute_time(time: i64) -> String {
     let (days, seconds) = (time.div_euclid(86_400), time.rem_euclid(86_400));
     // Howard Hinnant's civil_from_days.
     let z = days + 719_468;
@@ -395,6 +401,8 @@ impl GitLogPanel {
             _debounce: Task::ready(()),
             _operation: Task::ready(()),
             _subscriptions: subscriptions,
+            reveal: None,
+            reveal_pages: 0,
         }
     }
 
@@ -457,6 +465,42 @@ impl GitLogPanel {
             .update(cx, |input, cx| input.set_text(&path, cx));
         self.filter.paths = vec![path];
         self.reload(cx);
+    }
+
+    /// Selects commit `id` (full hash) with the filters cleared, loading
+    /// pages until it shows.
+    pub fn reveal_commit(&mut self, id: String, cx: &mut Context<Self>) {
+        self.reveal = Some(id);
+        self.reveal_pages = 0;
+        self.popup = None;
+        self.date_label = None;
+        self.selected_branch = None;
+        self.filter = LogFilter::default();
+        for input in [&self.text_input, &self.path_input] {
+            input.update(cx, |input, cx| input.set_text("", cx));
+        }
+        self.reload(cx);
+    }
+
+    fn finish_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.reveal.clone() else {
+            return;
+        };
+        if let Some(index) = self.commits.iter().position(|commit| commit.id == id) {
+            self.reveal = None;
+            self.anchor = Some(index);
+            self.set_selection(vec![index], cx);
+            self.scroll
+                .scroll_to_item(index, gpui::ScrollStrategy::Center);
+        } else if self.next.is_some() && self.reveal_pages < REVEAL_PAGES {
+            self.reveal_pages += 1;
+            self.load_more(cx);
+        } else {
+            self.reveal = None;
+            let short = crate::commit_panel::short_revision(&id).to_owned();
+            self.report = Some((format!("Commit {short} is not in the log").into(), false));
+            cx.notify();
+        }
     }
 
     /// Re-reads refs and the first page of the log, keeping the selection.
@@ -526,6 +570,7 @@ impl GitLogPanel {
                 }
                 this.anchor = selected.first().copied();
                 this.set_selection(selected, cx);
+                this.finish_reveal(cx);
                 cx.notify();
             })
             .ok();
@@ -558,6 +603,7 @@ impl GitLogPanel {
                         this.commits.extend(page.commits);
                         this.next = page.next;
                         this.graph = this.filter.graph(&this.commits);
+                        this.finish_reveal(cx);
                     }
                     Err(err) => {
                         this.next = None;

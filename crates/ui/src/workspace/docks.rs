@@ -17,6 +17,7 @@ actions!(
     [
         ToggleFiles,
         ToggleSearch,
+        ReplaceInFiles,
         ToggleTerminal,
         ToggleCommit,
         ToggleGitLog,
@@ -37,6 +38,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-e", ToggleFiles, ctx),
         KeyBinding::new("alt-1", ToggleFiles, ctx),
         KeyBinding::new("secondary-shift-f", ToggleSearch, ctx),
+        // PyCharm's Replace in Files; VS Code's Replace in Files.
+        KeyBinding::new("secondary-shift-r", ReplaceInFiles, ctx),
+        KeyBinding::new("secondary-shift-h", ReplaceInFiles, ctx),
         // PyCharm's Commit tool window; Ctrl+Shift+G is VS Code's Source
         // Control shortcut.
         KeyBinding::new("alt-0", ToggleCommit, ctx),
@@ -149,6 +153,18 @@ impl Workspace {
     ) {
         self.show_panel(PanelId::Search, cx);
         self.search.read(cx).focus(window, cx);
+    }
+
+    /// `Ctrl+Shift+R` / `Ctrl+Shift+H`: search with the replace field shown.
+    pub(super) fn replace_in_files(
+        &mut self,
+        _: &ReplaceInFiles,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(PanelId::Search, cx);
+        self.search
+            .update(cx, |search, cx| search.open_replace(window, cx));
     }
 
     /// Shows the Commit window (refreshing its status) and focuses the

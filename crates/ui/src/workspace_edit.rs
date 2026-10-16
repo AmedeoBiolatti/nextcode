@@ -1,8 +1,9 @@
 //! LSP `WorkspaceEdit`s (rename, code actions, `workspace/applyEdit`):
 //! text edits for open documents or files on disk, and file creation,
-//! renames and deletions, applied in the server's order. Also the minimal
-//! edit list between two texts, so whole-text results (formatters) keep
-//! cursors where they were.
+//! renames and deletions, applied in the server's order. Also project-wide
+//! Replace (the search panel's and headless `replace`) through the same
+//! documents, and the minimal edit list between two texts, so whole-text
+//! results (formatters) keep cursors where they were.
 
 use std::{
     io,
@@ -12,9 +13,10 @@ use std::{
 };
 
 use lsp::types::{
-    ApplyWorkspaceEditResponse, DocumentChangeOperation, DocumentChanges, OneOf, ResourceOp,
-    TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+    ApplyWorkspaceEditResponse, DocumentChangeOperation, DocumentChanges, OneOf, Position,
+    ResourceOp, TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
 };
+use search::{Replacer, Target};
 use similar::{Algorithm, DiffTag, TextDiff};
 use text::{Buffer, Encoding};
 use worktree::FileKind;
@@ -242,6 +244,9 @@ pub trait Documents {
     /// The version of the open document at `path`, or `None` if it is not
     /// open.
     fn version(&mut self, path: &Path) -> Option<i32>;
+    /// The current text of the open document at `path`, or `None` if it is
+    /// not open.
+    fn text(&mut self, path: &Path) -> Option<String>;
     /// Applies `edits` to the open document at `path`; `None` when it is not
     /// open, and the file on disk is edited instead.
     fn edit(
@@ -451,6 +456,118 @@ fn create(
     }
 }
 
+/// One file's matches for a project-wide replace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTargets {
+    pub path: PathBuf,
+    pub targets: Vec<Target>,
+}
+
+/// What a project-wide replace did, file by file.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReplaceReport {
+    /// Files changed and how many matches each, in order.
+    pub replaced: Vec<(PathBuf, usize)>,
+    /// Files left alone because they changed since the search, and why.
+    pub skipped: Vec<(PathBuf, String)>,
+    /// Files that could not be read, edited or written.
+    pub failed: Vec<(PathBuf, String)>,
+}
+
+impl ReplaceReport {
+    /// Matches replaced over all files.
+    pub fn matches(&self) -> usize {
+        self.replaced.iter().map(|(_, count)| count).sum()
+    }
+
+    /// One line for a notice, e.g. "Replaced 3 matches in 2 files; skipped
+    /// a.py (changed since the search)".
+    pub fn summary(&self, root: &Path) -> String {
+        let show = |path: &Path| {
+            path.strip_prefix(root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
+        let plural =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let mut summary = format!(
+            "Replaced {} in {}",
+            plural(self.matches(), "match", "matches"),
+            plural(self.replaced.len(), "file", "files")
+        );
+        if !self.skipped.is_empty() {
+            let names: Vec<String> = self.skipped.iter().map(|(path, _)| show(path)).collect();
+            summary += &format!("; skipped {} (changed since the search)", names.join(", "));
+        }
+        for (path, message) in &self.failed {
+            summary += &format!("; {} failed: {message}", show(path));
+        }
+        summary
+    }
+}
+
+/// Replaces each file's targets. A file's edits are planned against its
+/// current text (the open document, else the file read through `project`),
+/// and the file is skipped when any of its targets no longer matches with
+/// the text the search saw. Open documents take the edits (as one undo
+/// step in the editor, left unsaved); other files are written.
+pub fn replace(
+    project: &Project,
+    replacer: &Replacer,
+    files: &[FileTargets],
+    documents: &mut dyn Documents,
+) -> ReplaceReport {
+    let mut report = ReplaceReport::default();
+    for file in files.iter().filter(|file| !file.targets.is_empty()) {
+        let path = &file.path;
+        let open = documents.text(path);
+        let is_open = open.is_some();
+        let text = match open.map_or_else(|| project.read_text(path), Ok) {
+            Ok(text) => text,
+            Err(err) => {
+                report.failed.push((path.clone(), err.to_string()));
+                continue;
+            }
+        };
+        let planned = match replacer.plan(&text, &file.targets) {
+            Ok(planned) => planned,
+            Err(stale) => {
+                report.skipped.push((path.clone(), stale.to_string()));
+                continue;
+            }
+        };
+        let result = if is_open {
+            let edits: Vec<TextEdit> = planned
+                .iter()
+                .map(|replacement| {
+                    let line = replacement.line as u32;
+                    TextEdit::new(
+                        lsp::types::Range::new(
+                            Position::new(line, replacement.columns.start as u32),
+                            Position::new(line, replacement.columns.end as u32),
+                        ),
+                        replacement.text.clone(),
+                    )
+                })
+                .collect();
+            documents
+                .edit(path, &edits, Encoding::Utf8)
+                .unwrap_or_else(|| Err("the document was closed".into()))
+        } else {
+            let edited = search::apply_replacements(&text, &planned);
+            project
+                .write(path, edited.into_bytes())
+                .map_err(|err| err.to_string())
+        };
+        match result {
+            Ok(()) => report.replaced.push((path.clone(), planned.len())),
+            Err(message) => report.failed.push((path.clone(), message)),
+        }
+    }
+    report
+}
+
 /// Returns whether anything moved.
 fn rename(
     project: &Project,
@@ -524,6 +641,10 @@ mod tests {
     impl Documents for Open {
         fn version(&mut self, path: &Path) -> Option<i32> {
             self.docs.get(path).map(|(version, _)| *version)
+        }
+
+        fn text(&mut self, path: &Path) -> Option<String> {
+            self.docs.get(path).map(|(_, text)| text.clone())
         }
 
         fn edit(
@@ -721,5 +842,83 @@ mod tests {
         assert!(minimal_edits(new, new).is_empty());
         let edits = minimal_edits("a\nb\n", "a\nb\nc\n");
         assert_eq!(edits, [(4..4, "c\n".to_owned())]);
+    }
+
+    /// Targets of `query` in `text`, as a search of the file reports them.
+    fn targets(query: &search::SearchQuery, text: &str) -> Vec<Target> {
+        search::search_text(query, text)
+            .unwrap()
+            .iter()
+            .flat_map(Target::of_line)
+            .map(|(_, target)| target)
+            .collect()
+    }
+
+    #[test]
+    fn replace_edits_open_documents_writes_closed_files_and_skips_changed_ones() {
+        let (root, project) = temp_project("replace");
+        let query = search::SearchQuery {
+            pattern: r"old(\d)".into(),
+            regex: true,
+            case_sensitive: true,
+            ..Default::default()
+        };
+        let replacer = Replacer::new(&query, "new$1").unwrap();
+        let (open_path, disk, stale, missing) = (
+            root.join("open.rs"),
+            root.join("disk.py"),
+            root.join("stale.py"),
+            root.join("missing.py"),
+        );
+        // The open document differs from its file: its own text is searched.
+        fs::write(&open_path, "nothing\n").unwrap();
+        let open_text = "x = old1;\r\nold2();\r\n";
+        let mut open = Open::default();
+        open.docs.insert(open_path.clone(), (1, open_text.into()));
+        fs::write(&disk, "old1 old2 old3\n").unwrap();
+        fs::write(&stale, "a = old1\n").unwrap();
+        let mut disk_targets = targets(&query, "old1 old2 old3\n");
+        // The user excluded the middle match.
+        disk_targets.remove(1);
+        let files = [
+            FileTargets {
+                path: open_path.clone(),
+                targets: targets(&query, open_text),
+            },
+            FileTargets {
+                path: disk.clone(),
+                targets: disk_targets,
+            },
+            FileTargets {
+                path: stale.clone(),
+                targets: targets(&query, "a = old1\n"),
+            },
+            FileTargets {
+                path: missing.clone(),
+                targets: targets(&query, "old1\n"),
+            },
+        ];
+        // Changed after the search: the match moved.
+        fs::write(&stale, "ab = old1\n").unwrap();
+
+        let report = replace(&project, &replacer, &files, &mut open);
+        assert_eq!(report.replaced, [(open_path.clone(), 2), (disk.clone(), 2)]);
+        assert_eq!(open.docs[&open_path].1, "x = new1;\r\nnew2();\r\n");
+        assert_eq!(fs::read_to_string(&open_path).unwrap(), "nothing\n");
+        assert_eq!(fs::read_to_string(&disk).unwrap(), "new1 old2 new3\n");
+        assert_eq!(fs::read_to_string(&stale).unwrap(), "ab = old1\n");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].0, stale);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, missing);
+        let summary = report.summary(&root);
+        assert!(
+            summary.starts_with(
+                "Replaced 4 matches in 2 files; skipped stale.py (changed since the search); \
+                 missing.py failed: "
+            ),
+            "{summary}"
+        );
+        fs::remove_dir_all(root).ok();
     }
 }

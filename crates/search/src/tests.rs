@@ -360,3 +360,162 @@ fn empty_pattern_sends_only_done() {
     assert_eq!(results.files_searched, 0);
     assert_eq!(results.matches, 0);
 }
+
+/// Searches `text` as file `a.txt` and replaces every reported match.
+fn replace_all(text: &str, query: &SearchQuery, replacement: &str) -> String {
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    let dir = TempDir::new(&format!("replace-{}", RUNS.fetch_add(1, Ordering::Relaxed)));
+    dir.write("a.txt", text);
+    let results = run_default(&dir.0, query);
+    let targets: Vec<Target> = results
+        .files
+        .iter()
+        .flat_map(|file| &file.lines)
+        .flat_map(Target::of_line)
+        .map(|(_, target)| target)
+        .collect();
+    let replacer = Replacer::new(query, replacement).unwrap();
+    let planned = replacer.plan(text, &targets).expect("nothing changed");
+    apply_replacements(text, &planned)
+}
+
+#[test]
+fn replacements_expand_numbered_and_named_groups_only_in_regex_mode() {
+    let regex = SearchQuery {
+        regex: true,
+        ..query(r"(\w+)@(?P<host>\w+)")
+    };
+    assert_eq!(
+        replace_all("mail ann@home and bob@work\n", &regex, "${host}:$1 $$"),
+        "mail home:ann $ and work:bob $\n"
+    );
+    // An unknown group expands to nothing; `$1x` is the group named `1x`.
+    assert_eq!(replace_all("a@b\n", &regex, "[$9|${1}x]"), "[|ax]\n");
+    // Literal mode: `$1` stays as typed, metacharacters match themselves.
+    assert_eq!(
+        replace_all("f(x) f(y)\n", &query("f(x)"), "$1"),
+        "$1 f(y)\n"
+    );
+}
+
+#[test]
+fn replacements_honour_case_and_whole_word() {
+    let insensitive = SearchQuery {
+        case_sensitive: false,
+        ..query("foo")
+    };
+    assert_eq!(
+        replace_all("Foo FOO foo food\n", &insensitive, "bar"),
+        "bar bar bar bard\n"
+    );
+    assert_eq!(
+        replace_all("Foo FOO foo food\n", &query("foo"), "bar"),
+        "Foo FOO bar bard\n"
+    );
+    let word = SearchQuery {
+        whole_word: true,
+        ..insensitive
+    };
+    assert_eq!(
+        replace_all("Foo food foo_x (foo)\n", &word, "bar"),
+        "bar food foo_x (bar)\n"
+    );
+    // Regex anchors see the line, CRLF endings survive.
+    let anchored = SearchQuery {
+        regex: true,
+        ..query(r"^(\w+) = (\w+)$")
+    };
+    assert_eq!(
+        replace_all("a = 1\r\nb = 2\r\n", &anchored, "$2 = $1"),
+        "1 = a\r\n2 = b\r\n"
+    );
+}
+
+#[test]
+fn replacements_use_byte_columns_across_multibyte_text() {
+    assert_eq!(
+        replace_all("héllo wörld 😀 wörld\n", &query("wörld"), "мир"),
+        "héllo мир 😀 мир\n"
+    );
+    let replacer = Replacer::new(&query("wörld"), "x").unwrap();
+    let planned = replacer
+        .plan(
+            "😀\nwörld wörld\n",
+            &[Target {
+                line: 1,
+                column: 7,
+                text: "wörld".into(),
+                partial: false,
+            }],
+        )
+        .unwrap();
+    assert_eq!(planned[0].columns, 7..13);
+    assert_eq!(planned[0].offsets, 12..18);
+    // A line truncated by the search still yields the original columns.
+    let long = format!("{}é needle {} needle\n", "x".repeat(600), "y".repeat(50));
+    assert_eq!(
+        replace_all(&long, &query("needle"), "pin"),
+        format!("{}é pin {} pin\n", "x".repeat(600), "y".repeat(50))
+    );
+}
+
+#[test]
+fn plans_refuse_text_that_changed_since_the_search() {
+    let replacer = Replacer::new(&query("old"), "new").unwrap();
+    let target = |line, column| Target {
+        line,
+        column,
+        text: "old".into(),
+        partial: false,
+    };
+    let targets = [target(0, 4), target(1, 0)];
+    let planned = replacer.plan("the old\nold\n", &targets).unwrap();
+    assert_eq!(
+        apply_replacements("the old\nold\n", &planned),
+        "the new\nnew\n"
+    );
+    // A line inserted above, an edit moving the match, a removed match,
+    // and a file that got shorter are all stale.
+    for changed in [
+        "\nthe old\nold\n",
+        "the  old\nold\n",
+        "the old\nolD\n",
+        "the old",
+    ] {
+        assert!(replacer.plan(changed, &targets).is_err(), "{changed:?}");
+    }
+    // Only the listed targets change: an excluded match stays.
+    let planned = replacer.plan("the old\nold\n", &targets[1..]).unwrap();
+    assert_eq!(
+        apply_replacements("the old\nold\n", &planned),
+        "the old\nnew\n"
+    );
+}
+
+#[test]
+fn text_search_matches_the_file_search_and_filters_paths() {
+    let dir = TempDir::new("text");
+    let text = "one two\r\ntwo\nthree two two\n";
+    dir.write("src/a.txt", text);
+    let results = run_default(&dir.0, &query("two"));
+    assert_eq!(
+        search_text(&query("two"), text).unwrap(),
+        results.file("a.txt").lines
+    );
+    assert!(search_text(&query(""), text).unwrap().is_empty());
+
+    let filter = PathFilter::new(
+        &dir.0,
+        &SearchQuery {
+            include: vec!["src/**".into()],
+            exclude: vec!["gen/".into(), "*.log".into()],
+            ..query("x")
+        },
+    )
+    .unwrap();
+    assert!(filter.matches(&dir.0.join("src/a.txt")));
+    assert!(!filter.matches(&dir.0.join("src/b.log")));
+    assert!(!filter.matches(&dir.0.join("src/gen/c.txt")));
+    assert!(!filter.matches(&dir.0.join("other/a.txt")));
+    assert!(!filter.matches(Path::new("/elsewhere/src/a.txt")));
+}

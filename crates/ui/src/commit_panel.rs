@@ -2,8 +2,9 @@
 //! checkbox per file, folder and group; Commit commits exactly the checked
 //! files (`git commit --only`, untracked ones added first). With the
 //! `git.staging_area` setting it shows git's index instead (Staged /
-//! Unstaged groups with stage and unstage). Git runs where the project
-//! lives (locally, in WSL or in a dev container).
+//! Unstaged groups with stage and unstage). A second tab lists the shelf
+//! (`shelf_view`). Git runs where the project lives (locally, in WSL or in
+//! a dev container).
 
 use std::{collections::HashSet, io, ops::Range, time::Duration};
 
@@ -21,11 +22,13 @@ use crate::{
     editor::{self, Editor},
     project::Project,
     selectable::{SelectableText, selectable},
-    settings, theme,
+    settings,
+    shelf_view::{ShelfView, ShelfViewEvent},
+    theme,
 };
 
-const ROW_HEIGHT: f32 = 22.;
-const INDENT: f32 = 16.;
+pub(crate) const ROW_HEIGHT: f32 = 22.;
+pub(crate) const INDENT: f32 = 16.;
 
 actions!(
     commit_panel,
@@ -73,6 +76,14 @@ pub enum CommitPanelEvent {
     OpenFile(std::path::PathBuf),
     /// Commit and Push: the commit is done, confirm the push.
     Push(Repository),
+    /// Stash Changes… for these files (the Stash dialog asks for the
+    /// message).
+    Stash {
+        paths: Vec<String>,
+        include_untracked: bool,
+    },
+    /// Shelve Changes… for these files; `name` prefills the dialog.
+    Shelve { paths: Vec<String>, name: String },
     /// Status was re-read; open diffs may be stale.
     Refreshed,
 }
@@ -127,20 +138,10 @@ impl Group {
         match self {
             Self::Conflicts => entry.unstaged.filter(|&c| c == Change::Conflicted),
             Self::Unversioned => entry.unstaged.filter(|&c| c == Change::Untracked),
-            Self::Changes => (!special).then(|| combined_change(entry)),
+            Self::Changes => (!special).then(|| entry.combined_change()),
             Self::Staged => entry.staged.filter(|_| !special),
             Self::Unstaged => entry.unstaged.filter(|_| !special),
         }
-    }
-}
-
-/// An entry's change against HEAD, staged and unstaged parts together.
-fn combined_change(entry: &Entry) -> Change {
-    match (entry.staged, entry.unstaged) {
-        (Some(change @ (Change::Added | Change::Renamed | Change::Copied)), _) => change,
-        (Some(Change::Deleted), _) | (_, Some(Change::Deleted)) => Change::Deleted,
-        (Some(change), _) | (None, Some(change)) => change,
-        (None, None) => Change::Modified,
     }
 }
 
@@ -358,6 +359,13 @@ enum State {
     Failed(SharedString),
 }
 
+/// The Commit window's tabs (PyCharm's Local Changes / Shelf).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Changes,
+    Shelf,
+}
+
 /// The open right-click menu: where, and the files it acts on.
 struct ContextMenu {
     position: Point<Pixels>,
@@ -390,6 +398,8 @@ pub struct CommitPanel {
     inclusion: Inclusion,
     selected: Option<usize>,
     menu: Option<ContextMenu>,
+    tab: Tab,
+    shelf: Entity<ShelfView>,
     focus_handle: FocusHandle,
     _refresh: Task<()>,
     refresh_running: bool,
@@ -397,6 +407,7 @@ pub struct CommitPanel {
     refresh_scheduled: bool,
     _operation: Task<()>,
     _subscription: Subscription,
+    _shelf_subscription: Subscription,
 }
 
 pub fn change_color(change: Change) -> Hsla {
@@ -418,7 +429,7 @@ pub fn short_revision(revision: &str) -> &str {
 
 /// Selectable text in a row: double-click (diff / expand) and the
 /// right-click menu belong to the row.
-fn row_text(id: &'static str, text: impl Into<SharedString>) -> SelectableText {
+pub(crate) fn row_text(id: &'static str, text: impl Into<SharedString>) -> SelectableText {
     selectable(id, text)
         .double_click_through()
         .right_click_through()
@@ -456,6 +467,27 @@ impl CommitPanel {
     ) -> Self {
         let message = cx.new(Editor::text_area);
         let subscription = cx.subscribe(&message, |_, _, _: &editor::EditorEvent, cx| cx.notify());
+        let shelf = cx.new(|cx| ShelfView::new(project.clone(), cx));
+        let shelf_subscription = cx.subscribe(&shelf, |this, _, event, cx| match event {
+            ShelfViewEvent::OpenDiff { repository, source } => {
+                cx.emit(CommitPanelEvent::OpenDiff {
+                    repository: repository.clone(),
+                    source: source.clone(),
+                })
+            }
+            ShelfViewEvent::Changed { message, conflicts } => {
+                this.feedback = Some((message.clone().into(), theme::muted));
+                // Conflicts are resolved in the Changes tab.
+                if *conflicts {
+                    this.tab = Tab::Changes;
+                }
+                this.refresh(cx);
+            }
+            ShelfViewEvent::Failed(error) => {
+                this.feedback = Some((error.clone().into(), theme::error));
+                this.refresh(cx);
+            }
+        });
         let mut panel = Self {
             project,
             state: State::Loading,
@@ -471,6 +503,8 @@ impl CommitPanel {
             inclusion: Inclusion::default(),
             selected: None,
             menu: None,
+            tab: Tab::Changes,
+            shelf,
             focus_handle: cx.focus_handle(),
             _refresh: Task::ready(()),
             refresh_running: false,
@@ -478,6 +512,7 @@ impl CommitPanel {
             refresh_scheduled: false,
             _operation: Task::ready(()),
             _subscription: subscription,
+            _shelf_subscription: shelf_subscription,
         };
         match preloaded {
             Some(preloaded) => panel.show_preloaded(preloaded, cx),
@@ -643,6 +678,13 @@ impl CommitPanel {
         };
         self.rebuild_rows();
         self.selected = selected.and_then(|key| self.find_row(&key));
+        let (repository, shelf_visible) = (self.repository(), self.tab == Tab::Shelf);
+        self.shelf.update(cx, |shelf, cx| {
+            shelf.set_repository(repository);
+            if shelf_visible {
+                shelf.refresh(cx);
+            }
+        });
         cx.emit(CommitPanelEvent::Refreshed);
         cx.notify();
     }
@@ -655,6 +697,75 @@ impl CommitPanel {
     fn find_row(&self, key: &(Group, String, bool)) -> Option<usize> {
         let status = self.status()?;
         self.rows.iter().position(|row| row.key(status) == *key)
+    }
+
+    /// Shows the Changes or Shelf tab (reading the shelves again).
+    pub fn select_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.tab = tab;
+        self.menu = None;
+        if tab == Tab::Shelf {
+            self.shelf.update(cx, |shelf, cx| shelf.refresh(cx));
+        }
+        cx.notify();
+    }
+
+    /// Files for Shelve/Stash from the Git menu: the selected changes,
+    /// else the checked ones.
+    pub fn chosen_entries(&self) -> Vec<Entry> {
+        let entries = self.selected_entries();
+        if entries.is_empty() {
+            self.checked_entries()
+        } else {
+            entries
+        }
+    }
+
+    /// Shelve Changes… for `entries`: the dialog's name is the commit
+    /// message's first line, else the file names.
+    pub fn request_shelve(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
+        if entries.is_empty() {
+            self.feedback = Some(("Select the changes to shelve".into(), theme::error));
+            return cx.notify();
+        }
+        let message = self.message.read(cx).text();
+        let name = match message.lines().next().map(str::trim) {
+            Some(line) if !line.is_empty() => line.to_owned(),
+            _ => {
+                let names: Vec<&str> = entries
+                    .iter()
+                    .map(|entry| entry.path.rsplit('/').next().unwrap_or(&entry.path))
+                    .collect();
+                match names.as_slice() {
+                    [_, _, _, _, ..] => {
+                        format!("{}, {} and {} more", names[0], names[1], names.len() - 2)
+                    }
+                    names => names.join(", "),
+                }
+            }
+        };
+        let paths = entries.into_iter().map(|entry| entry.path).collect();
+        cx.emit(CommitPanelEvent::Shelve { paths, name });
+    }
+
+    /// Stash Changes… for `entries` (untracked files included when any
+    /// is untracked).
+    pub fn request_stash(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
+        if entries.is_empty() {
+            self.feedback = Some(("Select the changes to stash".into(), theme::error));
+            return cx.notify();
+        }
+        let include_untracked = entries
+            .iter()
+            .any(|entry| entry.unstaged == Some(Change::Untracked));
+        let mut paths = Vec::new();
+        for entry in entries {
+            paths.extend(entry.orig_path);
+            paths.push(entry.path);
+        }
+        cx.emit(CommitPanelEvent::Stash {
+            paths,
+            include_untracked,
+        });
     }
 
     /// Shows the outcome of a git operation run elsewhere (a popup).
@@ -1295,6 +1406,54 @@ impl CommitPanel {
         }
     }
 
+    /// Changes | Shelf, as PyCharm's Commit window tabs.
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab = |id: &'static str, label: &'static str, tab: Tab, active: bool| {
+            div()
+                .id(id)
+                .h_full()
+                .px_2()
+                .flex()
+                .items_center()
+                .text_sm()
+                .cursor_pointer()
+                .border_b_2()
+                .border_color(if active {
+                    theme::accent()
+                } else {
+                    gpui::transparent_black()
+                })
+                .text_color(if active {
+                    theme::text()
+                } else {
+                    theme::muted()
+                })
+                .hover(|style| style.text_color(theme::text()))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
+        };
+        div()
+            .h(px(26.))
+            .px_1()
+            .flex()
+            .flex_none()
+            .items_end()
+            .border_b_1()
+            .border_color(theme::border())
+            .child(tab(
+                "commit-tab-changes",
+                "Changes",
+                Tab::Changes,
+                self.tab == Tab::Changes,
+            ))
+            .child(tab(
+                "commit-tab-shelf",
+                "Shelf",
+                Tab::Shelf,
+                self.tab == Tab::Shelf,
+            ))
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let button = |id: &'static str, glyph: &'static str, title: &'static str, active: bool| {
             div()
@@ -1597,6 +1756,14 @@ impl CommitPanel {
         items.push((
             "Rollback…",
             Box::new(|this, entries, window, cx| this.rollback(entries, window, cx)),
+        ));
+        items.push((
+            "Shelve Changes…",
+            Box::new(|this, entries, _, cx| this.request_shelve(entries, cx)),
+        ));
+        items.push((
+            "Stash Changes…",
+            Box::new(|this, entries, _, cx| this.request_stash(entries, cx)),
         ));
         if single_file {
             items.push((
@@ -1950,6 +2117,19 @@ impl Render for CommitPanel {
             State::Loading => div().flex_1().into_any_element(),
         };
         let ready = matches!(self.state, State::Ready { .. });
+        let changes = !ready || self.tab == Tab::Changes;
+        // Below the shelf (or the error), where there is no commit area.
+        let feedback = (!changes || !ready)
+            .then(|| self.feedback.clone())
+            .flatten()
+            .map(|(text, color)| {
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(color())
+                    .child(selectable("feedback", text))
+            });
         div()
             .key_context("CommitPanel")
             .track_focus(&self.focus_handle)
@@ -1964,20 +2144,28 @@ impl Render for CommitPanel {
             .flex()
             .flex_col()
             .bg(theme::panel())
-            .when(ready, |panel| panel.child(self.render_toolbar(cx)))
-            .children(self.render_operation(cx))
-            .child(div().flex_1().min_h_0().flex().flex_col().child(body))
-            .when(ready, |panel| panel.child(self.render_commit_area(cx)))
-            .when(!ready, |panel| {
-                panel.children(self.feedback.clone().map(|(text, color)| {
-                    div()
-                        .px_2()
-                        .pb_1()
-                        .text_xs()
-                        .text_color(color())
-                        .child(selectable("feedback", text))
-                }))
+            .when(ready, |panel| panel.child(self.render_tabs(cx)))
+            .when(ready && changes, |panel| {
+                panel.child(self.render_toolbar(cx))
             })
+            .children(self.render_operation(cx))
+            .when(changes, |panel| {
+                panel.child(div().flex_1().min_h_0().flex().flex_col().child(body))
+            })
+            .when(!changes, |panel| {
+                panel.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(self.shelf.clone()),
+                )
+            })
+            .when(ready && changes, |panel| {
+                panel.child(self.render_commit_area(cx))
+            })
+            .children(feedback)
             .children(self.render_menu(cx))
     }
 }
@@ -2194,16 +2382,93 @@ mod tests {
     #[test]
     fn combined_changes_show_the_file_against_head() {
         assert_eq!(
-            combined_change(&entry("a", Some(Change::Added), Some(Change::Modified))),
+            entry("a", Some(Change::Added), Some(Change::Modified)).combined_change(),
             Change::Added
         );
         assert_eq!(
-            combined_change(&entry("a", Some(Change::Modified), Some(Change::Deleted))),
+            entry("a", Some(Change::Modified), Some(Change::Deleted)).combined_change(),
             Change::Deleted
         );
         assert_eq!(
-            combined_change(&entry("a", None, Some(Change::Modified))),
+            entry("a", None, Some(Change::Modified)).combined_change(),
             Change::Modified
         );
+    }
+
+    #[gpui::test]
+    fn shelve_and_stash_requests_carry_the_files_and_a_default_name(cx: &mut gpui::TestAppContext) {
+        use std::{cell::RefCell, process::Command, rc::Rc};
+        let dir = std::env::temp_dir().join(format!("next_code_requests_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let mut command = Command::new("git");
+            remote::launch::no_window(&mut command);
+            let output = command.arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.join("a.txt"), "a2\n").unwrap();
+        for name in ["b.txt", "c.txt", "d.txt"] {
+            std::fs::write(dir.join(name), "new\n").unwrap();
+        }
+
+        let panel = cx.new(|cx| CommitPanel::new(Project::local(dir.clone()), None, cx));
+        cx.run_until_parked();
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let requests = requests.clone();
+            cx.subscribe(&panel, move |_, event, _| match event {
+                CommitPanelEvent::Shelve { paths, name } => {
+                    requests.borrow_mut().push((paths.clone(), name.clone()))
+                }
+                CommitPanelEvent::Stash {
+                    paths,
+                    include_untracked,
+                } => requests
+                    .borrow_mut()
+                    .push((paths.clone(), format!("untracked: {include_untracked}"))),
+                _ => {}
+            })
+            .detach();
+        });
+        panel.update(cx, |panel, cx| {
+            let entries = panel.status().unwrap().entries.clone();
+            assert_eq!(entries.len(), 4);
+            panel.request_shelve(entries[..2].to_vec(), cx);
+            panel.request_shelve(entries.clone(), cx);
+            panel.message.update(cx, |message, cx| {
+                message.set_text("Fix login\n\nDetails", cx)
+            });
+            panel.request_shelve(entries[..1].to_vec(), cx);
+            panel.request_stash(entries[..1].to_vec(), cx);
+            panel.request_stash(entries[..2].to_vec(), cx);
+            panel.request_shelve(Vec::new(), cx);
+        });
+        cx.run_until_parked();
+        let strings = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            *requests.borrow(),
+            [
+                (strings(&["a.txt", "b.txt"]), "a.txt, b.txt".to_owned()),
+                (
+                    strings(&["a.txt", "b.txt", "c.txt", "d.txt"]),
+                    "a.txt, b.txt and 2 more".to_owned()
+                ),
+                (strings(&["a.txt"]), "Fix login".to_owned()),
+                (strings(&["a.txt"]), "untracked: false".to_owned()),
+                (strings(&["a.txt", "b.txt"]), "untracked: true".to_owned()),
+            ]
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.feedback.is_some(), "an empty selection is reported");
+        });
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

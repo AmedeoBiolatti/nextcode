@@ -17,7 +17,12 @@
 //! | `read` | `path` | `{text}` |
 //! | `write` | `path`, `text` | `null`; open documents are synced |
 //! | `stat` | `path` | `{kind: "file" \| "dir" \| null}` |
+//! | `create_file` / `create_dir` | `path` | `{path}`; missing parent folders are created; fails if something is there or the name is invalid where the project lives |
+//! | `rename_path` | `path`, `new_path` (rename or move; the target must not exist, a folder cannot go into itself) | `{path, edits: [{server, applied, changed, failure}], problems}`: running language servers that registered for `workspace/willRenameFiles` (e.g. rust-analyzer) edit their references first (`problems`: servers that failed or timed out); open documents follow; `didRenameFiles` after |
+//! | `copy_path` | `path`, `dir`? (default: its folder) | `{path}` of the copy: the same name if free in `dir`, else `name copy.ext`, `name copy 2.ext`, … |
+//! | `delete_path` | `path` or `paths`, `trash`? (Recycle Bin, local Windows projects only) | `null`; folders go with their contents, open documents close |
 //! | `search` | `pattern`, `regex`?, `case_sensitive`?, `whole_word`?, `include`?, `exclude`? | `{files, matches, files_searched, limit_hit}` |
+//! | `replace` | `pattern`, `replacement`, `regex`?, `case_sensitive`?, `whole_word`?, `include`?, `exclude`?, `paths`? (only files under these) | `{files: [{path, replacements}], replacements, skipped: [{path, reason}], failed: [{path, error}], limit_hit}`; `$1`/`${name}` expand in regex mode |
 //! | `watch` / `unwatch` | | starts/stops `files_changed` events |
 //! | `open` | `path`, `timeout_ms`? | starts the language server, opens the document: `{language, server, encoding}` |
 //! | `close` | `path` | `null` |
@@ -39,6 +44,9 @@
 //! | `git_commit` | `message`, `amend`? | `{summary}` (`<hash> <subject>`) |
 //! | `git_diff` | `path` (repository-relative); `staged`?, or `old` (revision) and `new`? (revision or `"worktree"`, the default); `whole_file`? | `{rows, added, removed, binary}`; index diffs come from `git diff` and include `hunk` rows `{index, header}` |
 //! | `git_apply_hunk` | `path`, `hunk` (index from `git_diff`), `action` (`"stage"` \| `"unstage"` \| `"discard"`), `staged`?, `whole_file`? (as for the `git_diff` that numbered the hunk) | `null` |
+//! | `git_line_changes` | `path`, `index`? (compare with the index instead of HEAD), `contents`? (the text to compare; the working-tree file by default) | `{base: "blob" \| "new_file" \| "none", changes: [{kind: "added" \| "modified" \| "deleted", new: {start, end}, old: {start, end}}]}` (0-based lines; the editor's change markers) |
+//! | `git_stage_line_change` | `path`, `index: true`, `change` (index in `git_line_changes`), `contents`? | `null`; the index gets only that change (Stage Hunk from the editor) |
+//! | `git_blame` | `path`, `contents`? (unsaved text: lines git cannot find are not committed) | `{commits: [{id, author, author_mail, time, summary, message}], lines: [commit index \| null]}` |
 //! | `git_branch_create` | `name`, `start`? (revision; HEAD), `switch`? (true) | `null` |
 //! | `git_switch` | `name` (branch, remote branch: tracked locally, or tag: detached) | `null` |
 //! | `git_branch_delete` | `name`, `force`? | `null` |
@@ -73,6 +81,16 @@
 //! | `git_tag` | `name`, `commit`? (HEAD), `message`? (annotated) | `null` |
 //! | `git_checkout_revision` | `commit` | `null`: detached HEAD |
 //! | `git_patch` | `commits` (oldest first) | `{patch}`: `git format-patch` mailbox (merges have none) |
+//! | `git_stash_list` | | `[{index, id, branch, message, date}]`, newest first (`date`: Unix seconds) |
+//! | `git_stash_push` | `message`? (empty: git's own), `include_untracked`? (false), `paths`? (default: every change) | `null`; fails when there is nothing to stash |
+//! | `git_stash_apply` | `index`? (0), `pop`? (false), `reinstate_index`? (false) | `{result: "done"}` or `{result: "conflicts", paths}` (a conflicting pop keeps the stash) |
+//! | `git_stash_drop` | `index` | `null` |
+//! | `git_stash_changes` | `index`? (0) | `[{path, orig_path, change, old, new}]`: tracked changes, then untracked files (`change: "untracked"`, `old: "empty"`); `old`/`new` are sides as in `git_diff` |
+//! | `git_shelve` | `paths`, `message` (the shelf's name) | `{id, message, date, base, files: [{path, orig_path, change}]}`: written to `.next_code/shelf/<id>/` (`shelf.patch`, `info.json`; the folder ignores itself), then the files go back to HEAD (new files are deleted) |
+//! | `git_unshelve` | `shelf` (its `id`; `id` names the request), `remove`? (false) | as `git_stash_apply`; three-way when the patch no longer applies cleanly; conflicts keep the shelf |
+//! | `git_shelf_list` | | shelves as `git_shelve` returns them, newest first |
+//! | `git_shelf_diff` | `shelf`, `path`, `whole_file`? | as `git_diff`: the shelved file against the version it was shelved on |
+//! | `git_shelf_delete` | `shelf` | `null` |
 //! | `python_info` | | `null` without `pyproject.toml`, else `{name, version, requires_python, locked_packages, interpreter, environment_python, pinned, uv, in_sync, dependencies: [{name, specifier, kind, locked}], scripts}` |
 //! | `python_sync` / `python_lock` | `upgrade`? (lock) | `{code, stdout, stderr}` of `uv sync` / `uv lock` |
 //! | `python_add` | `requirement`, `group`? or `optional`? (extra) | `{code, stdout, stderr}` of `uv add` |
@@ -168,6 +186,7 @@ use crate::{
 
 mod debug;
 mod edits;
+mod files;
 mod ports;
 mod runs;
 mod workflows;
@@ -365,6 +384,28 @@ fn path_json(path: &Path) -> Value {
     path.to_string_lossy().into()
 }
 
+/// A request's string array `name` (missing: empty).
+fn strings(request: &Value, name: &str) -> Vec<String> {
+    request[name]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The query of a `search` or `replace` request.
+fn search_query(request: &Value) -> SearchQuery {
+    SearchQuery {
+        pattern: request["pattern"].as_str().unwrap_or_default().to_owned(),
+        regex: request["regex"].as_bool().unwrap_or(false),
+        case_sensitive: request["case_sensitive"].as_bool().unwrap_or(false),
+        whole_word: request["whole_word"].as_bool().unwrap_or(false),
+        include: strings(request, "include"),
+        exclude: strings(request, "exclude"),
+    }
+}
+
 fn status_text(status: &ServerStatus) -> String {
     match status {
         ServerStatus::Starting => "starting".into(),
@@ -538,7 +579,11 @@ impl Session {
                 Err(err) => self.out.reply(&id, Err(err)),
             },
             "write" => self.write(id, &request, cx),
+            "create_file" | "create_dir" | "rename_path" | "copy_path" | "delete_path" => {
+                self.files(id, cmd, &request, cx)
+            }
             "search" => self.search(id, &request, cx),
+            "replace" => self.replace(id, &request, cx),
             "watch" => self.start_watch(id, cx),
             "unwatch" => {
                 self.watch = None;
@@ -592,6 +637,9 @@ impl Session {
                 }
                 Err(err) => self.out.reply(&id, Err(err)),
             },
+            "git_stash_list" | "git_stash_push" | "git_stash_apply" | "git_stash_drop"
+            | "git_stash_changes" | "git_shelve" | "git_unshelve" | "git_shelf_list"
+            | "git_shelf_diff" | "git_shelf_delete" => self.git_stash(id, cmd, &request, cx),
             command if command.starts_with("git_") => self.git(id, command, &request, cx),
             command if command.starts_with("python_") => self.python(id, command, &request, cx),
             "devcontainer_configs" => {
@@ -678,6 +726,9 @@ impl Session {
         let branch = request["branch"].as_str().map(str::to_owned);
         let new_name = request["new_name"].as_str().map(str::to_owned);
         let rebase = request["rebase"].as_bool().unwrap_or(false);
+        let editor_text = request["contents"].as_str().map(str::to_owned);
+        let against_index = request["index"].as_bool().unwrap_or(false);
+        let line_change = request["change"].as_u64().map(|change| change as usize);
         let command = command.to_owned();
         self.blocking(id, cx, move |project| {
             let repository = project.repository()?.ok_or_else(|| {
@@ -751,6 +802,58 @@ impl Session {
                         }
                     };
                     Ok(json!(source.compute(project, &repository, context)?.0))
+                }
+                "git_blame" => {
+                    let path = path.ok_or_else(|| missing("path"))?;
+                    Ok(json!(
+                        repository.blame(&path, editor_text.as_deref().map(str::as_bytes))?
+                    ))
+                }
+                "git_line_changes" | "git_stage_line_change" => {
+                    let path = path.ok_or_else(|| missing("path"))?;
+                    // The editor's text, else the file in the working tree.
+                    let current = match editor_text {
+                        Some(text) => text,
+                        None => {
+                            let bytes = project.worktree_file(&repository, &path)?;
+                            String::from_utf8_lossy(&bytes.unwrap_or_default()).into_owned()
+                        }
+                    };
+                    let object = repository
+                        .base_objects(std::slice::from_ref(&path), against_index)?
+                        .pop()
+                        .unwrap_or(git::BaseObject::None);
+                    let (kind, base, changes) = match &object {
+                        git::BaseObject::Blob(id) => {
+                            let bytes = repository.blob(id)?.unwrap_or_default();
+                            let base = String::from_utf8_lossy(&bytes).into_owned();
+                            let changes = git::line_changes(&base, &current, None);
+                            ("blob", base, changes)
+                        }
+                        git::BaseObject::NewFile => {
+                            ("new_file", String::new(), git::all_added(&current))
+                        }
+                        git::BaseObject::None => ("none", String::new(), Vec::new()),
+                    };
+                    if command == "git_line_changes" {
+                        return Ok(json!({ "base": kind, "changes": changes }));
+                    }
+                    if !against_index {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "staging a change needs `index: true` (changes against the index)",
+                        ));
+                    }
+                    let change = line_change.ok_or_else(|| missing("change"))?;
+                    let change = changes.get(change).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("{path} has {} changes", changes.len()),
+                        )
+                    })?;
+                    let staged = git::apply_change(&base, &current, change);
+                    repository.stage_contents(&path, staged.as_bytes())?;
+                    Ok(Value::Null)
                 }
                 "git_apply_hunk" => {
                     let path = path.ok_or_else(|| missing("path"))?;
@@ -965,6 +1068,88 @@ impl Session {
                 "git_patch" => {
                     let patch = repository.create_patch(&commits)?;
                     Ok(json!({ "patch": String::from_utf8_lossy(&patch) }))
+                }
+                other => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown command `{other}`"),
+                )),
+            }
+        });
+    }
+
+    /// `git_stash_*` and shelf commands (the UI's Stash/Unstash dialogs and
+    /// Shelf tab run the same `git` functions, with the same project files).
+    fn git_stash(&self, id: Value, command: &str, request: &Value, cx: &mut Context<Self>) {
+        let paths: Option<Vec<String>> = request["paths"].as_array().map(|paths| {
+            paths
+                .iter()
+                .filter_map(|path| path.as_str().map(str::to_owned))
+                .collect()
+        });
+        let message = request["message"].as_str().unwrap_or_default().to_owned();
+        let flag = |name: &str| request[name].as_bool().unwrap_or(false);
+        let (include_untracked, pop, reinstate_index, remove) = (
+            flag("include_untracked"),
+            flag("pop"),
+            flag("reinstate_index"),
+            flag("remove"),
+        );
+        let index = request["index"].as_u64().map(|index| index as usize);
+        let shelf = request["shelf"].as_str().map(str::to_owned);
+        let path = request["path"].as_str().map(str::to_owned);
+        let context = if flag("whole_file") {
+            git::FULL_FILE
+        } else {
+            git::DIFF_CONTEXT
+        };
+        let command = command.to_owned();
+        self.blocking(id, cx, move |project| {
+            let repository = project.repository()?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the project is not in a git repository",
+                )
+            })?;
+            let missing = |name: &str| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing parameter `{name}`"),
+                )
+            };
+            let files = crate::shelf_view::ProjectFiles::new(project, &repository);
+            match command.as_str() {
+                "git_stash_list" => Ok(json!(repository.stash_list()?)),
+                "git_stash_push" => repository
+                    .stash_push(&message, include_untracked, paths.as_deref())
+                    .map(|()| Value::Null),
+                "git_stash_apply" => Ok(json!(repository.stash_apply(
+                    index.unwrap_or(0),
+                    pop,
+                    reinstate_index
+                )?)),
+                "git_stash_drop" => repository
+                    .stash_drop(index.ok_or_else(|| missing("index"))?)
+                    .map(|()| Value::Null),
+                "git_stash_changes" => Ok(json!(repository.stash_changes(index.unwrap_or(0))?)),
+                "git_shelve" => {
+                    let paths = paths.ok_or_else(|| missing("paths"))?;
+                    Ok(json!(repository.shelve(&files, &paths, &message)?))
+                }
+                "git_unshelve" => {
+                    let shelf = shelf.ok_or_else(|| missing("shelf"))?;
+                    Ok(json!(repository.unshelve(&files, &shelf, remove)?))
+                }
+                "git_shelf_list" => Ok(json!(repository.shelves(&files)?)),
+                "git_shelf_diff" => {
+                    let shelf = shelf.ok_or_else(|| missing("shelf"))?;
+                    let path = path.ok_or_else(|| missing("path"))?;
+                    Ok(json!(
+                        repository.shelved_file_diff(&files, &shelf, &path, context)?
+                    ))
+                }
+                "git_shelf_delete" => {
+                    let shelf = shelf.ok_or_else(|| missing("shelf"))?;
+                    repository.delete_shelf(&shelf).map(|()| Value::Null)
                 }
                 other => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1211,22 +1396,7 @@ impl Session {
     }
 
     fn search(&self, id: Value, request: &Value, cx: &mut Context<Self>) {
-        let strings = |name: &str| -> Vec<String> {
-            request[name]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|value| value.as_str().map(str::to_owned))
-                .collect()
-        };
-        let query = SearchQuery {
-            pattern: request["pattern"].as_str().unwrap_or_default().to_owned(),
-            regex: request["regex"].as_bool().unwrap_or(false),
-            case_sensitive: request["case_sensitive"].as_bool().unwrap_or(false),
-            whole_word: request["whole_word"].as_bool().unwrap_or(false),
-            include: strings("include"),
-            exclude: strings("exclude"),
-        };
+        let query = search_query(request);
         let project = self.project.clone();
         let out = self.out.clone();
         cx.background_spawn(async move {

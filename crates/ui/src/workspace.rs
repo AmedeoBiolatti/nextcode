@@ -28,7 +28,7 @@ use crate::{
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     editor::{Editor, EditorEvent, ReloadOutcome},
     file_finder::{FileFinder, FileFinderEvent},
-    file_tree::{FileTree, OpenFile},
+    file_tree::{FileTree, FileTreeEvent},
     git_log::GitLogPanel,
     layout::{DockPosition, Layout, PanelId},
     location_picker::{LocationPicker, LocationPickerEvent},
@@ -52,11 +52,14 @@ use crate::{
 mod debug;
 mod docks;
 mod edits;
+mod files;
 mod git_flows;
+mod git_gutter;
 mod log_window;
 mod panes;
 mod runs;
 mod session;
+mod stash_flows;
 mod symbols;
 #[cfg(test)]
 mod tests;
@@ -303,6 +306,8 @@ pub struct Workspace {
     /// Owns the watch: dropping it stops watching.
     _watcher: Task<()>,
     _disconnects: Option<Task<()>>,
+    /// Change-marker bases and blame of the open editors.
+    git_gutters: git_gutter::GitGutters,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -327,12 +332,12 @@ impl Workspace {
         crate::startup::mark("workspace start");
         window.on_next_frame(|_, _| crate::startup::mark("first frame"));
         let root = project.root().to_path_buf();
-        let file_tree = cx.new(|_| FileTree::new(project.clone()));
+        let file_tree = cx.new(|cx| FileTree::new(project.clone(), cx));
         let tree_subscription = cx.subscribe_in(
             &file_tree,
             window,
-            |this, _, event: &OpenFile, window, cx| {
-                this.open(&event.0, window, cx);
+            |this, _, event: &FileTreeEvent, window, cx| {
+                this.on_file_tree_event(event, window, cx);
             },
         );
 
@@ -350,6 +355,15 @@ impl Workspace {
         let problems = cx.new(|cx| ProblemsPanel::new(root.clone(), lsp_store.clone(), cx));
         let terminal = cx.new(|cx| TerminalPanel::new(project.clone(), cx));
         let search = cx.new(|cx| SearchPanel::new(project.clone(), cx));
+        let workspace = cx.entity().downgrade();
+        search.update(cx, |search, _| {
+            search.set_unsaved_documents(std::rc::Rc::new(move |cx| {
+                workspace
+                    .upgrade()
+                    .map(|workspace| workspace.read(cx).unsaved_documents(cx))
+                    .unwrap_or_default()
+            }));
+        });
         let commit = cx.new(|cx| CommitPanel::new(project.clone(), git_preload, cx));
         let commit_subscription =
             cx.subscribe_in(&commit, window, |this, _, event, window, cx| match event {
@@ -360,7 +374,17 @@ impl Workspace {
                 CommitPanelEvent::Push(repository) => {
                     this.open_push_dialog(repository.clone(), window, cx)
                 }
-                CommitPanelEvent::Refreshed => this.reload_diffs(cx),
+                CommitPanelEvent::Stash {
+                    paths,
+                    include_untracked,
+                } => this.stash_dialog(Some(paths.clone()), *include_untracked, window, cx),
+                CommitPanelEvent::Shelve { paths, name } => {
+                    this.shelve_dialog(paths.clone(), name.clone(), window, cx)
+                }
+                CommitPanelEvent::Refreshed => {
+                    this.reload_diffs(cx);
+                    this.refresh_git_gutters(cx);
+                }
             });
         let git_log = cx.new(|cx| GitLogPanel::new(project.clone(), cx));
         let git_log_subscription = cx.subscribe_in(&git_log, window, Self::on_git_log_event);
@@ -403,6 +427,11 @@ impl Workspace {
                     if let Some(editor) = this.open_editor(path, window, cx) {
                         editor.update(cx, |editor, cx| editor.go_to_line(*line, *column, cx));
                     }
+                }
+                SearchPanelEvent::Replace { replacer, files } => {
+                    let report = this.apply_search_replace(replacer, files, cx);
+                    this.search
+                        .update(cx, |search, cx| search.replaced(report, cx));
                 }
             });
         let problems_subscription = cx.subscribe_in(
@@ -547,6 +576,7 @@ impl Workspace {
             reload_prompts: HashSet::new(),
             _watcher: watcher,
             _disconnects: disconnects,
+            git_gutters: Default::default(),
             _subscriptions: vec![
                 tree_subscription,
                 lsp_subscription,
@@ -659,6 +689,10 @@ impl Workspace {
             })
             .collect();
         for (editor, path, removed) in affected {
+            // The Files tree's own renames/deletes: tabs already followed.
+            if self.file_tree.read(cx).is_own_change(&path) {
+                continue;
+            }
             if removed {
                 self.notice = Some(format!("{} was deleted on disk", path.display()).into());
                 cx.notify();
@@ -1142,6 +1176,12 @@ impl Workspace {
                     EditorEvent::GutterMarkerClicked { line, kind } => {
                         this.gutter_marker_clicked(editor, *line, *kind, cx)
                     }
+                    EditorEvent::StageHunk { .. }
+                    | EditorEvent::ShowChangeDiff { .. }
+                    | EditorEvent::LoadBlame
+                    | EditorEvent::ShowCommit(_) => {
+                        this.on_editor_git_event(editor, event, window, cx)
+                    }
                 },
             );
         if let Some(language) = editor.read(cx).language() {
@@ -1178,6 +1218,7 @@ impl Workspace {
         let index = tabs.len() - 1;
         self.refresh_diagnostics(path, cx);
         self.activate(pane, index, window, cx);
+        self.refresh_git_gutters(cx);
         Some(editor)
     }
 
@@ -1725,6 +1766,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::git_refresh))
             .map(|element| self.on_git_actions(element, cx))
             .map(|element| self.on_log_actions(element, cx))
+            .map(|element| self.on_stash_actions(element, cx))
             .on_action(cx.listener(Self::python_sync))
             .on_action(cx.listener(Self::python_lock))
             .on_action(cx.listener(Self::run_file))
@@ -1735,6 +1777,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::go_forward))
             .on_action(cx.listener(Self::toggle_files))
             .on_action(cx.listener(Self::toggle_search))
+            .on_action(cx.listener(Self::replace_in_files))
             .on_action(cx.listener(Self::toggle_commit))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_python))

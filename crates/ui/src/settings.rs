@@ -25,7 +25,7 @@
 //!   "tests": { "discover_on_save": true, "pytest_args": ["-p", "no:randomly"],
 //!     "cargo_test_args": ["--features", "slow-tests"] },
 //!   "ports": { "auto_forward": true },
-//!   "git": { "staging_area": false, "update_method": "merge" } }
+//!   "git": { "staging_area": false, "update_method": "merge", "inline_blame": false } }
 //! ```
 
 use std::{
@@ -141,7 +141,7 @@ impl Default for PortSettings {
     }
 }
 
-/// `"git"`: the Commit window and Update Project.
+/// `"git"`: the Commit window, Update Project and the editor's blame.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GitSettings {
@@ -151,6 +151,9 @@ pub struct GitSettings {
     pub staging_area: bool,
     /// How Update Project brings in the upstream's commits.
     pub update_method: UpdateMethod,
+    /// Show the author, age and summary of the commit that last changed
+    /// the cursor's line after its end (VS Code's inline blame).
+    pub inline_blame: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]

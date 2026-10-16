@@ -5,32 +5,43 @@
 //! Commands go through a [`Runner`], so the same code drives `git` on this
 //! machine or inside WSL behind the agent.
 
+mod blame;
 mod diff;
 mod history;
+mod line_changes;
 mod log;
 mod operations;
 mod patch;
 mod revisions;
+mod shelf;
+mod stash;
 mod status;
 mod workflow;
 
 use std::{io, sync::Arc};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+pub use blame::{Blame, BlameCommit};
 pub use diff::{FULL_FILE, FileDiff, LineKind, Row, SideLine, SplitRow, diff, side_by_side};
 pub use history::{Commit, GraphRow, graph};
+pub use line_changes::{
+    BaseObject, LineChange, LineChangeKind, all_added, apply_change, line_changes,
+    minimal_edit, replace_lines, revert_change,
+};
 pub use log::{LogFilter, LogPage, SelectionChanges};
 pub use operations::Worktree;
 pub use patch::{Hunk, HunkAction, Patch, parse_patch};
 pub use revisions::{ApplyOutcome, ResetMode};
+pub use shelf::{SHELF_DIR, Shelf, WorktreeFiles};
+pub use stash::{Stash, StashFile};
 pub use status::{Change, Entry, Status};
 pub use workflow::{
     BranchTracking, OperationState, Outcome, PushTarget, ignore_entries, not_fully_merged,
 };
 
 /// A file that differs between two revisions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileChange {
     /// Repository-relative, `/`-separated; the new path for renames.
     pub path: String,

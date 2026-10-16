@@ -547,6 +547,57 @@ impl Project {
         }
     }
 
+    /// Creates an empty file; fails if anything is at `path`.
+    pub fn create_file(&self, path: &Path) -> io::Result<()> {
+        match &self.0.backend {
+            Backend::Local => fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map(drop),
+            Backend::Remote { .. } => {
+                if self.kind(path)?.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} already exists", path.display()),
+                    ));
+                }
+                self.write(path, Vec::new())
+            }
+        }
+    }
+
+    /// Copies a file, or a folder with its contents, to `to` (which must
+    /// not exist). Symlinks are copied as links where the project lives on
+    /// Unix.
+    pub fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
+        match &self.0.backend {
+            Backend::Local => copy_local(from, to),
+            Backend::Remote { .. } => self.run_tool(
+                "cp",
+                &["-R", "-P", "--", agent_path(from)?, agent_path(to)?],
+            ),
+        }
+    }
+
+    /// Whether [`Project::trash`] moves files to a recycle bin: local
+    /// projects on Windows.
+    pub fn can_trash(&self) -> bool {
+        cfg!(windows) && !self.is_remote()
+    }
+
+    /// Moves files and folders to the Windows Recycle Bin (see
+    /// [`Project::can_trash`]).
+    pub fn trash(&self, paths: &[PathBuf]) -> io::Result<()> {
+        if !self.can_trash() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this project has no recycle bin",
+            ));
+        }
+        trash_local(paths)
+    }
+
     /// Runs a POSIX tool where a remote project lives; its stderr is the
     /// error when it fails.
     fn run_tool(&self, program: &str, args: &[&str]) -> io::Result<()> {
@@ -678,11 +729,12 @@ impl Project {
     }
 
     /// Starts `program` (else the user's login shell) in a pty inside the
-    /// WSL distro or container, in the project root; `tap` follows its
-    /// output. Local projects start their terminals directly.
+    /// WSL distro or container, in `cwd` (default: the project root); `tap`
+    /// follows its output. Local projects start their terminals directly.
     pub fn spawn_remote_terminal(
         &self,
         program: Option<(&str, &[String])>,
+        cwd: Option<&Path>,
         size: (u16, u16, usize),
         palette: Palette,
         tap: Option<terminal::OutputTap>,
@@ -694,7 +746,7 @@ impl Project {
                 "local projects start terminals directly",
             )),
             Backend::Remote { client, .. } => client.spawn_terminal(
-                agent_path(&self.0.root)?,
+                agent_path(cwd.unwrap_or(&self.0.root))?,
                 program,
                 columns,
                 rows,
@@ -841,6 +893,91 @@ impl Project {
             Err(err) => Err(err),
         }
     }
+}
+
+/// Copies a file or a folder tree on this machine; `to` must not exist.
+fn copy_local(from: &Path, to: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(to).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", to.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if fs::symlink_metadata(from)?.file_type().is_symlink() {
+        return std::os::unix::fs::symlink(fs::read_link(from)?, to);
+    }
+    if fs::metadata(from)?.is_dir() {
+        fs::create_dir(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            copy_local(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        fs::copy(from, to).map(drop)
+    }
+}
+
+/// Moves paths to the Recycle Bin (`SHFileOperationW` with undo allowed,
+/// no UI). Drives without a recycle bin delete for good, as Explorer does
+/// after asking.
+#[cfg(windows)]
+fn trash_local(paths: &[PathBuf]) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::{
+        Win32::UI::Shell::{
+            FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+            SHFILEOPSTRUCTW, SHFileOperationW,
+        },
+        core::PCWSTR,
+    };
+
+    // The shell does not take `\\?\` paths: `\\?\C:\x` → `C:\x`,
+    // `\\?\UNC\host\share` → `\\host\share`.
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let verbatim_unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+    // NUL-separated, double-NUL-terminated.
+    let mut from: Vec<u16> = Vec::new();
+    for path in paths {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if let Some(rest) = wide.strip_prefix(verbatim_unc.as_slice()) {
+            from.extend(r"\\".encode_utf16());
+            from.extend_from_slice(rest);
+        } else if let Some(rest) = wide.strip_prefix(verbatim.as_slice()) {
+            from.extend_from_slice(rest);
+        } else {
+            from.extend_from_slice(&wide);
+        }
+        from.push(0);
+    }
+    from.push(0);
+    let mut operation = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        fFlags: (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0 | FOF_SILENT.0) as u16,
+        ..Default::default()
+    };
+    // SAFETY: `operation` points at `from`, which outlives the call.
+    let code = unsafe { SHFileOperationW(&mut operation) };
+    if code != 0 {
+        return Err(io::Error::other(format!(
+            "could not move to the Recycle Bin (shell error {code:#x})"
+        )));
+    }
+    if operation.fAnyOperationsAborted.as_bool() {
+        return Err(io::Error::other("moving to the Recycle Bin was cancelled"));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn trash_local(_: &[PathBuf]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "there is no recycle bin here",
+    ))
 }
 
 /// Runs git where the project lives.

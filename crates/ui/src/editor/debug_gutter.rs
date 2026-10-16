@@ -294,6 +294,7 @@ impl Editor {
         };
         let (em, left) = (layout.em_width, layout.breakpoint_left);
         let Some(line) = self.gutter_line_at(event.position, left, em * BREAKPOINT_COLUMNS) else {
+            self.open_gutter_menu(event.position, cx);
             return;
         };
         cx.stop_propagation();

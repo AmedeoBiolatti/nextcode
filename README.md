@@ -744,6 +744,80 @@ offers Abort; resolve and commit in the Commit window to finish it.
 or list; its base and target can be changed (the target may be another
 revision, and then swapped), and each file opens its diff.
 
+### Stash and shelf
+
+**Git > Stash Changes…** (also in the Commit window's right-click menu, for
+the chosen files) asks for an optional message and **Include untracked
+files** (preset when the chosen files include unversioned ones), then runs
+`git stash push` and reverts those changes. **Git > Unstash Changes…** lists
+the stashes (`stash@{n}`, message, branch, age) with the selected one's
+files below; double-click a file (or **View Diff**) for its diff (the commit
+it was made on ↔ the stash; untracked files against nothing). **Apply** keeps
+the stash, **Pop** drops it once applied, **Reinstate index** restores what
+was staged as staged, **Drop…** asks first. When the stash conflicts with the
+files now, the Commit window shows the files under Merge Conflicts and the
+stash is kept.
+
+The **shelf** is PyCharm's: **Shelve Changes…** (the Commit window's
+right-click menu, or Git > Shelve Changes… for the selected, else checked,
+files) asks for a name, prefilled from the commit message's first line or
+the file names, saves the changes as a patch against HEAD
+(`.next_code/shelf/<id>/shelf.patch`, binary-safe, plus `info.json` with
+the name, date, base commit and files; a `.gitignore` of `*` in
+`.next_code/shelf/` keeps them out of git) and rolls the files back
+(modified and deleted files return to HEAD, new files are deleted). The
+Commit window's **Shelf** tab (next to **Changes**; Git > Show Shelf) lists
+shelves newest first with their file count and age; expand one for its
+files, double-click a file for its diff. **Unshelve…** (toolbar or
+right-click) applies the patch to the working tree, removing the shelf or
+keeping it as you choose; if the patch no longer applies cleanly it is
+merged three-way and conflicting files show under Merge Conflicts (the
+shelf is then kept). **Delete…** asks first. Shelves live under the
+repository root where the project lives (WSL, container), and headless
+commands use the same code.
+
+Limits: unshelving restores changes as unstaged (staged/unstaged is not
+kept), and a three-way unshelve refuses files that have unstaged changes
+of their own ("does not match index"): commit, stash or roll them back
+first. Shelving needs at least one commit.
+
+### Changes and blame in the editor
+
+**Change markers**: the editor's gutter (between the line numbers and the
+fold arrows) marks lines that differ from the last commit — a green bar for
+added lines, a blue bar for modified ones, a grey triangle where lines were
+deleted — or from git's index with `"git": { "staging_area": true }`.
+They follow typing (the diff runs on a background thread 100 ms after you
+stop, 0.4–1 s for files over 256 KiB / 2 MiB) and refresh with the Commit
+window: after saves, commits, staging, checkouts and changes from a
+terminal. Untracked and ignored files have none; a file staged but never
+committed is all added. Line endings do not count (a CRLF checkout of an LF
+file shows no changes); adding or removing the final line break marks the
+last line.
+
+Clicking a marker opens the change: the committed lines (red) above the
+current ones (green), with **↑/↓** (previous/next change), **Rollback**
+(puts the committed lines back in the buffer; one undo step), **Stage
+Hunk** (staging-area mode: only that change goes into the index, the file
+on disk is untouched), **Show Diff** (the file's diff tab, scrolled to the
+change; it shows the saved file) and **✕** (or `Escape`). Keys: Next /
+Previous Change `Ctrl+Alt+Shift+Down` / `Up` (PyCharm; VS Code's
+`Alt+F5` / `Shift+Alt+F5` too; Go menu), **Rollback Lines** `Ctrl+Alt+Z`
+(every change touching the selected lines; Git menu).
+
+**Annotate with Git Blame** (right-click in the gutter, Git menu or the
+palette; again to close) adds a column left of the line numbers with the
+date and author of the commit that last changed each line, written once
+per run of lines from the same commit (commits of the last 30 days in the
+normal text color, older ones muted). Hovering shows the commit's hash,
+author, date and full message; clicking selects it in the Git tool window
+(filters cleared). Blame runs on the editor's text, so unsaved lines read
+"Not committed", and lines move with your edits; it runs again after a
+commit. With `"git": { "inline_blame": true }` the cursor's line also shows
+`author, age • summary` after its end (VS Code's inline blame).
+The gutter's right-click menu also has Rollback Lines and Show Change on a
+changed line.
+
 ## Window, menus and commands
 
 Top to bottom, a window has the menu bar (File, Edit, Selection, View, Go,
@@ -820,6 +894,56 @@ double-click does something (Commit window and Git log files, branches,
 Tests, Call Hierarchy, debugger values) a double-click on the text still
 does it instead of selecting a word; dragging still selects. A selection
 stays within one message.
+
+## Files tree
+
+The Files panel works like PyCharm's Project view (VS Code's Explorer where
+PyCharm has no equivalent), for local, WSL and dev container projects alike.
+
+- **Selection**: click selects and opens a file (focus stays in the tree;
+  double-click or `Enter` focuses the editor), `Ctrl`+click toggles a row,
+  `Shift`+click / `Shift+Up/Down` select a range, `Up/Down/Home/End` move,
+  `Right/Left` open/close folders, `Ctrl+A` selects every visible row.
+- **Context menu** (right-click a row, or empty space for the project
+  root): New File / Folder / Python File (adds `.py`) / Python Package
+  (folder with `__init__.py`), Cut, Copy, Paste, Duplicate, Copy Path,
+  Copy Relative Path, Rename, Delete, Reveal in File Explorer (local
+  projects), Open in Terminal (a shell in that folder). `Alt+Insert` shows
+  the New items under the selected row (`Up/Down/Enter` choose).
+- **Names** are typed in place (VS Code style): New puts an input at the top
+  of the folder (the selected folder, or the selected file's folder); a
+  path such as `pkg/sub/mod.py` creates the folders too. Rename (`F2` or
+  `Shift+F6`) selects the name without its extension. Problems show under
+  the input while typing: empty name, `/`, `.`/`..`, on local Windows
+  projects `\ < > : " | ? *`, control characters, trailing dot/space and
+  reserved names (`CON`, `NUL`, `COM1`…), and names already taken.
+  `Enter` applies, `Escape` cancels, clicking elsewhere applies a valid
+  name. A new file opens in an editor.
+- **Cut/Copy/Paste** (`Ctrl+X/C/V`) paste into the selected folder (or the
+  selected file's folder); copies whose name is taken become `name
+  copy.ext`, `name copy 2.ext`…; a cut entry moves (refused if the name is
+  taken there). `Ctrl+D` duplicates next to the original. The paths are
+  also put on the clipboard as text.
+- **Drag and drop** rows onto a folder (onto a file: its folder; onto empty
+  space: the root) to move them; hold `Ctrl` at the drop to copy; more than
+  five items ask first; `Escape` cancels the drag; a folder dropped into
+  itself does nothing.
+- **Delete** (`Delete` key) asks first, naming the item (or listing up to
+  ten) and any unsaved files among them. Local Windows projects move to the
+  Recycle Bin; Linux, WSL and dev container projects delete permanently
+  (the dialog says so). Editor tabs of deleted files close.
+- **Open editors follow** renames and moves (path, title, unsaved edits,
+  language server document, breakpoints); the watcher's events for the
+  tree's own changes are not treated as external edits (no reload prompt,
+  no "deleted on disk" notice, no second tree refresh).
+- **Language servers**: before a rename or move, running servers that
+  registered `workspace/willRenameFiles` are asked for edits (5 s each),
+  which are applied first; `didRenameFiles` follows. rust-analyzer updates
+  `mod` lines and paths; basedpyright updates Python imports
+  (`from helpers import x` → `from tools import x`). Servers without it are
+  skipped; failures and timeouts are reported with the operation's notice.
+- Errors (taken names, permissions, agent failures) appear as selectable
+  notices above the editor.
 
 ## Editing
 
@@ -999,6 +1123,42 @@ text).
   dropped) to the active file's language server, or every running one when
   the active tab has none; rows show kind, name, container and
   `path:line`, and `Enter` opens the file there.
+
+## Find and replace in files
+
+| Command | Keys |
+|---|---|
+| Find in Files (Search panel) | `Ctrl+Shift+F` |
+| Replace in Files (Edit menu) | `Ctrl+Shift+R` (PyCharm), `Ctrl+Shift+H` (VS Code) |
+| Replace All (in the panel) | `Ctrl+Alt+Enter` |
+
+The Search panel searches the project where it lives (locally, in WSL or in
+the dev container) with case (`Aa`), whole-word (`ab`) and regex (`.*`)
+toggles and include/exclude globs. Open files with unsaved changes are
+searched as the editor shows them, not as saved. **Replace in Files** (or
+the `▸` before the query) shows a replacement field: in regex mode `$1`,
+`${name}` expand to capture groups and `$$` is a `$` (the find bar's rules);
+otherwise the text is literal. With a replacement typed, every result row is
+one match showing the old text struck through and the new text next to it.
+On hover, a match row offers **Replace** and **×** (exclude it from the
+results), a file row **Replace All** (that file) and **×**; **Replace All**
+next to the field replaces every listed match after a confirmation (*Replace
+N matches in M files?*). In search-only mode a line row's **×** excludes the
+line.
+
+Replacing goes through the same path as language-server edits: files open in
+an editor change there (one undo step per file, left unsaved); other files
+are written through the project. Each file is checked first: if any of its
+listed matches is no longer at the same place with the same text (the file
+changed since the search), the file is skipped. A line under the status
+reports the counts, skipped files and failures (*Replaced 4 matches in 2
+files; skipped a.py (changed since the search)*), and the results refresh
+(exclusions are kept until the query changes). Limits: lines longer than
+~400 bytes are listed around their first match, so matches outside that
+window are neither shown nor replaced; at most 10 000 matches are listed;
+matches never span lines.
+
+Headless: `replace` (see [Headless mode](#headless-mode)).
 
 ## Refactoring and formatting
 
@@ -1269,7 +1429,11 @@ cargo run --release -p next_code -- --headless --wsl Ubuntu ~/project
 ```
 
 Commands: `info`, `list_dir`, `list_files`, `read`, `write`, `stat`,
-`search`, `watch`/`unwatch`, `open`/`close` (language server documents),
+`create_file`, `create_dir`, `rename_path` (with the language servers'
+`willRenameFiles` edits), `copy_path`, `delete_path`,
+`search`, `replace` (`pattern`, `replacement`, the search options, optional
+`paths`; per-file counts, skipped and failed files), `watch`/`unwatch`,
+`open`/`close` (language server documents),
 `diagnostics`, `definition`/`declaration`/`type_definition`/`implementation`,
 `signature_help` (with the highlighted parameter), `inlay_hints` (a line
 range), `incoming_calls`/`outgoing_calls` (call
@@ -1279,7 +1443,8 @@ them), `rename`, `code_actions` / `apply_code_action` (edits are written to
 disk and open documents synced; servers' `workspace/applyEdit` requests are
 applied too and reported as `applied_edit` events), `format`, `exec` (shell
 command in the project root, where
-the project lives), `git_status`, `git_diff`, `git_apply_hunk`, `git_stage`,
+the project lives), `git_status`, `git_diff`, `git_apply_hunk`,
+`git_line_changes`, `git_stage_line_change`, `git_blame`, `git_stage`,
 `git_unstage`, `git_discard`, `git_commit`, `git_branch_create`,
 `git_switch`, `git_branch_delete`, `git_fetch`, `git_pull`, `git_push`,
 `git_commit_paths`, `git_rollback`, `git_add`, `git_ignore`,
@@ -1290,7 +1455,10 @@ the project lives), `git_status`, `git_diff`, `git_apply_hunk`, `git_stage`,
 `git_refs`, `git_changes`, `git_commit_changes`, `git_selection_changes`,
 `git_commit_details`, `git_cherry_pick`, `git_revert`, `git_reset`,
 `git_undo_commit`, `git_reword`, `git_tag`, `git_checkout_revision`,
-`git_patch`, `python_info`, `python_sync`,
+`git_patch`, `git_stash_list`, `git_stash_push`, `git_stash_apply`,
+`git_stash_drop`, `git_stash_changes`, `git_shelve`, `git_unshelve`,
+`git_shelf_list`, `git_shelf_diff`, `git_shelf_delete`, `python_info`,
+`python_sync`,
 `python_lock`, `python_add`, `python_remove`, `python_pin`,
 `python_interpreters`, `python_test_at`, `devcontainer_configs`,
 `run_configurations`, `debug_request`, `tests_discover`, `tests_run`,

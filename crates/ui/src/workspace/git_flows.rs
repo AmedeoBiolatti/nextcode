@@ -21,6 +21,7 @@ actions!(git, [NewBranch, CheckoutRevision, Update, Rollback]);
 pub(super) fn bind_keys(cx: &mut App) {
     commit_panel::bind_keys(cx);
     git_dialogs::bind_keys(cx);
+    crate::stash_dialogs::bind_keys(cx);
 }
 
 /// The open branches popup; `position` is where the title-bar widget was

@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::{OperationState, Repository, check_revision, failure};
 
-/// How a cherry-pick or revert ended.
+/// How a cherry-pick, revert, stash apply or unshelve ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "result")]
 pub enum ApplyOutcome {
@@ -161,7 +161,7 @@ impl Repository {
         Ok(ApplyOutcome::Done { empty })
     }
 
-    fn conflicted_paths(&self) -> io::Result<Vec<String>> {
+    pub(crate) fn conflicted_paths(&self) -> io::Result<Vec<String>> {
         let output = self.checked(&["diff", "--name-only", "--diff-filter=U", "-z"])?;
         Ok(output
             .stdout

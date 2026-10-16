@@ -1,7 +1,7 @@
 //! Terminal panel: shell sessions in tabs, each rendered from a
 //! `terminal::Snapshot`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 use gpui::{
@@ -108,6 +108,7 @@ pub fn spawn_program(
     let (terminal, events) = match project {
         Some(project) if project.is_remote() => project.spawn_remote_terminal(
             Some((program, args)),
+            None,
             (options.columns, options.rows, options.scrollback),
             palette,
             tap,
@@ -978,6 +979,14 @@ impl TerminalPanel {
         }
     }
 
+    /// Starts the default shell in `dir` (a project folder) in a new tab
+    /// and focuses it (the Files tree's Open in Terminal).
+    pub fn new_terminal_in(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(profile) = profiles(&self.project).into_iter().next() {
+            self.spawn_in(&profile, Some(dir), window, cx);
+        }
+    }
+
     /// The project's virtualenv (`.venv`) as `(dir, bin dir)`, if any.
     fn venv(&self) -> Option<(PathBuf, PathBuf)> {
         let venv = self.project.resolve(".venv");
@@ -998,6 +1007,17 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<TerminalView>> {
+        self.spawn_in(profile, None, window, cx)
+    }
+
+    /// Starts `profile`'s shell in `cwd` (default: the project root).
+    fn spawn_in(
+        &mut self,
+        profile: &Profile,
+        cwd: Option<&Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TerminalView>> {
         let mut options = TerminalOptions::default_shell();
         // Existing terminals keep the palette they started with.
         let palette = theme::current().terminal;
@@ -1005,6 +1025,7 @@ impl TerminalPanel {
         let started = if profile.remote {
             self.project.spawn_remote_terminal(
                 None,
+                cwd,
                 (options.columns, options.rows, options.scrollback),
                 palette,
                 None,
@@ -1014,7 +1035,7 @@ impl TerminalPanel {
                 options.program = profile.program.into();
                 options.args = profile.args.iter().map(|&arg| arg.into()).collect();
             }
-            options.cwd = Some(self.project.root().to_path_buf());
+            options.cwd = Some(cwd.unwrap_or(self.project.root()).to_path_buf());
             // The project's virtualenv, activated as its `activate` would.
             if let Some((venv, bin)) = &venv {
                 let path = std::env::var_os("PATH").unwrap_or_default();
@@ -1043,10 +1064,18 @@ impl TerminalPanel {
         let name = profile.name;
         let view = cx.new(|cx| TerminalView::new(terminal, events, name, palette, cx));
         // Remote login shells set PATH from their profiles: activate after.
-        if profile.remote && venv.is_some() {
-            view.update(cx, |view, cx| {
-                view.write(b". .venv/bin/activate\r".to_vec(), cx)
-            });
+        if profile.remote
+            && let Some((venv, _)) = &venv
+        {
+            let activate = match cwd {
+                None => ". .venv/bin/activate\r".to_owned(),
+                Some(_) => {
+                    let script = self.project.join(venv, "bin/activate");
+                    let quoted = script.to_string_lossy().replace('\'', r"'\''");
+                    format!(". '{quoted}'\r")
+                }
+            };
+            view.update(cx, |view, cx| view.write(activate.into_bytes(), cx));
         }
         let subscription = self.subscribe_view(&view, window, cx);
         self.started = true;

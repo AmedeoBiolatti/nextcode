@@ -2,10 +2,10 @@
 
 use std::io;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// How a file differs on one side (index vs HEAD, or worktree vs index).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Change {
     Modified,
@@ -59,6 +59,18 @@ pub struct Entry {
     pub staged: Option<Change>,
     /// Worktree vs index (`Untracked`, `Conflicted` live here).
     pub unstaged: Option<Change>,
+}
+
+impl Entry {
+    /// The change against HEAD, staged and unstaged parts together.
+    pub fn combined_change(&self) -> Change {
+        match (self.staged, self.unstaged) {
+            (Some(change @ (Change::Added | Change::Renamed | Change::Copied)), _) => change,
+            (Some(Change::Deleted), _) | (_, Some(Change::Deleted)) => Change::Deleted,
+            (Some(change), _) | (None, Some(change)) => change,
+            (None, None) => Change::Modified,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
