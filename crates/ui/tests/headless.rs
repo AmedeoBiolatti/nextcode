@@ -14,6 +14,13 @@ use std::{
 
 use serde_json::{Value, json};
 
+/// Test tools are background processes too; keep them off the Windows desktop.
+fn background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    remote::launch::no_window(&mut command);
+    command
+}
+
 struct Headless {
     child: Child,
     stdin: ChildStdin,
@@ -34,7 +41,7 @@ impl Headless {
 
     /// `next_code --headless <args>`.
     fn launch(args: &[&std::ffi::OsStr], env: &[(&str, &std::path::Path)]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_next_code"))
+        let mut child = background_command(env!("CARGO_BIN_EXE_next_code"))
             .arg("--headless")
             .args(args)
             .envs(env.iter().copied())
@@ -157,7 +164,7 @@ fn headless_mode_stages_diffs_and_commits_with_git() {
     fs::remove_dir_all(&root).ok();
     fs::create_dir_all(&root).unwrap();
     let git = |args: &[&str]| {
-        let status = Command::new("git")
+        let status = background_command("git")
             .arg("-C")
             .arg(&root)
             .args(args)
@@ -375,7 +382,7 @@ fn headless_mode_commits_chosen_files_merges_and_pushes() {
     let root = base.join("repo");
     fs::create_dir_all(&root).unwrap();
     let run = |dir: &std::path::Path, args: &[&str]| {
-        let status = Command::new("git")
+        let status = background_command("git")
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -484,7 +491,7 @@ fn headless_mode_filters_the_log_and_operates_on_commits() {
     fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
     let git = |args: &[&str]| {
-        let status = Command::new("git")
+        let status = background_command("git")
             .arg("-C")
             .arg(&root)
             .args(args)
@@ -561,7 +568,7 @@ fn headless_mode_filters_the_log_and_operates_on_commits() {
 
     // Cherry-pick "topic adds t" cleanly; "topic edits main" conflicts.
     let id = |revision: &str| {
-        let output = Command::new("git")
+        let output = background_command("git")
             .arg("-C")
             .arg(&root)
             .args(["rev-parse", revision])
@@ -702,7 +709,7 @@ fn headless_mode_reads_python_projects_and_dev_container_configs() {
 
 #[test]
 fn headless_mode_decodes_rust_analyzer_semantic_tokens() {
-    if Command::new("rust-analyzer")
+    if background_command("rust-analyzer")
         .arg("--version")
         .output()
         .is_err()
@@ -781,7 +788,7 @@ fn headless_mode_decodes_rust_analyzer_semantic_tokens() {
 
 #[test]
 fn headless_mode_shows_rust_analyzer_call_hierarchy() {
-    if Command::new("rust-analyzer")
+    if background_command("rust-analyzer")
         .arg("--version")
         .output()
         .is_err()
@@ -858,7 +865,7 @@ fn headless_mode_shows_rust_analyzer_call_hierarchy() {
 
 #[test]
 fn headless_mode_lists_rust_analyzer_symbols() {
-    if Command::new("rust-analyzer")
+    if background_command("rust-analyzer")
         .arg("--version")
         .output()
         .is_err()
@@ -955,7 +962,7 @@ fn headless_mode_lists_rust_analyzer_symbols() {
 
 #[test]
 fn headless_mode_shows_rust_analyzer_signatures_hints_and_implementations() {
-    if Command::new("rust-analyzer")
+    if background_command("rust-analyzer")
         .arg("--version")
         .output()
         .is_err()
@@ -1061,7 +1068,7 @@ fn headless_mode_shows_rust_analyzer_signatures_hints_and_implementations() {
 
 #[test]
 fn headless_mode_renames_fixes_and_formats_with_rust_analyzer() {
-    if Command::new("rust-analyzer")
+    if background_command("rust-analyzer")
         .arg("--version")
         .output()
         .is_err()
@@ -1152,7 +1159,11 @@ fn headless_mode_renames_fixes_and_formats_with_rust_analyzer() {
     );
 
     // Format Document through rust-analyzer (rustfmt) fixes indentation.
-    if Command::new("rustfmt").arg("--version").output().is_ok() {
+    if background_command("rustfmt")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
         let open = headless.call(json!({ "cmd": "open", "path": "src/util.rs" }));
         assert_eq!(open["ok"], true, "{open}");
         let messy = "pub fn assist() {\nlet x = 1;\n      println!(\"{}\", x);\n}\n";
@@ -1199,7 +1210,7 @@ fn result_row<'a>(reply: &'a Value, id: &str) -> &'a Value {
 
 #[test]
 fn headless_mode_discovers_runs_and_configures_pytest_tests() {
-    if Command::new("uv").arg("--version").output().is_err() {
+    if background_command("uv").arg("--version").output().is_err() {
         println!("skipped: uv is not on PATH");
         return;
     }
@@ -1440,7 +1451,7 @@ fn debug_event(headless: &mut Headless, kind: &str) -> Value {
 
 #[test]
 fn headless_mode_debugs_python_with_debugpy() {
-    if Command::new("uv").arg("--version").output().is_err() {
+    if background_command("uv").arg("--version").output().is_err() {
         println!("skipped: uv is not on PATH (debugpy comes through `uv run --with debugpy`)");
         return;
     }
@@ -1565,7 +1576,7 @@ fn headless_mode_debugs_a_cargo_binary_with_lldb() {
          println!(\"total {total}\");\n}\n",
     )
     .unwrap();
-    let built = Command::new(env!("CARGO"))
+    let built = background_command(env!("CARGO"))
         .args(["build", "--quiet"])
         .current_dir(&root)
         .env_remove("CARGO_TARGET_DIR")
@@ -1619,14 +1630,17 @@ struct DevContainers(String);
 impl Drop for DevContainers {
     fn drop(&mut self) {
         let label = format!("label=devcontainer.local_folder={}", self.0);
-        let Ok(output) = Command::new("docker")
+        let Ok(output) = background_command("docker")
             .args(["ps", "-aq", "--filter", &label])
             .output()
         else {
             return;
         };
         for id in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-            Command::new("docker").args(["rm", "-f", id]).output().ok();
+            background_command("docker")
+                .args(["rm", "-f", id])
+                .output()
+                .ok();
         }
     }
 }
@@ -1770,7 +1784,7 @@ fn headless_mode_forwards_dev_container_ports() {
     let label = format!("label=devcontainer.local_folder={}", root.to_string_lossy());
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        let running = Command::new("docker")
+        let running = background_command("docker")
             .args(["ps", "-q", "--filter", &label])
             .output()
             .unwrap();

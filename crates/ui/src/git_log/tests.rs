@@ -8,8 +8,15 @@ use gpui::{Entity, TestAppContext};
 
 use super::{actions::CommitAction, *};
 
+/// Test tools are background processes too; keep them off the Windows desktop.
+fn background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    remote::launch::no_window(&mut command);
+    command
+}
+
 fn git(dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = background_command("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -79,7 +86,7 @@ fn long_repo(name: &str, count: usize) -> PathBuf {
             content.len()
         ));
     }
-    let mut child = Command::new("git")
+    let mut child = background_command("git")
         .arg("-C")
         .arg(&dir)
         .args(["fast-import", "--quiet"])

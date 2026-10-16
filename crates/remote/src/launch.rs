@@ -62,18 +62,14 @@ pub trait Target {
     }
 }
 
-/// Keeps console programs started from the GUI from opening a window. A
-/// process attached to a console (`--headless` run from a terminal) lets
-/// its children share that console instead.
+/// Keeps background console programs from opening a window, including
+/// when headless mode is attached to its caller's console. Redirected
+/// standard streams still work without a console.
 pub fn no_window(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // SAFETY: plain query; 0 means no console is attached.
-        let has_console = unsafe { windows_sys::Win32::System::Console::GetConsoleCP() } != 0;
-        if !has_console {
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     command
 }
@@ -456,6 +452,51 @@ pub fn connect(target: &dyn Target, root: &str) -> io::Result<Connection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn background_child_has_no_console_window_and_keeps_piped_stdio() {
+        const CHILD: &str = "NEXT_CODE_TEST_WINDOWLESS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // A windowless console may still have an input code page.
+            // SAFETY: both calls only query the process's console window.
+            let window = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+            assert!(
+                window.is_null()
+                    || unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(window) == 0
+                    }
+            );
+            let mut input = String::new();
+            io::Read::read_to_string(&mut io::stdin(), &mut input).unwrap();
+            assert_eq!(input, "piped input");
+            println!("piped output");
+            eprintln!("piped error");
+            return;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "launch::tests::background_child_has_no_console_window_and_keeps_piped_stdio",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = no_window(&mut command).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"piped input")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("piped output"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("piped error"));
+    }
 
     #[test]
     fn launch_reports_are_read_despite_login_noise() {
