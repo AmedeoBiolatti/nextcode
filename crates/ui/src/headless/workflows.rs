@@ -6,14 +6,14 @@
 //! `Project::open`), and commands run in terminals nobody sees (their last
 //! line is in `workflow_status`). URLs are reported, not opened.
 
-use std::{path::Path, time::Instant};
+use std::time::Instant;
 
 use workflow::{Ready, Status};
 
 use super::*;
 use crate::{
     terminal_panel::{self, TerminalView},
-    workflows::{Host, Source, Workflows, WorkflowsEvent},
+    workflows::{Host, Workflows, WorkflowsEvent},
 };
 
 /// A project being opened on a thread for a step.
@@ -111,8 +111,6 @@ impl Host for HeadlessHost {
     fn show(&mut self, _: &Location, _: &Entity<TerminalView>, _: &mut App) {}
 
     fn open_url(&mut self, _: &str, _: &mut App) {}
-
-    fn open_file(&mut self, _: &Source, _: &Path, _: &mut App) {}
 }
 
 /// Forwards the model's events as `workflow_event` lines.

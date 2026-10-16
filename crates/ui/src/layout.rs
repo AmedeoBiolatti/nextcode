@@ -16,8 +16,6 @@ pub enum PanelId {
     Commit,
     Python,
     Terminal,
-    /// Workflows (bottom dock, next to the Terminal).
-    Workflows,
     Problems,
     /// PyCharm's Git tool window (the Log).
     GitLog,
@@ -30,13 +28,12 @@ pub enum PanelId {
 }
 
 impl PanelId {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::Files,
         Self::Search,
         Self::Commit,
         Self::Python,
         Self::Terminal,
-        Self::Workflows,
         Self::Problems,
         Self::GitLog,
         Self::Ports,
@@ -54,7 +51,6 @@ impl PanelId {
             Self::Commit => "Commit",
             Self::Python => "Python",
             Self::Terminal => "Terminal",
-            Self::Workflows => "Workflows",
             Self::Problems => "Problems",
             Self::GitLog => "Git",
             Self::Ports => "Ports",
@@ -73,7 +69,6 @@ impl PanelId {
             }
             Self::Outline | Self::Debug => DockPosition::Right,
             Self::Terminal
-            | Self::Workflows
             | Self::Problems
             | Self::Ports
             | Self::GitLog
@@ -89,6 +84,38 @@ pub enum DockPosition {
     Left,
     Right,
     Bottom,
+}
+
+/// A panel name in a saved layout: one of today's, or a panel that no
+/// longer exists (the Workflows panel, now workflow tabs), which is
+/// dropped so the rest of the layout still loads.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedPanel {
+    Known(PanelId),
+    Removed(#[allow(dead_code)] String),
+}
+
+impl SavedPanel {
+    fn known(self) -> Option<PanelId> {
+        match self {
+            Self::Known(panel) => Some(panel),
+            Self::Removed(_) => None,
+        }
+    }
+}
+
+fn known_panels<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<PanelId>, D::Error> {
+    let saved = Vec::<SavedPanel>::deserialize(deserializer)?;
+    Ok(saved.into_iter().filter_map(SavedPanel::known).collect())
+}
+
+fn known_panel<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PanelId>, D::Error> {
+    Ok(Option::<SavedPanel>::deserialize(deserializer)?.and_then(SavedPanel::known))
 }
 
 impl DockPosition {
@@ -110,7 +137,9 @@ pub const MIN_DOCK_SIZE: f32 = 120.;
 #[serde(default)]
 pub struct DockLayout {
     /// Tab order.
+    #[serde(deserialize_with = "known_panels")]
     pub panels: Vec<PanelId>,
+    #[serde(deserialize_with = "known_panel")]
     pub active: Option<PanelId>,
     /// Width (side docks) or height (bottom dock) in logical pixels.
     pub size: f32,
@@ -160,7 +189,6 @@ impl Default for Layout {
             bottom: DockLayout {
                 panels: vec![
                     PanelId::Terminal,
-                    PanelId::Workflows,
                     PanelId::Problems,
                     PanelId::GitLog,
                     PanelId::Ports,
@@ -399,7 +427,6 @@ mod tests {
             [
                 PanelId::Search,
                 PanelId::Terminal,
-                PanelId::Workflows,
                 PanelId::Problems,
                 PanelId::GitLog,
                 PanelId::Ports,
@@ -424,7 +451,6 @@ mod tests {
             [
                 PanelId::Problems,
                 PanelId::Terminal,
-                PanelId::Workflows,
                 PanelId::GitLog,
                 PanelId::Ports,
                 PanelId::CallHierarchy,
@@ -436,7 +462,6 @@ mod tests {
             layout.bottom.panels,
             [
                 PanelId::Terminal,
-                PanelId::Workflows,
                 PanelId::GitLog,
                 PanelId::Ports,
                 PanelId::CallHierarchy,
@@ -503,11 +528,25 @@ mod tests {
             layout.position_of(PanelId::Problems),
             Some(DockPosition::Bottom)
         );
-        // Saved before the Workflows panel existed: bottom, like the Terminal.
+    }
+
+    #[test]
+    fn layouts_saved_with_the_workflows_panel_still_load() {
+        // Workflows were a bottom panel before they became tabs.
+        let mut layout: Layout = serde_json::from_str(
+            r#"{ "bottom": { "panels": ["terminal", "workflows", "problems"],
+                             "active": "workflows", "size": 300, "open": true },
+                 "left": { "panels": ["files"], "active": "files", "size": 250, "open": true } }"#,
+        )
+        .unwrap();
+        layout.normalize();
+        assert_eq!(layout.left.size, 250.);
         assert_eq!(
-            layout.position_of(PanelId::Workflows),
-            Some(DockPosition::Bottom)
+            &layout.bottom.panels[..2],
+            [PanelId::Terminal, PanelId::Problems]
         );
+        assert_eq!(layout.bottom.active, Some(PanelId::Terminal));
+        assert_eq!((layout.bottom.size, layout.bottom.open), (300., true));
     }
 
     #[test]

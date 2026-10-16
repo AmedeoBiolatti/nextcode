@@ -23,7 +23,6 @@ actions!(
         TogglePython,
         ToggleProblems,
         TogglePorts,
-        ToggleWorkflows,
         ToggleCallHierarchy,
         ToggleOutline,
         ToggleBottomDock,
@@ -91,7 +90,6 @@ impl Workspace {
             PanelId::Problems => Some(self.problems.clone().into()),
             PanelId::Ports => Some(self.ports_panel.clone().into()),
             PanelId::Terminal => Some(self.terminal.clone().into()),
-            PanelId::Workflows => Some(self.workflows.clone().into()),
             PanelId::Search => Some(self.search.clone().into()),
             PanelId::Commit => Some(self.commit.clone().into()),
             PanelId::GitLog => Some(self.git_log.clone().into()),
@@ -216,29 +214,6 @@ impl Workspace {
         self.toggle_panel(PanelId::Ports, cx);
     }
 
-    pub(super) fn toggle_workflows(
-        &mut self,
-        _: &ToggleWorkflows,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.toggle_panel(PanelId::Workflows, cx);
-    }
-
-    /// Run > Workflows…: shows the panel (it lists every workflow).
-    pub(super) fn show_workflows_action(
-        &mut self,
-        _: &crate::workflows::ShowWorkflows,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.show_workflows(cx);
-    }
-
-    pub(crate) fn show_workflows(&mut self, cx: &mut Context<Self>) {
-        self.show_panel(PanelId::Workflows, cx);
-    }
-
     /// Shows `view` in the Terminal panel (a workflow step's terminal).
     pub(crate) fn show_terminal_view(
         &mut self,
@@ -260,11 +235,6 @@ impl Workspace {
 
     pub(crate) fn terminal_panel(&self) -> Entity<TerminalPanel> {
         self.terminal.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn workflows_panel(&self) -> Entity<WorkflowsPanel> {
-        self.workflows.clone()
     }
 
     /// Forward a Port…: shows the Ports panel with its input focused.

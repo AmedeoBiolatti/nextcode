@@ -181,6 +181,7 @@ fn run() -> anyhow::Result<()> {
         terminal_panel::bind_keys(cx);
         ports::panel::bind_keys(cx);
         git_log::bind_keys(cx);
+        workflows::bind_keys(cx);
         theme::refresh(cx);
         app_state::init(cx);
         cx.on_window_closed(|cx| {

@@ -338,8 +338,8 @@ the workflow invalid: it is listed with the error and cannot run.
   is reused; new tabs open in the background). Local Windows:
   `powershell.exe -NoLogo -Command <line>`; WSL, containers, Linux: the
   user's login shell, `-lic <line>`. The tab stays when the command exits,
-  showing its exit code. Without a project the terminal is shown by the
-  Workflows panel (Terminal button). `.venv` is not activated (use `uv run`).
+  showing its exit code. Without a project the terminal is shown in the
+  workflow's tab (Terminal button). `.venv` is not activated (use `uv run`).
 - `check`: a process where the step runs (PowerShell `-NoProfile` on
   Windows, `sh -c` elsewhere), before `run`; exit 0 passes. Failing with
   `onFail`: the step shows Failed with that message and Retry; without it
@@ -366,14 +366,33 @@ alone); Retry Failed reruns failed steps; Stop All sends Ctrl+C to every
 command the run started and kills what still runs 3 s later (project tabs
 and containers stay); Run All starts afresh.
 
-UI: the Workflows panel (bottom dock next to the Terminal; View >
-Workflows, Run > Workflows…) lists the workflows (source: User or the
-project) and the selected one's steps with status, elapsed time, where it
-runs, its wait reason / failure / last output line, and Terminal, Continue,
-Restart/Retry buttons; Run All, Stop All, Retry Failed, Open File, ⟳, New….
-Run > New Workflow… writes a commented template to the user folder and
-opens it. The command palette has "Run Workflow: <name>" per workflow.
-Workflows run in the window that started them.
+UI: each workflow opens as its own tab in the window's tab row (marked ◈,
+colored by the run's state; opening the same file again shows its tab;
+restored with the window). Run > Open Workflow… picks one (user and open
+projects' workflows); Run > New Workflow… writes a commented template to
+the user folder and opens its tab; the command palette's "Run Workflow:
+<name>" opens the tab and runs it. The tab has the file in an editor on
+the left (Ctrl+S saves; drag the divider to resize) and a graph on the
+right: one column per dependency depth (longest chain of `needs`), cards
+ordered to reduce crossings, each with title, id and what it does, where
+it runs, status icon/color and elapsed time; edges turn green when their
+upstream is ready. The graph opens fitted to its pane (at most 100 %, at
+least 40 %, centered) and re-fits on resize and after edits until you zoom
+or pan: Ctrl+scroll zooms around the pointer, the corner overlay has −,
+the zoom, + and Fit (back to fitting); scroll (Shift+scroll sideways) or
+drag pans. The
+graph follows the buffer 200 ms after an edit; a file with problems shows
+them in a banner with line and column (click: go there) over the last
+good graph, dimmed. Clicking a card puts the cursor on its `"id"`; the
+card holding the cursor is highlighted. A selected card shows details
+below the graph: state, wait/failure reason or manual prompt, last output
+lines, Terminal (the project's terminal tab, or this machine's terminal
+inside the workflow tab), Continue, Restart/Retry. The toolbar shows the
+state (Idle, Running, All ready, Failed, Stopped), Run All (saves the file
+first if edited, then runs what was saved; Shift+F10), Stop All (Ctrl+F2)
+and Retry Failed. Workflow files in remote projects are read and written
+through the project (its tab opens first when a restored workflow tab
+needs it). Workflows run in the window that started them.
 
 Headless: `workflows_list`, `workflow_run`, `workflow_status`,
 `workflow_stop`, `workflow_continue`, `workflow_restart`, `workflow_retry`

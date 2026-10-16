@@ -45,7 +45,6 @@ use crate::{
     symbol_picker::SymbolPicker,
     terminal_panel::{TerminalPanel, TerminalPanelEvent, TerminalView},
     theme,
-    workflows::{self, WorkflowsPanel},
     worktree_picker::{WorktreePicker, WorktreePickerEvent},
 };
 
@@ -252,8 +251,6 @@ pub struct Workspace {
     /// model.
     ports_panel: Entity<PortsPanel>,
     terminal: Entity<TerminalPanel>,
-    /// The window's workflows.
-    workflows: Entity<WorkflowsPanel>,
     search: Entity<SearchPanel>,
     /// The Commit tool window.
     commit: Entity<CommitPanel>,
@@ -351,8 +348,6 @@ impl Workspace {
         });
         let problems = cx.new(|cx| ProblemsPanel::new(root.clone(), lsp_store.clone(), cx));
         let terminal = cx.new(|cx| TerminalPanel::new(project.clone(), cx));
-        let window_workflows = workflows::for_window(window, cx);
-        let workflows = cx.new(|cx| WorkflowsPanel::new(window_workflows, cx));
         let search = cx.new(|cx| SearchPanel::new(project.clone(), cx));
         let commit = cx.new(|cx| CommitPanel::new(project.clone(), git_preload, cx));
         let commit_subscription =
@@ -518,7 +513,6 @@ impl Workspace {
             problems,
             ports_panel,
             terminal,
-            workflows,
             search,
             commit,
             git_log,
@@ -1741,8 +1735,6 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_problems))
             .on_action(cx.listener(Self::toggle_ports))
             .on_action(cx.listener(Self::forward_port))
-            .on_action(cx.listener(Self::toggle_workflows))
-            .on_action(cx.listener(Self::show_workflows_action))
             .on_action(cx.listener(Self::toggle_call_hierarchy))
             .on_action(cx.listener(Self::toggle_outline))
             .on_action(cx.listener(Self::go_to_workspace_symbol))

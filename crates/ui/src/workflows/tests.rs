@@ -1,14 +1,16 @@
 //! A workflow driven through a real window: a check on this machine, a
 //! project tab opened for a step whose command runs in that project's
 //! Terminal panel, a manual gate, a command without a project, Restart
-//! and Stop All.
+//! and Stop All; and the workflow tab: its graph following the editor,
+//! problems over the last good graph, cards and the cursor, Run All saving
+//! first, restore with the window.
 
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
 
-use gpui::{TestAppContext, WindowHandle};
+use gpui::{Focusable, TestAppContext, WindowHandle};
 use workflow::Status;
 
 use super::*;
@@ -109,22 +111,25 @@ fn a_workflow_opens_projects_runs_steps_in_order_and_restart_reuses_the_terminal
     workflows.update(cx, |workflows, _| {
         workflows.user_dir = Some(root.join("user"))
     });
-    let alpha = workspace(window, 0, cx);
-    alpha.update(cx, |workspace, cx| workspace.show_workflows(cx));
     workflows
         .update(cx, |workflows, cx| workflows.refresh(cx))
         .detach();
     cx.run_until_parked();
-    let id = workflows.read_with(cx, |workflows, _| {
+    let (id, path) = workflows.read_with(cx, |workflows, _| {
         let found = &workflows.discovered()[0];
         assert_eq!(found.name, "Dev");
         assert_eq!(found.source, Source::User);
-        found.id.clone()
+        (found.id.clone(), found.path.clone())
     });
 
-    workflows
-        .update(cx, |workflows, cx| workflows.run_workflow(id.clone(), cx))
-        .detach();
+    // Its tab runs it.
+    let view = window
+        .update(cx, |shell, window, cx| {
+            shell.open_workflow(&Source::User, &path, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    view.update(cx, |view, cx| view.run_all(cx));
     wait_until(cx, "the server's output", |cx| {
         statuses(&workflows, cx) == ["ready", "ready", "running", "waiting"]
     });
@@ -143,13 +148,12 @@ fn a_workflow_opens_projects_runs_steps_in_order_and_restart_reuses_the_terminal
         first_view[0].read_with(cx, |view, _| view.run_name().map(str::to_owned)),
         Some("Server".to_owned())
     );
-    // The panel shows the steps and their states.
-    let panel = alpha.read_with(cx, |workspace, _| workspace.workflows_panel());
+    // The tab's graph shows the steps and their states.
     assert_eq!(
-        panel.read_with(cx, |panel, _| panel.shown.clone()),
+        view.read_with(cx, |view, cx| view.cards(cx)),
         [
             ("check".to_owned(), "ready".to_owned()),
-            ("Server".to_owned(), "ready".to_owned()),
+            ("server".to_owned(), "ready".to_owned()),
             ("gate".to_owned(), "running".to_owned()),
             ("done".to_owned(), "waiting".to_owned()),
         ]
@@ -163,7 +167,7 @@ fn a_workflow_opens_projects_runs_steps_in_order_and_restart_reuses_the_terminal
     workflows.read_with(cx, |workflows, _| {
         let active = workflows.run_of(&id).unwrap();
         assert_eq!(active.run.outcome(), Outcome::Ready);
-        assert!(active.terminal(3).is_some(), "shown by the panel");
+        assert!(active.terminal(3).is_some(), "shown by the tab");
         assert!(active.location(3).is_none());
     });
 
@@ -251,10 +255,8 @@ fn a_failing_check_without_on_fail_fails_the_workflow(cx: &mut TestAppContext) {
     assert!(refused.unwrap_err().contains("cannot run"));
 
     workflows
-        .update(cx, |workflows, cx| {
-            workflows.run_workflow(broken.clone(), cx)
-        })
-        .detach();
+        .update(cx, |workflows, cx| workflows.start(&broken, cx))
+        .unwrap();
     wait_until(cx, "the check", |cx| {
         statuses(&workflows, cx) == ["failed", "stopped"]
     });
@@ -267,5 +269,180 @@ fn a_failing_check_without_on_fail_fails_the_workflow(cx: &mut TestAppContext) {
         assert!(reason.starts_with("check failed ("), "{reason}");
         assert!(reason.contains("no route"), "{reason}");
     });
+    cleanup(root);
+}
+
+const DIAMOND: &str = r#"{
+  "name": "Diamond",
+  "steps": [
+    { "id": "check", "check": "exit 0" },
+    { "id": "api", "needs": ["check"], "check": "exit 0" },
+    { "id": "web", "needs": ["check"], "check": "exit 0" },
+    { "id": "join", "needs": ["api", "web"], "check": "exit 0" }
+  ]
+}
+"#;
+
+fn columns(view: &Entity<WorkflowView>, cx: &mut TestAppContext) -> Vec<Vec<String>> {
+    view.read_with(cx, |view, _| view.columns())
+}
+
+fn cursor_step(view: &Entity<WorkflowView>, cx: &mut TestAppContext) -> Option<String> {
+    view.read_with(cx, |view, _| view.cursor_step().map(str::to_owned))
+}
+
+/// Lets the graph catch up with the editor.
+fn settle(cx: &mut TestAppContext) {
+    cx.executor().advance_clock(Duration::from_millis(250));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestAppContext) {
+    let root = root("tab");
+    let path = root.join("user").join("diamond.jsonc");
+    std::fs::write(&path, DIAMOND).unwrap();
+    cx.update(crate::app_state::init);
+    cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
+    cx.run_until_parked();
+    let window = cx.windows()[0].downcast::<Shell>().unwrap();
+    let workflows = window
+        .update(cx, |_, window, cx| for_window(window, cx))
+        .unwrap();
+    workflows.update(cx, |workflows, _| {
+        workflows.user_dir = Some(root.join("user"))
+    });
+    let open = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |shell, window, cx| {
+                shell.open_workflow(&Source::User, &path, window, cx)
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let view = open(cx);
+    cx.run_until_parked();
+    let tabs = |cx: &mut TestAppContext| {
+        window
+            .read_with(cx, |shell, cx| shell.tab_summary(cx))
+            .unwrap()
+    };
+    assert_eq!(tabs(cx), (vec!["alpha".into(), "◈ Diamond".into()], 1));
+    // Opening it again shows the same tab.
+    cx.dispatch_action(window.into(), crate::shell::PreviousProject);
+    assert_eq!(tabs(cx).1, 0);
+    assert_eq!(open(cx), view);
+    assert_eq!(tabs(cx), (vec!["alpha".into(), "◈ Diamond".into()], 1));
+
+    // The editor holds the file, the graph its steps by depth.
+    let editor = view.read_with(cx, |view, _| view.editor());
+    assert_eq!(editor.read_with(cx, |editor, _| editor.text()), DIAMOND);
+    assert_eq!(
+        columns(&view, cx),
+        [vec!["check"], vec!["api", "web"], vec!["join"]]
+    );
+    let focused = window
+        .update(cx, |_, window, cx| {
+            editor.focus_handle(cx).is_focused(window)
+        })
+        .unwrap();
+    assert!(focused, "the tab's editor has focus");
+
+    // An unknown `needs` id: the problem, where it is; the last graph stays.
+    let broken = DIAMOND.replace(r#"["api", "web"]"#, r#"["api", "nope"]"#);
+    editor.update(cx, |editor, cx| editor.set_text(&broken, cx));
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |view, _| view.problems()).is_empty(),
+        "not before the pause"
+    );
+    settle(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.problems()),
+        [("`join` needs unknown step `nope`".to_owned(), Some((7, 38)))]
+    );
+    assert_eq!(
+        columns(&view, cx),
+        [vec!["check"], vec!["api", "web"], vec!["join"]]
+    );
+
+    // Fixed differently: the graph follows (`join` needs only `api`).
+    let fixed = DIAMOND.replace(r#"["api", "web"]"#, r#"["api"]"#);
+    editor.update(cx, |editor, cx| editor.set_text(&fixed, cx));
+    settle(cx);
+    assert!(view.read_with(cx, |view, _| view.problems()).is_empty());
+    assert_eq!(
+        view.read_with(cx, |view, _| view.edges()),
+        [
+            ("check".to_owned(), "api".to_owned()),
+            ("check".to_owned(), "web".to_owned()),
+            ("api".to_owned(), "join".to_owned()),
+        ]
+    );
+
+    // A card click puts the cursor on its `"id"`; the cursor in a step
+    // highlights its card.
+    window
+        .update(cx, |_, window, cx| {
+            view.update(cx, |view, cx| view.select("web", window, cx))
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let cursor_place = editor.read_with(cx, |editor, _| {
+        workflow::source::line_column(&editor.text(), editor.cursor())
+    });
+    assert_eq!(cursor_place, (6, 7));
+    assert_eq!(cursor_step(&view, cx).as_deref(), Some("web"));
+    let inside_api = fixed.find("\"api\", \"needs\"").unwrap();
+    editor.update(cx, |editor, cx| editor.set_cursor(inside_api, cx));
+    cx.run_until_parked();
+    assert_eq!(cursor_step(&view, cx).as_deref(), Some("api"));
+
+    // Run All saves the edits first, then runs what was saved.
+    assert!(view.read_with(cx, |view, cx| view.is_dirty(cx)));
+    view.update(cx, |view, cx| view.run_all(cx));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), fixed);
+    assert!(!view.read_with(cx, |view, cx| view.is_dirty(cx)));
+    wait_until(cx, "every check", |cx| {
+        view.read_with(cx, |view, cx| view.outcome(cx)) == Outcome::Ready
+    });
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.cards(cx)),
+        [
+            ("check".to_owned(), "ready".to_owned()),
+            ("api".to_owned(), "ready".to_owned()),
+            ("web".to_owned(), "ready".to_owned()),
+            ("join".to_owned(), "ready".to_owned()),
+        ]
+    );
+
+    // The tab is saved with the window and comes back with it.
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    let state = crate::app_state::load().unwrap();
+    assert_eq!(
+        state.windows[0].tabs[1],
+        crate::app_state::TabTarget::Workflow {
+            workflow: path.clone(),
+            project: None,
+        }
+    );
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| crate::shell::restore(state, None, cx));
+    cx.run_until_parked();
+    let restored = cx.windows()[0].downcast::<Shell>().unwrap();
+    assert_eq!(
+        restored
+            .read_with(cx, |shell, cx| shell.tab_summary(cx))
+            .unwrap(),
+        (vec!["alpha".into(), "◈ Diamond".into()], 1)
+    );
+    restored
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
     cleanup(root);
 }

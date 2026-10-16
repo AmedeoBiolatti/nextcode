@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value};
 
+use crate::source::{self, Problem};
+
 /// A parsed, valid workflow.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workflow {
@@ -107,24 +109,63 @@ const STEP_KEYS: &[&str] = &[
 /// has no `name` (the file name). Every problem found is reported, one per
 /// line.
 pub fn parse(text: &str, fallback_name: &str) -> Result<Workflow, String> {
-    let value: Value = serde_json::from_str(&devcontainer::jsonc::to_json(text))
-        .map_err(|err| format!("invalid JSON: {err}"))?;
-    let Value::Object(mut root) = value else {
-        return Err("a workflow is a JSON object with `name` and `steps`".into());
+    check(text, fallback_name).map_err(|problems| {
+        problems
+            .into_iter()
+            .map(|problem| problem.message)
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+/// What a problem found while parsing is about.
+enum At {
+    File,
+    /// The `steps` element at this index.
+    Step(usize),
+    /// That step's `"id"`.
+    StepId(usize),
+    /// One of that step's `needs`.
+    Need(usize, String),
+}
+
+/// [`parse`], with each problem located in `text` where possible: JSON
+/// syntax errors where the parser stopped, step problems at the step,
+/// unknown `needs` at the id, duplicates and cycles at the step's `"id"`.
+pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> {
+    let value: Value = match serde_json::from_str(&devcontainer::jsonc::to_json(text)) {
+        Ok(value) => value,
+        Err(err) => {
+            return Err(vec![Problem {
+                message: format!("invalid JSON: {err}"),
+                offset: (err.line() > 0).then(|| source::offset_of(text, err.line(), err.column())),
+            }]);
+        }
     };
-    let mut errors = Vec::new();
+    let file_problem = |message: &str| {
+        vec![Problem {
+            message: message.to_owned(),
+            offset: None,
+        }]
+    };
+    let Value::Object(mut root) = value else {
+        return Err(file_problem(
+            "a workflow is a JSON object with `name` and `steps`",
+        ));
+    };
+    let mut errors: Vec<(String, At)> = Vec::new();
     let name = match root.remove("name") {
         None => fallback_name.to_owned(),
         Some(Value::String(name)) if !name.trim().is_empty() => name,
         Some(_) => {
-            errors.push("`name` must be a non-empty string".to_owned());
+            errors.push(("`name` must be a non-empty string".to_owned(), At::File));
             fallback_name.to_owned()
         }
     };
     let steps = match root.remove("steps") {
         Some(Value::Array(steps)) => steps,
-        Some(_) => return Err("`steps` must be an array".into()),
-        None => return Err("missing `steps`".into()),
+        Some(_) => return Err(file_problem("`steps` must be an array")),
+        None => return Err(file_problem("missing `steps`")),
     };
     // `$schema`, `description` and other documentation keys are allowed.
     let steps: Vec<Step> = steps
@@ -133,7 +174,7 @@ pub fn parse(text: &str, fallback_name: &str) -> Result<Workflow, String> {
         .filter_map(|(index, step)| match parse_step(step) {
             Ok(step) => Some(step),
             Err(err) => {
-                errors.push(format!("step {}: {err}", index + 1));
+                errors.push((format!("step {}: {err}", index + 1), At::Step(index)));
                 None
             }
         })
@@ -142,10 +183,30 @@ pub fn parse(text: &str, fallback_name: &str) -> Result<Workflow, String> {
         errors.extend(validate(&steps));
     }
     if errors.is_empty() {
-        Ok(Workflow { name, steps })
-    } else {
-        Err(errors.join("\n"))
+        return Ok(Workflow { name, steps });
     }
+    let spans = source::step_spans(text);
+    Err(errors
+        .into_iter()
+        .map(|(message, at)| {
+            let offset = match at {
+                At::File => None,
+                At::Step(index) => spans.get(index).map(|span| span.start),
+                At::StepId(index) => spans
+                    .get(index)
+                    .map(|span| span.id_offset.unwrap_or(span.start)),
+                At::Need(index, need) => spans.get(index).map(|span| {
+                    span.needs
+                        .iter()
+                        .find(|(id, _)| *id == need)
+                        .map(|(_, at)| *at)
+                        .or(span.id_offset)
+                        .unwrap_or(span.start)
+                }),
+            };
+            Problem { message, offset }
+        })
+        .collect())
 }
 
 fn parse_step(value: Value) -> Result<Step, String> {
@@ -355,18 +416,21 @@ pub fn project_spec(value: Value) -> Result<ProjectSpec, String> {
 }
 
 /// Unique ids, known `needs`, no cycles.
-fn validate(steps: &[Step]) -> Vec<String> {
+fn validate(steps: &[Step]) -> Vec<(String, At)> {
     let mut errors = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
     for (i, step) in steps.iter().enumerate() {
         if index.insert(&step.id, i).is_some() {
-            errors.push(format!("duplicate step id `{}`", step.id));
+            errors.push((format!("duplicate step id `{}`", step.id), At::StepId(i)));
         }
     }
-    for step in steps {
+    for (i, step) in steps.iter().enumerate() {
         for need in &step.needs {
             if !index.contains_key(need.as_str()) {
-                errors.push(format!("`{}` needs unknown step `{need}`", step.id));
+                errors.push((
+                    format!("`{}` needs unknown step `{need}`", step.id),
+                    At::Need(i, need.clone()),
+                ));
             }
         }
     }
@@ -386,7 +450,7 @@ fn validate(steps: &[Step]) -> Vec<String> {
         index: &HashMap<&str, usize>,
         marks: &mut [Mark],
         path: &mut Vec<usize>,
-    ) -> Option<String> {
+    ) -> Option<(String, usize)> {
         match marks[at] {
             Mark::Done => return None,
             Mark::Active => {
@@ -396,7 +460,7 @@ fn validate(steps: &[Step]) -> Vec<String> {
                     .map(|&p| steps[p].id.as_str())
                     .collect();
                 cycle.push(&steps[at].id);
-                return Some(format!("dependency cycle: {}", cycle.join(" → ")));
+                return Some((format!("dependency cycle: {}", cycle.join(" → ")), at));
             }
             Mark::New => {}
         }
@@ -413,8 +477,8 @@ fn validate(steps: &[Step]) -> Vec<String> {
     }
     let mut marks = vec![Mark::New; steps.len()];
     for at in 0..steps.len() {
-        if let Some(cycle) = visit(at, steps, &index, &mut marks, &mut Vec::new()) {
-            errors.push(cycle);
+        if let Some((cycle, at)) = visit(at, steps, &index, &mut marks, &mut Vec::new()) {
+            errors.push((cycle, At::StepId(at)));
             break;
         }
     }
@@ -425,8 +489,9 @@ fn validate(steps: &[Step]) -> Vec<String> {
 pub const TEMPLATE: &str = r#"// A workflow starts a development environment in one go: checks, commands
 // in the terminals of several projects (opened as needed, dev containers
 // included), in order, with readiness conditions, browser links and manual
-// steps. Run it from the Workflows panel (View > Workflows) or the command
-// palette ("Run Workflow: <name>").
+// steps. Its tab (Run > Open Workflow…) shows this file next to the steps'
+// graph, which follows your edits; Run All saves and runs it. The command
+// palette has "Run Workflow: <name>" too.
 {
   "name": "My environment",
   "steps": [
@@ -670,5 +735,40 @@ mod tests {
     fn the_template_is_a_valid_workflow() {
         let workflow = parse(TEMPLATE, "template").unwrap();
         assert_eq!(workflow.steps.len(), 4);
+    }
+
+    #[test]
+    fn problems_point_at_where_they_are() {
+        let at = |text: &str| -> Vec<(String, Option<(usize, usize)>)> {
+            check(text, "f")
+                .unwrap_err()
+                .into_iter()
+                .map(|problem| {
+                    let place = problem.line_column(text);
+                    (problem.message, place)
+                })
+                .collect()
+        };
+        // JSON syntax: where the parser stopped (comments keep positions).
+        let broken = "{\n  // c\n  \"steps\": [\n    { \"id\": \"a\" \"run\": \"x\" }\n  ]\n}";
+        let problems = at(broken);
+        assert!(problems[0].0.starts_with("invalid JSON"), "{problems:?}");
+        assert_eq!(problems[0].1.map(|(line, _)| line), Some(4));
+        // An unknown `needs` id: at that id.
+        let unknown = "{\"steps\": [\n  {\"id\": \"a\", \"run\": \"x\"},\n  {\"id\": \"b\", \"run\": \"y\",\n   \"needs\": [\"a\", \"zz\"]}\n]}";
+        assert_eq!(
+            at(unknown),
+            [("`b` needs unknown step `zz`".to_owned(), Some((4, 19)))]
+        );
+        // A bad step: at the step; a duplicate: at its second `"id"`.
+        let bad = "{\"steps\": [\n  {\"id\": \"a\"},\n  {\"id\": \"a\", \"run\": \"x\"}]}";
+        assert_eq!(at(bad)[0].1, Some((2, 3)));
+        let duplicate = "{\"steps\": [\n  {\"id\": \"a\", \"run\": \"x\"},\n  {\"id\": \"a\", \"run\": \"x\"}]}";
+        assert_eq!(
+            at(duplicate),
+            [("duplicate step id `a`".to_owned(), Some((3, 4)))]
+        );
+        // File-level problems have no place.
+        assert_eq!(at("{}"), [("missing `steps`".to_owned(), None)]);
     }
 }

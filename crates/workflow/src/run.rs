@@ -178,6 +178,11 @@ impl StepState {
         self.watcher.last_line()
     }
 
+    /// Up to `count` last output lines, oldest first.
+    pub fn last_lines(&self, count: usize) -> Vec<&str> {
+        self.watcher.last_lines(count)
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }

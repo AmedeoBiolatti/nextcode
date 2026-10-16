@@ -1,7 +1,8 @@
 //! The window: the menu bar (on Windows also the title bar, with drag
-//! areas and caption buttons) with the command bar in it, project tabs,
-//! and the active project. Every window's root is a [`Shell`]; a project
-//! tab holds a `Workspace`, or `Connecting` while a remote project opens.
+//! areas and caption buttons) with the command bar in it, the tabs, and
+//! the active tab. Every window's root is a [`Shell`]; a project tab holds
+//! a `Workspace`, or `Connecting` while a remote project opens; a workflow
+//! tab holds a [`WorkflowView`] (the file and its graph).
 
 use std::{
     path::PathBuf,
@@ -18,7 +19,7 @@ use gpui::{
 };
 
 use crate::{
-    app_state::{self, AppState, SavedBounds, SavedWindow},
+    app_state::{self, AppState, SavedBounds, SavedWindow, TabTarget},
     command_palette::{Command, CommandPalette, CommandPaletteEvent},
     commands,
     connecting::{Connecting, ConnectingEvent},
@@ -30,7 +31,10 @@ use crate::{
     terminal_panel::TerminalView,
     theme::{self, Theme},
     theme_picker::{ThemePicker, ThemePickerEvent},
-    workflows::{self, NewWorkflow, RunWorkflow, Workflows},
+    workflows::{
+        self, NewWorkflow, OpenWorkflow, RunWorkflow, Source, WorkflowPicker, WorkflowPickerEvent,
+        WorkflowView, Workflows,
+    },
     workspace::{Preload, Workspace, WorkspaceEvent},
 };
 
@@ -89,14 +93,16 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// What a project tab shows.
+/// What a tab shows.
 enum Content {
     /// Restored from the last session and not shown yet: the project opens
     /// when the tab is first activated, so background tabs cost nothing at
     /// startup (no connection, watcher, git status or language servers).
+    /// A workflow tab also waits here while its remote project opens.
     Unloaded,
     Connecting(Entity<Connecting>),
     Workspace(Entity<Workspace>),
+    Workflow(Entity<WorkflowView>),
 }
 
 impl Content {
@@ -105,6 +111,7 @@ impl Content {
             Self::Unloaded => None,
             Self::Connecting(view) => Some(view.entity_id()),
             Self::Workspace(view) => Some(view.entity_id()),
+            Self::Workflow(view) => Some(view.entity_id()),
         }
     }
 
@@ -113,29 +120,53 @@ impl Content {
             Self::Unloaded => None,
             Self::Connecting(view) => Some(view.clone().into()),
             Self::Workspace(view) => Some(view.clone().into()),
+            Self::Workflow(view) => Some(view.clone().into()),
         }
     }
 }
 
-struct ProjectTab {
-    location: Location,
+struct Tab {
+    target: TabTarget,
     content: Content,
     _subscription: Option<Subscription>,
 }
 
-impl ProjectTab {
-    fn unloaded(location: Location) -> Self {
+impl Tab {
+    fn unloaded(target: TabTarget) -> Self {
         Self {
-            location,
+            target,
             content: Content::Unloaded,
             _subscription: None,
         }
     }
 
+    /// The project tab of `location`.
+    fn location(&self) -> Option<&Location> {
+        self.target.project()
+    }
+
     fn dirty_count(&self, cx: &App) -> usize {
         match &self.content {
             Content::Workspace(workspace) => workspace.read(cx).dirty_count(cx),
+            Content::Workflow(view) => usize::from(view.read(cx).is_dirty(cx)),
             Content::Unloaded | Content::Connecting(_) => 0,
+        }
+    }
+
+    /// What the tab bar shows.
+    fn title(&self, cx: &App) -> String {
+        match (&self.target, &self.content) {
+            (_, Content::Workflow(view)) => view.read(cx).name(),
+            (TabTarget::Project(location), _) => tab_title(location),
+            (TabTarget::Workflow { workflow, .. }, _) => workflows::file_stem(workflow),
+        }
+    }
+
+    /// What the window title names.
+    fn subject(&self, cx: &App) -> String {
+        match &self.target {
+            TabTarget::Project(location) => location.to_string(),
+            TabTarget::Workflow { .. } => format!("{} (workflow)", self.title(cx)),
         }
     }
 }
@@ -164,7 +195,7 @@ struct OpenMenu {
 
 pub struct Shell {
     focus_handle: FocusHandle,
-    tabs: Vec<ProjectTab>,
+    tabs: Vec<Tab>,
     active: usize,
     menus: Rc<MenuBar>,
     menu: Option<OpenMenu>,
@@ -172,6 +203,7 @@ pub struct Shell {
     palette: Option<(Entity<CommandPalette>, Subscription, Option<FocusHandle>)>,
     picker: Option<(Entity<ProjectPicker>, Subscription)>,
     theme_picker: Option<(Entity<ThemePicker>, Subscription)>,
+    workflow_picker: Option<(Entity<WorkflowPicker>, Subscription)>,
     notice: Option<SharedString>,
     /// The theme last drawn, and what is wrong with it (dismissable).
     theme: Arc<Theme>,
@@ -181,7 +213,8 @@ pub struct Shell {
     /// Windows' icon font for the caption buttons (Segoe Fluent Icons on
     /// Windows 11, Segoe MDL2 Assets on 10; same code points).
     caption_font: SharedString,
-    /// The window's workflows (they open project tabs here).
+    /// The window's workflows (they open project tabs here; their tabs
+    /// show them).
     workflows: Entity<Workflows>,
     _activation: Subscription,
     _bounds: Subscription,
@@ -215,7 +248,7 @@ pub(crate) fn tab_title(location: &Location) -> String {
 pub fn open_window(location: Location, preload: Option<Preload>, cx: &mut App) {
     let bounds = default_bounds(cx);
     open_with(
-        vec![location.absolute()],
+        vec![TabTarget::Project(location.absolute())],
         0,
         bounds,
         preload.map(|preload| (0, preload)),
@@ -250,7 +283,17 @@ pub fn restore(state: AppState, mut preload: Option<Preload>, cx: &mut App) {
         } else {
             None
         };
-        let tabs = saved.tabs.into_iter().map(Location::absolute).collect();
+        let tabs = saved
+            .tabs
+            .into_iter()
+            .map(|tab| match tab {
+                TabTarget::Project(location) => TabTarget::Project(location.absolute()),
+                TabTarget::Workflow { workflow, project } => TabTarget::Workflow {
+                    workflow,
+                    project: project.map(Location::absolute),
+                },
+            })
+            .collect();
         handles.push(open_with(tabs, saved.active, bounds, preload, cx));
     }
     handles[focused]
@@ -272,19 +315,25 @@ fn default_bounds(cx: &App) -> WindowBounds {
     WindowBounds::Windowed(Bounds::centered(None, window_size, cx))
 }
 
-/// Opens a window with project `tabs`, `active` showing; `preload` is the
-/// head start for the tab at its index.
+/// Opens a window with `tabs`, `active` showing; `preload` is the head
+/// start for the tab at its index.
 fn open_with(
-    tabs: Vec<Location>,
+    tabs: Vec<TabTarget>,
     active: usize,
     bounds: WindowBounds,
     mut preload: Option<(usize, Preload)>,
     cx: &mut App,
 ) -> WindowHandle<Shell> {
+    let subject = tabs.get(active).map(|tab| match tab {
+        TabTarget::Project(location) => location.to_string(),
+        TabTarget::Workflow { workflow, .. } => {
+            format!("{} (workflow)", workflows::file_stem(workflow))
+        }
+    });
     let options = WindowOptions {
         window_bounds: Some(bounds),
         titlebar: Some(TitlebarOptions {
-            title: Some(window_title(tabs.get(active)).into()),
+            title: Some(window_title(subject.as_deref()).into()),
             appears_transparent: CUSTOM_TITLE_BAR,
             ..Default::default()
         }),
@@ -294,7 +343,7 @@ fn open_with(
         cx.new(|cx| {
             let mut shell = Shell::new(window, cx);
             // Only the active tab opens now; the others when first shown.
-            shell.tabs = tabs.into_iter().map(ProjectTab::unloaded).collect();
+            shell.tabs = tabs.into_iter().map(Tab::unloaded).collect();
             if !shell.tabs.is_empty() {
                 let active = active.min(shell.tabs.len() - 1);
                 let preload = preload
@@ -310,9 +359,9 @@ fn open_with(
     .expect("failed to open window")
 }
 
-fn window_title(location: Option<&Location>) -> String {
-    match location {
-        Some(location) => format!("{location} — next_code"),
+fn window_title(subject: Option<&str>) -> String {
+    match subject {
+        Some(subject) => format!("{subject} — next_code"),
         None => "next_code".into(),
     }
 }
@@ -379,6 +428,7 @@ impl Shell {
             palette: None,
             picker: None,
             theme_picker: None,
+            workflow_picker: None,
             notice: None,
             theme: theme::current(),
             theme_notice: theme::problem().map(Into::into),
@@ -404,7 +454,7 @@ impl Shell {
     /// Reports the window to the saved app state (see `app_state`).
     fn remember(&self, window: &Window, cx: &mut App) {
         let saved = SavedWindow {
-            tabs: self.tabs.iter().map(|tab| tab.location.clone()).collect(),
+            tabs: self.tabs.iter().map(|tab| tab.target.clone()).collect(),
             active: self.active,
             bounds: Some(SavedBounds::from(window.window_bounds())),
         };
@@ -421,9 +471,10 @@ impl Shell {
     }
 
     fn position_of(&self, location: &Location) -> Option<usize> {
-        self.tabs
-            .iter()
-            .position(|tab| tab.location.opens_same(location))
+        self.tabs.iter().position(|tab| {
+            tab.location()
+                .is_some_and(|tab_location| tab_location.opens_same(location))
+        })
     }
 
     fn dirty_count(&self, cx: &App) -> usize {
@@ -455,13 +506,15 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.tabs.push(ProjectTab::unloaded(location));
+        self.tabs.push(Tab::unloaded(TabTarget::Project(location)));
         let index = self.tabs.len() - 1;
         self.load(index, preload, window, cx);
         self.activate(index, window, cx);
     }
 
-    /// Opens the project of tab `index` (`preload` is its head start).
+    /// Opens what tab `index` shows (`preload` is a project's head start).
+    /// A workflow tab stays unloaded while its remote project opens, or
+    /// when its file cannot be read (a notice says why).
     fn load(
         &mut self,
         index: usize,
@@ -469,8 +522,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let content = match self.tabs[index].location.clone() {
-            Location::Local(root) => {
+        let content = match self.tabs[index].target.clone() {
+            TabTarget::Project(Location::Local(root)) => {
                 let git = match preload {
                     Some(Preload::Local(git)) => Some(git),
                     _ => None,
@@ -479,18 +532,65 @@ impl Shell {
                     cx.new(|cx| Workspace::new(Project::local(root), git, window, cx)),
                 )
             }
-            remote => {
+            TabTarget::Project(remote) => {
                 let pending = match preload {
                     Some(Preload::Remote(pending)) => Some(pending),
                     _ => None,
                 };
                 Content::Connecting(cx.new(|cx| Connecting::new(remote, pending, window, cx)))
             }
+            TabTarget::Workflow { workflow, project } => {
+                match self.workflow_view(&workflow, project.as_ref(), window, cx) {
+                    Ok(Some(view)) => Content::Workflow(view),
+                    Ok(None) => return,
+                    Err(error) => {
+                        self.notice = Some(error.into());
+                        return cx.notify();
+                    }
+                }
+            }
         };
         let subscription = self.subscribe(&content, window, cx);
         let tab = &mut self.tabs[index];
         tab.content = content;
         tab._subscription = subscription;
+    }
+
+    /// The view of a workflow file: a user one (`project: None`) read from
+    /// disk, a project one through its project (`Ok(None)` while a remote
+    /// project still opens, in a background tab).
+    fn workflow_view(
+        &mut self,
+        path: &std::path::Path,
+        project: Option<&Location>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<Entity<WorkflowView>>, String> {
+        let (source, file_project) = match project {
+            None => {
+                let dir = path.parent().map(std::path::Path::to_path_buf);
+                (Source::User, Project::local(dir.unwrap_or_default()))
+            }
+            Some(location) => {
+                let opened = match (self.workspace_at(location), location) {
+                    (Some((_, workspace)), _) => workspace.read(cx).project().clone(),
+                    (None, Location::Local(root)) => Project::local(root.clone()),
+                    (None, _) => match self.workflow_project(location, window, cx)? {
+                        Some(project) => project,
+                        None => return Ok(None),
+                    },
+                };
+                (Source::Project(location.clone()), opened)
+            }
+        };
+        let text = file_project
+            .read_text(path)
+            .map_err(|err| format!("Cannot open {}: {err}", path.display()))?;
+        let workflows = self.workflows.clone();
+        let path = path.to_path_buf();
+        Ok(Some(cx.new(|cx| {
+            WorkflowView::new(workflows, source, path, file_project, &text, window, cx)
+        })))
     }
 
     fn subscribe(
@@ -513,6 +613,8 @@ impl Shell {
         }
         Some(match content {
             Content::Unloaded => return None,
+            // The tab bar shows its name and state.
+            Content::Workflow(view) => cx.observe(view, |_, _, cx| cx.notify()),
             Content::Connecting(connecting) => cx.subscribe_in(
                 connecting,
                 window,
@@ -567,13 +669,19 @@ impl Shell {
         let focused = window.focused(cx);
         let content = Content::Workspace(cx.new(|cx| Workspace::new(project, None, window, cx)));
         let subscription = self.subscribe(&content, window, cx);
-        self.tabs[index] = ProjectTab {
-            location,
+        self.tabs[index] = Tab {
+            target: TabTarget::Project(location.clone()),
             content,
             _subscription: subscription,
         };
-        if index == self.active {
-            self.activate(index, window, cx);
+        // The active tab may be a workflow of that project, waiting for it.
+        let waiting = self.tabs.get(self.active).is_some_and(|tab| {
+            matches!(tab.content, Content::Unloaded)
+                && matches!(&tab.target, TabTarget::Workflow { project: Some(of), .. }
+                    if of.opens_same(&location))
+        });
+        if index == self.active || waiting {
+            self.activate(self.active, window, cx);
         } else if let Some(focused) = focused {
             window.focus(&focused);
         }
@@ -588,19 +696,20 @@ impl Shell {
             self.load(index, None, window, cx);
         }
         let tab = &self.tabs[index];
-        window.set_window_title(&window_title(Some(&tab.location)));
+        window.set_window_title(&window_title(Some(&tab.subject(cx))));
         match &tab.content {
             Content::Workspace(workspace) => workspace.update(cx, |workspace, cx| {
                 workspace.refresh_git_status(cx);
                 workspace.focus_active(window, cx);
             }),
+            Content::Workflow(view) => window.focus(&view.focus_handle(cx)),
             Content::Unloaded | Content::Connecting(_) => window.focus(&self.focus_handle),
         }
         self.remember(window, cx);
         cx.notify();
     }
 
-    /// Closes a project tab, asking first if it has unsaved changes.
+    /// Closes a tab, asking first if it has unsaved changes.
     fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(index) else {
             return;
@@ -612,7 +721,7 @@ impl Shell {
         let id = tab.content.id();
         let message = format!(
             "{} has {dirty} file(s) with unsaved changes. Close it anyway?",
-            tab_title(&tab.location)
+            tab.title(cx)
         );
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -844,8 +953,8 @@ impl Shell {
     /// Opens a config file: in the active project when it is local, else
     /// with the system's editor.
     fn open_config(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ProjectTab {
-            location: Location::Local(_),
+        if let Some(Tab {
+            target: TabTarget::Project(Location::Local(_)),
             content: Content::Workspace(workspace),
             ..
         }) = self.tabs.get(self.active)
@@ -973,32 +1082,47 @@ impl Shell {
             .detach();
     }
 
-    /// Run Workflow: <name> (palette): starts it and shows the Workflows
-    /// panel.
-    fn run_workflow(&mut self, action: &RunWorkflow, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ProjectTab {
-            content: Content::Workspace(workspace),
-            ..
-        }) = self.tabs.get(self.active)
-        {
-            workspace.update(cx, |workspace, cx| workspace.show_workflows(cx));
+    /// Run Workflow: <name> (palette): opens its tab and runs it.
+    fn run_workflow(&mut self, action: &RunWorkflow, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(found) = self.workflows.read(cx).find(&action.id).cloned() else {
+            self.notice = Some(format!("No workflow `{}`", action.id).into());
+            return cx.notify();
+        };
+        if let Some(view) = self.open_workflow(&found.source, &found.path, window, cx) {
+            view.update(cx, |view, cx| view.run_all(cx));
         }
-        let started = self.workflows.update(cx, |workflows, cx| {
-            workflows.run_workflow(action.id.clone(), cx)
-        });
-        cx.spawn(async move |this, cx| {
-            if let Err(err) = started.await {
-                this.update(cx, |this, cx| {
-                    this.notice = Some(err.into());
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
     }
 
-    /// New Workflow…: a commented template in the user's workflows folder.
+    /// Open Workflow…: a picker over the workflows found (user and open
+    /// projects' ones).
+    fn open_workflow_picker(
+        &mut self,
+        _: &OpenWorkflow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = None;
+        let previous = window.focused(cx);
+        let workflows = self.workflows.clone();
+        let picker = cx.new(|cx| WorkflowPicker::new(workflows, cx));
+        let subscription = cx.subscribe_in(&picker, window, move |this, _, event, window, cx| {
+            this.workflow_picker = None;
+            match &previous {
+                Some(focus) => window.focus(focus),
+                None => window.focus(&this.focus_handle),
+            }
+            if let WorkflowPickerEvent::Open { source, path } = event {
+                this.open_workflow(source, path, window, cx);
+            }
+            cx.notify();
+        });
+        window.focus(&picker.focus_handle(cx));
+        self.workflow_picker = Some((picker, subscription));
+        cx.notify();
+    }
+
+    /// New Workflow…: a commented template in the user's workflows folder,
+    /// opened in its tab.
     fn new_workflow(&mut self, _: &NewWorkflow, window: &mut Window, cx: &mut Context<Self>) {
         let created = self
             .workflows
@@ -1008,7 +1132,7 @@ impl Shell {
             .and_then(workflows::create_template);
         match created {
             Ok(path) => {
-                self.open_config(path, window, cx);
+                self.open_workflow(&Source::User, &path, window, cx);
                 self.workflows
                     .update(cx, |workflows, cx| workflows.refresh(cx).detach());
             }
@@ -1016,6 +1140,52 @@ impl Shell {
                 self.notice = Some(format!("Could not create a workflow file: {err}").into());
                 cx.notify();
             }
+        }
+    }
+
+    /// Shows the tab of workflow file `path` (from `source`), opening one
+    /// if this window has none. `None` when the file cannot be read (a
+    /// notice says why) or its remote project is still opening.
+    pub(crate) fn open_workflow(
+        &mut self,
+        source: &Source,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<WorkflowView>> {
+        let project = match source {
+            Source::User => None,
+            Source::Project(location) => Some(location.clone()),
+        };
+        let target = TabTarget::Workflow {
+            workflow: path.to_path_buf(),
+            project: project.clone(),
+        };
+        let index = match self.tabs.iter().position(|tab| tab.target == target) {
+            Some(index) => index,
+            None => {
+                let content = match self.workflow_view(path, project.as_ref(), window, cx) {
+                    Ok(Some(view)) => Content::Workflow(view),
+                    Ok(None) => Content::Unloaded,
+                    Err(error) => {
+                        self.notice = Some(error.into());
+                        cx.notify();
+                        return None;
+                    }
+                };
+                let subscription = self.subscribe(&content, window, cx);
+                self.tabs.push(Tab {
+                    target,
+                    content,
+                    _subscription: subscription,
+                });
+                self.tabs.len() - 1
+            }
+        };
+        self.activate(index, window, cx);
+        match &self.tabs[index].content {
+            Content::Workflow(view) => Some(view.clone()),
+            _ => None,
         }
     }
 
@@ -1037,7 +1207,8 @@ impl Shell {
                 {
                     return Err(format!("{} is not a folder", root.display()));
                 }
-                self.tabs.push(ProjectTab::unloaded(location.clone()));
+                self.tabs
+                    .push(Tab::unloaded(TabTarget::Project(location.clone())));
                 let index = self.tabs.len() - 1;
                 if self.tabs.len() == 1 {
                     self.activate(index, window, cx);
@@ -1063,7 +1234,7 @@ impl Shell {
                 Some(error) => Err(error.to_string()),
                 None => Ok(None),
             },
-            Content::Unloaded => Ok(None),
+            Content::Unloaded | Content::Workflow(_) => Ok(None),
         }
     }
 
@@ -1072,9 +1243,10 @@ impl Shell {
         self.tabs
             .iter()
             .filter_map(|tab| match &tab.content {
-                Content::Workspace(workspace) => {
-                    Some((tab.location.clone(), workspace.read(cx).project().clone()))
-                }
+                Content::Workspace(workspace) => Some((
+                    tab.location()?.clone(),
+                    workspace.read(cx).project().clone(),
+                )),
                 _ => None,
             })
             .collect()
@@ -1128,26 +1300,6 @@ impl Shell {
         });
     }
 
-    /// Opens a workflow file: a user one like the settings, a project one
-    /// in its project tab.
-    pub(crate) fn workflow_open_file(
-        &mut self,
-        source: &workflows::Source,
-        path: &std::path::Path,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match source {
-            workflows::Source::User => self.open_config(path.to_path_buf(), window, cx),
-            workflows::Source::Project(location) => {
-                if let Some((index, workspace)) = self.workspace_at(location) {
-                    self.activate(index, window, cx);
-                    workspace.update(cx, |workspace, cx| workspace.open(path, window, cx));
-                }
-            }
-        }
-    }
-
     /// The workspaces of loaded tabs, in tab order (tests).
     #[cfg(test)]
     pub(crate) fn workspace_entities(&self) -> Vec<Entity<Workspace>> {
@@ -1158,6 +1310,21 @@ impl Shell {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Tab titles (workflow tabs marked with their icon) and the active tab
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn tab_summary(&self, cx: &App) -> (Vec<String>, usize) {
+        let titles = self
+            .tabs
+            .iter()
+            .map(|tab| match tab.target {
+                TabTarget::Project(_) => tab.title(cx),
+                TabTarget::Workflow { .. } => format!("{} {}", workflows::TAB_ICON, tab.title(cx)),
+            })
+            .collect();
+        (titles, self.active)
     }
 
     /// Opens menu `index`, resolving its rows for where focus is now.
@@ -1631,7 +1798,6 @@ impl Shell {
             .text_sm()
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let active = index == self.active;
-                let connecting = matches!(tab.content, Content::Connecting(_));
                 div()
                     .id(("project-tab", index))
                     .flex()
@@ -1654,10 +1820,27 @@ impl Shell {
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
                     )
-                    .child(if connecting {
-                        format!("{} …", tab_title(&tab.location))
-                    } else {
-                        tab_title(&tab.location)
+                    .children(match &tab.target {
+                        TabTarget::Project(_) => None,
+                        TabTarget::Workflow { .. } => {
+                            let color = match &tab.content {
+                                Content::Workflow(view) => {
+                                    workflows::outcome_color(view.read(cx).outcome(cx))
+                                }
+                                _ => theme::muted(),
+                            };
+                            Some(div().text_color(color).child(workflows::TAB_ICON))
+                        }
+                    })
+                    .child(match (&tab.content, &tab.target) {
+                        (Content::Connecting(_), _)
+                        | (Content::Unloaded, TabTarget::Workflow { .. }) => {
+                            format!("{} …", tab.title(cx))
+                        }
+                        _ => tab.title(cx),
+                    })
+                    .when(tab.dirty_count(cx) > 0 && tab.location().is_none(), |row| {
+                        row.child(div().text_xs().text_color(theme::muted()).child("●"))
                     })
                     .child(
                         div()
@@ -1873,11 +2056,22 @@ impl Render for Shell {
             self.theme_notice = theme::problem().map(Into::into);
         }
         let content = match self.tabs.get(self.active) {
-            // The active tab is loaded (see `activate`).
-            Some(tab) => tab
-                .content
-                .view()
-                .map_or_else(|| div().into_any_element(), AnyView::into_any_element),
+            // The active tab is loaded (see `activate`), or a workflow tab
+            // waits for its project.
+            Some(tab) => match tab.content.view() {
+                Some(view) => view.into_any_element(),
+                None => div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme::muted())
+                    .child(match tab.target {
+                        TabTarget::Workflow { .. } => "Opening the workflow's project…",
+                        TabTarget::Project(_) => "",
+                    })
+                    .into_any_element(),
+            },
             None => self.render_welcome(window, cx).into_any_element(),
         };
         let modal = |view: AnyView| {
@@ -1909,6 +2103,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::run_workflow))
             .on_action(cx.listener(Self::new_workflow))
+            .on_action(cx.listener(Self::open_workflow_picker))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if this.menu.is_some() && event.keystroke.key == "escape" {
                     this.close_menu(cx);
@@ -1995,6 +2190,11 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(picker, _)| modal(picker.clone().into())),
             )
+            .children(
+                self.workflow_picker
+                    .as_ref()
+                    .map(|(picker, _)| modal(picker.clone().into())),
+            )
     }
 }
 
@@ -2042,29 +2242,28 @@ mod tests {
         cx.windows()[0].downcast::<Shell>().unwrap()
     }
 
-    /// Tab titles and the active tab.
+    /// Tab titles (workflow tabs marked with their icon) and the active tab.
     fn tabs(
         window: gpui::WindowHandle<Shell>,
         cx: &mut gpui::TestAppContext,
     ) -> (Vec<String>, usize) {
         window
-            .read_with(cx, |shell, _| {
-                let titles = shell
-                    .tabs
-                    .iter()
-                    .map(|tab| tab_title(&tab.location))
-                    .collect();
-                (titles, shell.active)
-            })
+            .read_with(cx, |shell, cx| shell.tab_summary(cx))
             .unwrap()
     }
 
     /// Each saved window's tab titles and active tab.
     fn saved(state: &AppState) -> Vec<(Vec<String>, usize)> {
+        let title = |tab: &TabTarget| match tab {
+            TabTarget::Project(location) => tab_title(location),
+            TabTarget::Workflow { workflow, .. } => {
+                format!("{} {}", workflows::TAB_ICON, workflows::file_stem(workflow))
+            }
+        };
         state
             .windows
             .iter()
-            .map(|window| (window.tabs.iter().map(tab_title).collect(), window.active))
+            .map(|window| (window.tabs.iter().map(title).collect(), window.active))
             .collect()
     }
 
@@ -2223,7 +2422,9 @@ mod tests {
                     .read_with(cx, |shell, cx| match &shell.tabs[tab].content {
                         Content::Workspace(workspace) => Some(workspace.read(cx).tab_paths()),
                         Content::Unloaded => None,
-                        Content::Connecting(_) => panic!("local projects open at once"),
+                        Content::Connecting(_) | Content::Workflow(_) => {
+                            panic!("local projects open at once")
+                        }
                     })
                     .unwrap()
             };

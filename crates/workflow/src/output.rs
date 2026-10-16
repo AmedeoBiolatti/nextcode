@@ -2,7 +2,7 @@
 //! chunk boundaries, readiness regexes matched as output arrives, the last
 //! line for display, and the URLs printed (each reported once).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use regex::Regex;
 use terminal::{LinkTarget, find_links};
@@ -11,6 +11,8 @@ use terminal::{LinkTarget, find_links};
 const WINDOW: usize = 8 * 1024;
 /// Longest line kept for URL detection and display.
 const MAX_LINE: usize = 4 * 1024;
+/// Complete lines kept for display.
+const RECENT_LINES: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Escape {
@@ -122,8 +124,8 @@ pub struct OutputWatcher {
     window: String,
     /// The line being printed.
     line: String,
-    /// The last non-empty complete line.
-    last_line: String,
+    /// The last non-empty complete lines, oldest first.
+    recent: VecDeque<String>,
     urls: HashSet<String>,
 }
 
@@ -136,7 +138,7 @@ impl OutputWatcher {
             matched: false,
             window: String::new(),
             line: String::new(),
-            last_line: String::new(),
+            recent: VecDeque::new(),
             urls: HashSet::new(),
         }
     }
@@ -175,7 +177,10 @@ impl OutputWatcher {
                 // in a terminal) prints `logout` as it exits: not the
                 // command's output.
                 if !line.trim().is_empty() && line.trim() != "logout" {
-                    self.last_line = line;
+                    if self.recent.len() == RECENT_LINES {
+                        self.recent.pop_front();
+                    }
+                    self.recent.push_back(line);
                 }
             }
             if self.line.len() < MAX_LINE {
@@ -187,12 +192,23 @@ impl OutputWatcher {
 
     /// The line being printed if it has text, else the last complete one.
     pub fn last_line(&self) -> &str {
+        self.last_lines(1).pop().unwrap_or_default()
+    }
+
+    /// Up to `count` last lines (the one being printed included when it
+    /// has text), oldest first, trimmed.
+    pub fn last_lines(&self, count: usize) -> Vec<&str> {
         let current = self.line.trim();
-        if current.is_empty() || current == "logout" {
-            self.last_line.trim()
-        } else {
-            current
-        }
+        let current = (!current.is_empty() && current != "logout").then_some(current);
+        let complete = count.saturating_sub(usize::from(current.is_some()));
+        let mut lines: Vec<&str> = self
+            .recent
+            .iter()
+            .skip(self.recent.len().saturating_sub(complete))
+            .map(|line| line.trim())
+            .collect();
+        lines.extend(current);
+        lines
     }
 }
 
@@ -292,5 +308,17 @@ mod tests {
         assert_eq!(watcher.last_line(), "all up");
         watcher.push(b"\r\n");
         assert_eq!(watcher.last_line(), "all up");
+    }
+
+    #[test]
+    fn the_last_lines_include_the_one_being_printed() {
+        let mut watcher = OutputWatcher::new(None);
+        assert_eq!(watcher.last_lines(3), Vec::<&str>::new());
+        watcher.push(b"1\n2\n\n3\n4\n5\n6\n7\npartial");
+        assert_eq!(watcher.last_lines(3), ["6", "7", "partial"]);
+        watcher.push(b"\n");
+        assert_eq!(watcher.last_lines(3), ["6", "7", "partial"]);
+        assert_eq!(watcher.last_lines(99).len(), RECENT_LINES);
+        assert_eq!(watcher.last_line(), "partial");
     }
 }

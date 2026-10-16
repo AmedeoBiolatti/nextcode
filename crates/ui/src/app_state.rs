@@ -1,13 +1,13 @@
-//! The open windows (their project tabs, active tab, bounds and which one
-//! had focus), kept as `windows.json` in the local data dir next to
+//! The open windows (their tabs, active tab, bounds and which one had
+//! focus), kept as `windows.json` in the local data dir next to
 //! `recent.json` so a launch without a project reopens them, as VS Code's
 //! `window.restoreWindows: all` does.
 //!
 //! Every window reports itself (`update`) when its tabs, active tab or
 //! bounds change; the file follows 500 ms later. Closing a window while
 //! others remain drops it; closing the last one (which quits) and quitting
-//! keep every window open at that moment. A window without projects is
-//! kept only when it is the only one.
+//! keep every window open at that moment. A window without tabs is kept
+//! only when it is the only one.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -32,12 +32,36 @@ pub struct AppState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedWindow {
-    /// Project tabs, as `recent.json` stores locations.
-    pub tabs: Vec<Location>,
+    /// Project tabs as `recent.json` stores locations, and workflow tabs.
+    pub tabs: Vec<TabTarget>,
     #[serde(default)]
     pub active: usize,
     #[serde(default)]
     pub bounds: Option<SavedBounds>,
+}
+
+/// What a window tab shows: a project, or a workflow file (`project`: the
+/// project whose `.next_code/workflows` holds it; `None` for the user's
+/// workflows folder). Files from before workflow tabs list bare
+/// locations, which still read as project tabs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TabTarget {
+    Workflow {
+        workflow: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<Location>,
+    },
+    Project(Location),
+}
+
+impl TabTarget {
+    pub fn project(&self) -> Option<&Location> {
+        match self {
+            Self::Project(location) => Some(location),
+            Self::Workflow { .. } => None,
+        }
+    }
 }
 
 /// Logical pixels in screen coordinates; for a maximized or fullscreen
@@ -133,8 +157,9 @@ impl SavedBounds {
 }
 
 impl AppState {
-    /// Without project folders that no longer exist, and without windows
-    /// left with no tabs by that; `active` and `focused` in range.
+    /// Without project folders and local workflow files that no longer
+    /// exist, and without windows left with no tabs by that; `active` and
+    /// `focused` in range.
     fn existing(self) -> Self {
         fn exists(location: &Location) -> bool {
             match location {
@@ -143,12 +168,21 @@ impl AppState {
                 Location::Wsl { .. } => true,
             }
         }
+        fn tab_exists(tab: &TabTarget) -> bool {
+            match tab {
+                TabTarget::Project(location) => exists(location),
+                TabTarget::Workflow { workflow, project } => match project {
+                    None | Some(Location::Local(_)) => workflow.is_file(),
+                    Some(location) => exists(location),
+                },
+            }
+        }
         let mut focused = 0;
         let mut windows = Vec::new();
         for (index, mut window) in self.windows.into_iter().enumerate() {
             let had_tabs = !window.tabs.is_empty();
             let active = window.tabs.get(window.active).cloned();
-            window.tabs.retain(exists);
+            window.tabs.retain(tab_exists);
             if had_tabs && window.tabs.is_empty() {
                 continue;
             }
@@ -163,10 +197,10 @@ impl AppState {
         Self { windows, focused }
     }
 
-    /// The tab that will show in the focused window.
+    /// The project tab that will show in the focused window.
     pub fn focused_tab(&self) -> Option<&Location> {
         let window = self.windows.get(self.focused)?;
-        window.tabs.get(window.active)
+        window.tabs.get(window.active)?.project()
     }
 }
 
@@ -333,14 +367,25 @@ mod tests {
             windows: vec![
                 SavedWindow {
                     tabs: vec![
-                        Location::Local(PathBuf::from("/src/a")),
-                        Location::Wsl {
+                        TabTarget::Project(Location::Local(PathBuf::from("/src/a"))),
+                        TabTarget::Project(Location::Wsl {
                             distro: "Ubuntu".into(),
                             path: "/home/me/b".into(),
-                        },
-                        Location::DevContainer {
+                        }),
+                        TabTarget::Project(Location::DevContainer {
                             folder: Box::new(Location::Local(PathBuf::from("/src/c"))),
                             config: None,
+                        }),
+                        TabTarget::Workflow {
+                            workflow: PathBuf::from("/cfg/workflows/dev.jsonc"),
+                            project: None,
+                        },
+                        TabTarget::Workflow {
+                            workflow: PathBuf::from("/home/me/b/.next_code/workflows/w.json"),
+                            project: Some(Location::Wsl {
+                                distro: "Ubuntu".into(),
+                                path: "/home/me/b".into(),
+                            }),
                         },
                     ],
                     active: 1,
@@ -366,31 +411,58 @@ mod tests {
         let minimal: AppState =
             serde_json::from_str(r#"{ "windows": [ { "tabs": [ { "Local": "/src/a" } ] } ] }"#)
                 .unwrap();
+        assert_eq!(
+            minimal.windows[0].tabs,
+            [TabTarget::Project(Location::Local(PathBuf::from("/src/a")))]
+        );
+        assert!(
+            json.contains(r#""workflow": "/cfg/workflows/dev.jsonc""#),
+            "{json}"
+        );
         assert_eq!(minimal.focused, 0);
         assert_eq!(minimal.windows[0].active, 0);
         assert_eq!(minimal.windows[0].bounds, None);
     }
 
     #[test]
-    fn folders_that_are_gone_are_not_reopened() {
+    fn folders_and_workflow_files_that_are_gone_are_not_reopened() {
         let root = std::env::temp_dir().join(format!("nc-app-state-{}", std::process::id()));
         std::fs::create_dir_all(root.join("kept")).unwrap();
+        std::fs::write(root.join("dev.jsonc"), "{}").unwrap();
         let kept = local(&root.join("kept"));
         let gone = local(&root.join("gone"));
         let wsl = Location::Wsl {
             distro: "Ubuntu".into(),
             path: "/p".into(),
         };
-        let window = |tabs: Vec<Location>, active| SavedWindow {
+        let project = |location: &Location| TabTarget::Project(location.clone());
+        let workflow = |name: &str, project: Option<Location>| TabTarget::Workflow {
+            workflow: root.join(name),
+            project,
+        };
+        let window = |tabs: Vec<TabTarget>, active| SavedWindow {
             tabs,
             active,
             bounds: None,
         };
+        let remote_workflow = TabTarget::Workflow {
+            workflow: PathBuf::from("/p/.next_code/workflows/w.json"),
+            project: Some(wsl.clone()),
+        };
         let state = AppState {
             windows: vec![
-                window(vec![gone.clone()], 0),
-                window(vec![gone.clone(), wsl.clone(), kept.clone()], 2),
-                window(vec![kept.clone(), gone.clone()], 1),
+                window(vec![project(&gone), workflow("gone.json", None)], 0),
+                window(
+                    vec![
+                        project(&gone),
+                        project(&wsl),
+                        workflow("dev.jsonc", None),
+                        project(&kept),
+                        remote_workflow.clone(),
+                    ],
+                    3,
+                ),
+                window(vec![project(&kept), project(&gone)], 1),
             ],
             focused: 1,
         }
@@ -399,9 +471,17 @@ mod tests {
             state,
             AppState {
                 windows: vec![
-                    window(vec![wsl.clone(), kept.clone()], 1),
+                    window(
+                        vec![
+                            project(&wsl),
+                            workflow("dev.jsonc", None),
+                            project(&kept),
+                            remote_workflow,
+                        ],
+                        2
+                    ),
                     // The active tab is gone: the first one shows.
-                    window(vec![kept.clone()], 0),
+                    window(vec![project(&kept)], 0),
                 ],
                 focused: 0,
             }
@@ -476,7 +556,7 @@ mod tests {
         let mut tracker = Tracker::default();
         let project = local(std::path::Path::new("/src/a"));
         let window = |tabs: Vec<Location>| SavedWindow {
-            tabs,
+            tabs: tabs.into_iter().map(TabTarget::Project).collect(),
             active: 0,
             bounds: None,
         };

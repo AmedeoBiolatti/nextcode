@@ -7,9 +7,14 @@
 //! commands in their Terminal panels, open URLs) and feeds back output,
 //! exits, check results and listening ports.
 //!
+//! Each workflow file opens as a window tab, a [`WorkflowView`]: the file
+//! in an editor beside a live graph of its steps (`view`), with Run All,
+//! Stop All and per-step actions. Run > Open Workflow… picks one
+//! ([`WorkflowPicker`]).
+//!
 //! Commands: `run` steps start in a terminal tab of their project (named
 //! by `terminal`, else the title); without a project they run on this
-//! machine in a terminal the Workflows panel shows. Checks are plain
+//! machine in a terminal the workflow's tab shows. Checks are plain
 //! processes. See `commands` for the shells used.
 
 use std::{
@@ -21,8 +26,8 @@ use std::{
 
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    AnyWindowHandle, App, AppContext, Context, Entity, EventEmitter, Global, Window, WindowId,
-    actions,
+    AnyWindowHandle, App, AppContext, Context, Entity, EventEmitter, Global, Hsla, KeyBinding,
+    Window, WindowId, actions,
 };
 use terminal::{Output, OutputTap};
 use workflow::{Effect, Outcome, ProjectSpec, Run, Status, Workflow};
@@ -31,14 +36,20 @@ use crate::{
     project::{Location, Project},
     shell::Shell,
     terminal_panel::{self, TerminalView},
+    theme,
 };
 
 mod commands;
-mod panel;
+mod picker;
+mod view;
 
-pub use panel::WorkflowsPanel;
+pub use picker::{WorkflowPicker, WorkflowPickerEvent};
+pub use view::WorkflowView;
 
-actions!(workflows, [ShowWorkflows, NewWorkflow]);
+actions!(
+    workflows,
+    [OpenWorkflow, NewWorkflow, RunAll, StopAll, RetryFailed]
+);
 
 /// "Run Workflow: <name>" in the command palette.
 #[derive(Clone, PartialEq, Debug, gpui::Action)]
@@ -47,6 +58,19 @@ pub struct RunWorkflow {
     /// [`Discovered::id`].
     pub id: String,
 }
+
+pub fn bind_keys(cx: &mut App) {
+    let ctx = Some(view::CONTEXT);
+    cx.bind_keys([
+        // JetBrains' Run and Stop.
+        KeyBinding::new("shift-f10", RunAll, ctx),
+        KeyBinding::new("ctrl-f2", StopAll, ctx),
+    ]);
+    picker::bind_keys(cx);
+}
+
+/// Marks workflow tabs in the tab bar.
+pub const TAB_ICON: &str = "◈";
 
 /// Where workflows live inside a project.
 const PROJECT_DIR: &str = ".next_code/workflows";
@@ -78,6 +102,46 @@ impl Source {
     }
 }
 
+/// A workflow's id ([`Discovered::id`]): the file path, prefixed by the
+/// project for project files. Runs are keyed by it.
+pub fn workflow_id(source: &Source, path: &Path) -> String {
+    match source {
+        Source::User => path.to_string_lossy().into_owned(),
+        Source::Project(location) => format!("{location}|{}", path.display()),
+    }
+}
+
+/// A workflow file's name without `.json`/`.jsonc` (a workflow without
+/// `name` is called that).
+pub fn file_stem(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default()
+        .trim_end_matches(".jsonc")
+        .trim_end_matches(".json")
+        .to_owned()
+}
+
+/// What a workflow's state is called in its tab.
+pub fn outcome_text(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Idle => "Idle",
+        Outcome::Running => "Running",
+        Outcome::Ready => "All ready",
+        Outcome::Failed => "Failed",
+        Outcome::Stopped => "Stopped",
+    }
+}
+
+pub fn outcome_color(outcome: Outcome) -> Hsla {
+    match outcome {
+        Outcome::Idle | Outcome::Stopped => theme::muted(),
+        Outcome::Running => theme::accent(),
+        Outcome::Ready => theme::git_added(),
+        Outcome::Failed => theme::error(),
+    }
+}
+
 /// A workflow file and what parsing it gave.
 #[derive(Debug, Clone)]
 pub struct Discovered {
@@ -95,14 +159,8 @@ pub struct Discovered {
 fn discover(user_dir: Option<&Path>, projects: &[(Location, Project)]) -> Vec<Discovered> {
     let mut found = Vec::new();
     let is_workflow = |name: &str| name.ends_with(".json") || name.ends_with(".jsonc");
-    let mut add = |id: String, path: PathBuf, source: Source, text: std::io::Result<String>| {
-        let stem = path
-            .file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_default()
-            .trim_end_matches(".jsonc")
-            .trim_end_matches(".json")
-            .to_owned();
+    let mut add = |path: PathBuf, source: Source, text: std::io::Result<String>| {
+        let stem = file_stem(&path);
         let parsed = text
             .map_err(|err| format!("cannot read the file: {err}"))
             .and_then(|text| workflow::parse(&text, &stem))
@@ -111,7 +169,7 @@ fn discover(user_dir: Option<&Path>, projects: &[(Location, Project)]) -> Vec<Di
             .as_ref()
             .map_or(stem, |workflow| workflow.name.clone());
         found.push(Discovered {
-            id,
+            id: workflow_id(&source, &path),
             path,
             source,
             name,
@@ -129,12 +187,7 @@ fn discover(user_dir: Option<&Path>, projects: &[(Location, Project)]) -> Vec<Di
         paths.sort();
         for path in paths {
             let text = std::fs::read_to_string(&path);
-            add(
-                path.to_string_lossy().into_owned(),
-                path,
-                Source::User,
-                text,
-            );
+            add(path, Source::User, text);
         }
     }
     for (location, project) in projects {
@@ -169,8 +222,7 @@ fn discover(user_dir: Option<&Path>, projects: &[(Location, Project)]) -> Vec<Di
             let dir = project.join(&project.join(project.root(), ".next_code"), "workflows");
             let path = project.join(&dir, &name);
             let text = project.read_text(&path);
-            let id = format!("{location}|{}", path.display());
-            add(id, path, Source::Project(location.clone()), text);
+            add(path, Source::Project(location.clone()), text);
         }
     }
     found
@@ -200,8 +252,6 @@ pub(crate) trait Host {
     /// Shows a step's terminal in its project.
     fn show(&mut self, location: &Location, view: &Entity<TerminalView>, cx: &mut App);
     fn open_url(&mut self, url: &str, cx: &mut App);
-    /// Opens a workflow file for editing.
-    fn open_file(&mut self, source: &Source, path: &Path, cx: &mut App);
 }
 
 /// What a workflow step's project spec names.
@@ -440,21 +490,6 @@ impl Workflows {
         })
     }
 
-    /// Run All: re-reads the files, then starts workflow `id` afresh (a
-    /// run of it already going is stopped first).
-    pub fn run_workflow(
-        &mut self,
-        id: String,
-        cx: &mut Context<Self>,
-    ) -> gpui::Task<Result<u64, String>> {
-        let refresh = self.refresh(cx);
-        cx.spawn(async move |this, cx| {
-            refresh.await;
-            this.update(cx, |this, cx| this.start(&id, cx))
-                .map_err(|_| "the window closed".to_owned())?
-        })
-    }
-
     /// Starts workflow `id` as last read.
     pub fn start(&mut self, id: &str, cx: &mut Context<Self>) -> Result<u64, String> {
         let found = self
@@ -464,9 +499,24 @@ impl Workflows {
         let workflow = found
             .parsed
             .map_err(|err| format!("{} cannot run: {err}", found.name))?;
+        Ok(self.start_parsed(found.id, workflow, cx))
+    }
+
+    /// Starts `workflow` afresh as the workflow with id `workflow_id` (see
+    /// [`workflow_id`]); a run of it already going is stopped first and
+    /// its terminals reused.
+    pub fn start_parsed(
+        &mut self,
+        workflow_id: String,
+        workflow: Arc<Workflow>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         let now = Instant::now();
         // The previous run's terminals are reused (replaced by title).
-        let previous = self.runs.iter().position(|run| run.workflow_id == id);
+        let previous = self
+            .runs
+            .iter()
+            .position(|run| run.workflow_id == workflow_id);
         let mut steps: Vec<StepRuntime> =
             workflow.steps.iter().map(|_| Default::default()).collect();
         if let Some(index) = previous {
@@ -489,14 +539,14 @@ impl Workflows {
         run.start(now);
         self.runs.push(ActiveRun {
             id: id_number,
-            workflow_id: found.id.clone(),
+            workflow_id,
             run,
             steps,
             reported: Outcome::Idle,
         });
         self.schedule(cx);
         cx.notify();
-        Ok(id_number)
+        id_number
     }
 
     fn run_mut(&mut self, id: u64) -> Option<&mut ActiveRun> {
@@ -565,20 +615,6 @@ impl Workflows {
         cx.spawn(async move |this, cx| {
             this.update(cx, |this, cx| this.host.show(&location, &view, cx))
                 .ok();
-        })
-        .detach();
-    }
-
-    /// Opens workflow `id`'s file for editing.
-    pub fn open_file(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(found) = self.find(id).cloned() else {
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            this.update(cx, |this, cx| {
-                this.host.open_file(&found.source, &found.path, cx)
-            })
-            .ok();
         })
         .detach();
     }
@@ -990,13 +1026,6 @@ impl Host for WindowHost {
 
     fn open_url(&mut self, url: &str, cx: &mut App) {
         cx.open_url(url);
-    }
-
-    fn open_file(&mut self, source: &Source, path: &Path, cx: &mut App) {
-        self.update(cx, |shell, window, cx| {
-            shell.workflow_open_file(source, path, window, cx)
-        })
-        .ok();
     }
 }
 
