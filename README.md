@@ -399,6 +399,11 @@ Headless: `workflows_list`, `workflow_run`, `workflow_status`,
 and `workflow_event` notifications (see `crates/ui/src/headless.rs`).
 Other projects open without a window and URLs are reported, not opened.
 
+[docs/workflows-for-agents.md](docs/workflows-for-agents.md) is the full
+reference for writing and operating workflows (also for coding agents):
+every field and shape, how commands run, failure rules, design recipes,
+the validation loop, and the headless protocol with real transcripts.
+
 ## Debugging
 
 Debugging speaks the Debug Adapter Protocol to an adapter started where
