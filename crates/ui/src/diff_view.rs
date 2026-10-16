@@ -15,6 +15,9 @@ use gpui::{
 
 use crate::{commit_panel::short_revision, project::Project, theme};
 
+mod highlight;
+use highlight::DiffHighlights;
+
 const ROW_HEIGHT: f32 = 20.;
 
 /// What a diff compares.
@@ -117,6 +120,9 @@ pub struct DiffView {
     /// The `git diff` behind an index diff, for hunk actions.
     patch: Option<Patch>,
     split: Vec<SplitRow>,
+    /// The file's language (from its name), for syntax colors.
+    language: Option<syntax::Language>,
+    highlights: DiffHighlights,
     error: Option<SharedString>,
     focus_handle: FocusHandle,
     _load: Task<()>,
@@ -131,6 +137,7 @@ impl DiffView {
         cx: &mut Context<Self>,
     ) -> Self {
         let path = project.repository_path(&repository, source.path());
+        let language = syntax::Language::from_path(std::path::Path::new(source.path()));
         let options = cx.try_global::<DiffOptions>().copied().unwrap_or_default();
         let mut view = Self {
             project,
@@ -141,6 +148,8 @@ impl DiffView {
             diff: None,
             patch: None,
             split: Vec::new(),
+            language,
+            highlights: DiffHighlights::default(),
             error: None,
             focus_handle: cx.focus_handle(),
             _load: Task::ready(()),
@@ -167,10 +176,11 @@ impl DiffView {
 
     /// Recomputes the diff from the repository and working tree.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        let (project, repository, source) = (
+        let (project, repository, source, language) = (
             self.project.clone(),
             self.repository.clone(),
             self.source.clone(),
+            self.language,
         );
         let context = if self.options.whole_file {
             FULL_FILE
@@ -179,14 +189,19 @@ impl DiffView {
         };
         self._load = cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { source.compute(&project, &repository, context) })
+                .background_spawn(async move {
+                    let (diff, patch) = source.compute(&project, &repository, context)?;
+                    let highlights = DiffHighlights::compute(language, &diff.rows);
+                    Ok::<_, std::io::Error>((diff, patch, highlights))
+                })
                 .await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok((diff, patch)) => {
+                    Ok((diff, patch, highlights)) => {
                         this.split = git::side_by_side(&diff.rows);
                         this.diff = Some(diff);
                         this.patch = patch;
+                        this.highlights = highlights;
                         this.error = None;
                     }
                     Err(err) => this.error = Some(err.to_string().into()),
@@ -304,6 +319,8 @@ impl DiffView {
         numbers: [Option<usize>; 2],
         show_both: bool,
         text: &str,
+        spans: &[(Range<usize>, syntax::Highlight)],
+        styles: &[theme::SyntaxStyle],
     ) -> gpui::Div {
         let number = |line: Option<usize>| {
             div()
@@ -333,7 +350,7 @@ impl DiffView {
                 div()
                     .min_w_0()
                     .whitespace_nowrap()
-                    .child(text.replace('\t', "    ")),
+                    .child(highlight::styled_line(text, spans, styles)),
             )
     }
 
@@ -377,7 +394,15 @@ impl DiffView {
                 text,
             } => {
                 let target = new.or(*old);
-                Self::line_cells(*kind, [*old, *new], true, text)
+                // The old side's colors for removed lines, else the new one's.
+                let spans = match (kind, old, new) {
+                    (LineKind::Removed, Some(line), _) => self.highlights.line(true, *line),
+                    (_, _, Some(line)) => self.highlights.line(false, *line),
+                    _ => &[],
+                };
+                let theme = theme::current();
+                let styles = theme.syntax_styles(self.language);
+                Self::line_cells(*kind, [*old, *new], true, text, spans, styles)
                     .w_full()
                     .id(index)
                     .hover(|style| style.bg(theme::hover_row()))
@@ -396,12 +421,24 @@ impl DiffView {
                 header,
             } => self.render_hunk(index, *hunk, header, cx),
             SplitRow::Pair { left, right } => {
-                let half = |side: &Option<SideLine>, id: &'static str| -> gpui::AnyElement {
-                    match side {
-                        Some(line) => {
-                            let target = Some(line.line);
-                            let clickable = line.kind != LineKind::Removed;
-                            Self::line_cells(line.kind, [Some(line.line), None], false, &line.text)
+                let theme = theme::current();
+                let styles = theme.syntax_styles(self.language);
+                let half =
+                    |side: &Option<SideLine>, id: &'static str| -> gpui::AnyElement {
+                        match side {
+                            Some(line) => {
+                                let target = Some(line.line);
+                                let clickable = line.kind != LineKind::Removed;
+                                // Left is the old version, right the new one.
+                                let spans = self.highlights.line(id == "left", line.line);
+                                Self::line_cells(
+                                    line.kind,
+                                    [Some(line.line), None],
+                                    false,
+                                    &line.text,
+                                    spans,
+                                    styles,
+                                )
                                 .id((id, index))
                                 .flex_1()
                                 .flex_basis(relative(0.))
@@ -414,16 +451,16 @@ impl DiffView {
                                         }))
                                 })
                                 .into_any_element()
+                            }
+                            None => div()
+                                .flex_1()
+                                .flex_basis(relative(0.))
+                                .min_w_0()
+                                .h(px(ROW_HEIGHT))
+                                .bg(theme::panel())
+                                .into_any_element(),
                         }
-                        None => div()
-                            .flex_1()
-                            .flex_basis(relative(0.))
-                            .min_w_0()
-                            .h(px(ROW_HEIGHT))
-                            .bg(theme::panel())
-                            .into_any_element(),
-                    }
-                };
+                    };
                 // Two equal halves whatever their text: the row spans the
                 // pane and each side gets half of it.
                 div()
