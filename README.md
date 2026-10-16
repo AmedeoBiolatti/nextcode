@@ -315,16 +315,26 @@ conditions, browser links and manual gates. Files are found in
       "run": "npm run dev", "ready": { "output": "ready in \\d+ ms" }, "openUrls": true },
     { "id": "login", "needs": ["web"], "ready": { "manual": "Log in in the browser, then Continue." } },
     { "id": "tools", "needs": ["login", "worker"], "project": { "wsl": "Ubuntu", "path": "~/src/tools" },
-      "run": "./sync.sh --env dev", "env": { "TOKEN": "${env:FLEET_TOKEN}" }, "cwd": "scripts" }
+      "run": "./sync.sh --env dev", "env": { "TOKEN": "${env:FLEET_TOKEN}" }, "cwd": "scripts" },
+    // Checkpoints on Ctrl+C: 120 s before a stop kills it.
+    { "id": "eval", "needs": ["api"], "project": { "devcontainer": "C:/src/api" },
+      "run": "uv run python eval.py", "stop_grace_s": 120,
+      "artifacts": [{ "label": "metrics", "path": "out/metrics.json" }] },
+    // Runs once `eval` finished, also when it failed.
+    { "id": "report", "after": "eval", "project": { "devcontainer": "C:/src/api" },
+      "run": "uv run python report.py ${steps.eval.exit_code} ${steps.eval.artifacts.metrics}" }
   ]
 }
 ```
 
 Step fields: `id` (required, unique), `title`, `needs` (ids; a step starts
-when they are all ready, independent steps run in parallel), `project`,
-`run`, `terminal`, `check`, `onFail`, `ready`, `timeout_s`, `openUrls`,
-`env`, `cwd`. Unknown keys, unknown `needs`, duplicate ids and cycles make
-the workflow invalid: it is listed with the error and cannot run.
+when they are all ready, independent steps run in parallel), `after` (ids
+that must have finished, ready or failed), `project`, `run`, `terminal`,
+`check`, `onFail`, `ready`, `timeout_s`, `stop_grace_s`, `artifacts`,
+`openUrls`, `env`, `cwd`. Unknown keys, unknown `needs`/`after`, ids in
+both, duplicate ids, cycles (through `needs` and `after`) and `${steps.…}`
+variables naming a step outside `needs`/`after` make the workflow
+invalid: it is listed with the error and cannot run.
 
 - `project`: `{ "local": "C:/src/p" }`, `{ "wsl": "Ubuntu", "path": "~/p" }`,
   `{ "devcontainer": <folder>, "config"?: "<devcontainer.json>" }` (folder: a
@@ -356,15 +366,37 @@ the workflow invalid: it is listed with the error and cannot run.
 - `env`, `cwd` (relative to the project; the home folder without one) and
   the command lines expand `${workspaceFolder}` (the home folder without a
   project), `${userHome}` and `${env:NAME}` (the environment where the step
-  runs; read with `env` for WSL/containers).
+  runs; read with `env` for WSL/containers); so do artifact paths.
+- `stop_grace_s` (1–3600, default 3): every stop of the step's command
+  (Stop All, Restart, `timeout_s`, Run All replacing the run, the workflow
+  failing) sends Ctrl+C to its terminal and kills it only if it still runs
+  after that many seconds; meanwhile the step is `stopping` with a
+  countdown. A second Stop All kills at once.
+- `artifacts`: files (relative to `cwd`, else the project) and http(s)
+  links the step produces: `"out/metrics.json"`, `"https://…"`,
+  `{ "label": "...", "path": "..." }`, `{ "label": "...", "url": "..." }`.
+  When the step finishes they are resolved and looked up where it runs
+  (through the project for WSL/containers); the details strip links them
+  (a file opens in an editor tab of the step's project, a URL in the
+  browser; missing files dimmed, Check again), cards show `↗ N`.
+- `${steps.<id>.status}`, `${steps.<id>.exit_code}`,
+  `${steps.<id>.artifacts.<label>}` / `.<index>` in `run`, `check`, `cwd`,
+  `env`, artifact paths: what a step listed in `needs` or `after` left,
+  replaced when this step starts. Paths are as seen where the producing
+  step runs (another machine or container may not see them).
 
-States: pending → waiting (needs) → starting (opening the project, the
-check) → running → ready | failed | stopped. A failed step blocks its
-dependents (shown as blocked); others keep going. Restart reruns one step
-(its terminal tab is replaced; dependents that already run are left
-alone); Retry Failed reruns failed steps; Stop All sends Ctrl+C to every
-command the run started and kills what still runs 3 s later (project tabs
-and containers stay); Run All starts afresh.
+States: pending → waiting (needs/after) → starting (opening the project,
+the check) → running → ready | failed | stopped, with stopping (Ctrl+C
+sent, grace running) before stopped (or failed for a timeout). A failed
+step blocks its `needs` dependents (shown as blocked) but not its `after`
+dependents; a stopped one blocks both; others keep going. When nothing
+can progress and not every step is ready, the run is Failed (finished
+with failures; the failed steps keep their reason). Restart reruns one
+step (its old command is stopped with its grace first, then it starts in
+the same terminal; dependents that already run are left alone); Retry
+Failed reruns failed steps; Stop All stops every command the run started
+(project tabs and containers stay); Run All starts afresh (steps whose
+old command still stops start once it is gone).
 
 UI: each workflow opens as its own tab in the window's tab row (marked ◈,
 colored by the run's state; opening the same file again shows its tab;
@@ -373,10 +405,12 @@ projects' workflows); Run > New Workflow… writes a commented template to
 the user folder and opens its tab; the command palette's "Run Workflow:
 <name>" opens the tab and runs it. The tab has the file in an editor on
 the left (Ctrl+S saves; drag the divider to resize) and a graph on the
-right: one column per dependency depth (longest chain of `needs`), cards
-ordered to reduce crossings, each with title, id and what it does, where
-it runs, status icon/color and elapsed time; edges turn green when their
-upstream is ready. The graph opens fitted to its pane (at most 100 %, at
+right: one column per dependency depth (longest chain of `needs` and
+`after`), cards ordered to reduce crossings, each with title, id and what
+it does (`after` when it has some), where it runs, status icon/color and
+elapsed time; `needs` edges turn green when their upstream is ready,
+dashed `after` edges light up when their upstream finished (ready or
+failed). The graph opens fitted to its pane (at most 100 %, at
 least 40 %, centered) and re-fits on resize and after edits until you zoom
 or pan: Ctrl+scroll zooms around the pointer, the corner overlay has −,
 the zoom, + and Fit (back to fitting); scroll (Shift+scroll sideways) or
@@ -386,8 +420,9 @@ them in a banner with line and column (click: go there) over the last
 good graph, dimmed. Clicking a card puts the cursor on its `"id"`; the
 card holding the cursor is highlighted. A selected card shows details
 below the graph: state, wait/failure reason or manual prompt, last output
-lines, Terminal (the project's terminal tab, or this machine's terminal
-inside the workflow tab), Continue, Restart/Retry. The toolbar shows the
+lines, artifacts (links), Terminal (the project's terminal tab, or this
+machine's terminal inside the workflow tab), Continue, Restart/Retry. The
+toolbar shows the
 state (Idle, Running, All ready, Failed, Stopped), Run All (saves the file
 first if edited, then runs what was saved; Shift+F10), Stop All (Ctrl+F2)
 and Retry Failed. Workflow files in remote projects are read and written
@@ -395,8 +430,9 @@ through the project (its tab opens first when a restored workflow tab
 needs it). Workflows run in the window that started them.
 
 Headless: `workflows_list`, `workflow_run`, `workflow_status`,
-`workflow_stop`, `workflow_continue`, `workflow_restart`, `workflow_retry`
-and `workflow_event` notifications (see `crates/ui/src/headless.rs`).
+`workflow_stop`, `workflow_continue`, `workflow_restart`, `workflow_retry`,
+`workflow_check_artifacts` and `workflow_event` notifications (see
+`crates/ui/src/headless.rs`).
 Other projects open without a window and URLs are reported, not opened.
 
 [docs/workflows-for-agents.md](docs/workflows-for-agents.md) is the full

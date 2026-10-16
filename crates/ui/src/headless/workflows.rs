@@ -1,14 +1,15 @@
 //! Headless workflows: `workflows_list`, `workflow_run`, `workflow_status`,
 //! `workflow_stop`, `workflow_continue`, `workflow_restart`,
-//! `workflow_retry`, and `workflow_event` notifications. The same
-//! [`Workflows`] model as the GUI; steps for other projects open them
-//! without a window (local folders at once, WSL and dev containers like
-//! `Project::open`), and commands run in terminals nobody sees (their last
-//! line is in `workflow_status`). URLs are reported, not opened.
+//! `workflow_retry`, `workflow_check_artifacts`, and `workflow_event`
+//! notifications. The same [`Workflows`] model as the GUI; steps for other
+//! projects open them without a window (local folders at once, WSL and
+//! dev containers like `Project::open`), and commands run in terminals
+//! nobody sees (their last line is in `workflow_status`). URLs are
+//! reported, not opened.
 
 use std::time::Instant;
 
-use workflow::{Ready, Status};
+use workflow::{Artifact, ArtifactTarget, Ready, Status};
 
 use super::*;
 use crate::{
@@ -111,6 +112,8 @@ impl Host for HeadlessHost {
     fn show(&mut self, _: &Location, _: &Entity<TerminalView>, _: &mut App) {}
 
     fn open_url(&mut self, _: &str, _: &mut App) {}
+
+    fn open_file(&mut self, _: Option<&Location>, _: &std::path::Path, _: &mut App) {}
 }
 
 /// Forwards the model's events as `workflow_event` lines.
@@ -168,6 +171,14 @@ fn ready_json(ready: &Ready) -> Value {
     }
 }
 
+/// `{label, path}` or `{label, url}` as declared (`label` null without one).
+fn artifact_json(artifact: &Artifact) -> Value {
+    match &artifact.target {
+        ArtifactTarget::Path(path) => json!({ "label": artifact.label, "path": path }),
+        ArtifactTarget::Url(url) => json!({ "label": artifact.label, "url": url }),
+    }
+}
+
 fn list_json(workflows: &Workflows) -> Value {
     let list: Vec<Value> = workflows
         .discovered()
@@ -185,6 +196,7 @@ fn list_json(workflows: &Workflows) -> Value {
                                 "id": step.id,
                                 "title": step.title,
                                 "needs": step.needs,
+                                "after": step.after,
                                 "project": step.project.as_ref().map(|spec| {
                                     crate::workflows::location_of(spec)
                                         .map_or_else(|err| err, |location| location.to_string())
@@ -192,6 +204,8 @@ fn list_json(workflows: &Workflows) -> Value {
                                 "run": step.run,
                                 "check": step.check,
                                 "ready": ready_json(&step.ready),
+                                "stop_grace_s": step.stop_grace_s,
+                                "artifacts": step.artifacts.iter().map(artifact_json).collect::<Vec<_>>(),
                             })
                         })
                         .collect()
@@ -227,6 +241,22 @@ fn status_json(workflows: &Workflows, id: &str, cx: &App) -> Result<Value, Strin
         .zip(active.run.steps())
         .enumerate()
         .map(|(index, (step, state))| {
+            let checked = state.artifacts.as_ref().and_then(|checked| checked.as_ref().ok());
+            let artifacts: Vec<Value> = active
+                .run
+                .definition(index)
+                .artifacts
+                .iter()
+                .enumerate()
+                .map(|(at, artifact)| {
+                    let found = checked.and_then(|checked| checked.get(at));
+                    let mut value = artifact_json(artifact);
+                    value["name"] = json!(artifact.name());
+                    value["resolved"] = json!(found.map(|found| &found.resolved));
+                    value["exists"] = json!(found.map(|found| found.exists));
+                    value
+                })
+                .collect();
             json!({
                 "id": step.id,
                 "title": step.label(),
@@ -236,6 +266,7 @@ fn status_json(workflows: &Workflows, id: &str, cx: &App) -> Result<Value, Strin
                     _ => None,
                 },
                 "detail": state.detail,
+                "blocked": state.is_blocked(),
                 "last_line": state.last_line(),
                 "check_output": state.check_output,
                 "exit_code": state.exit.flatten(),
@@ -243,6 +274,8 @@ fn status_json(workflows: &Workflows, id: &str, cx: &App) -> Result<Value, Strin
                 "elapsed_ms": state.elapsed(now).map(|elapsed| elapsed.as_millis() as u64),
                 "location": active.location(index).map(ToString::to_string),
                 "terminal": active.terminal(index).map(|view| view.read(cx).run_name().map(str::to_owned)),
+                "artifacts": artifacts,
+                "artifacts_error": state.artifacts.as_ref().and_then(|checked| checked.as_ref().err()),
             })
         })
         .collect();
@@ -307,6 +340,10 @@ impl Session {
                     "workflow_restart" => {
                         let step = step(&request)?;
                         Ok(json!(workflows.restart_step(&found, step, cx)))
+                    }
+                    "workflow_check_artifacts" => {
+                        let step = step(&request)?;
+                        Ok(json!(workflows.check_artifacts(&found, step, cx)))
                     }
                     "workflow_continue" => {
                         let step = step(&request)?;

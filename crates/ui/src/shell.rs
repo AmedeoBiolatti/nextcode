@@ -1300,6 +1300,46 @@ impl Shell {
         });
     }
 
+    /// Opens a workflow step's artifact `path` in an editor tab of the
+    /// project at `location` (opened if needed), and shows that tab.
+    /// `None` (a step on this machine): the local project tab holding the
+    /// file, else the file's folder as a new project tab.
+    pub(crate) fn workflow_open_file(
+        &mut self,
+        location: Option<&Location>,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let location = match location {
+            Some(location) => location.clone(),
+            None => {
+                let holding = self
+                    .workflow_projects(cx)
+                    .into_iter()
+                    .filter(|(_, project)| !project.is_remote() && path.starts_with(project.root()))
+                    .max_by_key(|(_, project)| project.root().components().count());
+                match holding {
+                    Some((location, _)) => location,
+                    None => match path.parent() {
+                        Some(folder) => Location::Local(folder.to_path_buf()),
+                        None => return,
+                    },
+                }
+            }
+        };
+        if !matches!(self.workflow_project(&location, window, cx), Ok(Some(_))) {
+            self.notice = Some(format!("Could not open {} in {location}", path.display()).into());
+            return cx.notify();
+        }
+        let Some((index, workspace)) = self.workspace_at(&location) else {
+            return;
+        };
+        self.activate(index, window, cx);
+        window.activate_window();
+        workspace.update(cx, |workspace, cx| workspace.open(path, window, cx));
+    }
+
     /// The workspaces of loaded tabs, in tab order (tests).
     #[cfg(test)]
     pub(crate) fn workspace_entities(&self) -> Vec<Entity<Workspace>> {

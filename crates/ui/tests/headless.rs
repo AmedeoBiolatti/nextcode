@@ -1962,6 +1962,243 @@ fn headless_mode_runs_a_workflow_across_projects() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// `workflow_status` of `path`, polled until `done` holds for it.
+fn status_until(headless: &mut Headless, path: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let status = headless.call(json!({ "cmd": "workflow_status", "path": path }));
+        if done(&status["result"]) {
+            return status["result"].clone();
+        }
+        assert!(Instant::now() < deadline, "timed out: {status}");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// An evaluation that fails (exit 1) after writing an artifact, and a
+/// report that runs `after` it with `${steps.eval.exit_code}` and the
+/// artifact's path: the run finishes with failures, the report ready.
+/// Then Stop during an evaluation that checkpoints on Ctrl+C: it gets its
+/// `stop_grace_s` (longer than the old 3 s kill) and writes its checkpoint
+/// before it exits; a report after it is blocked.
+#[test]
+fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
+    let root = std::env::temp_dir().join(format!("next_code_wf_after_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    for dir in ["main/.next_code/workflows", "config"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    // Windows' canonical form (`\\?\C:\…`) trips PowerShell's `Set-Content`.
+    let root = if cfg!(windows) {
+        root
+    } else {
+        root.canonicalize().unwrap()
+    };
+    let main = root.join("main");
+    // The report line reads the same in sh and PowerShell.
+    let report = "echo 'code=${steps.eval.exit_code} status=${steps.eval.status} \
+                  metrics=${steps.eval.artifacts.metrics}' | tee report.txt";
+    let (eval, checkpointing) = if cfg!(windows) {
+        (
+            "New-Item -ItemType Directory -Force out | Out-Null; Set-Content out/metrics.json '{}'; \
+             'evaluated'; exit 1",
+            "New-Item -ItemType Directory -Force out | Out-Null; try { 'evaluating'; Start-Sleep 60 } \
+             finally { Start-Sleep 4; Set-Content out/checkpoint.txt saved; 'checkpoint written' }",
+        )
+    } else {
+        fs::write(
+            main.join("eval.sh"),
+            "mkdir -p out\n\
+             trap 'sleep 4; echo saved > out/checkpoint.txt; echo checkpoint written; exit 3' INT\n\
+             echo evaluating\n\
+             sleep 60\n",
+        )
+        .unwrap();
+        (
+            "mkdir -p out && echo '{}' > out/metrics.json && echo evaluated && exit 1",
+            "sh eval.sh",
+        )
+    };
+    let workflows = main.join(".next_code/workflows");
+    let evaluate = json!({
+        "name": "Evaluate",
+        "steps": [
+            {
+                "id": "eval", "project": { "local": main }, "run": eval, "stop_grace_s": 20,
+                "artifacts": [
+                    { "label": "metrics", "path": "out/metrics.json" },
+                    { "label": "missing", "path": "out/none.txt" },
+                    "https://example.com/runs/1"
+                ]
+            },
+            {
+                "id": "report", "after": "eval", "project": { "local": main }, "run": report,
+                "artifacts": ["report.txt"]
+            }
+        ]
+    });
+    fs::write(workflows.join("evaluate.jsonc"), format!("{evaluate:#}")).unwrap();
+    let grace = json!({
+        "name": "Grace",
+        "steps": [
+            {
+                "id": "eval", "project": { "local": main }, "run": checkpointing,
+                "stop_grace_s": 20,
+                "artifacts": [{ "label": "checkpoint", "path": "out/checkpoint.txt" }]
+            },
+            {
+                "id": "report", "after": ["eval"], "project": { "local": main },
+                "run": "echo ${steps.eval.artifacts.checkpoint}"
+            }
+        ]
+    });
+    fs::write(workflows.join("grace.jsonc"), grace.to_string()).unwrap();
+
+    let mut headless = Headless::launch(
+        &[main.as_os_str()],
+        &[("XDG_CONFIG_HOME", &root.join("config"))],
+    );
+    let ready = headless.next(|line| line["event"].is_string());
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let list = headless.call(json!({ "cmd": "workflows_list" }));
+    let listed = list["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|found| found["path"].as_str().unwrap().ends_with("evaluate.jsonc"))
+        .unwrap()
+        .clone();
+    assert_eq!(listed["error"], Value::Null, "{listed}");
+    assert_eq!(listed["steps"][1]["after"], json!(["eval"]));
+    assert_eq!(listed["steps"][0]["stop_grace_s"], 20);
+    assert_eq!(
+        listed["steps"][0]["artifacts"][0],
+        json!({ "label": "metrics", "path": "out/metrics.json" })
+    );
+    assert_eq!(
+        listed["steps"][0]["artifacts"][2],
+        json!({ "label": null, "url": "https://example.com/runs/1" })
+    );
+
+    // The evaluation fails; the report runs after it anyway.
+    let run = headless.call(json!({ "cmd": "workflow_run", "path": "evaluate.jsonc" }));
+    assert_eq!(run["ok"], true, "{run}");
+    let failed = step_event(&mut headless, "eval", "failed");
+    assert_eq!(failed["reason"], "failed (exit code 1)", "{failed}");
+    let reported = step_event(&mut headless, "report", "ready");
+    assert_eq!(reported["status"], "ready", "{reported}");
+    let outcome = headless.next(|line| {
+        line["type"] == "outcome" && line["workflow"] == "Evaluate" && line["outcome"] != "running"
+    });
+    assert_eq!(
+        outcome["outcome"], "failed",
+        "finished with failures: {outcome}"
+    );
+    let status = status_until(&mut headless, "evaluate.jsonc", |status| {
+        status["steps"][1]["artifacts"][0]["exists"] == true
+    });
+    assert_eq!(status["outcome"], "failed", "{status}");
+    let eval = &status["steps"][0];
+    assert_eq!(eval["status"], "failed");
+    assert_eq!(eval["exit_code"], 1);
+    let metrics = &eval["artifacts"][0];
+    assert_eq!(metrics["label"], "metrics");
+    assert_eq!(metrics["exists"], true, "{status}");
+    let metrics_path = metrics["resolved"].as_str().unwrap().to_owned();
+    assert!(
+        metrics_path.ends_with(if cfg!(windows) {
+            "out\\metrics.json"
+        } else {
+            "out/metrics.json"
+        }),
+        "{metrics_path}"
+    );
+    assert!(fs::metadata(&metrics_path).is_ok(), "{metrics_path}");
+    assert_eq!(eval["artifacts"][1]["exists"], false, "missing: {status}");
+    assert_eq!(
+        eval["artifacts"][2]["resolved"],
+        "https://example.com/runs/1"
+    );
+    assert_eq!(eval["artifacts"][2]["exists"], true);
+    let report = &status["steps"][1];
+    assert_eq!(report["status"], "ready");
+    assert_eq!(
+        report["last_line"],
+        format!("code=1 status=failed metrics={metrics_path}"),
+        "{status}"
+    );
+
+    // Stop while evaluating: Ctrl+C, then the step's grace to checkpoint.
+    let run = headless.call(json!({ "cmd": "workflow_run", "path": "grace.jsonc" }));
+    assert_eq!(run["ok"], true, "{run}");
+    let run_id = run["result"]["run"].clone();
+    status_until(&mut headless, "grace.jsonc", |status| {
+        status["steps"][0]["last_line"] == "evaluating"
+    });
+    let stopped_at = Instant::now();
+    let stop = headless.call(json!({ "cmd": "workflow_stop", "path": "grace.jsonc" }));
+    assert_eq!(stop["result"], true, "{stop}");
+    let stopping = headless.next(|line| {
+        line["type"] == "step"
+            && line["run"] == run_id
+            && line["step"] == "eval"
+            && line["status"] == "stopping"
+    });
+    assert!(
+        stopping["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("stopping ("),
+        "{stopping}"
+    );
+    let stopped = headless.next(|line| {
+        line["type"] == "step"
+            && line["run"] == run_id
+            && line["step"] == "eval"
+            && (line["status"] == "stopped" || line["status"] == "failed")
+    });
+    assert_eq!(stopped["status"], "stopped", "{stopped}");
+    let took = stopped_at.elapsed();
+    assert!(
+        took >= Duration::from_millis(3500) && took < Duration::from_secs(20),
+        "the checkpoint took {took:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(main.join("out/checkpoint.txt"))
+            .unwrap()
+            .trim(),
+        "saved"
+    );
+    let status = status_until(&mut headless, "grace.jsonc", |status| {
+        status["steps"][0]["artifacts"][0]["exists"] == true
+    });
+    assert_eq!(status["outcome"], "stopped", "{status}");
+    if cfg!(unix) {
+        assert_eq!(status["steps"][0]["exit_code"], 3, "{status}");
+        // The terminal echoes the Ctrl+C (`^C`) before it.
+        let last = status["steps"][0]["last_line"].as_str().unwrap();
+        assert!(last.ends_with("checkpoint written"), "{last}");
+    }
+    assert_eq!(status["steps"][1]["status"], "stopped");
+    // A report after a stopped evaluation can never run.
+    let restart = headless
+        .call(json!({ "cmd": "workflow_restart", "path": "grace.jsonc", "step": "report" }));
+    assert_eq!(restart["result"], true, "{restart}");
+    let status = status_until(&mut headless, "grace.jsonc", |status| {
+        status["steps"][1]["status"] == "waiting"
+    });
+    assert_eq!(
+        status["steps"][1]["detail"], "blocked: eval was stopped",
+        "{status}"
+    );
+    assert_eq!(status["steps"][1]["blocked"], true);
+    assert_eq!(status["outcome"], "failed");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
 /// A workflow step in a dev container: the container is brought up for
 /// the step, its command runs in a pty inside, and its port is seen
 /// through the agent.

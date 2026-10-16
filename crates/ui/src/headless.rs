@@ -98,13 +98,14 @@
 //! | `ports_list` | | `{available, listening: [{port, addresses, pid, command}], forwarded: [{port, host, local_port, address, url, origin, label, connections, process}], error}` after a fresh scan (`origin`: `auto` \| `user` \| `dev_container`; `available` false for local projects) |
 //! | `ports_forward` | `port` (number or `"host:port"`), `host`?, `local_port`? (required when given; default: the same port, else the next free one) | `{local_port, url}`; a user port, saved for the project |
 //! | `ports_stop` | `port`, `host`? | `null`; an automatically forwarded port stays unforwarded while it keeps listening |
-//! | `workflows_list` | | `[{id, name, path, source, error, steps: [{id, title, needs, project, run, check, ready}], outcome}]`: the user's workflows (`<config>/next_code/workflows/`) and the project's (`.next_code/workflows/`), read again for every workflow command |
-//! | `workflow_run` | `name`, `path` (or its end) or `id` | `{run, id}`; starts it afresh (a run of it going is stopped first); progress comes as `workflow_event`s |
-//! | `workflow_status` | `name`/`path`/`id` | `{run, workflow, outcome, steps: [{id, title, status, reason, detail, last_line, check_output, exit_code, exited, elapsed_ms, location, terminal}]}` |
-//! | `workflow_stop` | `name`/`path`/`id` | `true` if it had run: Stop All (Ctrl+C, then kill after 3 s) |
+//! | `workflows_list` | | `[{id, name, path, source, error, steps: [{id, title, needs, after, project, run, check, ready, stop_grace_s, artifacts: [{label, path or url}]}], outcome}]`: the user's workflows (`<config>/next_code/workflows/`) and the project's (`.next_code/workflows/`), read again for every workflow command |
+//! | `workflow_run` | `name`, `path` (or its end) or `id` | `{run, id}`; starts it afresh (a run of it going is stopped first, each command with its step's grace; a step starts once its old command is gone); progress comes as `workflow_event`s |
+//! | `workflow_status` | `name`/`path`/`id` | `{run, workflow, outcome, steps: [{id, title, status, reason, detail, blocked, last_line, check_output, exit_code, exited, elapsed_ms, location, terminal, artifacts: [{label, name, path or url, resolved, exists}], artifacts_error}]}` |
+//! | `workflow_stop` | `name`/`path`/`id` | `true` if it had run: Stop All (Ctrl+C, then kill after the step's `stop_grace_s`, default 3 s; a second stop kills at once) |
 //! | `workflow_continue` | `name`/`path`/`id`, `step` (id) | `null`; an error if the step does not wait for Continue |
-//! | `workflow_restart` | `name`/`path`/`id`, `step` | `true`: the step starts again (its command replaced) |
+//! | `workflow_restart` | `name`/`path`/`id`, `step` | `true`: the step starts again once its old command is gone (same terminal) |
 //! | `workflow_retry` | `name`/`path`/`id` | `true` if it had run: failed steps start again |
+//! | `workflow_check_artifacts` | `name`/`path`/`id`, `step` | `true` if the step has artifacts and got to where it runs: they are looked up again (see `workflow_status`) |
 //! | `shutdown` | | stops language servers and workflow commands, and exits |
 //!
 //! Events: `progress` (while a dev container opens), `ready` (after
@@ -119,9 +120,10 @@
 //! `port_available` (`port`, `url`, `label`, `action`: what the GUI does
 //! as `onAutoForward` says: `notify`, `openBrowser`, `silent`),
 //! `workflow_event` (`type`: `step` with `run`, `workflow`, `step`,
-//! `status` (`pending`, `waiting`, `starting`, `running`, `ready`,
-//! `failed`, `stopped`), `reason`, `detail`; `outcome` with `outcome`
-//! (`running`, `ready`, `failed`, `stopped`); `url` with `step`, `url`:
+//! `status` (`pending`, `waiting`, `starting`, `running`, `stopping`,
+//! `ready`, `failed`, `stopped`), `reason`, `detail`; `outcome` with
+//! `outcome` (`running`, `ready`, `failed`: finished with failures or a
+//! check without `onFail` failed, `stopped`); `url` with `step`, `url`:
 //! an `openUrls` URL, which headless mode does not open). Workflow steps
 //! for other projects open them without a window; commands run in
 //! terminals nobody sees.

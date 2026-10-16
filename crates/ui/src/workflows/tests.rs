@@ -182,12 +182,13 @@ fn a_workflow_opens_projects_runs_steps_in_order_and_restart_reuses_the_terminal
         1
     );
 
-    // Stop All interrupts the server; the tabs stay.
+    // Stop All interrupts the server (stopping until it exits, killed
+    // after its grace at the latest); the tabs stay.
     workflows.update(cx, |workflows, cx| workflows.stop(&id, cx));
+    assert_eq!(statuses(&workflows, cx)[1], "stopping");
     wait_until(cx, "the stop", |cx| {
         statuses(&workflows, cx)[1] == "stopped"
     });
-    cx.executor().advance_clock(STOP_GRACE);
     wait_until(cx, "the server to end", |cx| {
         terminal.read_with(cx, |terminal, cx| {
             terminal.views()[0].read(cx).exit().is_some()

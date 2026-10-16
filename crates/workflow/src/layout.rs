@@ -1,9 +1,10 @@
 //! Where a workflow's steps go in its graph, like Azure DevOps' pipeline
 //! stages: one column per dependency depth (the longest chain of `needs`
-//! from a step without needs), steps in a column ordered by a few
-//! barycenter sweeps so edges cross less, columns centered on the tallest
-//! one, and edges from the right side of a step to the left side of each
-//! step that needs it. Pure geometry in logical pixels.
+//! and `after` from a step without either), steps in a column ordered by a
+//! few barycenter sweeps so edges cross less, columns centered on the
+//! tallest one, and edges from the right side of a step to the left side
+//! of each step that needs it or runs after it. Pure geometry in logical
+//! pixels.
 
 use std::collections::HashMap;
 
@@ -38,6 +39,7 @@ impl Default for Metrics {
 pub struct NodeSpec<'a> {
     pub id: &'a str,
     pub needs: &'a [String],
+    pub after: &'a [String],
 }
 
 /// A step's place: its column (depth), row in the column, and top-left
@@ -50,12 +52,14 @@ pub struct Node {
     pub y: f32,
 }
 
-/// `from` (a need) → `to` (the step needing it), between the middle of
-/// `from`'s right side and the middle of `to`'s left side.
+/// `from` (a need, or a step `to` runs after) → `to`, between the middle
+/// of `from`'s right side and the middle of `to`'s left side.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Edge {
     pub from: usize,
     pub to: usize,
+    /// An `after` edge (`to` starts once `from` finished, ready or not).
+    pub after: bool,
     pub start: (f32, f32),
     pub end: (f32, f32),
 }
@@ -97,25 +101,40 @@ pub fn layout(nodes: &[NodeSpec], metrics: Metrics) -> Result<GraphLayout, Strin
             return Err(format!("duplicate step id `{}`", node.id));
         }
     }
-    let mut needs: Vec<Vec<usize>> = Vec::with_capacity(nodes.len());
+    // Per step: what it depends on, and whether through `after`.
+    let mut needs: Vec<Vec<(usize, bool)>> = Vec::with_capacity(nodes.len());
     for node in nodes {
-        let mut resolved = Vec::with_capacity(node.needs.len());
-        for need in node.needs {
-            let at = *index
-                .get(need.as_str())
-                .ok_or_else(|| format!("`{}` needs unknown step `{need}`", node.id))?;
-            if !resolved.contains(&at) {
-                resolved.push(at);
+        let mut resolved: Vec<(usize, bool)> =
+            Vec::with_capacity(node.needs.len() + node.after.len());
+        let listed = node
+            .needs
+            .iter()
+            .map(|id| (id, false))
+            .chain(node.after.iter().map(|id| (id, true)));
+        for (need, after) in listed {
+            let at = *index.get(need.as_str()).ok_or_else(|| {
+                if after {
+                    format!("`{}` runs after unknown step `{need}`", node.id)
+                } else {
+                    format!("`{}` needs unknown step `{need}`", node.id)
+                }
+            })?;
+            if !resolved.iter().any(|&(listed, _)| listed == at) {
+                resolved.push((at, after));
             }
         }
         needs.push(resolved);
     }
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     for (at, node_needs) in needs.iter().enumerate() {
-        for &need in node_needs {
+        for &(need, _) in node_needs {
             dependents[need].push(at);
         }
     }
+    let upstream: Vec<Vec<usize>> = needs
+        .iter()
+        .map(|listed| listed.iter().map(|&(at, _)| at).collect())
+        .collect();
 
     // Longest path from the roots, in topological (Kahn) order.
     let mut waiting: Vec<usize> = needs.iter().map(Vec::len).collect();
@@ -181,7 +200,7 @@ pub fn layout(nodes: &[NodeSpec], metrics: Metrics) -> Result<GraphLayout, Strin
     for _ in 0..SWEEPS {
         for column in 1..column_count {
             let center = centers(&columns);
-            reorder(&mut columns[column], &needs, &center);
+            reorder(&mut columns[column], &upstream, &center);
         }
         for column in (0..column_count.saturating_sub(1)).rev() {
             let center = centers(&columns);
@@ -213,11 +232,12 @@ pub fn layout(nodes: &[NodeSpec], metrics: Metrics) -> Result<GraphLayout, Strin
     }
     let mut edges = Vec::new();
     for (to, node_needs) in needs.iter().enumerate() {
-        for &from in node_needs {
+        for &(from, after) in node_needs {
             let (a, b) = (placed[from], placed[to]);
             edges.push(Edge {
                 from,
                 to,
+                after,
                 start: (a.x + metrics.card_width, a.y + metrics.card_height / 2.),
                 end: (b.x, b.y + metrics.card_height / 2.),
             });
@@ -248,6 +268,7 @@ pub fn layout_workflow(workflow: &Workflow, metrics: Metrics) -> Result<GraphLay
         .map(|step| NodeSpec {
             id: &step.id,
             needs: &step.needs,
+            after: &step.after,
         })
         .collect();
     layout(&specs, metrics)
@@ -348,16 +369,26 @@ mod tests {
         margin: 5.,
     };
 
-    /// `("id", "need need")` pairs.
+    /// `("id", "need need ~after")` pairs.
     fn graph(steps: &[(&str, &str)]) -> Result<GraphLayout, String> {
-        let needs: Vec<Vec<String>> = steps
+        let lists: Vec<(Vec<String>, Vec<String>)> = steps
             .iter()
-            .map(|(_, needs)| needs.split_whitespace().map(str::to_owned).collect())
+            .map(|(_, needs)| {
+                let (after, needs): (Vec<&str>, Vec<&str>) =
+                    needs.split_whitespace().partition(|id| id.starts_with('~'));
+                (
+                    needs.into_iter().map(str::to_owned).collect(),
+                    after
+                        .into_iter()
+                        .map(|id| id.trim_start_matches('~').to_owned())
+                        .collect(),
+                )
+            })
             .collect();
         let specs: Vec<NodeSpec> = steps
             .iter()
-            .zip(&needs)
-            .map(|((id, _), needs)| NodeSpec { id, needs })
+            .zip(&lists)
+            .map(|((id, _), (needs, after))| NodeSpec { id, needs, after })
             .collect();
         layout(&specs, M)
     }
@@ -470,6 +501,31 @@ mod tests {
         );
         // A need listed twice draws one edge.
         assert_eq!(graph(&[("a", ""), ("b", "a a")]).unwrap().edges.len(), 1);
+    }
+
+    #[test]
+    fn after_edges_count_for_depth_and_are_marked() {
+        let steps = [("eval", ""), ("report", "~eval"), ("notify", "report")];
+        let layout = graph(&steps).unwrap();
+        assert_eq!(
+            ids(&steps, &layout),
+            [vec!["eval"], vec!["report"], vec!["notify"]]
+        );
+        let kinds: Vec<(usize, usize, bool)> = layout
+            .edges
+            .iter()
+            .map(|edge| (edge.from, edge.to, edge.after))
+            .collect();
+        assert_eq!(kinds, [(0, 1, true), (1, 2, false)]);
+        assert_eq!(
+            graph(&[("a", "~nope")]).unwrap_err(),
+            "`a` runs after unknown step `nope`"
+        );
+        assert!(
+            graph(&[("a", "~b"), ("b", "a")])
+                .unwrap_err()
+                .contains("cycle")
+        );
     }
 
     #[test]

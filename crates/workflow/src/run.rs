@@ -1,19 +1,24 @@
 //! One run of a workflow as a state machine, without I/O: the caller
 //! performs the [`Effect`]s (open a project, run a check, start a command,
-//! stop one, open a URL) and reports back what happened (project opened,
-//! check result, output, exit, listening ports, clock ticks). Every report
-//! carries the step's generation from the effect, so results of a step
-//! that was restarted or stopped since are ignored.
+//! interrupt or kill one, check artifacts, open a URL) and reports back
+//! what happened (project opened, check result, output, exit, listening
+//! ports, artifacts, clock ticks). Every report carries the step's
+//! generation from the effect, so results of a step that was restarted or
+//! stopped since are ignored.
 //!
-//! Per step: Pending → Waiting (for `needs`) → Starting (opening the
-//! project, running the check) → Running (the command runs; not ready
-//! yet) → Ready | Failed | Stopped.
+//! Per step: Pending → Waiting (for `needs` and `after`) → Starting
+//! (opening the project, running the check) → Running (the command runs;
+//! not ready yet) → Ready | Failed | Stopped. Stopping a live command
+//! (Stop All, Restart, Run All, `timeout_s`, the workflow failing) goes
+//! through Stopping: Ctrl+C, then a kill if it has not exited after the
+//! step's `stop_grace_s`.
 
 use std::time::{Duration, Instant};
 
 use crate::{
-    file::{Ready, Workflow},
+    file::{Ready, Step, Workflow},
     output::OutputWatcher,
+    vars::{self, StepField, StepRef},
 };
 
 /// How long after a step got ready the URLs it prints still open.
@@ -23,12 +28,14 @@ pub const URL_GRACE: Duration = Duration::from_secs(3);
 pub enum Status {
     /// The workflow has not started it.
     Pending,
-    /// Waiting for the steps it needs.
+    /// Waiting for the steps it needs or runs after.
     Waiting,
     /// Opening its project or running its check.
     Starting,
     /// Its command runs (or it waits for its port, delay or Continue).
     Running,
+    /// Its command got Ctrl+C and has until its grace ends to exit.
+    Stopping,
     Ready,
     Failed(String),
     Stopped,
@@ -41,15 +48,19 @@ impl Status {
             Self::Waiting => "waiting",
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::Stopping => "stopping",
             Self::Ready => "ready",
             Self::Failed(_) => "failed",
             Self::Stopped => "stopped",
         }
     }
 
-    /// Waiting, starting or running.
+    /// Waiting, starting, running or stopping.
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Waiting | Self::Starting | Self::Running)
+        matches!(
+            self,
+            Self::Waiting | Self::Starting | Self::Running | Self::Stopping
+        )
     }
 }
 
@@ -62,20 +73,33 @@ pub enum Effect {
         step: usize,
         generation: u64,
     },
-    /// Run the step's check; answer with [`Run::check_finished`].
+    /// Run the step's check ([`Run::definition`]); answer with
+    /// [`Run::check_finished`].
     RunCheck {
         step: usize,
         generation: u64,
     },
-    /// Start the step's command in its terminal (replacing what ran there);
-    /// report [`Run::output`] and [`Run::exited`], or [`Run::start_failed`].
+    /// Start the step's command ([`Run::definition`]) in its terminal
+    /// (replacing what ran there); report [`Run::output`] and
+    /// [`Run::exited`], or [`Run::start_failed`].
     StartCommand {
         step: usize,
         generation: u64,
     },
-    /// Interrupt the step's command, and kill it if it does not exit soon.
-    StopCommand {
+    /// Ctrl+C to the step's command. It has the step's `stop_grace_s` to
+    /// exit (report [`Run::exited`] as usual) before a [`Effect::KillCommand`].
+    InterruptCommand {
         step: usize,
+    },
+    /// Kill the step's command now (the run no longer waits for it).
+    KillCommand {
+        step: usize,
+    },
+    /// Resolve the step's artifacts where it runs and see which files
+    /// exist; answer with [`Run::artifacts_checked`].
+    CheckArtifacts {
+        step: usize,
+        generation: u64,
     },
     OpenUrl {
         step: usize,
@@ -98,7 +122,9 @@ pub enum Outcome {
     Running,
     /// Every step is ready.
     Ready,
-    /// A check without `onFail` failed: everything was stopped.
+    /// Finished with failures: nothing can progress and some step is not
+    /// ready (failed, blocked or waiting for Retry); or a check without
+    /// `onFail` failed and everything was stopped.
     Failed,
     /// Stop All.
     Stopped,
@@ -116,13 +142,41 @@ impl Outcome {
     }
 }
 
+/// An artifact as checked where its step runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactState {
+    /// The absolute path as seen where the step runs, or the URL;
+    /// variables expanded.
+    pub resolved: String,
+    /// Whether the file exists (URLs: true).
+    pub exists: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Idle,
     Project,
     Check,
-    /// Readiness pending; `command` tells whether a command was started.
+    /// Readiness pending.
     Waiting,
+    /// The command was interrupted and may still run.
+    Stopping,
+}
+
+/// What a stopping step becomes once its command is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Then {
+    Stopped,
+    Fail(String),
+    /// Waits for what it waits for again, then starts afresh.
+    Restart,
+}
+
+#[derive(Debug)]
+struct Stop {
+    /// When the command is killed if it still runs.
+    deadline: Instant,
+    then: Then,
 }
 
 #[derive(Debug)]
@@ -138,12 +192,31 @@ pub struct StepState {
     pub exit: Option<Option<i32>>,
     /// The check's last output line when it failed.
     pub check_output: Option<String>,
+    /// Its artifacts as last checked (`None`: not yet), in file order, or
+    /// why they could not be checked.
+    pub artifacts: Option<Result<Vec<ArtifactState>, String>>,
     phase: Phase,
     generation: u64,
-    /// A command was started and has not exited (as far as reported).
-    command_live: bool,
+    /// The generation its command started with, while it runs (as far as
+    /// reported).
+    command: Option<u64>,
+    stop: Option<Stop>,
     ready_at: Option<Instant>,
     watcher: OutputWatcher,
+    /// Waiting, but a step it waits for can never get there.
+    blocked: bool,
+    /// Waiting for a previous run's command in its terminal to end.
+    held: bool,
+    /// Its check failed with `onFail`: it waits for Retry.
+    awaiting_retry: bool,
+    /// It got to where it runs (its project is open): artifacts can be
+    /// located.
+    placed: bool,
+    /// It finished and its artifacts are being checked: steps waiting for
+    /// it wait for that too (they may read `${steps.<id>.artifacts.…}`).
+    artifacts_pending: bool,
+    /// Its definition with `${steps.…}` replaced, since it started.
+    resolved: Option<Step>,
 }
 
 impl StepState {
@@ -155,11 +228,19 @@ impl StepState {
             finished: None,
             exit: None,
             check_output: None,
+            artifacts: None,
             phase: Phase::Idle,
             generation: 0,
-            command_live: false,
+            command: None,
+            stop: None,
             ready_at: None,
             watcher: OutputWatcher::new(None),
+            blocked: false,
+            held: false,
+            awaiting_retry: false,
+            placed: false,
+            artifacts_pending: false,
+            resolved: None,
         }
     }
 
@@ -189,7 +270,17 @@ impl StepState {
 
     /// Whether its command is (as far as known) still running.
     pub fn command_live(&self) -> bool {
-        self.command_live
+        self.command.is_some()
+    }
+
+    /// Waiting for a step that can never get ready (or finish).
+    pub fn is_blocked(&self) -> bool {
+        self.blocked
+    }
+
+    /// When a stopping command gets killed.
+    pub fn stop_deadline(&self) -> Option<Instant> {
+        self.stop.as_ref().map(|stop| stop.deadline)
     }
 }
 
@@ -234,11 +325,20 @@ impl Run {
         self.workflow.steps.iter().position(|step| step.id == id)
     }
 
+    /// Step `index` as it runs: once it started, with its `${steps.…}`
+    /// variables replaced.
+    pub fn definition(&self, index: usize) -> &Step {
+        self.steps[index]
+            .resolved
+            .as_ref()
+            .unwrap_or(&self.workflow.steps[index])
+    }
+
     pub fn outcome(&self) -> Outcome {
         self.outcome
     }
 
-    /// Whether anything is waiting, starting or running.
+    /// Whether anything is waiting, starting, running or stopping.
     pub fn is_active(&self) -> bool {
         self.steps.iter().any(|step| step.status.is_active())
     }
@@ -269,55 +369,139 @@ impl Run {
             .collect()
     }
 
-    /// Run All: stops what runs, then starts every step afresh.
+    /// Run All: every step starts afresh; one whose command still runs
+    /// is stopped first and starts once that command is gone.
     pub fn start(&mut self, now: Instant) {
-        self.stop_all(now);
         for index in 0..self.steps.len() {
-            self.reset(index, now);
+            if self.steps[index].command.is_some() {
+                self.stop_command(index, Then::Restart, now);
+            } else {
+                self.reset(index, now);
+            }
         }
         self.outcome = Outcome::Running;
         self.advance(now);
     }
 
-    /// Stop All: interrupts every command the run started; unfinished
-    /// steps (and ready ones whose command still runs) become Stopped.
+    /// Stop All: Ctrl+C to every command the run started (unfinished steps
+    /// and ready ones whose command still runs become Stopping, then
+    /// Stopped); a second Stop All kills the commands still stopping.
     pub fn stop_all(&mut self, now: Instant) {
+        self.stop_everything(true, now);
+    }
+
+    /// Stop All for a run being replaced by a new one: steps already
+    /// stopping keep their grace.
+    pub fn drain(&mut self, now: Instant) {
+        self.stop_everything(false, now);
+    }
+
+    fn stop_everything(&mut self, kill_stopping: bool, now: Instant) {
         let mut stopped = false;
         for index in 0..self.steps.len() {
-            let state = &self.steps[index];
-            if state.status.is_active() || (state.status == Status::Ready && state.command_live) {
-                self.stop_step(index, now);
+            let state = &mut self.steps[index];
+            if state.status == Status::Stopping {
+                if let Some(stop) = &mut state.stop
+                    && stop.then == Then::Restart
+                {
+                    stop.then = Then::Stopped;
+                }
+                if kill_stopping {
+                    self.kill(index, now);
+                }
+            } else if state.status.is_active()
+                || (state.status == Status::Ready && state.command.is_some())
+            {
+                self.stop_command(index, Then::Stopped, now);
                 stopped = true;
             }
         }
-        if stopped || self.outcome == Outcome::Running || self.outcome == Outcome::Ready {
+        if stopped || matches!(self.outcome, Outcome::Running | Outcome::Ready) {
             self.outcome = Outcome::Stopped;
         }
     }
 
-    fn stop_step(&mut self, index: usize, now: Instant) {
+    /// Ctrl+C to the step's command: Stopping until it exits or its grace
+    /// ends, then `then`. Without a live command, `then` at once.
+    fn stop_command(&mut self, index: usize, then: Then, now: Instant) {
+        let grace = self.workflow.steps[index].stop_grace();
         let state = &mut self.steps[index];
-        state.generation += 1;
-        state.phase = Phase::Idle;
-        state.ready_at = None;
-        state.detail.clear();
-        if state.command_live {
-            state.command_live = false;
-            self.effects.push(Effect::StopCommand { step: index });
+        if state.status == Status::Stopping {
+            if let Some(stop) = &mut state.stop {
+                stop.then = then;
+            }
+            self.stopping_detail(index, now);
+            return;
         }
-        self.set_status(index, Status::Stopped, now);
+        state.generation += 1;
+        state.ready_at = None;
+        if state.command.is_some() {
+            state.phase = Phase::Stopping;
+            state.stop = Some(Stop {
+                deadline: now + grace,
+                then,
+            });
+            self.effects.push(Effect::InterruptCommand { step: index });
+            self.stopping_detail(index, now);
+            self.set_status(index, Status::Stopping, now);
+        } else {
+            self.finish_stop(index, then, now);
+        }
     }
 
-    /// Restarts one step (whatever its state): it waits for its needs
-    /// again, then starts; its command replaces the previous one.
+    /// The stopped command is gone (or there was none).
+    fn finish_stop(&mut self, index: usize, then: Then, now: Instant) {
+        let state = &mut self.steps[index];
+        state.stop = None;
+        state.phase = Phase::Idle;
+        state.detail.clear();
+        match then {
+            Then::Stopped => self.set_status(index, Status::Stopped, now),
+            Then::Fail(reason) => self.set_status(index, Status::Failed(reason), now),
+            Then::Restart => self.reset(index, now),
+        }
+    }
+
+    /// Kills a stopping step's command and finishes the stop.
+    fn kill(&mut self, index: usize, now: Instant) {
+        let state = &mut self.steps[index];
+        let Some(stop) = state.stop.take() else {
+            return;
+        };
+        state.command = None;
+        self.effects.push(Effect::KillCommand { step: index });
+        self.finish_stop(index, stop.then, now);
+    }
+
+    /// `stopping (N s left)`, after the reason when it will fail.
+    fn stopping_detail(&mut self, index: usize, now: Instant) {
+        let state = &mut self.steps[index];
+        let Some(stop) = &state.stop else {
+            return;
+        };
+        let left = stop.deadline.saturating_duration_since(now);
+        let seconds = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+        let before = match &stop.then {
+            Then::Stopped => String::new(),
+            Then::Fail(reason) => format!("{reason}; "),
+            Then::Restart => "restarting; ".into(),
+        };
+        state.detail = format!("{before}stopping ({seconds} s left)");
+    }
+
+    /// Restarts one step (whatever its state): its command, if it still
+    /// runs, is stopped first; then it waits for its needs again and starts
+    /// in the same terminal.
     pub fn restart(&mut self, index: usize, now: Instant) {
         if index >= self.steps.len() {
             return;
         }
-        self.reset(index, now);
-        if self.outcome != Outcome::Running {
-            self.outcome = Outcome::Running;
+        if self.steps[index].command.is_some() {
+            self.stop_command(index, Then::Restart, now);
+        } else {
+            self.reset(index, now);
         }
+        self.outcome = Outcome::Running;
         self.advance(now);
     }
 
@@ -348,8 +532,30 @@ impl Run {
         waiting
     }
 
-    /// Back to Waiting with a new generation; a live command is stopped
-    /// (the next start replaces its terminal).
+    /// Keeps step `index` waiting until [`Run::release`]: the command of a
+    /// previous run still ends in its terminal. Call before [`Run::start`].
+    pub fn hold(&mut self, index: usize) {
+        if let Some(state) = self.steps.get_mut(index) {
+            state.held = true;
+        }
+    }
+
+    /// The previous command in step `index`'s terminal is gone.
+    pub fn release(&mut self, index: usize, now: Instant) {
+        if let Some(state) = self.steps.get_mut(index)
+            && state.held
+        {
+            state.held = false;
+            self.advance(now);
+        }
+    }
+
+    /// Whether step `index` is held (see [`Run::hold`]).
+    pub fn is_held(&self, index: usize) -> bool {
+        self.steps.get(index).is_some_and(|state| state.held)
+    }
+
+    /// Back to Waiting with a new generation (its command is gone).
     fn reset(&mut self, index: usize, now: Instant) {
         let step = &self.workflow.steps[index];
         let pattern = match &step.ready {
@@ -357,19 +563,23 @@ impl Run {
             _ => None,
         };
         let state = &mut self.steps[index];
+        debug_assert!(state.command.is_none(), "reset with a live command");
         state.generation += 1;
         state.phase = Phase::Idle;
         state.started = None;
         state.finished = None;
         state.exit = None;
         state.check_output = None;
+        state.artifacts = None;
+        state.stop = None;
         state.ready_at = None;
         state.detail.clear();
         state.watcher = OutputWatcher::new(pattern);
-        if state.command_live {
-            state.command_live = false;
-            self.effects.push(Effect::StopCommand { step: index });
-        }
+        state.blocked = false;
+        state.awaiting_retry = false;
+        state.placed = false;
+        state.artifacts_pending = false;
+        state.resolved = None;
         self.set_status(index, Status::Waiting, now);
     }
 
@@ -378,7 +588,8 @@ impl Run {
         if state.status == status {
             return;
         }
-        if matches!(status, Status::Ready | Status::Failed(_) | Status::Stopped) {
+        let finished = matches!(status, Status::Ready | Status::Failed(_) | Status::Stopped);
+        if finished {
             state.finished = Some(now);
         }
         state.status = status.clone();
@@ -386,55 +597,138 @@ impl Run {
             step: index,
             status,
         });
+        // What it produced: steps waiting for it wait for the check too.
+        if finished && state.placed && !self.workflow.steps[index].artifacts.is_empty() {
+            state.artifacts_pending = true;
+            self.effects.push(Effect::CheckArtifacts {
+                step: index,
+                generation: state.generation,
+            });
+        }
     }
 
-    /// Starts every waiting step whose needs are ready; notes what blocks
-    /// the others.
+    /// What keeps waiting step `index` from starting: steps still on their
+    /// way (`needs …; after …`), and steps that can never get there
+    /// (`(id, why)`).
+    fn blockers(&self, index: usize) -> (String, Vec<(&str, &'static str)>) {
+        let step = &self.workflow.steps[index];
+        let mut needs: Vec<&str> = Vec::new();
+        let mut after: Vec<&str> = Vec::new();
+        let mut stuck: Vec<(&str, &'static str)> = Vec::new();
+        for need in &step.needs {
+            let Some(state) = self.step(need).map(|at| &self.steps[at]) else {
+                continue;
+            };
+            match &state.status {
+                Status::Ready if !state.artifacts_pending => {}
+                Status::Failed(_) | Status::Stopped => stuck.push((need, "did not get ready")),
+                Status::Waiting if state.blocked => stuck.push((need, "can never run")),
+                _ => needs.push(need),
+            }
+        }
+        for id in &step.after {
+            let Some(state) = self.step(id).map(|at| &self.steps[at]) else {
+                continue;
+            };
+            match &state.status {
+                Status::Failed(_) if state.awaiting_retry => stuck.push((id, "waits for Retry")),
+                Status::Ready | Status::Failed(_) if !state.artifacts_pending => {}
+                Status::Stopped => stuck.push((id, "was stopped")),
+                Status::Waiting if state.blocked => stuck.push((id, "can never run")),
+                _ => after.push(id),
+            }
+        }
+        let mut waiting = Vec::new();
+        if !needs.is_empty() {
+            waiting.push(format!("needs {}", needs.join(", ")));
+        }
+        if !after.is_empty() {
+            waiting.push(format!("after {}", after.join(", ")));
+        }
+        (waiting.join("; "), stuck)
+    }
+
+    /// Starts every waiting step whose needs are ready and whose `after`
+    /// steps finished; notes what holds or blocks the others; then settles
+    /// the outcome.
     fn advance(&mut self, now: Instant) {
         loop {
-            let mut started = false;
+            let mut changed = false;
             for index in 0..self.steps.len() {
                 if self.steps[index].status != Status::Waiting {
                     continue;
                 }
-                let blockers: Vec<(String, bool)> = self.workflow.steps[index]
-                    .needs
-                    .iter()
-                    .filter_map(|need| {
-                        let at = self.step(need)?;
-                        match &self.steps[at].status {
-                            Status::Ready => None,
-                            Status::Failed(_) | Status::Stopped => Some((need.clone(), true)),
-                            _ => Some((need.clone(), false)),
-                        }
-                    })
-                    .collect();
-                if blockers.is_empty() {
+                if self.steps[index].held {
+                    let state = &mut self.steps[index];
+                    state.detail = "waiting for its previous command to end".into();
+                    state.blocked = false;
+                    continue;
+                }
+                let (waiting, stuck) = self.blockers(index);
+                if waiting.is_empty() && stuck.is_empty() {
                     self.begin(index, now);
-                    started = true;
+                    changed = true;
+                    continue;
+                }
+                let blocked = !stuck.is_empty();
+                let detail = if blocked {
+                    // `a, b did not get ready; c was stopped`.
+                    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+                    for (id, why) in stuck {
+                        match groups.iter_mut().find(|(reason, _)| *reason == why) {
+                            Some((_, ids)) => ids.push(id),
+                            None => groups.push((why, vec![id])),
+                        }
+                    }
+                    let groups: Vec<String> = groups
+                        .into_iter()
+                        .map(|(why, ids)| format!("{} {why}", ids.join(", ")))
+                        .collect();
+                    format!("blocked: {}", groups.join("; "))
                 } else {
-                    let names: Vec<&str> = blockers.iter().map(|(id, _)| id.as_str()).collect();
-                    self.steps[index].detail = if blockers.iter().any(|(_, stuck)| *stuck) {
-                        format!("blocked: {} did not get ready", names.join(", "))
-                    } else {
-                        format!("needs {}", names.join(", "))
-                    };
+                    waiting
+                };
+                let state = &mut self.steps[index];
+                state.detail = detail;
+                if state.blocked != blocked {
+                    state.blocked = blocked;
+                    changed = true;
                 }
             }
-            if !started {
+            if !changed {
                 break;
             }
         }
-        if self.outcome == Outcome::Running
-            && self.steps.iter().all(|state| state.status == Status::Ready)
-        {
+        self.settle();
+    }
+
+    /// Ready when every step is; failed (with failures) when nothing can
+    /// progress any more.
+    fn settle(&mut self) {
+        if self.outcome != Outcome::Running {
+            return;
+        }
+        if self.steps.iter().all(|state| state.status == Status::Ready) {
             self.outcome = Outcome::Ready;
+            return;
+        }
+        let progressing = self.steps.iter().any(|state| match state.status {
+            Status::Pending | Status::Starting | Status::Running | Status::Stopping => true,
+            Status::Waiting => !state.blocked,
+            Status::Ready | Status::Failed(_) | Status::Stopped => false,
+        });
+        if !progressing {
+            self.outcome = Outcome::Failed;
         }
     }
 
     fn begin(&mut self, index: usize, now: Instant) {
-        let generation = self.steps[index].generation;
         self.steps[index].started = Some(now);
+        match self.resolve(index) {
+            Ok(step) => self.steps[index].resolved = Some(step),
+            Err(error) => return self.fail(index, error, now),
+        }
+        let generation = self.steps[index].generation;
         self.set_status(index, Status::Starting, now);
         if self.workflow.steps[index].project.is_some() {
             self.steps[index].phase = Phase::Project;
@@ -448,8 +742,71 @@ impl Run {
         }
     }
 
+    /// Step `index` with its `${steps.…}` variables replaced by what the
+    /// steps it waits for left.
+    fn resolve(&self, index: usize) -> Result<Step, String> {
+        let step = &self.workflow.steps[index];
+        if !step.texts().any(|text| text.contains("${steps.")) {
+            return Ok(step.clone());
+        }
+        let ids: Vec<&str> = step.upstream().collect();
+        let value = |found: &StepRef| -> Result<String, String> {
+            let at = self
+                .step(found.step)
+                .ok_or_else(|| format!("`{}`: no step `{}`", found.text, found.step))?;
+            let state = &self.steps[at];
+            match &found.field {
+                StepField::Status => Ok(state.status.name().to_owned()),
+                StepField::ExitCode => Ok(state
+                    .exit
+                    .flatten()
+                    .map(|code| code.to_string())
+                    .unwrap_or_default()),
+                StepField::Artifact(by) => {
+                    let artifact = self.workflow.steps[at].artifact(by).ok_or_else(|| {
+                        format!("`{}`: `{}` has no such artifact", found.text, found.step)
+                    })?;
+                    match &state.artifacts {
+                        Some(Ok(checked)) => checked
+                            .get(artifact)
+                            .map(|checked| checked.resolved.clone())
+                            .ok_or_else(|| format!("`{}`: not checked", found.text)),
+                        Some(Err(error)) => Err(format!(
+                            "`{}`: the artifacts of `{}` could not be resolved: {error}",
+                            found.text, found.step
+                        )),
+                        None => Err(format!(
+                            "`{}`: `{}` did not get to check its artifacts",
+                            found.text, found.step
+                        )),
+                    }
+                }
+            }
+        };
+        let replace = |text: &str| vars::substitute(text, &ids, value);
+        let mut resolved = step.clone();
+        for text in [&mut resolved.run, &mut resolved.check, &mut resolved.cwd]
+            .into_iter()
+            .flatten()
+        {
+            *text = replace(text)?;
+        }
+        for text in resolved.env.values_mut() {
+            *text = replace(text)?;
+        }
+        for artifact in &mut resolved.artifacts {
+            match &mut artifact.target {
+                crate::ArtifactTarget::Path(text) | crate::ArtifactTarget::Url(text) => {
+                    *text = replace(text)?;
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
     fn after_project(&mut self, index: usize, now: Instant) {
         let generation = self.steps[index].generation;
+        self.steps[index].placed = true;
         if self.workflow.steps[index].check.is_some() {
             self.steps[index].phase = Phase::Check;
             self.steps[index].detail = "checking".into();
@@ -480,7 +837,7 @@ impl Run {
             state.ready_at = Some(now + Duration::from_millis(ms));
         }
         if has_command {
-            state.command_live = true;
+            state.command = Some(generation);
             self.effects.push(Effect::StartCommand {
                 step: index,
                 generation,
@@ -501,16 +858,17 @@ impl Run {
         self.set_status(index, Status::Ready, now);
     }
 
+    /// Fails the step; a command that still runs is stopped first (the
+    /// step is Stopping until it is gone).
     fn fail(&mut self, index: usize, reason: String, now: Instant) {
+        if self.steps[index].command.is_some() {
+            return self.stop_command(index, Then::Fail(reason), now);
+        }
         let state = &mut self.steps[index];
         state.phase = Phase::Idle;
         state.ready_at = None;
         state.detail.clear();
         state.generation += 1;
-        if state.command_live {
-            state.command_live = false;
-            self.effects.push(Effect::StopCommand { step: index });
-        }
         self.set_status(index, Status::Failed(reason), now);
     }
 
@@ -572,6 +930,7 @@ impl Run {
         self.steps[index].check_output = (!last.is_empty()).then(|| last.clone());
         match self.workflow.steps[index].on_fail.clone() {
             Some(message) => {
+                self.steps[index].awaiting_retry = true;
                 self.fail(index, message, now);
                 self.advance(now);
             }
@@ -582,27 +941,45 @@ impl Run {
                     format!("check failed ({what}): {last}")
                 };
                 self.fail(index, reason, now);
-                self.stop_all(now);
+                self.drain(now);
                 self.outcome = Outcome::Failed;
             }
         }
     }
 
-    /// The command could not start.
+    /// The command could not start (or was not started: the step was
+    /// stopped before).
     pub fn start_failed(&mut self, index: usize, generation: u64, error: &str, now: Instant) {
+        let Some(state) = self.steps.get_mut(index) else {
+            return;
+        };
+        if state.command == Some(generation) {
+            state.command = None;
+            if let Some(stop) = state.stop.take() {
+                self.finish_stop(index, stop.then, now);
+                self.advance(now);
+                return;
+            }
+        }
         if self.current(index, generation) {
-            self.steps[index].command_live = false;
             self.fail(index, format!("could not start: {error}"), now);
             self.advance(now);
         }
     }
 
-    /// Output of the step's command.
+    /// Output of the step's command (kept while it stops, too).
     pub fn output(&mut self, index: usize, generation: u64, bytes: &[u8], now: Instant) {
-        if !self.current(index, generation) {
+        let Some(state) = self.steps.get_mut(index) else {
+            return;
+        };
+        let current = state.generation == generation;
+        if !current && state.command != Some(generation) {
             return;
         }
-        let seen = self.steps[index].watcher.push(bytes);
+        let seen = state.watcher.push(bytes);
+        if !current {
+            return;
+        }
         let step = &self.workflow.steps[index];
         let state = &self.steps[index];
         let waiting = state.status == Status::Running && state.phase == Phase::Waiting;
@@ -626,14 +1003,21 @@ impl Run {
         }
     }
 
-    /// The step's command exited.
+    /// The step's command exited (a stopping one: the stop is done).
     pub fn exited(&mut self, index: usize, generation: u64, code: Option<i32>, now: Instant) {
-        if !self.current(index, generation) || !self.steps[index].command_live {
+        let Some(state) = self.steps.get_mut(index) else {
+            return;
+        };
+        if state.command != Some(generation) {
             return;
         }
-        let state = &mut self.steps[index];
-        state.command_live = false;
+        state.command = None;
         state.exit = Some(code);
+        if let Some(stop) = state.stop.take() {
+            self.finish_stop(index, stop.then, now);
+            self.advance(now);
+            return;
+        }
         let waiting = state.status == Status::Running && state.phase == Phase::Waiting;
         if !waiting {
             return;
@@ -668,12 +1052,55 @@ impl Run {
         }
     }
 
-    /// Delays and timeouts up to `now`.
+    /// The step's artifacts, resolved and checked where it runs (in file
+    /// order), or why they could not be.
+    pub fn artifacts_checked(
+        &mut self,
+        index: usize,
+        generation: u64,
+        result: Result<Vec<ArtifactState>, String>,
+        now: Instant,
+    ) {
+        if !self.current(index, generation) {
+            return;
+        }
+        let state = &mut self.steps[index];
+        state.artifacts = Some(result);
+        state.artifacts_pending = false;
+        self.advance(now);
+    }
+
+    /// Checks the step's artifacts again; false if it has none or did not
+    /// get to where it runs.
+    pub fn check_artifacts(&mut self, index: usize) -> bool {
+        let Some(state) = self.steps.get(index) else {
+            return false;
+        };
+        let wanted = state.placed && !self.workflow.steps[index].artifacts.is_empty();
+        if wanted {
+            self.effects.push(Effect::CheckArtifacts {
+                step: index,
+                generation: state.generation,
+            });
+        }
+        wanted
+    }
+
+    /// Delays, timeouts and stop graces up to `now`.
     pub fn tick(&mut self, now: Instant) {
         let mut changed = false;
         for index in 0..self.steps.len() {
             let state = &self.steps[index];
-            if !state.status.is_active() || state.status == Status::Waiting {
+            if state.status == Status::Stopping {
+                if state.stop.as_ref().is_some_and(|stop| stop.deadline <= now) {
+                    self.kill(index, now);
+                    changed = true;
+                } else {
+                    self.stopping_detail(index, now);
+                }
+                continue;
+            }
+            if !matches!(state.status, Status::Starting | Status::Running) {
                 continue;
             }
             if state.phase == Phase::Waiting && state.ready_at.is_some_and(|at| at <= now) {
@@ -705,13 +1132,16 @@ impl Run {
         self.steps
             .iter()
             .enumerate()
-            .filter(|(_, state)| matches!(state.status, Status::Starting | Status::Running))
             .flat_map(|(index, state)| {
+                let stop = state.stop_deadline();
+                if !matches!(state.status, Status::Starting | Status::Running) {
+                    return [stop, None, None];
+                }
                 let timeout = self.workflow.steps[index]
                     .timeout_s
                     .zip(state.started)
                     .map(|(seconds, started)| started + Duration::from_secs(seconds));
-                [state.ready_at, timeout]
+                [stop, state.ready_at, timeout]
             })
             .flatten()
             .min()
@@ -719,406 +1149,4 @@ impl Run {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::file::parse;
-
-    fn run(text: &str) -> Run {
-        Run::new(parse(text, "test").unwrap())
-    }
-
-    fn statuses(run: &Run) -> Vec<&'static str> {
-        run.steps()
-            .iter()
-            .map(|state| state.status.name())
-            .collect()
-    }
-
-    fn generation(run: &Run, index: usize) -> u64 {
-        run.steps()[index].generation()
-    }
-
-    const CHAIN: &str = r#"{"steps": [
-        {"id": "a", "run": "a"},
-        {"id": "b", "run": "b"},
-        {"id": "c", "needs": ["a", "b"], "run": "c"},
-        {"id": "d", "needs": ["c"], "run": "d"}
-    ]}"#;
-
-    #[test]
-    fn independent_steps_start_together_and_needs_wait() {
-        let t = Instant::now();
-        let mut run = run(CHAIN);
-        assert_eq!(run.outcome(), Outcome::Idle);
-        assert_eq!(statuses(&run), ["pending"; 4]);
-        run.start(t);
-        assert_eq!(statuses(&run), ["running", "running", "waiting", "waiting"]);
-        assert_eq!(
-            run.take_effects(),
-            [
-                Effect::StartCommand {
-                    step: 0,
-                    generation: generation(&run, 0)
-                },
-                Effect::StartCommand {
-                    step: 1,
-                    generation: generation(&run, 1)
-                },
-            ]
-        );
-        assert_eq!(run.steps()[2].detail, "needs a, b");
-        run.exited(0, generation(&run, 0), Some(0), t);
-        assert_eq!(statuses(&run), ["ready", "running", "waiting", "waiting"]);
-        assert_eq!(run.steps()[2].detail, "needs b");
-        run.exited(1, generation(&run, 1), Some(0), t);
-        assert_eq!(statuses(&run), ["ready", "ready", "running", "waiting"]);
-        run.exited(2, generation(&run, 2), Some(0), t);
-        run.exited(3, generation(&run, 3), Some(0), t);
-        assert_eq!(statuses(&run), ["ready"; 4]);
-        assert_eq!(run.outcome(), Outcome::Ready);
-        let changes: Vec<(usize, &str)> = run
-            .take_changes()
-            .iter()
-            .map(|change| (change.step, change.status.name()))
-            .collect();
-        assert_eq!(
-            &changes[..4],
-            [
-                (0, "waiting"),
-                (1, "waiting"),
-                (2, "waiting"),
-                (3, "waiting")
-            ]
-        );
-        assert!(changes.contains(&(2, "running")));
-        assert_eq!(changes.last(), Some(&(3, "ready")));
-    }
-
-    #[test]
-    fn projects_open_and_checks_run_before_the_command() {
-        let t = Instant::now();
-        let mut run = run(
-            r#"{"steps": [{"id": "a", "project": {"local": "/p"}, "check": "c", "run": "r"}]}"#,
-        );
-        run.start(t);
-        let g = generation(&run, 0);
-        assert_eq!(
-            run.take_effects(),
-            [Effect::OpenProject {
-                step: 0,
-                generation: g
-            }]
-        );
-        assert_eq!(statuses(&run), ["starting"]);
-        assert_eq!(run.steps()[0].detail, "opening the project");
-        run.project_opened(0, g, t);
-        assert_eq!(
-            run.take_effects(),
-            [Effect::RunCheck {
-                step: 0,
-                generation: g
-            }]
-        );
-        assert_eq!(run.steps()[0].detail, "checking");
-        run.check_finished(
-            0,
-            g,
-            CheckResult::Exited {
-                code: Some(0),
-                output: String::new(),
-            },
-            t,
-        );
-        assert_eq!(
-            run.take_effects(),
-            [Effect::StartCommand {
-                step: 0,
-                generation: g
-            }]
-        );
-        assert_eq!(statuses(&run), ["running"]);
-
-        let mut failing =
-            self::run(r#"{"steps": [{"id": "a", "project": {"local": "/p"}, "run": "r"}]}"#);
-        failing.start(t);
-        failing.project_failed(0, generation(&failing, 0), "no such folder", t);
-        assert_eq!(
-            failing.steps()[0].status,
-            Status::Failed("could not open the project: no such folder".into())
-        );
-    }
-
-    #[test]
-    fn a_failed_check_with_on_fail_waits_for_retry() {
-        let t = Instant::now();
-        let mut run = run(r#"{"steps": [
-                {"id": "vpn", "check": "ping", "onFail": "Connect the VPN"},
-                {"id": "other", "run": "x", "ready": {"port": 80}},
-                {"id": "app", "needs": ["vpn"], "run": "app"}
-            ]}"#);
-        run.start(t);
-        run.take_effects();
-        run.check_finished(
-            0,
-            generation(&run, 0),
-            CheckResult::Exited {
-                code: Some(1),
-                output: "Request timed out.\n".into(),
-            },
-            t,
-        );
-        assert_eq!(
-            run.steps()[0].status,
-            Status::Failed("Connect the VPN".into())
-        );
-        assert_eq!(
-            run.steps()[0].check_output.as_deref(),
-            Some("Request timed out.")
-        );
-        assert_eq!(statuses(&run), ["failed", "running", "waiting"]);
-        assert_eq!(run.steps()[2].detail, "blocked: vpn did not get ready");
-        assert_eq!(run.outcome(), Outcome::Running);
-        assert!(run.take_effects().is_empty(), "nothing else is stopped");
-
-        run.retry_failed(t);
-        let g = generation(&run, 0);
-        assert_eq!(
-            run.take_effects(),
-            [Effect::RunCheck {
-                step: 0,
-                generation: g
-            }]
-        );
-        run.check_finished(
-            0,
-            g,
-            CheckResult::Exited {
-                code: Some(0),
-                output: String::new(),
-            },
-            t,
-        );
-        assert_eq!(statuses(&run), ["ready", "running", "running"]);
-    }
-
-    #[test]
-    fn a_failed_check_without_on_fail_fails_the_workflow() {
-        let t = Instant::now();
-        let mut run = run(r#"{"steps": [
-                {"id": "server", "run": "serve", "ready": {"output": "up"}},
-                {"id": "docker", "check": "docker info"},
-                {"id": "app", "needs": ["docker"], "run": "app"}
-            ]}"#);
-        run.start(t);
-        run.take_effects();
-        run.check_finished(
-            1,
-            generation(&run, 1),
-            CheckResult::Error("docker not found".into()),
-            t,
-        );
-        assert_eq!(
-            run.steps()[1].status,
-            Status::Failed("check failed (docker not found)".into())
-        );
-        assert_eq!(statuses(&run), ["stopped", "failed", "stopped"]);
-        assert_eq!(run.take_effects(), [Effect::StopCommand { step: 0 }]);
-        assert_eq!(run.outcome(), Outcome::Failed);
-        assert!(!run.is_active());
-    }
-
-    #[test]
-    fn readiness_by_output_port_delay_manual_and_exit() {
-        let t = Instant::now();
-        let mut run = run(r#"{"steps": [
-                {"id": "out", "run": "s", "ready": {"output": "Listening on (\\d+)"}},
-                {"id": "port", "run": "s", "ready": {"port": 8000}},
-                {"id": "delay", "run": "s", "ready": {"delay_ms": 500}},
-                {"id": "gate", "ready": {"manual": "Log in"}},
-                {"id": "build", "run": "make"}
-            ]}"#);
-        run.start(t);
-        run.output(0, generation(&run, 0), b"\x1b[32mListening", t);
-        assert_eq!(run.steps()[0].status, Status::Running);
-        run.output(0, generation(&run, 0), b" on\x1b[0m 8080\r\n", t);
-        assert_eq!(run.steps()[0].status, Status::Ready);
-        assert_eq!(run.steps()[0].last_line(), "Listening on 8080");
-
-        assert_eq!(run.port_watches(), [(1, generation(&run, 1), 8000)]);
-        run.port_state(1, generation(&run, 1), false, t);
-        assert_eq!(run.steps()[1].status, Status::Running);
-        run.port_state(1, generation(&run, 1), true, t);
-        assert_eq!(run.steps()[1].status, Status::Ready);
-        assert!(run.port_watches().is_empty());
-
-        assert_eq!(run.next_deadline(), Some(t + Duration::from_millis(500)));
-        run.tick(t + Duration::from_millis(499));
-        assert_eq!(run.steps()[2].status, Status::Running);
-        run.tick(t + Duration::from_millis(500));
-        assert_eq!(run.steps()[2].status, Status::Ready);
-
-        assert_eq!(run.steps()[3].detail, "Log in");
-        assert!(!run.continue_step(0, t), "not a manual step");
-        assert!(run.continue_step(3, t));
-        assert!(!run.continue_step(3, t), "already continued");
-        assert_eq!(run.steps()[3].status, Status::Ready);
-
-        run.exited(4, generation(&run, 4), Some(2), t);
-        assert_eq!(
-            run.steps()[4].status,
-            Status::Failed("failed (exit code 2)".into())
-        );
-        assert_eq!(run.outcome(), Outcome::Running);
-        // Exiting before readiness fails; exiting after it is only noted.
-        run.exited(0, generation(&run, 0), Some(1), t);
-        assert_eq!(run.steps()[0].status, Status::Ready);
-        assert_eq!(run.steps()[0].exit, Some(Some(1)));
-        run.restart(1, t);
-        run.exited(1, generation(&run, 1), Some(0), t);
-        assert_eq!(
-            run.steps()[1].status,
-            Status::Failed("exited before it was ready (exit code 0)".into())
-        );
-    }
-
-    #[test]
-    fn timeouts_fail_the_step_and_stop_its_command() {
-        let t = Instant::now();
-        let mut run = run(r#"{"steps": [
-                {"id": "slow", "run": "s", "ready": {"output": "never"}, "timeout_s": 10},
-                {"id": "after", "needs": ["slow"], "run": "x"}
-            ]}"#);
-        run.start(t);
-        run.take_effects();
-        assert_eq!(run.next_deadline(), Some(t + Duration::from_secs(10)));
-        run.tick(t + Duration::from_secs(9));
-        assert_eq!(statuses(&run), ["running", "waiting"]);
-        run.tick(t + Duration::from_secs(10));
-        assert_eq!(
-            run.steps()[0].status,
-            Status::Failed("timed out after 10 s".into())
-        );
-        assert_eq!(run.take_effects(), [Effect::StopCommand { step: 0 }]);
-        assert_eq!(
-            run.steps()[0].elapsed(t + Duration::from_secs(60)),
-            Some(Duration::from_secs(10))
-        );
-        assert_eq!(run.steps()[1].detail, "blocked: slow did not get ready");
-    }
-
-    #[test]
-    fn stop_interrupts_live_commands_and_ignores_late_reports() {
-        let t = Instant::now();
-        let mut run = run(r#"{"steps": [
-                {"id": "server", "run": "s", "ready": {"port": 80}},
-                {"id": "build", "run": "make"},
-                {"id": "after", "needs": ["build"], "run": "x"}
-            ]}"#);
-        run.start(t);
-        let old = generation(&run, 0);
-        run.port_state(0, old, true, t);
-        run.exited(1, generation(&run, 1), Some(0), t);
-        run.take_effects();
-        assert_eq!(statuses(&run), ["ready", "ready", "running"]);
-        run.stop_all(t);
-        // The ready server still ran: stopped too; the build had exited.
-        assert_eq!(statuses(&run), ["stopped", "ready", "stopped"]);
-        assert_eq!(
-            run.take_effects(),
-            [
-                Effect::StopCommand { step: 0 },
-                Effect::StopCommand { step: 2 }
-            ]
-        );
-        assert_eq!(run.outcome(), Outcome::Stopped);
-        assert!(!run.is_active());
-        // Reports from the stopped commands change nothing.
-        run.exited(0, old, Some(130), t);
-        run.output(2, generation(&run, 2) - 1, b"late\n", t);
-        assert_eq!(statuses(&run), ["stopped", "ready", "stopped"]);
-
-        // Run All again starts everything afresh.
-        run.start(t);
-        assert_eq!(statuses(&run), ["running", "running", "waiting"]);
-        assert_eq!(run.outcome(), Outcome::Running);
-    }
-
-    #[test]
-    fn restart_replaces_the_command_and_drops_stale_results() {
-        let t = Instant::now();
-        let mut run = run(r#"{"steps": [{"id": "a", "run": "s", "ready": {"output": "up"}}]}"#);
-        run.start(t);
-        let first = generation(&run, 0);
-        run.take_effects();
-        run.restart(0, t);
-        let second = generation(&run, 0);
-        assert_ne!(first, second);
-        assert_eq!(
-            run.take_effects(),
-            [
-                Effect::StopCommand { step: 0 },
-                Effect::StartCommand {
-                    step: 0,
-                    generation: second
-                }
-            ]
-        );
-        // The replaced command's output and exit are ignored.
-        run.output(0, first, b"up\n", t);
-        run.exited(0, first, Some(1), t);
-        assert_eq!(run.steps()[0].status, Status::Running);
-        run.output(0, second, b"up\n", t);
-        assert_eq!(run.steps()[0].status, Status::Ready);
-    }
-
-    #[test]
-    fn urls_open_once_until_the_step_is_ready() {
-        let t = Instant::now();
-        let mut run = run(r#"{"steps": [
-                {"id": "web", "run": "s", "openUrls": true, "ready": {"output": "compiled"}},
-                {"id": "quiet", "run": "s", "ready": {"output": "x"}}
-            ]}"#);
-        run.start(t);
-        run.take_effects();
-        let g = generation(&run, 0);
-        run.output(0, g, b"Local: http://localhost:5173/\r\n", t);
-        run.output(
-            0,
-            g,
-            b"Local: http://localhost:5173/\r\nLogin: https://auth.example/x\n",
-            t,
-        );
-        run.output(1, generation(&run, 1), b"http://ignored/\n", t);
-        assert_eq!(
-            run.take_effects(),
-            [
-                Effect::OpenUrl {
-                    step: 0,
-                    url: "http://localhost:5173/".into()
-                },
-                Effect::OpenUrl {
-                    step: 0,
-                    url: "https://auth.example/x".into()
-                },
-            ]
-        );
-        // The line right after the one that made it ready still counts…
-        run.output(0, g, b"compiled\nhttp://after.ready/\n", t);
-        assert_eq!(run.steps()[0].status, Status::Ready);
-        assert_eq!(
-            run.take_effects(),
-            [Effect::OpenUrl {
-                step: 0,
-                url: "http://after.ready/".into()
-            }]
-        );
-        // …later output does not.
-        run.output(
-            0,
-            g,
-            b"http://later/\n",
-            t + URL_GRACE + Duration::from_millis(1),
-        );
-        assert!(run.take_effects().is_empty());
-    }
-}
+mod tests;

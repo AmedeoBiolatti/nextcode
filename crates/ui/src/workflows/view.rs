@@ -1,6 +1,7 @@
 //! A workflow's tab: the file in an editor on the left, its steps as a
 //! graph on the right (Azure DevOps style: columns by dependency depth,
-//! cards with state, edges from each need to the steps needing it), and a
+//! cards with state, solid edges from each need to the steps needing it,
+//! dashed ones from each step to those running `after` it), and a
 //! toolbar with the workflow's state, Run All, Stop All and Retry Failed.
 //!
 //! The graph follows the buffer, 200 ms after the last edit: a file that
@@ -8,8 +9,9 @@
 //! a click goes there) over the last good graph, dimmed. Clicking a card
 //! selects it, puts the editor's cursor on its `"id"` and shows its
 //! details below the graph (state, wait or failure reason, last output
-//! lines, Terminal / Continue / Restart or Retry); the card holding the
-//! editor's cursor is highlighted. Run All saves the file first.
+//! lines, artifact links, Terminal / Continue / Restart or Retry); the
+//! card holding the editor's cursor is highlighted. Run All saves the file
+//! first.
 
 use std::{
     cell::Cell,
@@ -27,8 +29,8 @@ use gpui::{
 };
 use text::Buffer;
 use workflow::{
-    GraphLayout, Metrics, Outcome, Ready, Status, Step, StepSpan, StepState, View as Placement,
-    Workflow,
+    ArtifactTarget, GraphLayout, Metrics, Outcome, Ready, Status, Step, StepSpan, StepState,
+    View as Placement, Workflow,
 };
 
 use super::{
@@ -119,19 +121,30 @@ fn elapsed_text(elapsed: Duration) -> String {
     }
 }
 
+/// The last component of a path (`/` or `\` separated).
+fn base_name(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+}
+
 fn status_look(status: &Status) -> (&'static str, Hsla) {
     match status {
         Status::Pending => ("○", theme::muted()),
         Status::Waiting => ("◦", theme::muted()),
         Status::Starting => ("◌", theme::warning()),
         Status::Running => ("▶", theme::accent()),
+        Status::Stopping => ("□", theme::warning()),
         Status::Ready => ("✓", theme::git_added()),
         Status::Failed(_) => ("✗", theme::error()),
         Status::Stopped => ("■", theme::muted()),
     }
 }
 
-/// What a step does, in a few words: `check · run · port 8000`.
+/// What a step does, in a few words: `check · run · port 8000 · after`
+/// (`after`: it runs once the steps on its dashed edges finished).
 fn kind_hint(step: &Step) -> String {
     let mut parts: Vec<String> = Vec::new();
     if step.check.is_some() {
@@ -146,6 +159,9 @@ fn kind_hint(step: &Step) -> String {
         Ready::Port(port) => parts.push(format!("port {port}")),
         Ready::Manual(_) => parts.push("manual".into()),
         Ready::Delay(ms) => parts.push(format!("delay {ms} ms")),
+    }
+    if !step.after.is_empty() {
+        parts.push("after".into());
     }
     parts.join(" · ")
 }
@@ -648,6 +664,11 @@ impl WorkflowView {
         if !kind.is_empty() {
             detail = format!("{detail} · {kind}");
         }
+        // While it stops, the countdown says how long it may still take.
+        if let Some((_, state)) = state.filter(|(_, state)| state.status == Status::Stopping) {
+            detail = state.detail.clone();
+        }
+        let artifacts = step.artifacts.len();
         // Sizes, text and spacing follow the zoom; hit testing comes with
         // the elements being where they are drawn.
         let scale = placement.scale;
@@ -724,9 +745,31 @@ impl WorkflowView {
                     .child(div().truncate().text_color(theme::muted()).child(detail))
                     .child(
                         div()
-                            .truncate()
-                            .text_color(theme::accent_text())
-                            .child(place(step, active, state.map(|(at, _)| at))),
+                            .flex()
+                            .items_center()
+                            .gap(size(6.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme::accent_text())
+                                    .child(place(step, active, state.map(|(at, _)| at))),
+                            )
+                            .when(artifacts > 0, |line| {
+                                line.child(
+                                    div()
+                                        .flex_none()
+                                        .px(size(4.))
+                                        .rounded(size(3.))
+                                        .border_1()
+                                        .border_color(theme::border())
+                                        .text_size(size(11.))
+                                        .line_height(size(14.))
+                                        .text_color(theme::muted())
+                                        .child(format!("↗ {artifacts}")),
+                                )
+                            }),
                     ),
             )
             .into_any_element()
@@ -743,11 +786,14 @@ impl WorkflowView {
         };
         let workflows = self.workflows.read(cx);
         let active = workflows.run_of(&self.id);
-        let ready: Vec<bool> = workflow
+        // Needs edges light up once the need is ready; dashed `after`
+        // edges once the step finished, ready or failed.
+        let statuses: Vec<Status> = workflow
             .steps
             .iter()
             .map(|step| {
-                state_of(active, &step.id).is_some_and(|(_, state)| state.status == Status::Ready)
+                state_of(active, &step.id)
+                    .map_or(Status::Pending, |(_, state)| state.status.clone())
             })
             .collect();
         let placement = self.placement();
@@ -758,10 +804,17 @@ impl WorkflowView {
                 px(placement.offset.1 + y * scale),
             )
         };
-        let edges: Vec<(Point<Pixels>, Point<Pixels>, bool)> = layout
+        let edges: Vec<(Point<Pixels>, Point<Pixels>, bool, bool)> = layout
             .edges
             .iter()
-            .map(|edge| (at(edge.start), at(edge.end), ready[edge.from]))
+            .map(|edge| {
+                let lit = match &statuses[edge.from] {
+                    Status::Ready => true,
+                    Status::Failed(_) => edge.after,
+                    _ => false,
+                };
+                (at(edge.start), at(edge.end), lit, edge.after)
+            })
             .collect();
         let cards: Vec<AnyElement> = workflow
             .steps
@@ -779,16 +832,19 @@ impl WorkflowView {
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, _| {
-                        for (start, end, lit) in &edges {
+                        for (start, end, lit, after) in &edges {
                             let (start, end) = (*start + bounds.origin, *end + bounds.origin);
-                            let color = if *lit {
-                                theme::git_added()
-                            } else {
-                                theme::muted()
+                            let color = match (*lit, *after) {
+                                (true, false) => theme::git_added(),
+                                (true, true) => theme::accent(),
+                                (false, _) => theme::muted(),
                             };
                             let bend = ((end.x - start.x) / 2.).max(px(24. * scale));
                             let width = (if *lit { 2. } else { 1.5 }) * scale.max(0.6);
                             let mut path = PathBuilder::stroke(px(width));
+                            if *after {
+                                path = path.dash_array(&[px(6. * scale), px(4. * scale)]);
+                            }
                             path.move_to(start);
                             path.cubic_bezier_to(
                                 end,
@@ -857,6 +913,7 @@ impl WorkflowView {
                     .collect()
             })
             .unwrap_or_default();
+        let artifacts = self.render_artifacts(step, state, cx);
         let run_index = state.map(|(at, _)| at);
         let has_terminal = active
             .zip(run_index)
@@ -990,7 +1047,8 @@ impl WorkflowView {
                                         lines.into_iter().map(|line| div().truncate().child(line)),
                                     ),
                             )
-                        }),
+                        })
+                        .children(artifacts),
                 )
                 .children(terminal.map(|view| {
                     div()
@@ -1001,6 +1059,125 @@ impl WorkflowView {
                         .border_color(theme::border())
                         .child(div().flex_1().min_w_0().child(view))
                 }))
+                .into_any_element(),
+        )
+    }
+
+    /// The step's artifacts as links: files open in an editor tab of the
+    /// step's project, URLs in the browser; a file not found is dimmed
+    /// and marked missing. "Check again" looks them up again.
+    fn render_artifacts(
+        &self,
+        step: &Step,
+        state: Option<(usize, &StepState)>,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if step.artifacts.is_empty() {
+            return None;
+        }
+        let checked = state.and_then(|(_, state)| state.artifacts.as_ref());
+        let error = checked.and_then(|checked| checked.as_ref().err().cloned());
+        let checked = checked.and_then(|checked| checked.as_ref().ok());
+        let run_index = state.map(|(at, _)| at);
+        let checkable = state.is_some_and(|(_, state)| {
+            !matches!(
+                state.status,
+                Status::Pending | Status::Waiting | Status::Starting
+            )
+        });
+        let rows = step.artifacts.iter().enumerate().map(|(index, artifact)| {
+            let found = checked.and_then(|checked| checked.get(index));
+            let url = matches!(artifact.target, ArtifactTarget::Url(_));
+            let name = match (&artifact.label, found) {
+                (Some(label), _) => label.clone(),
+                (None, Some(found)) if !url => base_name(&found.resolved).to_owned(),
+                (None, Some(found)) => found.resolved.clone(),
+                (None, None) => artifact.name().to_owned(),
+            };
+            let (opens, note) = match found {
+                Some(found) if found.exists => (true, ""),
+                Some(_) => (false, "missing"),
+                None => (false, "not checked"),
+            };
+            let shown = found.map_or_else(
+                || artifact.target.text().to_owned(),
+                |found| found.resolved.clone(),
+            );
+            div()
+                .id(("step-artifact", index))
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_sm()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(if opens {
+                            theme::accent_text()
+                        } else {
+                            theme::muted()
+                        })
+                        .child(if url { format!("{name} ↗") } else { name }),
+                )
+                .when(!note.is_empty(), |row| {
+                    row.child(div().flex_none().text_color(theme::warning()).child(note))
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme::muted())
+                        .child(shown),
+                )
+                .when_some(run_index.filter(|_| opens), |row, at| {
+                    row.cursor_pointer()
+                        .hover(|style| style.bg(theme::hover_row()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let id = this.id.clone();
+                            this.workflows.update(cx, |workflows, cx| {
+                                workflows.open_artifact(&id, at, index, cx)
+                            });
+                        }))
+                })
+        });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .text_xs()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme::muted())
+                                .child("Artifacts"),
+                        )
+                        .when_some(run_index.filter(|_| checkable), |header, at| {
+                            header.child(button("step-artifacts-check", "Check again").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    let id = this.id.clone();
+                                    this.workflows.update(cx, |workflows, cx| {
+                                        workflows.check_artifacts(&id, at, cx);
+                                    });
+                                }),
+                            ))
+                        })
+                        .children(error.map(|error| {
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme::error())
+                                .child(error)
+                        })),
+                )
+                .children(rows)
                 .into_any_element(),
         )
     }

@@ -4,8 +4,11 @@
 //! each open project's `.next_code/workflows/`. A [`Workflows`] model per
 //! window (and one in headless mode) runs them: it performs what a
 //! `workflow::Run` asks for through a [`Host`] (open project tabs, start
-//! commands in their Terminal panels, open URLs) and feeds back output,
-//! exits, check results and listening ports.
+//! commands in their Terminal panels, Ctrl+C and kill them when the run
+//! says so, look up artifacts, open URLs and files) and feeds back output,
+//! exits, check results, artifacts and listening ports. A run replaced by
+//! Run All keeps draining (its commands get their stop grace); the new
+//! run's steps sharing their terminals wait for them.
 //!
 //! Each workflow file opens as a window tab, a [`WorkflowView`]: the file
 //! in an editor beside a live graph of its steps (`view`), with Run All,
@@ -74,12 +77,11 @@ pub const TAB_ICON: &str = "◈";
 
 /// Where workflows live inside a project.
 const PROJECT_DIR: &str = ".next_code/workflows";
-/// How often running workflows check timeouts, ports and opening projects.
+/// How often running workflows check timeouts, stop graces, ports and
+/// opening projects.
 const TICK: Duration = Duration::from_millis(250);
 /// How often a step's port is looked up.
 const PORT_POLL: Duration = Duration::from_secs(1);
-/// Time a stopped command gets after Ctrl+C before it is killed.
-const STOP_GRACE: Duration = Duration::from_secs(3);
 
 /// The user's workflows folder (next to `settings.json`).
 pub fn user_dir() -> Option<PathBuf> {
@@ -252,6 +254,9 @@ pub(crate) trait Host {
     /// Shows a step's terminal in its project.
     fn show(&mut self, location: &Location, view: &Entity<TerminalView>, cx: &mut App);
     fn open_url(&mut self, url: &str, cx: &mut App);
+    /// Opens a step's artifact file in an editor tab of the project at
+    /// `location` (`None`: a file on this machine).
+    fn open_file(&mut self, location: Option<&Location>, path: &Path, cx: &mut App);
 }
 
 /// What a workflow step's project spec names.
@@ -361,6 +366,9 @@ pub struct Workflows {
     user_dir: Option<PathBuf>,
     discovered: Vec<Discovered>,
     runs: Vec<ActiveRun>,
+    /// Replaced runs whose commands are still stopping (their steps in the
+    /// new run wait for them: the same terminals).
+    draining: Vec<ActiveRun>,
     next_run: u64,
     inputs: mpsc::UnboundedSender<Input>,
     pump_scheduled: bool,
@@ -425,6 +433,7 @@ impl Workflows {
             user_dir,
             discovered: Vec::new(),
             runs: Vec::new(),
+            draining: Vec::new(),
             next_run: 1,
             inputs,
             pump_scheduled: false,
@@ -503,8 +512,9 @@ impl Workflows {
     }
 
     /// Starts `workflow` afresh as the workflow with id `workflow_id` (see
-    /// [`workflow_id`]); a run of it already going is stopped first and
-    /// its terminals reused.
+    /// [`workflow_id`]); a run of it already going is stopped first (with
+    /// each step's grace) and its terminals reused: a step whose old
+    /// command still stops starts once that command is gone.
     pub fn start_parsed(
         &mut self,
         workflow_id: String,
@@ -521,21 +531,22 @@ impl Workflows {
             workflow.steps.iter().map(|_| Default::default()).collect();
         if let Some(index) = previous {
             let mut old = self.runs.remove(index);
-            old.run.stop_all(now);
-            for effect in old.run.take_effects() {
-                if let Effect::StopCommand { step } = effect {
-                    stop_command(old.steps[step].command.clone(), cx);
-                }
-            }
+            old.run.drain(now);
             for (index, step) in workflow.steps.iter().enumerate() {
                 if let Some(at) = old.run.step(&step.id) {
-                    steps[index].command = old.steps[at].command.take();
+                    steps[index].command = old.steps[at].command.clone();
                 }
             }
+            self.draining.push(old);
         }
         let id_number = self.next_run;
         self.next_run += 1;
         let mut run = Run::new((*workflow).clone());
+        for (index, step) in workflow.steps.iter().enumerate() {
+            if self.still_stopping(&workflow_id, &step.id) {
+                run.hold(index);
+            }
+        }
         run.start(now);
         self.runs.push(ActiveRun {
             id: id_number,
@@ -549,8 +560,44 @@ impl Workflows {
         id_number
     }
 
+    /// Whether a replaced run of workflow `workflow_id` still stops its
+    /// step `step`'s command.
+    fn still_stopping(&self, workflow_id: &str, step: &str) -> bool {
+        self.draining.iter().any(|old| {
+            old.workflow_id == workflow_id
+                && old
+                    .run
+                    .step(step)
+                    .is_some_and(|at| old.run.steps()[at].status == Status::Stopping)
+        })
+    }
+
+    /// Lets held steps start whose old command is gone; true if any did.
+    fn release_held(&mut self) -> bool {
+        let now = Instant::now();
+        let mut released = false;
+        for index in 0..self.runs.len() {
+            for step in 0..self.runs[index].run.steps().len() {
+                let active = &self.runs[index];
+                if !active.run.is_held(step)
+                    || self
+                        .still_stopping(&active.workflow_id, &active.run.workflow().steps[step].id)
+                {
+                    continue;
+                }
+                self.runs[index].run.release(step, now);
+                released = true;
+            }
+        }
+        released
+    }
+
+    /// A run by id: the latest runs, then replaced ones still stopping.
     fn run_mut(&mut self, id: u64) -> Option<&mut ActiveRun> {
-        self.runs.iter_mut().find(|run| run.id == id)
+        self.runs
+            .iter_mut()
+            .chain(&mut self.draining)
+            .find(|run| run.id == id)
     }
 
     fn with_run(
@@ -572,9 +619,22 @@ impl Workflows {
         true
     }
 
-    /// Stop All: interrupts (then kills) the commands the workflow started;
-    /// project tabs and containers stay.
+    /// Stop All: Ctrl+C to the commands the workflow started, killed after
+    /// their step's grace (at once on a second Stop All); project tabs and
+    /// containers stay.
     pub fn stop(&mut self, workflow_id: &str, cx: &mut Context<Self>) -> bool {
+        let now = Instant::now();
+        // A second Stop All also kills what a replaced run still stops.
+        if self
+            .run_of(workflow_id)
+            .is_some_and(|active| active.run.outcome() == Outcome::Stopped)
+        {
+            for old in &mut self.draining {
+                if old.workflow_id == workflow_id {
+                    old.run.stop_all(now);
+                }
+            }
+        }
         self.with_run(workflow_id, cx, |run, now| run.stop_all(now))
     }
 
@@ -598,6 +658,70 @@ impl Workflows {
             continued = run.continue_step(step, now)
         });
         continued
+    }
+
+    /// Checks step `step`'s artifacts again; false if it has none to check.
+    pub fn check_artifacts(
+        &mut self,
+        workflow_id: &str,
+        step: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut checking = false;
+        self.with_run(workflow_id, cx, |run, _| {
+            checking = run.check_artifacts(step)
+        });
+        checking
+    }
+
+    /// Opens artifact `artifact` of step `step`: a file in an editor tab
+    /// of the step's project (this machine's without one), a URL in the
+    /// browser.
+    pub fn open_artifact(
+        &mut self,
+        workflow_id: &str,
+        step: usize,
+        artifact: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.run_of(workflow_id) else {
+            return;
+        };
+        let Some(Ok(checked)) = active
+            .run
+            .steps()
+            .get(step)
+            .and_then(|s| s.artifacts.as_ref())
+        else {
+            return;
+        };
+        let Some(resolved) = checked
+            .get(artifact)
+            .map(|checked| checked.resolved.clone())
+        else {
+            return;
+        };
+        let is_url = matches!(
+            active.run.definition(step).artifacts.get(artifact),
+            Some(workflow::Artifact {
+                target: workflow::ArtifactTarget::Url(_),
+                ..
+            })
+        );
+        let location = active.location(step).cloned();
+        // Not inside the click's window update: the host updates windows.
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| {
+                if is_url {
+                    this.host.open_url(&resolved, cx);
+                } else {
+                    this.host
+                        .open_file(location.as_ref(), Path::new(&resolved), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Shows step `step`'s terminal in its project tab.
@@ -664,19 +788,40 @@ impl Workflows {
 
     /// Performs every pending effect and reports changes.
     fn pump(&mut self, cx: &mut Context<Self>) {
-        for index in 0..self.runs.len() {
-            loop {
-                let effects = self.runs[index].run.take_effects();
-                if effects.is_empty() {
-                    break;
-                }
-                for effect in effects {
-                    self.perform(index, effect, cx);
+        loop {
+            let mut performed = false;
+            for index in 0..self.runs.len() {
+                loop {
+                    let effects = self.runs[index].run.take_effects();
+                    if effects.is_empty() {
+                        break;
+                    }
+                    performed = true;
+                    for effect in effects {
+                        self.perform(index, effect, cx);
+                    }
                 }
             }
+            // Replaced runs only stop their commands.
+            for old in &mut self.draining {
+                for effect in old.run.take_effects() {
+                    performed = true;
+                    match effect {
+                        Effect::InterruptCommand { step } => {
+                            command(&old.steps[step], cx, TerminalView::interrupt)
+                        }
+                        Effect::KillCommand { step } => {
+                            command(&old.steps[step], cx, TerminalView::kill)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !self.release_held() && !performed {
+                break;
+            }
         }
-        for index in 0..self.runs.len() {
-            let active = &mut self.runs[index];
+        for active in self.runs.iter_mut().chain(&mut self.draining) {
             let changes = active.run.take_changes();
             let workflow = active.run.workflow().name.clone();
             for change in changes {
@@ -700,6 +845,7 @@ impl Workflows {
                 });
             }
         }
+        self.draining.retain(|old| old.run.is_active());
         self.ensure_ticking(cx);
         cx.notify();
     }
@@ -723,7 +869,7 @@ impl Workflows {
                 }
             }
             Effect::RunCheck { step, generation } => {
-                let definition = self.runs[index].run.workflow().steps[step].clone();
+                let definition = self.runs[index].run.definition(step).clone();
                 let project = self.runs[index].steps[step].project.clone();
                 cx.spawn(async move |this, cx| {
                     let result = cx
@@ -744,7 +890,7 @@ impl Workflows {
                 .detach();
             }
             Effect::StartCommand { step, generation } => {
-                let definition = self.runs[index].run.workflow().steps[step].clone();
+                let definition = self.runs[index].run.definition(step).clone();
                 let project = self.runs[index].steps[step].project.clone();
                 cx.spawn(async move |this, cx| {
                     let background = project.clone();
@@ -762,8 +908,32 @@ impl Workflows {
                 })
                 .detach();
             }
-            Effect::StopCommand { step } => {
-                stop_command(self.runs[index].steps[step].command.clone(), cx);
+            Effect::InterruptCommand { step } => {
+                command(&self.runs[index].steps[step], cx, TerminalView::interrupt)
+            }
+            Effect::KillCommand { step } => {
+                command(&self.runs[index].steps[step], cx, TerminalView::kill)
+            }
+            Effect::CheckArtifacts { step, generation } => {
+                let definition = self.runs[index].run.definition(step).clone();
+                let project = self.runs[index].steps[step].project.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            commands::check_artifacts(&definition, project.as_ref())
+                        })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        if let Some(active) = this.run_mut(run_id) {
+                            active
+                                .run
+                                .artifacts_checked(step, generation, result, Instant::now());
+                        }
+                        this.pump(cx);
+                    })
+                    .ok();
+                })
+                .detach();
             }
             Effect::OpenUrl { step, url } => {
                 self.host.open_url(&url, cx);
@@ -817,21 +987,26 @@ impl Workflows {
         program: Result<(workflow::Step, (String, Vec<String>)), String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.runs.iter().position(|run| run.id == run_id) else {
+        let now = Instant::now();
+        let Some(active) = self.run_mut(run_id) else {
             return;
         };
-        if self.runs[index].run.steps()[step].generation() != generation {
-            return; // restarted or stopped meanwhile
+        if active.run.steps()[step].generation() != generation {
+            // Stopped (or replaced) meanwhile: it will not start.
+            active
+                .run
+                .start_failed(step, generation, "stopped before it started", now);
+            return;
         }
-        let now = Instant::now();
         let (definition, (program, args)) = match program {
             Ok(program) => program,
             Err(error) => {
-                self.runs[index]
-                    .run
-                    .start_failed(step, generation, &error, now);
+                active.run.start_failed(step, generation, &error, now);
                 return;
             }
+        };
+        let Some(index) = self.runs.iter().position(|run| run.id == run_id) else {
+            return;
         };
         let inputs = self.inputs.clone();
         let tap: OutputTap = Arc::new(move |output| {
@@ -871,20 +1046,22 @@ impl Workflows {
     /// Stops every run and kills its commands at once (shutdown).
     pub fn kill_all(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        for active in &mut self.runs {
+        for active in self.runs.iter_mut().chain(&mut self.draining) {
             active.run.stop_all(now);
             active.run.take_effects();
             for runtime in &active.steps {
-                if let Some(view) = &runtime.command {
-                    view.update(cx, |view, cx| view.kill(cx));
-                }
+                command(runtime, cx, TerminalView::kill);
             }
         }
+        self.draining.clear();
         cx.notify();
     }
 
     fn any_active(&self) -> bool {
-        self.runs.iter().any(|active| active.run.is_active())
+        self.runs
+            .iter()
+            .chain(&self.draining)
+            .any(|active| active.run.is_active())
     }
 
     /// Ticks while some step is active: timeouts, delays, projects being
@@ -948,7 +1125,11 @@ impl Workflows {
                 .detach();
             }
         }
-        // Delays and timeouts may have finished steps.
+        // Replaced runs: their stop graces.
+        for old in &mut self.draining {
+            old.run.tick(now);
+        }
+        // Delays, timeouts and graces may have finished steps.
         self.pump(cx);
         let active = self.any_active();
         if !active {
@@ -958,17 +1139,16 @@ impl Workflows {
     }
 }
 
-/// Ctrl+C now, then a kill if it still runs after a grace period.
-fn stop_command(view: Option<Entity<TerminalView>>, cx: &mut App) {
-    let Some(view) = view else {
-        return;
-    };
-    view.update(cx, |view, cx| view.interrupt(cx));
-    cx.spawn(async move |cx| {
-        cx.background_executor().timer(STOP_GRACE).await;
-        view.update(cx, |view, cx| view.kill(cx)).ok();
-    })
-    .detach();
+/// Ctrl+C to (`TerminalView::interrupt`) or kills (`TerminalView::kill`)
+/// the step's command, if it started one.
+fn command(
+    runtime: &StepRuntime,
+    cx: &mut App,
+    action: fn(&mut TerminalView, &mut Context<TerminalView>),
+) {
+    if let Some(view) = &runtime.command {
+        view.update(cx, action);
+    }
 }
 
 /// The window's project tabs, through its [`Shell`].
@@ -1026,6 +1206,13 @@ impl Host for WindowHost {
 
     fn open_url(&mut self, url: &str, cx: &mut App) {
         cx.open_url(url);
+    }
+
+    fn open_file(&mut self, location: Option<&Location>, path: &Path, cx: &mut App) {
+        self.update(cx, |shell, window, cx| {
+            shell.workflow_open_file(location, path, window, cx)
+        })
+        .ok();
     }
 }
 

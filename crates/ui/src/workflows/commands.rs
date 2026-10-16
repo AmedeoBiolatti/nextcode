@@ -1,15 +1,20 @@
 //! The processes a workflow step starts: its `run` command in a terminal
 //! (PowerShell on Windows, the user's login shell elsewhere) and its
 //! `check` as a plain process, with `${…}` variables, `env` and `cwd`
-//! applied as run configurations do.
+//! applied as run configurations do; and where its artifacts are.
 
-use std::{collections::HashMap, net::TcpStream, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    net::TcpStream,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use run::{
     CommandLine,
     shell::{self, Shell},
 };
-use workflow::{CheckResult, Step};
+use workflow::{ArtifactState, ArtifactTarget, CheckResult, Step};
 
 use crate::project::Project;
 
@@ -68,30 +73,69 @@ impl Place {
         }
     }
 
-    /// One shell line that changes to the step's `cwd`, exports its `env`
-    /// and runs `command`, with variables expanded.
-    pub(crate) fn line(&self, step: &Step, command: &str) -> Result<String, String> {
+    /// Expands `${…}` variables as they read where the step runs.
+    fn with_context<R>(&self, then: impl FnOnce(&run::Context) -> R) -> R {
         let lookup = |name: &str| self.env.get(name).cloned();
-        let context = run::Context {
+        then(&run::Context {
             workspace_folder: &self.root,
             file: None,
             line: None,
             separator: self.separator,
             env: &lookup,
             user_home: self.home.as_deref(),
+        })
+    }
+
+    /// The step's working directory, absolute.
+    fn cwd(&self, step: &Step) -> Result<String, String> {
+        self.with_context(|context| {
+            Ok(context.absolute(&context.substitute(step.cwd.as_deref().unwrap_or(""))?))
+        })
+    }
+
+    /// One shell line that changes to the step's `cwd`, exports its `env`
+    /// and runs `command`, with variables expanded.
+    pub(crate) fn line(&self, step: &Step, command: &str) -> Result<String, String> {
+        let cwd = self.cwd(step)?;
+        self.with_context(|context| {
+            let env = step
+                .env
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), context.substitute(value)?)))
+                .collect::<Result<_, String>>()?;
+            let command = run::Command {
+                line: CommandLine::Shell(context.substitute(command)?),
+                cwd,
+                env,
+            };
+            Ok(shell::terminal_line(&command, &self.root, self.shell))
+        })
+    }
+
+    /// The step's artifacts with variables expanded, paths made absolute
+    /// against its `cwd`.
+    fn artifacts(&self, step: &Step) -> Result<Vec<(String, bool)>, String> {
+        let cwd = self.cwd(step)?;
+        let lookup = |name: &str| self.env.get(name).cloned();
+        let base = run::Context {
+            workspace_folder: &cwd,
+            file: None,
+            line: None,
+            separator: self.separator,
+            env: &lookup,
+            user_home: self.home.as_deref(),
         };
-        let cwd = context.absolute(&context.substitute(step.cwd.as_deref().unwrap_or(""))?);
-        let env = step
-            .env
-            .iter()
-            .map(|(name, value)| Ok((name.clone(), context.substitute(value)?)))
-            .collect::<Result<_, String>>()?;
-        let command = run::Command {
-            line: CommandLine::Shell(context.substitute(command)?),
-            cwd,
-            env,
-        };
-        Ok(shell::terminal_line(&command, &self.root, self.shell))
+        self.with_context(|context| {
+            step.artifacts
+                .iter()
+                .map(|artifact| match &artifact.target {
+                    ArtifactTarget::Path(path) => {
+                        Ok((base.absolute(&context.substitute(path)?), false))
+                    }
+                    ArtifactTarget::Url(url) => Ok((context.substitute(url)?, true)),
+                })
+                .collect()
+        })
     }
 
     /// The program and arguments for a terminal running `line`.
@@ -179,6 +223,29 @@ pub(crate) fn run_check(step: &Step, project: Option<&Project>) -> CheckResult {
     }
 }
 
+/// The step's artifacts as seen where it runs: variables expanded, paths
+/// absolute (against its `cwd`) and looked up there. Blocks.
+pub(crate) fn check_artifacts(
+    step: &Step,
+    project: Option<&Project>,
+) -> Result<Vec<ArtifactState>, String> {
+    let place = Place::of(project)?;
+    let resolved = place.artifacts(step)?;
+    // Without a project the files are on this machine.
+    let host = Project::local(PathBuf::from(&place.root));
+    let project = project.unwrap_or(&host);
+    Ok(resolved
+        .into_iter()
+        .map(|(resolved, url)| ArtifactState {
+            exists: url
+                || project
+                    .kind(Path::new(&resolved))
+                    .is_ok_and(|kind| kind.is_some()),
+            resolved,
+        })
+        .collect())
+}
+
 /// Whether something accepts TCP connections on `port` here (local
 /// projects and steps without one). Blocks up to a second.
 pub(crate) fn port_open_locally(port: u16) -> bool {
@@ -211,6 +278,7 @@ mod tests {
             id: "s".into(),
             title: None,
             needs: Vec::new(),
+            after: Vec::new(),
             project: None,
             run: Some("serve".into()),
             terminal: None,
@@ -224,6 +292,8 @@ mod tests {
                 .map(|&(name, value)| (name.to_owned(), value.to_owned()))
                 .collect::<BTreeMap<_, _>>(),
             cwd: cwd.map(Into::into),
+            stop_grace_s: workflow::DEFAULT_STOP_GRACE_S,
+            artifacts: Vec::new(),
         }
     }
 
@@ -287,6 +357,68 @@ mod tests {
         assert_eq!(program, "/bin/sh");
         assert_eq!(args[3], "npm start");
         assert!(args[1].contains("-lic \"$1\""));
+    }
+
+    #[test]
+    fn artifacts_resolve_against_the_cwd_with_variables() {
+        let artifact = |label: Option<&str>, target: ArtifactTarget| workflow::Artifact {
+            label: label.map(Into::into),
+            target,
+        };
+        let mut eval = step(Some("runs"), &[]);
+        eval.artifacts = vec![
+            artifact(None, ArtifactTarget::Path("out/metrics.json".into())),
+            artifact(
+                Some("abs"),
+                ArtifactTarget::Path("${userHome}/log.txt".into()),
+            ),
+            artifact(
+                None,
+                ArtifactTarget::Url("https://board/${env:TOKEN}".into()),
+            ),
+        ];
+        assert_eq!(
+            place(Shell::Posix).artifacts(&eval).unwrap(),
+            [
+                ("/home/me/app/runs/out/metrics.json".to_owned(), false),
+                ("/home/me/log.txt".to_owned(), false),
+                ("https://board/s3cr'et".to_owned(), true),
+            ]
+        );
+        assert_eq!(
+            place(Shell::PowerShell).artifacts(&eval).unwrap()[0].0,
+            r"C:\src\app\runs\out\metrics.json"
+        );
+        eval.artifacts = vec![artifact(None, ArtifactTarget::Path("${file}".into()))];
+        assert!(place(Shell::Posix).artifacts(&eval).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifacts_are_looked_up_where_the_step_runs() {
+        let root = std::env::temp_dir().join(format!("nc-artifacts-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(root.join("out/here.txt"), "x").unwrap();
+        let project = Project::local(root.clone());
+        let mut eval = step(None, &[]);
+        eval.artifacts = vec![
+            workflow::Artifact {
+                label: None,
+                target: ArtifactTarget::Path("out/here.txt".into()),
+            },
+            workflow::Artifact {
+                label: None,
+                target: ArtifactTarget::Path("out/missing.txt".into()),
+            },
+        ];
+        let checked = check_artifacts(&eval, Some(&project)).unwrap();
+        let exists: Vec<bool> = checked.iter().map(|checked| checked.exists).collect();
+        assert_eq!(exists, [true, false]);
+        assert_eq!(
+            checked[0].resolved,
+            root.join("out/here.txt").to_string_lossy()
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
