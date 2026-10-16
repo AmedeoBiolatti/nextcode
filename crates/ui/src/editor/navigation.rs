@@ -408,8 +408,8 @@ impl Editor {
             .iter()
             .filter(|d| d.range.start < word.end && word.start < d.range.end)
             .map(|d| {
-                let message = match &d.source {
-                    Some(source) => format!("{} ({source})", d.message).into(),
+                let message = match crate::lsp_store::diagnostic_origin(&d.lsp) {
+                    Some(origin) => format!("{} ({origin})", d.message).into(),
                     None => d.message.clone(),
                 };
                 (d.severity, message)
@@ -432,6 +432,13 @@ impl Editor {
             .evaluator
             .clone()
             .zip(self.hover_expression(&word));
+        // Under the word's start, so the pointer can move straight down
+        // from anywhere on the word into the popover.
+        let x = self
+            .screen_position(word.start)
+            .map(|(x, _)| x)
+            .filter(|&x| x <= position.x)
+            .unwrap_or(position.x);
         if !messages.is_empty() || hover_request.is_some() || debug_value.is_some() {
             self._hover_delay = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(HOVER_DELAY).await;
@@ -478,7 +485,7 @@ impl Editor {
                     }
                     this.hover = Some(HoverPopover {
                         row,
-                        x: position.x,
+                        x,
                         messages,
                         docs,
                     });
@@ -500,15 +507,19 @@ impl Editor {
         let bounds = layout.bounds;
         let line_top = layout.line_height * hover.row as f32 - self.scroll.y;
         let below = line_top < bounds.size.height * 0.6;
-        let diagnostics = hover.messages.iter().map(|(severity, message)| {
-            div()
-                .flex()
-                .gap_2()
-                .font_family(theme::UI_FONT)
-                .child(div().text_color(severity.color()).child(severity.label()))
-                .child(message.clone())
-                .into_any_element()
-        });
+        let diagnostics = hover
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, (severity, message))| {
+                div()
+                    .flex()
+                    .gap_2()
+                    .font_family(theme::UI_FONT)
+                    .child(div().text_color(severity.color()).child(severity.label()))
+                    .child(selectable(("diagnostic", index), message.clone()))
+                    .into_any_element()
+            });
         let separator = (!hover.messages.is_empty() && !hover.docs.is_empty())
             .then(|| div().h(px(1.)).bg(theme::border()).into_any_element());
         Some(
@@ -535,30 +546,40 @@ impl Editor {
                 .shadow_md()
                 .text_sm()
                 .cursor_default()
-                // Moving over the popover must not re-target the hover.
+                // Moving over the popover must not re-target the hover, and
+                // pressing in it (to select text) must not close it.
                 .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .children(diagnostics)
                 .children(separator)
-                .children(markdown_blocks(&hover.docs)),
+                .children(markdown_blocks("doc", &hover.docs)),
         )
     }
 }
 
-/// Renders parsed Markdown: code in the editor font, prose in the UI font.
-pub(super) fn markdown_blocks(blocks: &[Block]) -> impl Iterator<Item = AnyElement> + '_ {
-    blocks.iter().map(|block| match block {
-        Block::Code { text, .. } => div()
-            .font_family(theme::MONO_FONT)
-            .text_color(theme::text())
-            .child(SharedString::from(text.clone()))
-            .into_any_element(),
-        Block::Paragraph(text) => div()
-            .font_family(theme::UI_FONT)
-            .text_color(theme::text())
-            .child(SharedString::from(text.clone()))
-            .into_any_element(),
-        Block::Rule => div().h(px(1.)).bg(theme::border()).into_any_element(),
-    })
+/// Renders parsed Markdown: code in the editor font, prose in the UI font;
+/// selectable, with ids `(id, index)`.
+pub(super) fn markdown_blocks<'a>(
+    id: &'static str,
+    blocks: &'a [Block],
+) -> impl Iterator<Item = AnyElement> + 'a {
+    blocks
+        .iter()
+        .enumerate()
+        .map(move |(index, block)| match block {
+            Block::Code { text, .. } => div()
+                .font_family(theme::MONO_FONT)
+                .text_color(theme::text())
+                .child(selectable((id, index), text.clone()))
+                .into_any_element(),
+            Block::Paragraph(text) => div()
+                .font_family(theme::UI_FONT)
+                .text_color(theme::text())
+                .child(selectable((id, index), text.clone()))
+                .into_any_element(),
+            Block::Rule => div().h(px(1.)).bg(theme::border()).into_any_element(),
+        })
 }
 
 pub(super) fn is_content_modified<T>(result: &Result<T, lsp::Error>) -> bool {

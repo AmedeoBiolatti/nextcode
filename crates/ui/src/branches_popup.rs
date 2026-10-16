@@ -11,7 +11,9 @@ use gpui::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
-    project_picker, theme,
+    project_picker,
+    selectable::selectable,
+    theme,
 };
 
 const ROW_HEIGHT: f32 = 24.;
@@ -422,7 +424,7 @@ impl BranchesPopup {
                     .when(branch.head, |name| {
                         name.font_weight(gpui::FontWeight::SEMIBOLD)
                     })
-                    .child(label),
+                    .child(selectable("name", label)),
             )
             .when(ahead > 0, |row| {
                 row.child(
@@ -430,7 +432,7 @@ impl BranchesPopup {
                         .flex_none()
                         .text_xs()
                         .text_color(theme::git_added())
-                        .child(format!("↑{ahead}")),
+                        .child(selectable("ahead", format!("↑{ahead}"))),
                 )
             })
             .when(behind > 0, |row| {
@@ -439,7 +441,7 @@ impl BranchesPopup {
                         .flex_none()
                         .text_xs()
                         .text_color(theme::accent_text())
-                        .child(format!("↓{behind}")),
+                        .child(selectable("behind", format!("↓{behind}"))),
                 )
             })
             .child(
@@ -450,7 +452,7 @@ impl BranchesPopup {
                     .text_right()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(upstream.unwrap_or_default()),
+                    .child(selectable("upstream", upstream.unwrap_or_default())),
             )
             .child(
                 div()
@@ -533,7 +535,7 @@ impl Render for BranchesPopup {
                     .pb_0p5()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(*title)
+                    .child(selectable(("header", index), *title))
                     .into_any_element(),
                 Item::Action(label, command) => {
                     let command = command.clone();
@@ -610,7 +612,7 @@ impl Render for BranchesPopup {
                     .py_1()
                     .text_xs()
                     .text_color(theme::error())
-                    .child(error)
+                    .child(selectable("error", error))
             }));
         div()
             .key_context("ProjectPicker")

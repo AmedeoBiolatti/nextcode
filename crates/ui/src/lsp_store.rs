@@ -603,6 +603,21 @@ impl LspStore {
     }
 }
 
+/// Where a diagnostic comes from, as VS Code shows it: `rustc(E0308)`,
+/// the source or the code alone, or `None`.
+pub fn diagnostic_origin(diagnostic: &lsp::types::Diagnostic) -> Option<String> {
+    let code = diagnostic.code.as_ref().map(|code| match code {
+        lsp::types::NumberOrString::Number(number) => number.to_string(),
+        lsp::types::NumberOrString::String(text) => text.clone(),
+    });
+    match (&diagnostic.source, code) {
+        (Some(source), Some(code)) => Some(format!("{source}({code})")),
+        (None, Some(code)) => Some(code),
+        (Some(source), None) => Some(source.clone()),
+        (None, None) => None,
+    }
+}
+
 fn progress_text(title: &str, message: Option<&str>, percentage: Option<u32>) -> String {
     let mut text = title.to_owned();
     if let Some(message) = message.filter(|m| !m.is_empty()) {

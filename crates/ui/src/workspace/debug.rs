@@ -21,6 +21,7 @@ use crate::{
         store::{Breakpoint, DebugStore, DebugStoreEvent},
     },
     editor::{DebugEvaluator, DebugLine, GutterBreakpoint},
+    selectable::selectable,
 };
 
 pub fn bind_keys(cx: &mut App) {
@@ -666,12 +667,10 @@ impl Workspace {
                 } else {
                     theme::run_marker()
                 }))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::text())
-                        .child(format!("Debugging {}: {status}", session.name())),
-                )
+                .child(div().text_xs().text_color(theme::text()).child(selectable(
+                    "debug-status",
+                    format!("Debugging {}: {status}", session.name()),
+                )))
                 .child(div().flex_1())
                 .child(if paused {
                     button("bar-continue", "▶ Continue F5", true, Box::new(Continue))

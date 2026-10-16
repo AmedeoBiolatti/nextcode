@@ -13,7 +13,7 @@ use super::{
     ClearConsole, NextConsoleInput, PreviousConsoleInput, SubmitConsoleInput,
     session::{DebugSession, DebugSessionEvent, OutputCategory},
 };
-use crate::{editor::Editor, theme};
+use crate::{editor::Editor, selectable::selectable, theme};
 
 const ROW_HEIGHT: f32 = 18.;
 const HISTORY_LIMIT: usize = 100;
@@ -160,7 +160,10 @@ impl Render for DebugConsole {
                 .p_2()
                 .text_sm()
                 .text_color(theme::muted())
-                .child("Program output and debugger messages show here; type an expression below while paused.")
+                .child(selectable(
+                    "empty",
+                    "Program output and debugger messages show here; type an expression below while paused.",
+                ))
                 .into_any_element()
         } else {
             uniform_list(
@@ -171,9 +174,11 @@ impl Render for DebugConsole {
                         return Vec::new();
                     };
                     let lines = session.read(cx).output();
+                    // One element per line: the list is virtualized (up to
+                    // the session's output cap), so a selection is per line.
                     range
-                        .filter_map(|index| lines.get(index))
-                        .map(|line| {
+                        .filter_map(|index| Some((index, lines.get(index)?)))
+                        .map(|(index, line)| {
                             div()
                                 .h(px(ROW_HEIGHT))
                                 .px_2()
@@ -181,7 +186,7 @@ impl Render for DebugConsole {
                                 .font_family(theme::MONO_FONT)
                                 .text_sm()
                                 .text_color(color(line.category))
-                                .child(line.text.clone())
+                                .child(selectable(("line", index), line.text.clone()))
                                 .into_any_element()
                         })
                         .collect()

@@ -15,7 +15,7 @@ use super::{
     session::{Children, DebugSession, SessionState, WatchValue},
     store::DebugStore,
 };
-use crate::{editor::Editor, theme};
+use crate::{editor::Editor, selectable::selectable, theme};
 
 const ROW_HEIGHT: f32 = 22.;
 const INDENT: f32 = 14.;
@@ -295,7 +295,7 @@ impl DebugPanel {
                     } else {
                         theme::muted()
                     })
-                    .child(label),
+                    .child(selectable("status", label)),
             )
     }
 
@@ -326,14 +326,14 @@ impl DebugPanel {
                 div()
                     .flex_1()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(section.title().to_uppercase()),
+                    .child(selectable("title", section.title().to_uppercase())),
             )
             .children(extra)
     }
 
     fn render_call_stack(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(session_entity) = self.session.clone() else {
-            return vec![message("Not debugging").into_any_element()];
+            return vec![message("stack-message", "Not debugging").into_any_element()];
         };
         let session = session_entity.read(cx);
         if session.state() != SessionState::Stopped {
@@ -342,7 +342,7 @@ impl DebugPanel {
                 SessionState::Starting => "Starting…",
                 _ => "Not paused",
             };
-            return vec![message(text).into_any_element()];
+            return vec![message("stack-message", text).into_any_element()];
         }
         let mut rows = Vec::new();
         let threads = session.threads().to_vec();
@@ -368,11 +368,8 @@ impl DebugPanel {
                         .on_click(move |_, _, cx| {
                             session.update(cx, |session, cx| session.select_thread(id, cx))
                         })
-                        .child(format!(
-                            "{} {}",
-                            if is_current { "▾" } else { "▸" },
-                            thread.name
-                        ))
+                        .child(if is_current { "▾" } else { "▸" })
+                        .child(selectable("name", thread.name.clone()))
                         .into_any_element(),
                 );
             }
@@ -409,24 +406,24 @@ impl DebugPanel {
                                 } else {
                                     theme::muted()
                                 })
-                                .child(frame.name.clone()),
+                                .child(selectable("name", frame.name.clone())),
                         )
                         .child(
                             div()
                                 .flex_none()
                                 .text_xs()
                                 .text_color(theme::muted())
-                                .child(location),
+                                .child(selectable("location", location)),
                         )
                         .into_any_element(),
                 );
             }
             if frames.is_empty() {
-                rows.push(message("Loading…").into_any_element());
+                rows.push(message("stack-loading", "Loading…").into_any_element());
             }
         }
         if rows.is_empty() {
-            rows.push(message("No threads").into_any_element());
+            rows.push(message("stack-message", "No threads").into_any_element());
         }
         rows
     }
@@ -549,10 +546,19 @@ impl DebugPanel {
             .text_sm();
         match row.kind {
             RowKind::Loading => element
-                .child(div().text_color(theme::muted()).child("Loading…"))
+                .child(
+                    div()
+                        .text_color(theme::muted())
+                        .child(selectable("loading", "Loading…")),
+                )
                 .into_any_element(),
             RowKind::Message(color) => element
-                .child(div().truncate().text_color(color).child(row.value))
+                .child(
+                    div()
+                        .truncate()
+                        .text_color(color)
+                        .child(selectable("message", row.value)),
+                )
                 .into_any_element(),
             RowKind::More(reference) => {
                 let session = session.clone();
@@ -598,7 +604,7 @@ impl DebugPanel {
                         div()
                             .flex_none()
                             .text_color(theme::accent_text())
-                            .child(row.name.clone()),
+                            .child(selectable("name", row.name.clone())),
                     )
                     .child(div().flex_none().text_color(theme::muted()).child("="))
                     .child(match &self.editing {
@@ -639,7 +645,15 @@ impl DebugPanel {
                                         },
                                     ))
                                 })
-                                .child(row.value)
+                                .child({
+                                    // A double-click edits the value.
+                                    let text = selectable("text", row.value);
+                                    if expandable {
+                                        text
+                                    } else {
+                                        text.double_click_through()
+                                    }
+                                })
                                 .into_any_element()
                         }
                     })
@@ -650,7 +664,7 @@ impl DebugPanel {
                             .truncate()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(type_name)
+                            .child(selectable("type", type_name))
                     }))
                     .into_any_element()
             }
@@ -659,14 +673,16 @@ impl DebugPanel {
 
     fn render_variables(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(session_entity) = self.session.clone() else {
-            return vec![message("Not debugging").into_any_element()];
+            return vec![message("variables-message", "Not debugging").into_any_element()];
         };
         let session = session_entity.read(cx);
         if session.state() != SessionState::Stopped {
-            return vec![message("Variables show while paused").into_any_element()];
+            return vec![
+                message("variables-message", "Variables show while paused").into_any_element(),
+            ];
         }
         if session.scopes().is_empty() {
-            return vec![message("Loading…").into_any_element()];
+            return vec![message("variables-loading", "Loading…").into_any_element()];
         }
         let mut rows = Vec::new();
         for scope in session.scopes() {
@@ -723,7 +739,11 @@ impl DebugPanel {
                                 .text_color(theme::muted())
                                 .child(if row.expanded { "▾" } else { "▸" }),
                         )
-                        .child(div().text_color(theme::text()).child(row.name))
+                        .child(
+                            div()
+                                .text_color(theme::text())
+                                .child(selectable("name", row.name)),
+                        )
                         .into_any_element()
                 } else {
                     self.render_variable_row(&session_entity, index, row, "var", cx)
@@ -798,7 +818,7 @@ impl DebugPanel {
                         div()
                             .flex_none()
                             .text_color(theme::accent_text())
-                            .child(expression.clone()),
+                            .child(selectable("expression", expression.clone())),
                     )
                     .child(div().flex_none().text_color(theme::muted()).child("="))
                     .child(
@@ -808,7 +828,7 @@ impl DebugPanel {
                             .truncate()
                             .font_family(theme::MONO_FONT)
                             .text_color(color)
-                            .child(value),
+                            .child(selectable("value", value)),
                     )
                     .child(
                         div()
@@ -857,7 +877,7 @@ impl DebugPanel {
                 .child(self.watch_input.clone())
                 .into_any_element(),
         );
-        elements.push(message("Enter adds an expression").into_any_element());
+        elements.push(message("watch-hint", "Enter adds an expression").into_any_element());
         elements
     }
 
@@ -892,7 +912,7 @@ impl DebugPanel {
                             .min_w_0()
                             .truncate()
                             .text_color(theme::text())
-                            .child(filter.label.clone()),
+                            .child(selectable("label", filter.label.clone())),
                     )
                     .into_any_element(),
             );
@@ -961,7 +981,7 @@ impl DebugPanel {
                             div()
                                 .flex_none()
                                 .text_color(theme::text())
-                                .child(format!("{name}:{}", line + 1)),
+                                .child(selectable("location", format!("{name}:{}", line + 1))),
                         )
                         .child(
                             div()
@@ -970,7 +990,7 @@ impl DebugPanel {
                                 .truncate()
                                 .text_xs()
                                 .text_color(theme::muted())
-                                .child(detail),
+                                .child(selectable("detail", detail)),
                         )
                         .child(
                             div()
@@ -993,7 +1013,11 @@ impl DebugPanel {
         }
         if !any {
             elements.push(
-                message("Click the gutter or press F9 to add a breakpoint").into_any_element(),
+                message(
+                    "breakpoints-hint",
+                    "Click the gutter or press F9 to add a breakpoint",
+                )
+                .into_any_element(),
             );
         }
         elements
@@ -1008,13 +1032,13 @@ fn capitalize(text: &str) -> String {
     }
 }
 
-fn message(text: impl Into<SharedString>) -> impl IntoElement {
+fn message(id: &'static str, text: impl Into<SharedString>) -> impl IntoElement {
     div()
         .px_2()
         .py_1()
         .text_xs()
         .text_color(theme::muted())
-        .child(text.into())
+        .child(selectable(id, text.into()))
 }
 
 fn row(id: SharedString, depth: usize) -> gpui::Stateful<gpui::Div> {

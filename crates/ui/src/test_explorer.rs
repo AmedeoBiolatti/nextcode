@@ -20,6 +20,7 @@ use run::{NodeKind, Status, TestResult, TestTree, Tool};
 use crate::{
     editor::{Editor, EditorEvent},
     project::Project,
+    selectable::selectable,
     settings, theme,
 };
 
@@ -452,13 +453,19 @@ impl TestsPanel {
                     }),
             )
             .child(div().w(px(14.)).flex_none().text_color(color).child(icon))
-            .child(div().flex_1().min_w_0().truncate().child(row.label))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(selectable("label", row.label).double_click_through()),
+            )
             .children(row.counts.map(|counts| {
                 div()
                     .flex_none()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(counts)
+                    .child(selectable("counts", counts).double_click_through())
             }))
             .child(
                 button("test-run", "▶", theme::run_marker()).on_click(cx.listener(
@@ -614,7 +621,11 @@ impl Render for TestsPanel {
                             .truncate()
                             .text_xs()
                             .text_color(theme::muted())
-                            .children(self.status.clone()),
+                            .children(
+                                self.status
+                                    .clone()
+                                    .map(|status| selectable("status", status)),
+                            ),
                     ),
             )
             .child(
@@ -630,7 +641,7 @@ impl Render for TestsPanel {
                     .rounded_sm()
                     .child(self.filter.clone()),
             )
-            .children(self.errors.iter().map(|error| {
+            .children(self.errors.iter().enumerate().map(|(index, error)| {
                 div()
                     .flex_none()
                     .px_2()
@@ -638,7 +649,7 @@ impl Render for TestsPanel {
                     .text_color(theme::error())
                     .max_h(px(120.))
                     .overflow_hidden()
-                    .child(error.clone())
+                    .child(selectable(("error", index), error.clone()))
             }))
             .child(
                 uniform_list(
@@ -665,18 +676,22 @@ impl Render for TestsPanel {
                     .p_2()
                     .overflow_y_scroll()
                     .text_xs()
-                    .child(div().text_sm().child(title))
-                    .children(
-                        message
-                            .map(|message| div().py_1().text_color(theme::error()).child(message)),
-                    )
+                    .child(div().text_sm().child(selectable("title", title)))
+                    .children(message.map(|message| {
+                        div()
+                            .py_1()
+                            .text_color(theme::error())
+                            .child(selectable("message", message))
+                    }))
                     .child(
                         div()
                             .font_family(theme::MONO_FONT)
                             .text_color(theme::text())
                             .whitespace_normal()
-                            .children(
-                                // The end of long outputs (where failures are).
+                            // The end of long outputs (where failures are),
+                            // one block so a selection can span lines.
+                            .child(selectable(
+                                "output",
                                 output
                                     .lines()
                                     .rev()
@@ -684,13 +699,9 @@ impl Render for TestsPanel {
                                     .collect::<Vec<_>>()
                                     .into_iter()
                                     .rev()
-                                    .map(|line| {
-                                        div()
-                                            .min_h(px(14.))
-                                            .child(SharedString::from(line.to_owned()))
-                                    })
-                                    .collect::<Vec<_>>(),
-                            ),
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            )),
                     )
             }))
     }

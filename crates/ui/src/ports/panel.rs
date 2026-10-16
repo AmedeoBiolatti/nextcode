@@ -10,6 +10,7 @@ use gpui::{
 use super::{Origin, Ports};
 use crate::{
     editor::{Editor, EditorEvent},
+    selectable::selectable,
     theme,
 };
 
@@ -162,7 +163,11 @@ impl PortsPanel {
             .items_center()
             .gap_2()
             .text_sm()
-            .child(div().text_color(theme::muted()).child(prompt))
+            .child(
+                div()
+                    .text_color(theme::muted())
+                    .child(selectable("prompt", prompt)),
+            )
             .child(
                 div()
                     .w(px(220.))
@@ -207,12 +212,10 @@ impl Render for PortsPanel {
             .text_color(theme::text());
         if !ports.available() {
             return base
-                .child(
-                    div()
-                        .p_3()
-                        .text_color(theme::muted())
-                        .child("Port forwarding is for WSL and container projects."),
-                )
+                .child(div().p_3().text_color(theme::muted()).child(selectable(
+                    "message",
+                    "Port forwarding is for WSL and container projects.",
+                )))
                 .into_any_element();
         }
 
@@ -241,7 +244,7 @@ impl Render for PortsPanel {
                             } else {
                                 theme::muted()
                             })
-                            .child(text)
+                            .child(selectable("message", text))
                     }),
             );
 
@@ -253,11 +256,9 @@ impl Render for PortsPanel {
             .text_color(theme::muted())
             .border_b_1()
             .border_color(theme::border())
-            .children(
-                COLUMNS
-                    .iter()
-                    .map(|&(title, width)| Self::cell(width).child(title)),
-            )
+            .children(COLUMNS.iter().enumerate().map(|(index, &(title, width))| {
+                Self::cell(width).child(selectable(("column", index), title))
+            }))
             .child(div().w(px(220.)).flex_none());
 
         let rows: Vec<gpui::AnyElement> = ports
@@ -293,7 +294,7 @@ impl Render for PortsPanel {
                     .flex()
                     .items_center()
                     .hover(|style| style.bg(theme::hover_row()))
-                    .child(Self::cell(COLUMNS[0].1).child(port))
+                    .child(Self::cell(COLUMNS[0].1).child(selectable("port", port)))
                     .child(
                         Self::cell(COLUMNS[1].1).child(
                             div()
@@ -301,21 +302,24 @@ impl Render for PortsPanel {
                                 .text_color(theme::accent_text())
                                 .cursor_pointer()
                                 .hover(|style| style.underline())
-                                .child(address)
+                                .child(selectable("address", address))
                                 .on_click(move |_, _, cx| cx.open_url(&url)),
                         ),
                     )
                     .child(
                         Self::cell(COLUMNS[2].1)
                             .text_color(theme::muted())
-                            .child(process),
+                            .child(selectable("process", process)),
                     )
                     .child(
                         Self::cell(COLUMNS[3].1)
                             .text_color(theme::muted())
-                            .child(forwarded.origin.label()),
+                            .child(selectable("origin", forwarded.origin.label())),
                     )
-                    .child(Self::cell(COLUMNS[4].1).child(forwarded.connections().to_string()))
+                    .child(Self::cell(COLUMNS[4].1).child(selectable(
+                        "connections",
+                        forwarded.connections().to_string(),
+                    )))
                     .child(
                         div()
                             .w(px(220.))
@@ -362,10 +366,11 @@ impl Render for PortsPanel {
             })
             .collect();
         let empty = rows.is_empty().then(|| {
-            div().p_3().text_color(theme::muted()).child(
+            div().p_3().text_color(theme::muted()).child(selectable(
+                "empty",
                 "No forwarded ports. Forward a port, or start a server: ports that start \
                  listening are forwarded automatically.",
-            )
+            ))
         });
         let editing = self.editing.clone();
         base.child(toolbar)

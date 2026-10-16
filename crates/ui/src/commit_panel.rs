@@ -20,6 +20,7 @@ use crate::{
     diff_view::DiffSource,
     editor::{self, Editor},
     project::Project,
+    selectable::{SelectableText, selectable},
     settings, theme,
 };
 
@@ -413,6 +414,14 @@ pub fn change_color(change: Change) -> Hsla {
 pub fn short_revision(revision: &str) -> &str {
     let hex = revision.len() >= 20 && revision.bytes().all(|b| b.is_ascii_hexdigit());
     if hex { &revision[..8] } else { revision }
+}
+
+/// Selectable text in a row: double-click (diff / expand) and the
+/// right-click menu belong to the row.
+fn row_text(id: &'static str, text: impl Into<SharedString>) -> SelectableText {
+    selectable(id, text)
+        .double_click_through()
+        .right_click_through()
 }
 
 /// A checkbox drawn in the theme's colors.
@@ -1430,7 +1439,7 @@ impl CommitPanel {
                         } else {
                             theme::text()
                         })
-                        .child(group.title()),
+                        .child(row_text("title", group.title())),
                 )
                 .child(
                     div()
@@ -1439,10 +1448,13 @@ impl CommitPanel {
                         .truncate()
                         .text_xs()
                         .text_color(theme::muted())
-                        .child(match count {
-                            1 => "1 file".to_owned(),
-                            n => format!("{n} files"),
-                        }),
+                        .child(row_text(
+                            "count",
+                            match count {
+                                1 => "1 file".to_owned(),
+                                n => format!("{n} files"),
+                            },
+                        )),
                 )
                 .children(actions)
                 .into_any_element(),
@@ -1458,7 +1470,7 @@ impl CommitPanel {
                         .min_w_0()
                         .truncate()
                         .text_color(theme::text())
-                        .child(label.clone()),
+                        .child(row_text("label", label.clone())),
                 )
                 .children(actions)
                 .into_any_element(),
@@ -1488,7 +1500,7 @@ impl CommitPanel {
                                     .flex_none()
                                     .text_color(change_color(*change))
                                     .when(*change == Change::Deleted, |name| name.line_through())
-                                    .child(name.to_owned()),
+                                    .child(row_text("name", name.to_owned())),
                             )
                             .child(
                                 div()
@@ -1496,7 +1508,7 @@ impl CommitPanel {
                                     .truncate()
                                     .text_xs()
                                     .text_color(theme::muted())
-                                    .child(detail),
+                                    .child(row_text("detail", detail)),
                             ),
                     )
                     .children(actions)
@@ -1706,7 +1718,12 @@ impl CommitPanel {
                 .gap_2()
                 .text_xs()
                 .bg(theme::active_row())
-                .child(div().flex_1().text_color(theme::warning()).child(text))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_color(theme::warning())
+                        .child(selectable("operation", text)),
+                )
                 .when(rebasing, |banner| {
                     banner.child(
                         button("operation-continue", "Continue").on_click(
@@ -1757,7 +1774,7 @@ impl CommitPanel {
                     } else {
                         Check::Unchecked
                     }))
-                    .child("Amend")
+                    .child(selectable("amend", "Amend"))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_amend(cx))),
             )
             .child(
@@ -1824,11 +1841,12 @@ impl CommitPanel {
                             .on_click(cx.listener(|this, _, _, cx| this.commit(true, cx))),
                     ),
             )
-            .children(
-                self.feedback
-                    .clone()
-                    .map(|(text, color)| div().text_xs().text_color(color()).child(text)),
-            )
+            .children(self.feedback.clone().map(|(text, color)| {
+                div()
+                    .text_xs()
+                    .text_color(color())
+                    .child(selectable("feedback", text))
+            }))
     }
 }
 
@@ -1852,7 +1870,7 @@ impl Render for CommitPanel {
                 .p_3()
                 .text_sm()
                 .text_color(color)
-                .child(text)
+                .child(selectable("message", text))
                 .into_any_element()
         };
         let body = match &self.state {
@@ -1865,12 +1883,15 @@ impl Render for CommitPanel {
                 .gap_1()
                 .text_sm()
                 .text_color(theme::muted())
-                .child("No local changes")
-                .child(div().text_xs().child(if status.unborn {
-                    "No commits yet".to_owned()
-                } else {
-                    "Everything is committed".to_owned()
-                }))
+                .child(selectable("empty", "No local changes"))
+                .child(div().text_xs().child(selectable(
+                    "empty-detail",
+                    if status.unborn {
+                        "No commits yet"
+                    } else {
+                        "Everything is committed"
+                    },
+                )))
                 .into_any_element(),
             State::Ready { .. } => uniform_list(
                 "commit-rows",
@@ -1894,17 +1915,19 @@ impl Render for CommitPanel {
                     .flex_col()
                     .gap_2()
                     .text_sm()
-                    .child(format!(
-                        "Git refuses this repository because its folder ({path}) belongs \
-                         to another user than the one running git. This is common for \
-                         folders on another drive, shared folders, or folders mounted \
-                         into WSL."
+                    .child(selectable(
+                        "untrusted",
+                        format!(
+                            "Git refuses this repository because its folder ({path}) belongs \
+                             to another user than the one running git. This is common for \
+                             folders on another drive, shared folders, or folders mounted \
+                             into WSL."
+                        ),
                     ))
-                    .child(
-                        div()
-                            .text_color(theme::muted())
-                            .child("Trusting it adds the folder to git's safe.directory list."),
-                    )
+                    .child(div().text_color(theme::muted()).child(selectable(
+                        "untrusted-hint",
+                        "Trusting it adds the folder to git's safe.directory list.",
+                    )))
                     .child(
                         div()
                             .id("trust-repository")
@@ -1951,7 +1974,7 @@ impl Render for CommitPanel {
                         .pb_1()
                         .text_xs()
                         .text_color(color())
-                        .child(text)
+                        .child(selectable("feedback", text))
                 }))
             })
             .children(self.render_menu(cx))

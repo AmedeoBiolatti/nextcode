@@ -30,6 +30,7 @@ use crate::{
     diff_view::DiffSource,
     editor::{self, Editor, EditorEvent},
     project::Project,
+    selectable::selectable,
     theme,
 };
 
@@ -295,7 +296,7 @@ fn graph_cell(row: &GraphRow, head: bool) -> impl IntoElement {
 }
 
 /// A branch or tag label in a commit row; `remote` outlines remote branches.
-fn ref_label(name: &str, remote: bool) -> impl IntoElement {
+fn ref_label(index: usize, name: &str, remote: bool) -> impl IntoElement {
     let (label, background, border, text) = if let Some(branch) = name.strip_prefix("HEAD -> ") {
         (
             format!("HEAD → {branch}"),
@@ -341,7 +342,7 @@ fn ref_label(name: &str, remote: bool) -> impl IntoElement {
         .bg(background)
         .text_xs()
         .text_color(text)
-        .child(label)
+        .child(selectable(("ref", index), label).right_click_through())
 }
 
 impl GitLogPanel {
@@ -827,15 +828,17 @@ impl GitLogPanel {
                             .truncate()
                             .text_color(theme::text())
                             .when(head, |subject| subject.font_weight(gpui::FontWeight::BOLD))
-                            .child(commit.subject.clone()),
+                            .child(
+                                selectable("subject", commit.subject.clone()).right_click_through(),
+                            ),
                     )
                     .child(div().flex_1())
-                    .children(commit.refs.iter().map(|name| {
+                    .children(commit.refs.iter().enumerate().map(|(i, name)| {
                         let remote = self
                             .refs
                             .iter()
                             .any(|r| r.kind == git::RefKind::Remote && r.name == *name);
-                        ref_label(name, remote)
+                        ref_label(i, name, remote)
                     })),
             )
             .child(
@@ -845,7 +848,7 @@ impl GitLogPanel {
                     .truncate()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(commit.author.clone()),
+                    .child(selectable("author", commit.author.clone()).right_click_through()),
             )
             .child(
                 div()
@@ -854,7 +857,7 @@ impl GitLogPanel {
                     .truncate()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(relative_time(commit.time)),
+                    .child(selectable("time", relative_time(commit.time)).right_click_through()),
             )
             .into_any_element()
     }
@@ -1113,7 +1116,10 @@ impl GitLogPanel {
                         .pt_1()
                         .text_xs()
                         .text_color(theme::muted())
-                        .child("Paths (repository-relative, comma-separated), Enter applies:")
+                        .child(selectable(
+                            "paths-label",
+                            "Paths (repository-relative, comma-separated), Enter applies:",
+                        ))
                         .into_any_element(),
                 );
                 items.push(
@@ -1167,7 +1173,7 @@ impl GitLogPanel {
                 .p_3()
                 .text_sm()
                 .text_color(theme::muted())
-                .child("Select a commit to see its changes")
+                .child(selectable("empty", "Select a commit to see its changes"))
                 .into_any_element();
         };
         let commits = self.selected_commits();
@@ -1176,13 +1182,13 @@ impl GitLogPanel {
                 .p_2()
                 .text_sm()
                 .text_color(theme::muted())
-                .child("Loading…")
+                .child(selectable("loading", "Loading…"))
                 .into_any_element(),
             Some(Err(err)) => div()
                 .p_2()
                 .text_sm()
                 .text_color(theme::error())
-                .child(err.clone())
+                .child(selectable("error", err.clone()))
                 .into_any_element(),
             Some(Ok(span)) => {
                 let changes = span.changes.clone();
@@ -1259,26 +1265,34 @@ impl GitLogPanel {
                     .flex_col()
                     .gap_1()
                     .text_sm()
-                    .child(div().text_color(theme::text()).child(message))
+                    .child(
+                        div()
+                            .text_color(theme::text())
+                            .child(selectable("message", message)),
+                    )
                     .child(
                         div()
                             .mt_2()
                             .font_family(theme::MONO_FONT)
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(commit.id.clone()),
+                            .child(selectable("hash", commit.id.clone())),
                     )
-                    .child(div().text_xs().text_color(theme::muted()).child(format!(
-                        "{} <{}> on {}",
-                        commit.author,
-                        commit.email,
-                        absolute_time(commit.time)
+                    .child(div().text_xs().text_color(theme::muted()).child(selectable(
+                        "author",
+                        format!(
+                            "{} <{}> on {}",
+                            commit.author,
+                            commit.email,
+                            absolute_time(commit.time)
+                        ),
                     )))
-                    .children(
-                        branches.map(|branches| {
-                            div().text_xs().text_color(theme::muted()).child(branches)
-                        }),
-                    )
+                    .children(branches.map(|branches| {
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(selectable("branches", branches))
+                    }))
                     .into_any_element()
             }
             commits => div()
@@ -1291,7 +1305,7 @@ impl GitLogPanel {
                 .flex_col()
                 .gap_1()
                 .text_sm()
-                .children(commits.iter().map(|commit| {
+                .children(commits.iter().enumerate().map(|(index, commit)| {
                     div()
                         .flex()
                         .gap_2()
@@ -1301,14 +1315,14 @@ impl GitLogPanel {
                                 .font_family(theme::MONO_FONT)
                                 .text_xs()
                                 .text_color(theme::muted())
-                                .child(commit.short_id().to_owned()),
+                                .child(selectable(("hash", index), commit.short_id().to_owned())),
                         )
                         .child(
                             div()
                                 .min_w_0()
                                 .truncate()
                                 .text_color(theme::text())
-                                .child(commit.subject.clone()),
+                                .child(selectable(("subject", index), commit.subject.clone())),
                         )
                 }))
                 .into_any_element(),
@@ -1326,7 +1340,7 @@ impl GitLogPanel {
                     .text_color(theme::muted())
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(header),
+                    .child(selectable("header", header)),
             )
             .child(div().flex_1().min_h_0().flex().flex_col().child(files))
             .child(
@@ -1365,7 +1379,7 @@ impl GitLogPanel {
                         } else {
                             theme::muted()
                         })
-                        .child(message),
+                        .child(selectable("report", message)),
                 )
                 .when(self.conflict, |row| {
                     row.child(
@@ -1411,7 +1425,7 @@ impl GitLogPanel {
                 } else {
                     theme::muted()
                 })
-                .child(message)
+                .child(selectable("message", message))
                 .into_any_element();
         }
         let list: gpui::AnyElement = match &self.error {
@@ -1419,17 +1433,20 @@ impl GitLogPanel {
                 .p_3()
                 .text_sm()
                 .text_color(theme::error())
-                .child(error.clone())
+                .child(selectable("error", error.clone()))
                 .into_any_element(),
             _ if !self.loading && self.commits.is_empty() => div()
                 .p_3()
                 .text_sm()
                 .text_color(theme::muted())
-                .child(if self.filter.is_empty() {
-                    "No commits yet"
-                } else {
-                    "No commits matching the filters"
-                })
+                .child(selectable(
+                    "empty",
+                    if self.filter.is_empty() {
+                        "No commits yet"
+                    } else {
+                        "No commits matching the filters"
+                    },
+                ))
                 .into_any_element(),
             _ => uniform_list(
                 "log-commits",

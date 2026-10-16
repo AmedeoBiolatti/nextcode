@@ -18,6 +18,7 @@ use lsp::types::{
 use crate::{
     editor::symbol_kind_badge,
     lsp_store::{RunningServer, request_retrying},
+    selectable::selectable,
     theme,
 };
 
@@ -532,7 +533,7 @@ impl CallHierarchyPanel {
                 return base
                     .pl(px(INDENT * (node.depth + 1) as f32 + 22.))
                     .text_color(theme::muted())
-                    .child(div().truncate().child(text))
+                    .child(div().truncate().child(selectable("message", text)))
                     .into_any_element();
             }
             Row::Node(_) => {}
@@ -581,7 +582,7 @@ impl CallHierarchyPanel {
                 div()
                     .flex_none()
                     .text_color(theme::text())
-                    .child(node.item.name.clone()),
+                    .child(selectable("name", node.item.name.clone()).double_click_through()),
             )
             .children(node.item.detail.as_ref().map(|detail| {
                 div()
@@ -590,14 +591,14 @@ impl CallHierarchyPanel {
                     .truncate()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(detail.clone())
+                    .child(selectable("detail", detail.clone()).double_click_through())
             }))
             .child(
                 div()
                     .flex_none()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(place),
+                    .child(selectable("place", place).double_click_through()),
             )
             .into_any_element()
     }
@@ -650,7 +651,10 @@ impl Render for CallHierarchyPanel {
                 .p_3()
                 .text_sm()
                 .text_color(theme::muted())
-                .child("Run Show Call Hierarchy (Shift+Alt+H) on a function in the editor.")
+                .child(selectable(
+                    "empty",
+                    "Run Show Call Hierarchy (Shift+Alt+H) on a function in the editor.",
+                ))
                 .into_any_element();
         };
         let title: SharedString = tree
@@ -685,14 +689,18 @@ impl Render for CallHierarchyPanel {
                     .border_b_1()
                     .border_color(theme::border())
                     .text_sm()
-                    .child(div().text_color(theme::muted()).child(caption))
+                    .child(
+                        div()
+                            .text_color(theme::muted())
+                            .child(selectable("caption", caption)),
+                    )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_color(theme::text())
-                            .child(title),
+                            .child(selectable("title", title)),
                     )
                     .child(self.direction_button(Direction::Incoming, "Incoming", cx))
                     .child(self.direction_button(Direction::Outgoing, "Outgoing", cx)),
@@ -704,7 +712,10 @@ impl Render for CallHierarchyPanel {
                         .py_1()
                         .text_xs()
                         .text_color(theme::muted())
-                        .child("The language server stopped; run Show Call Hierarchy again."),
+                        .child(selectable(
+                            "stopped",
+                            "The language server stopped; run Show Call Hierarchy again.",
+                        )),
                 )
             })
             .child(

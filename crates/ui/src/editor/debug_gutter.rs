@@ -424,7 +424,7 @@ impl Editor {
                         .font_family(theme::UI_FONT)
                         .text_xs()
                         .text_color(theme::muted())
-                        .child(FIELD_LABELS[index]),
+                        .child(selectable(("label", index), FIELD_LABELS[index])),
                 )
                 .child(
                     div()
@@ -473,7 +473,10 @@ impl Editor {
                             .font_family(theme::UI_FONT)
                             .text_xs()
                             .text_color(theme::text())
-                            .child(format!("Breakpoint on line {}", editing.line + 1)),
+                            .child(selectable(
+                                "title",
+                                format!("Breakpoint on line {}", editing.line + 1),
+                            )),
                     )
                     .children(
                         editing
@@ -492,7 +495,10 @@ impl Editor {
                                     .font_family(theme::UI_FONT)
                                     .text_xs()
                                     .text_color(theme::muted())
-                                    .child("Enter to apply · Tab next field · Escape to cancel"),
+                                    .child(selectable(
+                                        "hint",
+                                        "Enter to apply · Tab next field · Escape to cancel",
+                                    )),
                             )
                             .child(
                                 div()

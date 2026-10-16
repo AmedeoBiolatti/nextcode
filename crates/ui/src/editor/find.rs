@@ -554,7 +554,9 @@ impl Editor {
                                 } else {
                                     count_color
                                 })
-                                .when(!empty_query, |count| count.child(self.find_count())),
+                                .when(!empty_query, |count| {
+                                    count.child(selectable("find-count", self.find_count()))
+                                }),
                         )
                         .child(
                             button("find-prev", "↑")

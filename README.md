@@ -709,6 +709,20 @@ label, a submenu, or a list. Command names are `namespace::Name` (`app`,
 `workspace`, `editor`, `git`, `python`); unknown ones show disabled with a
 notice, and an invalid file falls back to the built-in menus.
 
+**Copying text from the UI.** Messages, errors, notices, banners, hover
+and parameter-hint docs, Problems entries (with their `source(code)`, e.g.
+`rustc(E0308)`), workflow details and step output, test failures and the
+status bar can be selected like web-page text: drag (also past the text's
+end), double-click a word, triple-click the whole message; `Ctrl+C` (or
+`Ctrl+Insert`, Edit > Copy) copies, `Ctrl+A` selects the whole message,
+`Escape` clears and returns focus where it was. Right-click shows **Copy**
+and **Copy All**. A plain click still does what it did (a Problems row or
+the workflow banner still jumps to the location), and in rows where a
+double-click does something (Commit window and Git log files, branches,
+Tests, Call Hierarchy, debugger values) a double-click on the text still
+does it instead of selecting a word; dragging still selects. A selection
+stays within one message.
+
 ## Editing
 
 Shortcuts follow VS Code (JetBrains where VS Code has none); the menus and

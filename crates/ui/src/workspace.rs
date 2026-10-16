@@ -41,6 +41,7 @@ use crate::{
     recent,
     revision_picker::{RevisionPicker, RevisionPickerEvent},
     search_panel::{SearchPanel, SearchPanelEvent},
+    selectable::selectable,
     settings::Settings,
     symbol_picker::SymbolPicker,
     terminal_panel::{TerminalPanel, TerminalPanelEvent, TerminalView},
@@ -1549,7 +1550,12 @@ impl Workspace {
                     .border_b_1()
                     .border_color(theme::border())
                     .text_sm()
-                    .child(div().flex_1().min_w_0().child(offer.message.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(selectable(("offer", index), offer.message.clone())),
+                    )
                     .child(
                         button("offer-accept", offer.kind.action()).on_click(cx.listener(
                             move |this, _, window, cx| {
@@ -1779,13 +1785,14 @@ impl Render for Workspace {
                             .iter()
                             .chain(&self.notice)
                             .cloned()
-                            .map(|notice| {
+                            .enumerate()
+                            .map(|(index, notice)| {
                                 div()
                                     .px_3()
                                     .py_1()
                                     .text_sm()
                                     .text_color(theme::error())
-                                    .child(notice)
+                                    .child(selectable(("notice", index), notice))
                             }),
                     )
                     .children(self.render_offers(cx))

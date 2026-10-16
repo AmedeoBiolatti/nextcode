@@ -5,7 +5,7 @@ use git::{Ref, RefKind};
 use gpui::{ClickEvent, Context, div, prelude::*, px};
 
 use super::GitLogPanel;
-use crate::theme;
+use crate::{selectable::selectable, theme};
 
 pub(super) const LOCAL: &str = "local";
 pub(super) const REMOTE: &str = "remote";
@@ -201,7 +201,7 @@ impl GitLogPanel {
                             .min_w_0()
                             .truncate()
                             .when(filtering, |text| text.font_weight(gpui::FontWeight::BOLD))
-                            .child(label.clone()),
+                            .child(selectable("label", label.clone()).double_click_through()),
                     ),
                 BranchRow::Group {
                     label,
@@ -212,7 +212,7 @@ impl GitLogPanel {
                     .pl(px(8. + 14. * *depth as f32))
                     .text_color(theme::muted())
                     .child(if *collapsed { "▸" } else { "▾" })
-                    .child(label.clone()),
+                    .child(selectable("label", label.clone()).double_click_through()),
                 BranchRow::Ref {
                     label,
                     kind,
@@ -233,7 +233,7 @@ impl GitLogPanel {
                                 .truncate()
                                 .text_color(theme::text())
                                 .when(filtering, |text| text.font_weight(gpui::FontWeight::BOLD))
-                                .child(label.clone()),
+                                .child(selectable("label", label.clone()).double_click_through()),
                         )
                 }
             }
@@ -253,7 +253,7 @@ impl GitLogPanel {
                     .border_color(theme::border())
                     .text_xs()
                     .text_color(theme::muted())
-                    .child("Branches"),
+                    .child(selectable("branches-title", "Branches")),
             )
             .child(
                 div()

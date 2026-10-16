@@ -12,7 +12,7 @@ use std::{
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla,
-    KeyBinding, MouseButton, ScrollStrategy, SharedString, StyledText, Subscription, Task,
+    KeyBinding, MouseButton, ScrollStrategy, SharedString, Subscription, Task,
     UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 use language::{Location, symbols as model};
@@ -27,6 +27,7 @@ use crate::{
     editor::{self, Editor, EditorEvent, SymbolsStatus, symbol_kind_badge},
     lsp_store::{RunningServer, request_retrying},
     project::Project,
+    selectable::selectable,
     theme,
 };
 
@@ -565,7 +566,7 @@ impl SymbolPicker {
                 div()
                     .flex_none()
                     .text_color(theme::text())
-                    .child(StyledText::new(item.name.clone()).with_highlights(highlights)),
+                    .child(selectable("name", item.name.clone()).with_highlights(highlights)),
             )
             .child(
                 div()
@@ -574,14 +575,14 @@ impl SymbolPicker {
                     .truncate()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(item.detail.clone()),
+                    .child(selectable("detail", item.detail.clone())),
             )
             .child(
                 div()
                     .flex_none()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(item.hint.clone()),
+                    .child(selectable("hint", item.hint.clone())),
             )
     }
 }
@@ -742,8 +743,12 @@ impl Render for SymbolPicker {
                     .border_color(theme::border())
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(div().truncate().child(self.title.clone()))
-                    .child(div().flex_none().child(status)),
+                    .child(
+                        div()
+                            .truncate()
+                            .child(selectable("title", self.title.clone())),
+                    )
+                    .child(div().flex_none().child(selectable("status", status))),
             )
             // Keep clicks inside the modal from reaching the editor below.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

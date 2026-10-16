@@ -40,6 +40,7 @@ use super::{
 use crate::{
     editor::{Editor, EditorEvent},
     project::Project,
+    selectable::selectable,
     shell::tab_title,
     theme,
 };
@@ -551,7 +552,11 @@ impl WorkflowView {
                     .text_color(outcome_color(outcome))
                     .child(super::TAB_ICON),
             )
-            .child(div().flex_none().child(self.name()))
+            .child(
+                div()
+                    .flex_none()
+                    .child(selectable("workflow-name", self.name())),
+            )
             .child(
                 div()
                     .flex_1()
@@ -559,7 +564,7 @@ impl WorkflowView {
                     .truncate()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(self.path.display().to_string()),
+                    .child(selectable("workflow-path", self.path.display().to_string())),
             )
             .children(self.notice.clone().map(|notice| {
                 div()
@@ -568,7 +573,7 @@ impl WorkflowView {
                     .truncate()
                     .text_xs()
                     .text_color(theme::error())
-                    .child(notice)
+                    .child(selectable("workflow-notice", notice))
             }))
             .child(
                 div()
@@ -580,7 +585,7 @@ impl WorkflowView {
                     .text_color(outcome_color(outcome))
                     .border_1()
                     .border_color(outcome_color(outcome))
-                    .child(outcome_text(outcome)),
+                    .child(selectable("text", outcome_text(outcome))),
             )
             .child(
                 button("workflow-run-all", "Run All")
@@ -629,7 +634,10 @@ impl WorkflowView {
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, window, cx| this.go_to_problem(window, cx)))
-                .child(format!("{place}{}{more}", first.message))
+                .child(selectable(
+                    "text",
+                    format!("{place}{}{more}", first.message),
+                ))
                 .into_any_element(),
         )
     }
@@ -999,13 +1007,17 @@ impl WorkflowView {
                                 .items_center()
                                 .gap_2()
                                 .child(div().flex_none().text_color(color).child(icon))
-                                .child(div().flex_none().child(step.label().to_owned()))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .child(selectable("step-label", step.label().to_owned())),
+                                )
                                 .child(
                                     div()
                                         .flex_none()
                                         .text_xs()
                                         .text_color(color)
-                                        .child(status.name()),
+                                        .child(selectable("step-status", status.name())),
                                 )
                                 .child(
                                     div()
@@ -1014,9 +1026,12 @@ impl WorkflowView {
                                         .truncate()
                                         .text_xs()
                                         .text_color(theme::muted())
-                                        .child(format!(
-                                            "{elapsed}  {}",
-                                            place(step, active, run_index)
+                                        .child(selectable(
+                                            "step-place",
+                                            format!(
+                                                "{elapsed}  {}",
+                                                place(step, active, run_index)
+                                            ),
                                         )),
                                 )
                                 .child(actions),
@@ -1030,10 +1045,11 @@ impl WorkflowView {
                                     } else {
                                         theme::text()
                                     })
-                                    .child(reason),
+                                    .child(selectable("step-reason", reason)),
                             )
                         })
                         .when(!lines.is_empty(), |details| {
+                            // One block, so a selection can span the lines.
                             details.child(
                                 div()
                                     .px_2()
@@ -1043,9 +1059,9 @@ impl WorkflowView {
                                     .font_family(theme::MONO_FONT)
                                     .text_xs()
                                     .text_color(theme::muted())
-                                    .children(
-                                        lines.into_iter().map(|line| div().truncate().child(line)),
-                                    ),
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .child(selectable("step-output", lines.join("\n"))),
                             )
                         })
                         .children(artifacts),
@@ -1117,10 +1133,18 @@ impl WorkflowView {
                         } else {
                             theme::muted()
                         })
-                        .child(if url { format!("{name} ↗") } else { name }),
+                        .child(selectable(
+                            "name",
+                            if url { format!("{name} ↗") } else { name },
+                        )),
                 )
                 .when(!note.is_empty(), |row| {
-                    row.child(div().flex_none().text_color(theme::warning()).child(note))
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_color(theme::warning())
+                            .child(selectable("note", note)),
+                    )
                 })
                 .child(
                     div()
@@ -1128,7 +1152,7 @@ impl WorkflowView {
                         .min_w_0()
                         .truncate()
                         .text_color(theme::muted())
-                        .child(shown),
+                        .child(selectable("path", shown)),
                 )
                 .when_some(run_index.filter(|_| opens), |row, at| {
                     row.cursor_pointer()
@@ -1156,7 +1180,7 @@ impl WorkflowView {
                             div()
                                 .flex_none()
                                 .text_color(theme::muted())
-                                .child("Artifacts"),
+                                .child(selectable("step-artifacts-heading", "Artifacts")),
                         )
                         .when_some(run_index.filter(|_| checkable), |header, at| {
                             header.child(button("step-artifacts-check", "Check again").on_click(
@@ -1174,7 +1198,7 @@ impl WorkflowView {
                                 .min_w_0()
                                 .truncate()
                                 .text_color(theme::error())
-                                .child(error)
+                                .child(selectable("step-artifacts-error", error))
                         })),
                 )
                 .children(rows)
@@ -1283,7 +1307,7 @@ impl WorkflowView {
                         .justify_center()
                         .text_xs()
                         .text_color(theme::text())
-                        .child(format!("{percent}%")),
+                        .child(selectable("percent", format!("{percent}%"))),
                 )
                 .child(
                     button("workflow-zoom-in", "+")
@@ -1318,7 +1342,10 @@ impl Render for WorkflowView {
                 .items_center()
                 .justify_center()
                 .text_color(theme::muted())
-                .child("No steps yet: add some to `steps`.")
+                .child(selectable(
+                    "graph-empty",
+                    "No steps yet: add some to `steps`.",
+                ))
                 .into_any_element(),
             Some(workflow) => self.render_graph(workflow, now, cx),
             None => div()
@@ -1327,7 +1354,10 @@ impl Render for WorkflowView {
                 .items_center()
                 .justify_center()
                 .text_color(theme::muted())
-                .child("The graph shows once the file is a valid workflow.")
+                .child(selectable(
+                    "graph-empty",
+                    "The graph shows once the file is a valid workflow.",
+                ))
                 .into_any_element(),
         };
         let details = workflow

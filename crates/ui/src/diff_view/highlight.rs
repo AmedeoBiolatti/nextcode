@@ -8,11 +8,14 @@
 use std::{collections::HashMap, ops::Range};
 
 use git::{LineKind, Row};
-use gpui::{FontStyle, FontWeight, HighlightStyle, StrikethroughStyle, StyledText, UnderlineStyle};
+use gpui::{FontStyle, FontWeight, HighlightStyle, StrikethroughStyle, UnderlineStyle};
 use syntax::{Highlight, Language, Syntax};
 use text::Buffer;
 
-use crate::theme::SyntaxStyle;
+use crate::{
+    selectable::{SelectableText, selectable},
+    theme::SyntaxStyle,
+};
 
 /// Highlights of one line, as byte ranges within the line.
 pub type LineSpans = Vec<(Range<usize>, Highlight)>;
@@ -104,12 +107,12 @@ fn highlight_lines<'a>(
 }
 
 /// `text` with tabs as four spaces, colored by `spans` (byte ranges of the
-/// original text) in `styles`.
+/// original text) in `styles`, as selectable text.
 pub fn styled_line(
     text: &str,
     spans: &[(Range<usize>, Highlight)],
     styles: &[SyntaxStyle],
-) -> StyledText {
+) -> SelectableText {
     let (shown, spans) = expand_tabs(text, spans);
     let highlights: Vec<(Range<usize>, HighlightStyle)> = spans
         .into_iter()
@@ -117,7 +120,7 @@ pub fn styled_line(
             Some((range, highlight_style(styles.get(highlight.index())?)))
         })
         .collect();
-    StyledText::new(shown).with_highlights(highlights)
+    selectable("text", shown).with_highlights(highlights)
 }
 
 /// `text` with tabs as four spaces, and `spans` moved to match.

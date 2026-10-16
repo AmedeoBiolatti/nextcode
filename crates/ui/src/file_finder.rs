@@ -8,7 +8,7 @@ use std::{
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    KeyBinding, MouseButton, ScrollStrategy, SharedString, StyledText, Subscription, Task,
+    KeyBinding, MouseButton, ScrollStrategy, SharedString, Subscription, Task,
     UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 use nucleo_matcher::{
@@ -19,6 +19,7 @@ use nucleo_matcher::{
 use crate::{
     editor::{self, Editor, EditorEvent},
     project::Project,
+    selectable::selectable,
     theme,
 };
 
@@ -194,16 +195,14 @@ impl FileFinder {
                 row.hover(|style| style.bg(theme::hover_row()))
             })
             .on_click(cx.listener(move |this, _, _, cx| this.open(index, cx)))
-            .child(
-                div().text_color(theme::text()).child(
-                    StyledText::new(name).with_highlights(highlights(name_start..path.len())),
-                ),
-            )
+            .child(div().text_color(theme::text()).child(
+                selectable("name", name).with_highlights(highlights(name_start..path.len())),
+            ))
             .child(
                 div()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(StyledText::new(dir).with_highlights(highlights(0..name_start))),
+                    .child(selectable("dir", dir).with_highlights(highlights(0..name_start))),
             )
     }
 }
@@ -327,7 +326,7 @@ impl Render for FileFinder {
                     .border_color(theme::border())
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(status),
+                    .child(selectable("status", status)),
             )
             // Keep clicks inside the modal from reaching the editor below.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

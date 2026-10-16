@@ -23,6 +23,7 @@ use text::{Bias, Buffer, Change, Encoding};
 use crate::{
     lsp_store::RunningServer,
     project::Project,
+    selectable::selectable,
     theme::{self, SyntaxStyle},
 };
 
@@ -532,7 +533,6 @@ struct EditorDiagnostic {
     range: Range<usize>,
     severity: Severity,
     message: SharedString,
-    source: Option<SharedString>,
     /// Rendered faded (e.g. unused imports).
     unnecessary: bool,
     /// Rendered struck through.
@@ -1648,7 +1648,6 @@ impl Editor {
                         _ => Severity::Error,
                     },
                     message: diagnostic.message.clone().into(),
-                    source: diagnostic.source.clone().map(Into::into),
                     unnecessary: tags.contains(&DiagnosticTag::UNNECESSARY),
                     deprecated: tags.contains(&DiagnosticTag::DEPRECATED),
                     lsp: diagnostic.clone(),
@@ -2734,7 +2733,7 @@ impl Render for Editor {
                                 .min_w_0()
                                 .truncate()
                                 .text_color(message_color)
-                                .child(message),
+                                .child(selectable("status-message", message)),
                         )
                         .child(
                             div()
@@ -2743,11 +2742,18 @@ impl Render for Editor {
                                 .min_w_0()
                                 .children(
                                     self.lsp_status.clone().map(|(status, color)| {
-                                        div().min_w_0().truncate().text_color(color()).child(status)
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_color(color())
+                                            .child(selectable("server-status", status))
                                     }),
                                 )
-                                .child(div().flex_none().child(format!(
-                                    "{selection_count}Ln {line}, Col {column}   {indent}   {line_ending}   UTF-8   {language}"
+                                .child(div().flex_none().child(selectable(
+                                    "position",
+                                    format!(
+                                        "{selection_count}Ln {line}, Col {column}   {indent}   {line_ending}   UTF-8   {language}"
+                                    ),
                                 )))
                                 .when(errors + warnings > 0, |row| {
                                     row.child(
@@ -2757,12 +2763,15 @@ impl Render for Editor {
                                             .child(
                                                 div()
                                                     .text_color(theme::error())
-                                                    .child(format!("✕ {errors}")),
+                                                    .child(selectable("errors", format!("✕ {errors}"))),
                                             )
                                             .child(
                                                 div()
                                                     .text_color(theme::warning())
-                                                    .child(format!("⚠ {warnings}")),
+                                                    .child(selectable(
+                                                        "warnings",
+                                                        format!("⚠ {warnings}"),
+                                                    )),
                                             ),
                                     )
                                 }),

@@ -144,6 +144,8 @@ const HIDDEN_NAMESPACES: &[&str] = &[
     // Keys inside the Commit window and git dialogs.
     "commit_panel",
     "git_dialog",
+    // Escape on selected static text.
+    "selectable",
 ];
 
 /// Building blocks of typing and list navigation, not commands.

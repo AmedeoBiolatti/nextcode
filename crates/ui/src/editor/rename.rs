@@ -251,6 +251,8 @@ impl Editor {
                     .border_color(theme::accent())
                     .rounded_md()
                     .shadow_lg()
+                    // Presses here (selecting the hint) are not the text's.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         div()
                             .h(layout.line_height)
@@ -264,7 +266,7 @@ impl Editor {
                             .font_family(theme::UI_FONT)
                             .text_xs()
                             .text_color(theme::muted())
-                            .child("Enter to rename, Escape to cancel"),
+                            .child(selectable("hint", "Enter to rename, Escape to cancel")),
                     ),
             ),
         )

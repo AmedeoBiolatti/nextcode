@@ -433,7 +433,10 @@ impl Workspace {
                         .p_3()
                         .text_sm()
                         .text_color(theme::muted())
-                        .child("This panel is not available yet.")
+                        .child(crate::selectable::selectable(
+                            "empty",
+                            "This panel is not available yet.",
+                        ))
                         .into_any_element(),
                 ),
             },

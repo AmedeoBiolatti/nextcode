@@ -5,13 +5,14 @@ use std::{ops::Range, path::PathBuf, time::Duration};
 use futures::StreamExt;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla,
-    SharedString, StyledText, Subscription, Task, Window, div, prelude::*, px, uniform_list,
+    SharedString, Subscription, Task, Window, div, prelude::*, px, uniform_list,
 };
 use search::{FileMatches, SearchEvent, SearchLimits, SearchQuery};
 
 use crate::{
     editor::{self, Editor, EditorEvent},
     project::{Project, SearchHandle},
+    selectable::selectable,
     theme,
 };
 
@@ -243,21 +244,26 @@ impl SearchPanel {
                     .items_center()
                     .gap_2()
                     .text_sm()
-                    .child(div().flex_none().text_color(theme::text()).child(name))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme::text())
+                            .child(selectable("name", name)),
+                    )
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(dir),
+                            .child(selectable("dir", dir)),
                     )
                     .child(
                         div()
                             .flex_none()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(matches.lines.len().to_string()),
+                            .child(selectable("count", matches.lines.len().to_string())),
                     )
             }
             Row::Line { file, line } => {
@@ -301,7 +307,7 @@ impl SearchPanel {
                             .w(px(36.))
                             .text_xs()
                             .text_color(theme::muted())
-                            .child((found.line + 1).to_string()),
+                            .child(selectable("line", (found.line + 1).to_string())),
                     )
                     .child(
                         div()
@@ -310,7 +316,9 @@ impl SearchPanel {
                             .font_family(theme::MONO_FONT)
                             .text_sm()
                             .text_color(theme::text())
-                            .child(StyledText::new(trimmed.to_owned()).with_highlights(highlights)),
+                            .child(
+                                selectable("text", trimmed.to_owned()).with_highlights(highlights),
+                            ),
                     )
             }
         }
@@ -388,11 +396,12 @@ impl Render for SearchPanel {
                         include_empty,
                     ))
                     .child(input(&self.exclude, "Files to exclude", exclude_empty))
-                    .children(
-                        self.status.clone().map(|(status, color)| {
-                            div().text_xs().text_color(color()).child(status)
-                        }),
-                    ),
+                    .children(self.status.clone().map(|(status, color)| {
+                        div()
+                            .text_xs()
+                            .text_color(color())
+                            .child(selectable("status", status))
+                    })),
             )
             .child(
                 uniform_list(

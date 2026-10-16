@@ -11,6 +11,7 @@ use gpui::{
 use super::{Discovered, Source, Workflows};
 use crate::{
     editor::{self, Editor, EditorEvent},
+    selectable::selectable,
     theme,
 };
 
@@ -180,19 +181,22 @@ impl Render for WorkflowPicker {
                                             .flex_1()
                                             .min_w_0()
                                             .truncate()
-                                            .child(found.name.clone()),
+                                            .child(selectable("name", found.name.clone())),
                                     )
                                     .when(found.parsed.is_err(), |row| {
                                         row.child(
                                             div()
                                                 .text_xs()
                                                 .text_color(theme::error())
-                                                .child("invalid"),
+                                                .child(selectable("invalid", "invalid")),
                                         )
                                     }),
                             )
                             .child(div().text_xs().text_color(theme::muted()).truncate().child(
-                                format!("{} · {}", found.source.label(), found.path.display()),
+                                selectable(
+                                    "detail",
+                                    format!("{} · {}", found.source.label(), found.path.display()),
+                                ),
                             ))
                     }),
             )
@@ -203,10 +207,11 @@ impl Render for WorkflowPicker {
                         .py_2()
                         .text_xs()
                         .text_color(theme::muted())
-                        .child(
+                        .child(selectable(
+                            "empty",
                             "No workflows. Run > New Workflow… creates one in the user folder; \
                              projects can have .next_code/workflows/*.jsonc.",
-                        ),
+                        )),
                 )
             })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

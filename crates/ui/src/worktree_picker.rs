@@ -9,7 +9,9 @@ use gpui::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
-    project_picker, theme,
+    project_picker,
+    selectable::selectable,
+    theme,
 };
 
 const ROW_HEIGHT: f32 = 26.;
@@ -273,7 +275,10 @@ impl Render for WorktreePicker {
                     .pt_2()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child("Open a worktree, or type a branch name to add one"),
+                    .child(selectable(
+                        "title",
+                        "Open a worktree, or type a branch name to add one",
+                    )),
             )
             .child(
                 div()
@@ -345,7 +350,7 @@ impl Render for WorktreePicker {
                                     .min_w_0()
                                     .truncate()
                                     .text_color(theme::text())
-                                    .child(name),
+                                    .child(selectable("name", name)),
                             )
                             .child(
                                 div()
@@ -353,7 +358,7 @@ impl Render for WorktreePicker {
                                     .truncate()
                                     .text_xs()
                                     .text_color(theme::muted())
-                                    .child(detail),
+                                    .child(selectable("detail", detail)),
                             )
                             .children(removable.map(|worktree| {
                                 div()
@@ -376,7 +381,7 @@ impl Render for WorktreePicker {
                         .py_1()
                         .text_xs()
                         .text_color(theme::muted())
-                        .child("Working…"),
+                        .child(selectable("busy", "Working…")),
                 )
             })
             .children(self.error.clone().map(|error| {
@@ -385,7 +390,7 @@ impl Render for WorktreePicker {
                     .py_1()
                     .text_xs()
                     .text_color(theme::error())
-                    .child(error)
+                    .child(selectable("error", error))
             }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
     }

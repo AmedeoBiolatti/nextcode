@@ -10,7 +10,8 @@ use language::Location;
 use lsp::types::DiagnosticSeverity;
 
 use crate::{
-    lsp_store::{LspStore, LspStoreEvent},
+    lsp_store::{LspStore, LspStoreEvent, diagnostic_origin},
+    selectable::selectable,
     theme,
 };
 
@@ -33,6 +34,8 @@ enum Row {
         severity: Severity,
         message: SharedString,
         position: SharedString,
+        /// `source(code)`, as VS Code shows it ("rustc(E0308)").
+        code: Option<SharedString>,
     },
 }
 
@@ -143,6 +146,7 @@ impl ProblemsPanel {
                         .to_owned()
                         .into(),
                     position: format!("{}:{}", start.line + 1, start.character + 1).into(),
+                    code: diagnostic_origin(diagnostic).map(Into::into),
                 });
             }
         }
@@ -159,7 +163,10 @@ impl Render for ProblemsPanel {
                 .p_3()
                 .text_sm()
                 .text_color(theme::muted())
-                .child("No problems reported by language servers.")
+                .child(selectable(
+                    "empty",
+                    "No problems reported by language servers.",
+                ))
                 .into_any_element();
         }
         uniform_list(
@@ -181,18 +188,17 @@ impl Render for ProblemsPanel {
                             .gap_2()
                             .text_sm()
                             .text_color(theme::text())
-                            .child(path.clone())
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::muted())
-                                    .child(format!("{errors} errors, {warnings} warnings")),
-                            ),
+                            .child(selectable("path", path.clone()))
+                            .child(div().text_xs().text_color(theme::muted()).child(selectable(
+                                "counts",
+                                format!("{errors} errors, {warnings} warnings"),
+                            ))),
                         Row::Problem {
                             location,
                             severity,
                             message,
                             position,
+                            code,
                         } => {
                             let (badge, color) = severity.badge();
                             let location = location.clone();
@@ -217,14 +223,21 @@ impl Render for ProblemsPanel {
                                         .min_w_0()
                                         .truncate()
                                         .text_color(theme::text())
-                                        .child(message.clone()),
+                                        .child(selectable("message", message.clone())),
                                 )
+                                .children(code.clone().map(|code| {
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child(selectable("code", code))
+                                }))
                                 .child(
                                     div()
                                         .flex_none()
                                         .text_xs()
                                         .text_color(theme::muted())
-                                        .child(position.clone()),
+                                        .child(selectable("position", position.clone())),
                                 )
                         }
                     })

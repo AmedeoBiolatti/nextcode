@@ -15,6 +15,7 @@ use serde::Serialize;
 use crate::{
     editor::{self, Editor, EditorEvent},
     project::Project,
+    selectable::selectable,
     theme,
 };
 
@@ -391,18 +392,23 @@ impl PythonPanel {
             .py_1()
             .flex()
             .flex_col()
-            .child(div().text_sm().text_color(theme::text()).child(title))
             .child(
                 div()
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child(environment),
+                    .text_sm()
+                    .text_color(theme::text())
+                    .child(selectable("title", title)),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(details.join(" · ")),
+                    .child(selectable("environment", environment)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(selectable("details", details.join(" · "))),
             )
     }
 
@@ -426,7 +432,10 @@ impl PythonPanel {
             .pt_2()
             .text_xs()
             .text_color(theme::muted())
-            .child(title.to_uppercase())
+            .child(selectable(
+                SharedString::from(format!("section-{title}")),
+                title.to_uppercase(),
+            ))
     }
 
     fn row(id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
@@ -497,11 +506,10 @@ impl PythonPanel {
                         .unwrap_or_else(|| "download".into());
                     Self::row(("py-python", index))
                         .cursor_pointer()
-                        .child(
-                            div()
-                                .text_color(theme::text())
-                                .child(format!("{} {}", interpreter.implementation, version)),
-                        )
+                        .child(div().text_color(theme::text()).child(selectable(
+                            "version",
+                            format!("{} {}", interpreter.implementation, version),
+                        )))
                         .child(
                             div()
                                 .flex_1()
@@ -509,7 +517,7 @@ impl PythonPanel {
                                 .truncate()
                                 .text_xs()
                                 .text_color(theme::muted())
-                                .child(detail),
+                                .child(selectable("path", detail)),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| this.pin(version.clone(), cx)))
                 }))
@@ -534,7 +542,11 @@ impl PythonPanel {
                 Self::row(("py-script", index))
                     .cursor_pointer()
                     .child(div().text_color(theme::accent_text()).child("▶"))
-                    .child(div().text_color(theme::text()).child(name.clone()))
+                    .child(
+                        div()
+                            .text_color(theme::text())
+                            .child(selectable("name", name.clone())),
+                    )
                     .child(div().text_xs().text_color(theme::muted()).child("script"))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(PythonPanelEvent::Run(request.clone()))
@@ -560,7 +572,11 @@ impl PythonPanel {
                     let (remove_name, remove_kind) = (name.clone(), dependency.kind.clone());
                     let upgrade_name = name.clone();
                     Self::row(("py-dep", index))
-                        .child(div().text_color(theme::text()).child(name.clone()))
+                        .child(
+                            div()
+                                .text_color(theme::text())
+                                .child(selectable("name", name.clone())),
+                        )
                         .child(
                             div()
                                 .flex_1()
@@ -568,13 +584,16 @@ impl PythonPanel {
                                 .truncate()
                                 .text_xs()
                                 .text_color(theme::muted())
-                                .child(dependency.requirement.specifier.clone()),
+                                .child(selectable(
+                                    "specifier",
+                                    dependency.requirement.specifier.clone(),
+                                )),
                         )
                         .children(dependency.locked.clone().map(|version| {
                             div()
                                 .text_xs()
                                 .text_color(theme::accent_text())
-                                .child(version)
+                                .child(selectable("locked", version))
                         }))
                         .child(
                             div()
@@ -620,18 +639,21 @@ impl PythonPanel {
             .flex_col()
             .child(self.render_header(info))
             .child(actions)
-            .children(
-                status.map(|(text, color)| {
-                    div().px_2().pt_1().text_xs().text_color(color).child(text)
-                }),
-            )
+            .children(status.map(|(text, color)| {
+                div()
+                    .px_2()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(color)
+                    .child(selectable("status", text))
+            }))
             .children(self.busy.clone().map(|label| {
                 div()
                     .px_2()
                     .pt_1()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(format!("{label}…"))
+                    .child(selectable("busy", format!("{label}…")))
             }))
             .when(!self.output.is_empty() && !busy, |panel| {
                 panel.child(
@@ -648,7 +670,7 @@ impl PythonPanel {
                         } else {
                             theme::muted()
                         })
-                        .children(self.output.iter().map(|line| div().child(line.clone()))),
+                        .child(selectable("output", self.output.join("\n"))),
                 )
             })
             .children(interpreters)
@@ -713,19 +735,22 @@ impl Render for PythonPanel {
                 .p_2()
                 .text_sm()
                 .text_color(theme::muted())
-                .child("Reading the project…")
+                .child(selectable("message", "Reading the project…"))
                 .into_any_element(),
             State::NoProject => div()
                 .p_2()
                 .text_sm()
                 .text_color(theme::muted())
-                .child("No pyproject.toml in this folder. `uv init` makes one.")
+                .child(selectable(
+                    "message",
+                    "No pyproject.toml in this folder. `uv init` makes one.",
+                ))
                 .into_any_element(),
             State::Failed(error) => div()
                 .p_2()
                 .text_sm()
                 .text_color(theme::error())
-                .child(error.clone())
+                .child(selectable("error", error.clone()))
                 .into_any_element(),
             State::Ready(info) => {
                 let info = info.clone();

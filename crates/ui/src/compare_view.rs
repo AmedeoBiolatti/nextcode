@@ -14,6 +14,7 @@ use crate::{
     change_tree::{self, Node},
     commit_panel::{change_color, short_revision},
     diff_view::DiffSource,
+    selectable::selectable,
     theme,
 };
 
@@ -202,12 +203,15 @@ impl CompareView {
 }
 
 /// A row of a changed-files tree or list: folders toggle, files open.
+/// The names are selectable; a double-click on them reaches the row (the
+/// git log's details pane opens a file's diff on double-click).
 pub fn render_change_node(
     node: &Node,
     changes: &[FileChange],
     index: usize,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
+    let text = |id: &'static str, text: String| selectable(id, text).double_click_through();
     let row = div()
         .id(("change", index))
         .h(px(ROW_HEIGHT))
@@ -229,7 +233,7 @@ pub fn render_change_node(
             .pl(px(8. + 14. * *depth as f32))
             .text_color(theme::muted())
             .child(if *collapsed { "▸" } else { "▾" })
-            .child(label.clone())
+            .child(text("label", label.clone()))
             .into_any_element(),
         Node::File {
             item,
@@ -244,7 +248,7 @@ pub fn render_change_node(
                     div()
                         .flex_none()
                         .text_color(theme::text())
-                        .child(name.clone()),
+                        .child(text("name", name.clone())),
                 )
                 .child(
                     div()
@@ -253,7 +257,7 @@ pub fn render_change_node(
                         .truncate()
                         .text_xs()
                         .text_color(theme::muted())
-                        .child(renamed.unwrap_or_else(|| dir.clone())),
+                        .child(text("dir", renamed.unwrap_or_else(|| dir.clone()))),
                 )
                 .child(
                     div()
@@ -305,7 +309,7 @@ impl Render for CompareView {
                 div()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(format!("{count} files")),
+                    .child(selectable("count", format!("{count} files"))),
             )
             .child(Self::button(
                 "layout",
@@ -323,20 +327,23 @@ impl Render for CompareView {
                 .py_1()
                 .text_xs()
                 .text_color(theme::muted())
-                .child("Includes staged and unstaged changes; untracked files are not listed.")
+                .child(selectable(
+                    "note",
+                    "Includes staged and unstaged changes; untracked files are not listed.",
+                ))
         });
         let body = match (&self.error, &self.changes) {
             (Some(error), _) => div()
                 .p_3()
                 .text_sm()
                 .text_color(theme::error())
-                .child(error.clone())
+                .child(selectable("error", error.clone()))
                 .into_any_element(),
             (None, Some(changes)) if changes.is_empty() => div()
                 .p_3()
                 .text_sm()
                 .text_color(theme::muted())
-                .child("No differences.")
+                .child(selectable("empty", "No differences."))
                 .into_any_element(),
             (None, Some(_)) => uniform_list(
                 "compare-files",
@@ -351,7 +358,7 @@ impl Render for CompareView {
                 .p_3()
                 .text_sm()
                 .text_color(theme::muted())
-                .child("Comparing…")
+                .child(selectable("loading", "Comparing…"))
                 .into_any_element(),
         };
         div()

@@ -34,6 +34,7 @@ mod revision_picker;
 mod run_config;
 mod search_panel;
 mod settings;
+mod selectable;
 mod shell;
 mod startup;
 mod symbol_picker;
@@ -169,6 +170,7 @@ fn run() -> anyhow::Result<()> {
         startup::mark("gpui ready");
         editor::bind_keys(cx);
         shell::bind_keys(cx);
+        selectable::bind_keys(cx);
         command_palette::bind_keys(cx);
         workspace::bind_keys(cx);
         file_finder::bind_keys(cx);

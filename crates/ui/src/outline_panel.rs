@@ -13,6 +13,7 @@ use syntax::Language;
 
 use crate::{
     editor::{Editor, SymbolsStatus, symbol_kind_badge},
+    selectable::selectable,
     theme,
 };
 
@@ -307,7 +308,12 @@ impl OutlinePanel {
                     .text_color(color)
                     .child(badge),
             )
-            .child(div().flex_none().text_color(theme::text()).child(name))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme::text())
+                    .child(selectable("name", name)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -315,7 +321,7 @@ impl OutlinePanel {
                     .truncate()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(detail),
+                    .child(selectable("detail", detail)),
             )
     }
 }
@@ -406,8 +412,13 @@ impl Render for OutlinePanel {
                 cx.listener(|this, _, window, _| window.focus(&this.focus_handle)),
             )
             .size_full();
-        let message =
-            |text: &'static str| div().p_3().text_sm().text_color(theme::muted()).child(text);
+        let message = |text: &'static str| {
+            div()
+                .p_3()
+                .text_sm()
+                .text_color(theme::muted())
+                .child(selectable("message", text))
+        };
         let Some(editor) = self.editor.clone() else {
             return root.child(message("Open a file to see its outline."));
         };

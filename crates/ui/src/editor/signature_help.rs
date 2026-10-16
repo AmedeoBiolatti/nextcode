@@ -4,11 +4,12 @@
 //! Typing one of the server's trigger characters (e.g. `(` or `,`) or
 //! `Ctrl+Shift+Space` asks for it; while it shows, every edit and cursor
 //! move asks again (as a retrigger), and the popover closes when the
-//! server says the cursor left the call, on Escape, or on a click.
+//! server says the cursor left the call, on Escape, or on a click outside
+//! it (its text is selectable).
 //! Several signatures (overloads) cycle with Up/Down or the popover's
 //! arrows.
 
-use gpui::{FontWeight, HighlightStyle, StyledText};
+use gpui::{FontWeight, HighlightStyle};
 use language::markdown::Block;
 use lsp::types::{
     Documentation, ParameterLabel, SignatureHelp, SignatureHelpContext, SignatureHelpParams,
@@ -297,10 +298,9 @@ impl Editor {
                 .text_color(theme::muted())
                 .font_family(theme::UI_FONT)
                 .child(arrow("▲", -1, cx))
-                .child(format!(
-                    "{}/{}",
-                    popover.active + 1,
-                    popover.help.signatures.len()
+                .child(selectable(
+                    "counter",
+                    format!("{}/{}", popover.active + 1, popover.help.signatures.len()),
                 ))
                 .child(arrow("▼", 1, cx))
         });
@@ -327,19 +327,29 @@ impl Editor {
                 .text_sm()
                 .cursor_default()
                 .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                // Pressing in it (to select text) must not move the cursor.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .child(
                     div().flex().gap_2().children(counter).child(
                         div()
                             .font_family(theme::MONO_FONT)
                             .text_color(theme::text())
                             .child(
-                                StyledText::new(signature.label.clone()).with_highlights(highlight),
+                                selectable("label", signature.label.clone())
+                                    .with_highlights(highlight),
                             ),
                     ),
                 )
                 .children(separator)
-                .children(navigation::markdown_blocks(&parameter_docs))
-                .children(navigation::markdown_blocks(&signature_docs))
+                .children(navigation::markdown_blocks(
+                    "parameter-doc",
+                    &parameter_docs,
+                ))
+                .children(navigation::markdown_blocks(
+                    "signature-doc",
+                    &signature_docs,
+                ))
                 .into_any_element(),
         )
     }

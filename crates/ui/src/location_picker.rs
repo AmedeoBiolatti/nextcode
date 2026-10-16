@@ -8,7 +8,7 @@ use gpui::{
 };
 use language::Location;
 
-use crate::{project::Project, theme};
+use crate::{project::Project, selectable::selectable, theme};
 
 actions!(location_picker, [SelectPrev, SelectNext, Confirm, Dismiss]);
 
@@ -167,7 +167,10 @@ impl Render for LocationPicker {
                     .border_b_1()
                     .border_color(theme::border())
                     .text_color(theme::muted())
-                    .child(format!("{} ({})", self.title, self.entries.len())),
+                    .child(selectable(
+                        "title",
+                        format!("{} ({})", self.title, self.entries.len()),
+                    )),
             )
             .child(
                 uniform_list(
@@ -198,7 +201,7 @@ impl Render for LocationPicker {
                                         div()
                                             .flex_none()
                                             .text_color(theme::text())
-                                            .child(entry.name.clone()),
+                                            .child(selectable("name", entry.name.clone())),
                                     )
                                     .child(
                                         div()
@@ -207,7 +210,7 @@ impl Render for LocationPicker {
                                             .truncate()
                                             .font_family(theme::MONO_FONT)
                                             .text_color(theme::text())
-                                            .child(entry.preview.clone()),
+                                            .child(selectable("preview", entry.preview.clone())),
                                     )
                                     .child(
                                         div()
@@ -216,7 +219,7 @@ impl Render for LocationPicker {
                                             .truncate()
                                             .text_xs()
                                             .text_color(theme::muted())
-                                            .child(entry.dir.clone()),
+                                            .child(selectable("dir", entry.dir.clone())),
                                     )
                             })
                             .collect()

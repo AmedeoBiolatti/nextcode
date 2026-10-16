@@ -10,7 +10,7 @@ use gpui::{
 };
 
 use super::{CopyRevision, GitLogEvent, GitLogPanel};
-use crate::{commit_panel::short_revision, theme};
+use crate::{commit_panel::short_revision, selectable::selectable, theme};
 
 const DIALOG_CONTEXT: &str = "GitResetDialog";
 
@@ -566,8 +566,16 @@ impl Render for ResetDialog {
             .shadow_lg()
             .text_sm()
             .text_color(theme::text())
-            .child(div().font_weight(gpui::FontWeight::BOLD).child("Git Reset"))
-            .child(div().text_color(theme::muted()).child(self.title.clone()))
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child(selectable("title", "Git Reset")),
+            )
+            .child(
+                div()
+                    .text_color(theme::muted())
+                    .child(selectable("subtitle", self.title.clone())),
+            )
             .children(ResetMode::ALL.into_iter().map(|mode| {
                 let checked = mode == self.mode;
                 div()
@@ -591,12 +599,16 @@ impl Render for ResetDialog {
                             .child(if checked { "◉" } else { "○" }),
                     )
                     .child(
-                        div().flex().flex_col().child(mode.label()).child(
-                            div()
-                                .text_xs()
-                                .text_color(theme::muted())
-                                .child(mode.description()),
-                        ),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(selectable("label", mode.label()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child(selectable("description", mode.description())),
+                            ),
                     )
             }))
             .child(

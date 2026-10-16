@@ -10,7 +10,9 @@ use gpui::{
 use crate::{
     editor::{self, Editor, EditorEvent},
     project::Location,
-    recent, theme,
+    recent,
+    selectable::selectable,
+    theme,
 };
 
 actions!(project_picker, [Dismiss]);
@@ -163,7 +165,7 @@ impl Render for ProjectPicker {
                                 row.hover(|style| style.bg(theme::hover_row()))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| this.open(index, cx)))
-                            .child(label.clone())
+                            .child(selectable("label", label.clone()))
                     }),
             )
             .child(
@@ -174,7 +176,7 @@ impl Render for ProjectPicker {
                     .border_color(theme::border())
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(hint),
+                    .child(selectable("hint", hint)),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
     }

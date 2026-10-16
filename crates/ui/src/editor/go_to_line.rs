@@ -145,6 +145,8 @@ impl Editor {
                         .rounded_md()
                         .shadow_lg()
                         .font_family(theme::UI_FONT)
+                        // Presses here (selecting the hint) are not the text's.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
                             div()
                                 .h(px(28.))
@@ -157,7 +159,12 @@ impl Editor {
                                 .text_sm()
                                 .child(go_to.input.clone()),
                         )
-                        .child(div().text_xs().text_color(theme::muted()).child(hint)),
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child(selectable("hint", hint)),
+                        ),
                 ),
         )
     }

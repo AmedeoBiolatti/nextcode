@@ -27,6 +27,7 @@ use crate::{
     project::{Location, Project},
     project_picker::{ProjectPicker, ProjectPickerEvent},
     recent,
+    selectable::{self, selectable},
     settings::Settings,
     terminal_panel::TerminalView,
     theme::{self, Theme},
@@ -1940,7 +1941,11 @@ impl Shell {
             .items_center()
             .justify_center()
             .gap_2()
-            .child(div().text_lg().child("No project open"))
+            .child(
+                div()
+                    .text_lg()
+                    .child(selectable("welcome-title", "No project open")),
+            )
             .child(
                 link("welcome-open", with_keys("Open Project…", &OpenProject)).on_click(
                     cx.listener(|this, _, window, cx| this.prompt_for_project(false, window, cx)),
@@ -1957,7 +1962,7 @@ impl Shell {
                         .mt_4()
                         .text_sm()
                         .text_color(theme::muted())
-                        .child("Recent projects"),
+                        .child(selectable("welcome-recent-heading", "Recent projects")),
                 )
             })
             .children(
@@ -1974,7 +1979,7 @@ impl Shell {
                             .text_sm()
                             .cursor_pointer()
                             .hover(|style| style.bg(theme::hover_row()))
-                            .child(label)
+                            .child(selectable("label", label))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open(location.clone(), window, cx)
                             }))
@@ -2168,7 +2173,7 @@ impl Render for Shell {
                     .text_sm()
                     .text_color(theme::error())
                     .cursor_pointer()
-                    .child(notice)
+                    .child(selectable("text", notice))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.notice = None;
                         cx.notify();
@@ -2182,7 +2187,7 @@ impl Render for Shell {
                     .text_sm()
                     .text_color(theme::error())
                     .cursor_pointer()
-                    .child(notice)
+                    .child(selectable("text", notice))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.theme_notice = None;
                         cx.notify();
@@ -2235,6 +2240,7 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(picker, _)| modal(picker.clone().into())),
             )
+            .children(selectable::context_menu(window, cx))
     }
 }
 

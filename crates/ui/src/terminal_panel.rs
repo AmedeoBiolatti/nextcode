@@ -18,7 +18,7 @@ use terminal::{
 };
 use worktree::FileKind;
 
-use crate::{project::Project, theme};
+use crate::{project::Project, selectable::selectable, theme};
 
 const CONTEXT: &str = "Terminal";
 
@@ -1199,7 +1199,7 @@ impl Render for TerminalPanel {
                     .py_1()
                     .text_sm()
                     .text_color(theme::error())
-                    .child(error)
+                    .child(selectable("error", error))
             }))
             .child(
                 div()

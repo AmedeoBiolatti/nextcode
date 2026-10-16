@@ -9,6 +9,7 @@ use run::{Configuration, Source};
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    selectable::selectable,
     theme,
 };
 
@@ -191,13 +192,18 @@ impl Render for ConfigurationPicker {
                                 } else {
                                     theme::text()
                                 })
-                                .child(div().flex_1().truncate().child(data.name.clone()))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .truncate()
+                                        .child(selectable("name", data.name.clone())),
+                                )
                                 .when(current, |line| {
                                     line.child(
                                         div()
                                             .text_xs()
                                             .text_color(theme::muted())
-                                            .child("selected"),
+                                            .child(selectable("current", "selected")),
                                     )
                                 }),
                         )
@@ -210,10 +216,13 @@ impl Render for ConfigurationPicker {
                                 } else {
                                     theme::muted()
                                 })
-                                .child(match &data.disabled {
-                                    Some(reason) => format!("disabled: {reason}").into(),
-                                    None => data.detail.clone(),
-                                }),
+                                .child(selectable(
+                                    "detail",
+                                    match &data.disabled {
+                                        Some(reason) => format!("disabled: {reason}").into(),
+                                        None => data.detail.clone(),
+                                    },
+                                )),
                         )
                     }
                     Entry::Edit => row.child(

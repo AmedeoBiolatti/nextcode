@@ -7,6 +7,7 @@ use gpui::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    selectable::selectable,
     theme,
 };
 
@@ -173,7 +174,7 @@ impl Render for ThemePicker {
                         .py_1()
                         .text_xs()
                         .text_color(theme::muted())
-                        .child("No matching themes"),
+                        .child(selectable("empty", "No matching themes")),
                 )
             })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

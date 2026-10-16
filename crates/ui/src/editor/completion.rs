@@ -437,7 +437,7 @@ impl Editor {
                 .rounded_md()
                 .shadow_md()
                 .text_sm()
-                .children(super::navigation::markdown_blocks(&docs).collect::<Vec<_>>())
+                .children(super::navigation::markdown_blocks("doc", &docs).collect::<Vec<_>>())
         });
         Some(
             div()

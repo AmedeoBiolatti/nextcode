@@ -10,7 +10,9 @@ use gpui::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
-    project_picker, theme,
+    project_picker,
+    selectable::selectable,
+    theme,
 };
 
 actions!(git_dialog, [Confirm]);
@@ -176,7 +178,7 @@ impl Render for InputDialog {
             .child(
                 div()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(self.title.clone()),
+                    .child(selectable("title", self.title.clone())),
             )
             .child(
                 div()
@@ -214,7 +216,7 @@ impl Render for InputDialog {
                             .text_size(px(10.))
                             .child(if checked { "✓" } else { "" }),
                     )
-                    .child(label)
+                    .child(selectable("checkbox-label", label))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some((_, checked)) = &mut this.checkbox {
                             *checked = !*checked;
@@ -222,11 +224,12 @@ impl Render for InputDialog {
                         cx.notify();
                     }))
             }))
-            .children(
-                self.error
-                    .clone()
-                    .map(|error| div().text_xs().text_color(theme::error()).child(error)),
-            )
+            .children(self.error.clone().map(|error| {
+                div()
+                    .text_xs()
+                    .text_color(theme::error())
+                    .child(selectable("error", error))
+            }))
             .child(
                 div()
                     .flex()
@@ -389,14 +392,12 @@ impl Render for PushDialog {
             .bg(theme::background())
             .p_1()
             .when(target.is_some() && commits.is_empty(), |list| {
-                list.child(
-                    div()
-                        .p_1()
-                        .text_color(theme::muted())
-                        .child("No commits to push; the branch is up to date."),
-                )
+                list.child(div().p_1().text_color(theme::muted()).child(selectable(
+                    "up-to-date",
+                    "No commits to push; the branch is up to date.",
+                )))
             })
-            .children(commits.iter().map(|commit| {
+            .children(commits.iter().enumerate().map(|(index, commit)| {
                 let (hash, subject) = commit.split_once(' ').unwrap_or((commit, ""));
                 div()
                     .flex()
@@ -407,9 +408,14 @@ impl Render for PushDialog {
                             .flex_none()
                             .font_family(theme::MONO_FONT)
                             .text_color(theme::muted())
-                            .child(hash.to_owned()),
+                            .child(selectable(("hash", index), hash.to_owned())),
                     )
-                    .child(div().min_w_0().truncate().child(subject.to_owned()))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(selectable(("subject", index), subject.to_owned())),
+                    )
             }));
         let can_push = matches!(&self.state, PushState::Ready { .. });
         frame()
@@ -423,12 +429,16 @@ impl Render for PushDialog {
                 }),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(header))
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(selectable("title", header)),
+            )
             .when(matches!(self.state, PushState::Loading), |dialog| {
                 dialog.child(
                     div()
                         .text_color(theme::muted())
-                        .child("Reading outgoing commits…"),
+                        .child(selectable("loading", "Reading outgoing commits…")),
                 )
             })
             .when(target.is_some(), |dialog| dialog.child(list))
@@ -437,7 +447,7 @@ impl Render for PushDialog {
                     div()
                         .text_xs()
                         .text_color(theme::error())
-                        .child(error.clone()),
+                        .child(selectable("error", error.clone())),
                 ),
                 _ => None,
             })

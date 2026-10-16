@@ -9,7 +9,9 @@ use gpui::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
-    project_picker, theme,
+    project_picker,
+    selectable::selectable,
+    theme,
 };
 
 const ROW_HEIGHT: f32 = 26.;
@@ -209,7 +211,7 @@ impl Render for RevisionPicker {
                     .pt_2()
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(self.title),
+                    .child(selectable("title", self.title)),
             )
             .child(
                 div()
@@ -241,8 +243,17 @@ impl Render for RevisionPicker {
                                 row.hover(|style| style.bg(theme::hover_row()))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| this.choose(index, cx)))
-                            .child(div().text_color(theme::text()).child(name))
-                            .child(div().text_xs().text_color(theme::muted()).child(detail))
+                            .child(
+                                div()
+                                    .text_color(theme::text())
+                                    .child(selectable("name", name)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child(selectable("detail", detail)),
+                            )
                     }),
             )
             .children(self.error.clone().map(|error| {
@@ -251,7 +262,7 @@ impl Render for RevisionPicker {
                     .py_1()
                     .text_xs()
                     .text_color(theme::error())
-                    .child(error)
+                    .child(selectable("error", error))
             }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
     }

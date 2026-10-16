@@ -13,7 +13,7 @@ use gpui::{
     Window, div, prelude::*, px, relative, uniform_list,
 };
 
-use crate::{commit_panel::short_revision, project::Project, theme};
+use crate::{commit_panel::short_revision, project::Project, selectable::selectable, theme};
 
 mod highlight;
 use highlight::DiffHighlights;
@@ -283,7 +283,13 @@ impl DiffView {
             .gap_2()
             .bg(theme::panel())
             .text_color(theme::accent_text())
-            .child(div().flex_1().min_w_0().truncate().child(header.to_owned()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(selectable(("hunk", row), header.to_owned())),
+            )
             .children(self.hunk_actions().iter().map(|&(action, label)| {
                 div()
                     .id((label, row))
@@ -354,7 +360,7 @@ impl DiffView {
             )
     }
 
-    fn skipped(lines: usize) -> gpui::AnyElement {
+    fn skipped(row: usize, lines: usize) -> gpui::AnyElement {
         div()
             .w_full()
             .h(px(ROW_HEIGHT))
@@ -363,7 +369,10 @@ impl DiffView {
             .items_center()
             .bg(theme::panel())
             .text_color(theme::muted())
-            .child(format!("⋯ {lines} unchanged lines"))
+            .child(selectable(
+                ("skipped", row),
+                format!("⋯ {lines} unchanged lines"),
+            ))
             .into_any_element()
     }
 
@@ -382,7 +391,7 @@ impl DiffView {
             return div().into_any_element();
         };
         match &diff.rows[index] {
-            Row::Skipped { lines } => Self::skipped(*lines),
+            Row::Skipped { lines } => Self::skipped(index, *lines),
             Row::Hunk {
                 index: hunk,
                 header,
@@ -415,7 +424,7 @@ impl DiffView {
 
     fn render_split(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         match &self.split[index] {
-            SplitRow::Skipped { lines } => Self::skipped(*lines),
+            SplitRow::Skipped { lines } => Self::skipped(index, *lines),
             SplitRow::Hunk {
                 index: hunk,
                 header,
@@ -569,16 +578,19 @@ impl Render for DiffView {
             (Some(error), _) => div()
                 .p_3()
                 .text_color(theme::error())
-                .child(error.clone())
+                .child(selectable("error", error.clone()))
                 .into_any_element(),
             (None, Some(diff)) if diff.rows.is_empty() => div()
                 .p_3()
                 .text_color(theme::muted())
-                .child(if diff.binary {
-                    "Binary files are not shown."
-                } else {
-                    "No differences in content."
-                })
+                .child(selectable(
+                    "empty",
+                    if diff.binary {
+                        "Binary files are not shown."
+                    } else {
+                        "No differences in content."
+                    },
+                ))
                 .into_any_element(),
             (None, Some(_)) if options.side_by_side => uniform_list(
                 "diff-split",
@@ -624,7 +636,12 @@ impl Render for DiffView {
                     .font_family(theme::UI_FONT)
                     .text_sm()
                     .text_color(theme::muted())
-                    .child(div().min_w_0().truncate().child(header))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(selectable("header", header)),
+                    )
                     .child(toolbar),
             )
             .child(body)

@@ -12,6 +12,7 @@ use gpui::{Context, EventEmitter, SharedString, Task, Window, div, prelude::*, p
 
 use crate::{
     project::{Location, Project},
+    selectable::selectable,
     theme,
 };
 
@@ -138,14 +139,15 @@ impl Render for Connecting {
             .p_8()
             .bg(theme::background())
             .text_color(theme::text())
-            .child(div().text_lg().child(self.heading()))
+            .child(div().text_lg().child(selectable("heading", self.heading())))
             .child(
                 div()
                     .text_sm()
                     .text_color(theme::muted())
-                    .child(self.location.to_string()),
+                    .child(selectable("location", self.location.to_string())),
             )
             .when(!self.log.is_empty(), |this| {
+                // One block, so a selection can span the lines.
                 this.child(
                     div()
                         .w(px(720.))
@@ -155,11 +157,9 @@ impl Render for Connecting {
                         .font_family(theme::MONO_FONT)
                         .text_xs()
                         .text_color(theme::muted())
-                        .children(
-                            self.log
-                                .iter()
-                                .map(|line| div().truncate().child(line.clone())),
-                        ),
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(selectable("log", self.log.join("\n"))),
                 )
             })
             .children(self.error.clone().map(|error| {
@@ -167,7 +167,7 @@ impl Render for Connecting {
                     .max_w(px(720.))
                     .text_sm()
                     .text_color(theme::error())
-                    .child(error)
+                    .child(selectable("error", error))
             }))
             .children(self.error.is_some().then(|| {
                 div()

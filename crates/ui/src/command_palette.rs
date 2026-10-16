@@ -10,6 +10,7 @@ use gpui::{
 use crate::{
     commands,
     editor::{self, Editor, EditorEvent},
+    selectable::selectable,
     theme,
 };
 
@@ -180,7 +181,7 @@ impl Render for CommandPalette {
                 .flex()
                 .items_center()
                 .text_color(theme::muted())
-                .child("No matching commands")
+                .child(selectable("empty", "No matching commands"))
                 .into_any_element()
         } else {
             uniform_list(
