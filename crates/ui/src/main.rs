@@ -2,6 +2,7 @@
 // `startup::attach_console`).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod app_state;
 mod branch_picker;
 mod call_hierarchy;
 mod change_tree;
@@ -43,41 +44,44 @@ mod workspace;
 mod workspace_edit;
 mod worktree_picker;
 
-use std::ffi::OsString;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::Context as _;
 use gpui::{App, Application};
 
 use crate::project::Location;
 
-const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code --automation [--port PORT] [--width PX] [--height PX] [--state-dir DIR] -- [PROJECT_DIR]\n\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).";
+const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code --automation [--port PORT] [--width PX] [--height PX] [--state-dir DIR] -- [PROJECT_DIR]\n\nWithout a project, the windows open when next_code last closed reopen (else the welcome screen;\n\"restore_windows\": false in settings.json always shows it). PROJECT_DIR . is the current directory,\nwhich --headless and --devcontainer also use when no project is given.\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).";
 
-/// Reads the command line: a local directory (default: the current one), a
+/// Reads the command line: a local directory (`.` is the current one), a
 /// `\\wsl.localhost\<distro>\...` path, or `--wsl <distro> <linux path>`,
-/// optionally preceded by `--devcontainer`.
-fn parse_args(args: &[OsString]) -> anyhow::Result<Location> {
+/// optionally preceded by `--devcontainer` (alone: the current directory).
+/// `None`: no project, reopen the last session's windows.
+fn parse_args(args: &[OsString]) -> anyhow::Result<Option<Location>> {
     match args {
-        [flag, rest @ ..] if flag == "--devcontainer" => Ok(Location::DevContainer {
-            folder: Box::new(parse_args(rest)?),
+        [flag, rest @ ..] if flag == "--devcontainer" => Ok(Some(Location::DevContainer {
+            folder: Box::new(parse_args(rest)?.unwrap_or_else(current_dir)),
             config: None,
-        }),
-        [] => Ok(Location::Local(
-            std::env::current_dir().context("reading current directory")?,
-        )),
+        })),
+        [] => Ok(None),
         [flag, rest @ ..] if flag == "--wsl" => match rest {
-            [distro, path] => Ok(Location::Wsl {
+            [distro, path] => Ok(Some(Location::Wsl {
                 distro: distro.to_string_lossy().into_owned(),
                 path: path.to_string_lossy().into_owned(),
-            }),
+            })),
             _ => anyhow::bail!("--wsl needs a distro and a Linux path\n{USAGE}"),
         },
         [path] if path == "--help" || path == "-h" => anyhow::bail!("{USAGE}"),
         [path] => Location::parse(&path.to_string_lossy())
+            .map(Some)
             .ok_or_else(|| anyhow::anyhow!("empty project path\n{USAGE}")),
         _ => anyhow::bail!("{USAGE}"),
     }
+}
+
+/// The current directory, made absolute by [`checked`].
+fn current_dir() -> Location {
+    Location::Local(PathBuf::from("."))
 }
 
 /// Local folders made absolute and checked.
@@ -107,6 +111,14 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// What the window(s) at startup show.
+enum Launch {
+    /// The project on the command line, alone (as in VS Code).
+    Open(Location),
+    /// The last session's windows (none: the welcome screen).
+    Restore(app_state::AppState),
+}
+
 fn run() -> anyhow::Result<()> {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--automation") {
@@ -126,18 +138,29 @@ fn run() -> anyhow::Result<()> {
     if headless {
         args.remove(0);
     }
-    let location = checked(parse_args(&args)?)?;
+    let location = parse_args(&args)?.map(checked).transpose()?;
     if headless {
         startup::attach_console();
-        headless::run(location);
+        headless::run(match location {
+            Some(location) => location,
+            None => checked(current_dir())?,
+        });
         return Ok(());
     }
+    let launch = match location {
+        Some(location) => Launch::Open(location),
+        None => Launch::Restore(app_state::restorable()),
+    };
 
     startup::set_app_id();
     // Warm up graphics, and connect to WSL or read git status, while gpui
     // sets up the platform.
     let prewarm = startup::prewarm();
-    let preload = workspace::Preload::start(&location);
+    let preload = match &launch {
+        Launch::Open(location) => Some(location),
+        Launch::Restore(state) => state.focused_tab(),
+    }
+    .map(workspace::Preload::start);
     let application = Application::new();
     startup::mark("gpui platform");
     application.run(move |cx: &mut App| {
@@ -156,6 +179,7 @@ fn run() -> anyhow::Result<()> {
         terminal_panel::bind_keys(cx);
         ports::panel::bind_keys(cx);
         theme::refresh(cx);
+        app_state::init(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -163,7 +187,10 @@ fn run() -> anyhow::Result<()> {
         })
         .detach();
         startup::close_on_termination(cx);
-        shell::open_window(location, Some(preload), cx);
+        match launch {
+            Launch::Open(location) => shell::open_window(location, preload, cx),
+            Launch::Restore(state) => shell::restore(state, preload, cx),
+        }
         // The window's renderer exists now.
         prewarm.finish();
         startup::mark("window opened");
@@ -180,6 +207,13 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
+    /// The project `args` name.
+    fn project(list: &[&str]) -> Location {
+        parse_args(&args(list))
+            .unwrap()
+            .expect("a project is named")
+    }
+
     fn wsl(distro: &str, path: &str) -> Location {
         Location::Wsl {
             distro: distro.into(),
@@ -188,29 +222,43 @@ mod tests {
     }
 
     #[test]
+    fn no_project_restores_and_a_dot_is_the_current_directory() {
+        assert_eq!(parse_args(&[]).unwrap(), None, "reopen the last windows");
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            checked(project(&["."])).unwrap(),
+            Location::Local(cwd.clone())
+        );
+        assert_eq!(
+            checked(project(&["--devcontainer"])).unwrap(),
+            Location::DevContainer {
+                folder: Box::new(Location::Local(cwd)),
+                config: None,
+            },
+            "--devcontainer alone: the current directory's container"
+        );
+        assert!(parse_args(&args(&["--help"])).is_err());
+        assert!(parse_args(&args(&["a", "b"])).is_err());
+    }
+
+    #[test]
     fn wsl_projects_keep_their_linux_paths() {
         assert_eq!(
-            parse_args(&args(&["--wsl", "Ubuntu", "/home/me/p"])).unwrap(),
+            project(&["--wsl", "Ubuntu", "/home/me/p"]),
             wsl("Ubuntu", "/home/me/p")
         );
         assert_eq!(
-            parse_args(&args(&[r"\\wsl.localhost\Ubuntu-24.04\home\me\my p\"])).unwrap(),
+            project(&[r"\\wsl.localhost\Ubuntu-24.04\home\me\my p\"]),
             wsl("Ubuntu-24.04", "/home/me/my p")
         );
+        assert_eq!(project(&[r"\\WSL$\Debian"]), wsl("Debian", "/"));
         assert_eq!(
-            parse_args(&args(&[r"\\WSL$\Debian"])).unwrap(),
-            wsl("Debian", "/")
-        );
-        assert_eq!(
-            parse_args(&args(&[r"C:\dev\p"])).unwrap(),
+            project(&[r"C:\dev\p"]),
             Location::Local(PathBuf::from(r"C:\dev\p"))
         );
+        assert_eq!(project(&["Ubuntu:~/src/p"]), wsl("Ubuntu", "~/src/p"));
         assert_eq!(
-            parse_args(&args(&["Ubuntu:~/src/p"])).unwrap(),
-            wsl("Ubuntu", "~/src/p")
-        );
-        assert_eq!(
-            parse_args(&args(&["C:/dev/p"])).unwrap(),
+            project(&["C:/dev/p"]),
             Location::Local(PathBuf::from("C:/dev/p"))
         );
         assert!(parse_args(&args(&["--wsl", "/home/me/p"])).is_err());
@@ -223,11 +271,11 @@ mod tests {
             config: None,
         };
         assert_eq!(
-            parse_args(&args(&["--devcontainer", "--wsl", "Ubuntu", "/home/me/p"])).unwrap(),
+            project(&["--devcontainer", "--wsl", "Ubuntu", "/home/me/p"]),
             in_container(wsl("Ubuntu", "/home/me/p"))
         );
         assert_eq!(
-            parse_args(&args(&["--devcontainer", r"C:\dev\p"])).unwrap(),
+            project(&["--devcontainer", r"C:\dev\p"]),
             in_container(Location::Local(PathBuf::from(r"C:\dev\p")))
         );
         assert_eq!(

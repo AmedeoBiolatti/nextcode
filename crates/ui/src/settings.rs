@@ -9,6 +9,7 @@
 //!   "semantic_highlighting": true,
 //!   "auto_close_brackets": true,
 //!   "restore_session": true,
+//!   "restore_windows": true,
 //!   "word_wrap": false,
 //!   "inlay_hints": true,
 //!   "format_on_save": false,
@@ -48,6 +49,9 @@ pub struct Settings {
     pub auto_close_brackets: bool,
     /// Reopen a project's editor tabs and splits where they were left.
     pub restore_session: bool,
+    /// A launch without a project reopens the windows and project tabs
+    /// open when the editor last closed (else the welcome screen).
+    pub restore_windows: bool,
     /// Wrap long lines at the editor's width (Alt+Z toggles per editor).
     pub word_wrap: bool,
     /// Show language servers' inlay hints (inferred types, parameter
@@ -68,6 +72,7 @@ impl Default for Settings {
             semantic_highlighting: true,
             auto_close_brackets: true,
             restore_session: true,
+            restore_windows: true,
             word_wrap: false,
             inlay_hints: true,
             format_on_save: false,

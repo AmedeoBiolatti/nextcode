@@ -82,8 +82,9 @@ fn log_panics() {
 
 /// Closes every window (as their close buttons would, but without asking
 /// about unsaved files) on SIGTERM, SIGINT or SIGHUP, so dev containers
-/// and language servers are shut down as on a normal exit. A second
-/// signal falls back to the default action.
+/// and language servers are shut down as on a normal exit. Like a quit,
+/// every open window reopens next time. A second signal falls back to the
+/// default action.
 #[cfg(unix)]
 pub fn close_on_termination(cx: &mut gpui::App) {
     use futures::StreamExt;
@@ -108,6 +109,7 @@ pub fn close_on_termination(cx: &mut gpui::App) {
     cx.spawn(async move |cx| {
         if rx.next().await.is_some() {
             cx.update(|cx| {
+                crate::app_state::quit(cx);
                 for window in cx.windows() {
                     window
                         .update(cx, |_, window, _| window.remove_window())

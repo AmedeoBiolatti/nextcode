@@ -12,11 +12,13 @@ use std::{
 use gpui::{
     Action, AnyElement, AnyView, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle,
     Focusable, Image, ImageFormat, KeyBinding, KeyDownEvent, MouseButton, PathPromptOptions,
-    PromptLevel, SharedString, Subscription, TitlebarOptions, Window, WindowBounds,
-    WindowControlArea, WindowOptions, actions, anchored, deferred, div, img, prelude::*, px, size,
+    Pixels, PromptLevel, SharedString, Subscription, TitlebarOptions, Window, WindowBounds,
+    WindowControlArea, WindowHandle, WindowOptions, actions, anchored, deferred, div, img,
+    prelude::*, px, size,
 };
 
 use crate::{
+    app_state::{self, AppState, SavedBounds, SavedWindow},
     command_palette::{Command, CommandPalette, CommandPaletteEvent},
     commands,
     connecting::{Connecting, ConnectingEvent},
@@ -164,6 +166,7 @@ pub struct Shell {
     /// Windows 11, Segoe MDL2 Assets on 10; same code points).
     caption_font: SharedString,
     _activation: Subscription,
+    _bounds: Subscription,
 }
 
 /// A short name for a project tab.
@@ -192,9 +195,54 @@ fn tab_title(location: &Location) -> String {
 
 /// Opens `location` in a new window.
 pub fn open_window(location: Location, preload: Option<Preload>, cx: &mut App) {
-    let location = location.absolute();
-    // 1280×800, but never past 90 % of the screen (the taskbar and the
-    // window frame need room).
+    let bounds = default_bounds(cx);
+    open_with(
+        vec![location.absolute()],
+        0,
+        bounds,
+        preload.map(|preload| (0, preload)),
+        cx,
+    );
+}
+
+/// Reopens the windows of `state` (see `app_state`), focusing the one that
+/// had focus, or opens one window with the welcome screen when there are
+/// none. `preload` is for the focused window's active tab.
+pub fn restore(state: AppState, mut preload: Option<Preload>, cx: &mut App) {
+    if state.windows.is_empty() {
+        let bounds = default_bounds(cx);
+        open_with(Vec::new(), 0, bounds, None, cx);
+        return;
+    }
+    let displays: Vec<Bounds<Pixels>> = cx
+        .primary_display()
+        .into_iter()
+        .chain(cx.displays())
+        .map(|display| display.bounds())
+        .collect();
+    let focused = state.focused.min(state.windows.len() - 1);
+    let mut handles = Vec::new();
+    for (index, saved) in state.windows.into_iter().enumerate() {
+        let bounds = match saved.bounds {
+            Some(bounds) => bounds.clamped(&displays),
+            None => default_bounds(cx),
+        };
+        let preload = if index == focused {
+            preload.take().map(|preload| (saved.active, preload))
+        } else {
+            None
+        };
+        let tabs = saved.tabs.into_iter().map(Location::absolute).collect();
+        handles.push(open_with(tabs, saved.active, bounds, preload, cx));
+    }
+    handles[focused]
+        .update(cx, |_, window, _| window.activate_window())
+        .ok();
+}
+
+/// 1280×800 in the middle of the primary display, but never past 90 % of
+/// it (the taskbar and the window frame need room).
+fn default_bounds(cx: &App) -> WindowBounds {
     let screen = cx
         .primary_display()
         .map(|display| display.bounds().size)
@@ -203,11 +251,22 @@ pub fn open_window(location: Location, preload: Option<Preload>, cx: &mut App) {
         px(1280.).min(screen.width * 0.9),
         px(800.).min(screen.height * 0.88),
     );
-    let bounds = Bounds::centered(None, window_size, cx);
+    WindowBounds::Windowed(Bounds::centered(None, window_size, cx))
+}
+
+/// Opens a window with project `tabs`, `active` showing; `preload` is the
+/// head start for the tab at its index.
+fn open_with(
+    tabs: Vec<Location>,
+    active: usize,
+    bounds: WindowBounds,
+    mut preload: Option<(usize, Preload)>,
+    cx: &mut App,
+) -> WindowHandle<Shell> {
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(bounds),
         titlebar: Some(TitlebarOptions {
-            title: Some(window_title(Some(&location)).into()),
+            title: Some(window_title(tabs.get(active)).into()),
             appears_transparent: CUSTOM_TITLE_BAR,
             ..Default::default()
         }),
@@ -216,11 +275,20 @@ pub fn open_window(location: Location, preload: Option<Preload>, cx: &mut App) {
     cx.open_window(options, |window, cx| {
         cx.new(|cx| {
             let mut shell = Shell::new(window, cx);
-            shell.add_tab(location, preload, window, cx);
+            for (index, location) in tabs.into_iter().enumerate() {
+                let preload = preload
+                    .take_if(|(at, _)| *at == index)
+                    .map(|(_, preload)| preload);
+                shell.add_tab(location, preload, window, cx);
+            }
+            if active < shell.tabs.len() {
+                shell.activate(active, window, cx);
+            }
+            shell.remember(window, cx);
             shell
         })
     })
-    .expect("failed to open window");
+    .expect("failed to open window")
 }
 
 fn window_title(location: Option<&Location>) -> String {
@@ -268,10 +336,12 @@ impl Shell {
         // when the window returns.
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
+                app_state::focused(window.window_handle().window_id(), cx);
                 this.refresh_menus(cx);
                 theme::refresh(cx);
             }
         });
+        let bounds = cx.observe_window_bounds(window, |this, window, cx| this.remember(window, cx));
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
         theme::refresh(cx);
@@ -299,9 +369,20 @@ impl Shell {
                 "Segoe MDL2 Assets".into()
             },
             _activation: activation,
+            _bounds: bounds,
         };
         shell.refresh_menus(cx);
         shell
+    }
+
+    /// Reports the window to the saved app state (see `app_state`).
+    fn remember(&self, window: &Window, cx: &mut App) {
+        let saved = SavedWindow {
+            tabs: self.tabs.iter().map(|tab| tab.location.clone()).collect(),
+            active: self.active,
+            bounds: Some(SavedBounds::from(window.window_bounds())),
+        };
+        app_state::update(window.window_handle().window_id(), saved, cx);
     }
 
     fn refresh_menus(&mut self, cx: &mut Context<Self>) {
@@ -436,6 +517,7 @@ impl Shell {
         if index == self.active {
             self.activate(index, window, cx);
         }
+        self.remember(window, cx);
         cx.notify();
     }
 
@@ -450,6 +532,7 @@ impl Shell {
             }
             Content::Connecting(_) => window.focus(&self.focus_handle),
         }
+        self.remember(window, cx);
         cx.notify();
     }
 
@@ -494,6 +577,7 @@ impl Shell {
             self.active = 0;
             window.set_window_title(&window_title(None));
             window.focus(&self.focus_handle);
+            self.remember(window, cx);
             return cx.notify();
         }
         let next = if self.active > index {
@@ -761,7 +845,8 @@ impl Shell {
         }
     }
 
-    /// Exits after one confirmation covering every window's unsaved files.
+    /// Exits after one confirmation covering every window's unsaved files;
+    /// every open window reopens next time.
     fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
         let this_window = window.window_handle();
         let mut dirty = self.dirty_count(cx);
@@ -776,6 +861,7 @@ impl Shell {
             }
         }
         if dirty == 0 {
+            app_state::quit(cx);
             return cx.quit();
         }
         let message = format!("{dirty} file(s) have unsaved changes. Exit anyway?");
@@ -788,7 +874,11 @@ impl Shell {
         );
         cx.spawn(async move |_, cx| {
             if answer.await == Ok(0) {
-                cx.update(|cx| cx.quit()).ok();
+                cx.update(|cx| {
+                    app_state::quit(cx);
+                    cx.quit();
+                })
+                .ok();
             }
         })
         .detach();
@@ -1627,6 +1717,212 @@ mod tests {
                 (titles, shell.active)
             })
             .unwrap()
+    }
+
+    /// Each saved window's tab titles and active tab.
+    fn saved(state: &AppState) -> Vec<(Vec<String>, usize)> {
+        state
+            .windows
+            .iter()
+            .map(|window| (window.tabs.iter().map(tab_title).collect(), window.active))
+            .collect()
+    }
+
+    fn shells(cx: &mut gpui::TestAppContext) -> Vec<gpui::WindowHandle<Shell>> {
+        cx.windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<Shell>())
+            .collect()
+    }
+
+    /// Closes `window` as its close button would.
+    fn close_window(window: gpui::WindowHandle<Shell>, cx: &mut gpui::TestAppContext) {
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Lets the debounced save of the app state happen.
+    fn settle(cx: &mut gpui::TestAppContext) {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
+        cx.run_until_parked();
+    }
+
+    /// Opens `path` in project tab `tab` of `window`.
+    fn open_file(
+        window: gpui::WindowHandle<Shell>,
+        tab: usize,
+        path: &std::path::Path,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        window
+            .update(cx, |shell, window, cx| {
+                let Content::Workspace(workspace) = &shell.tabs[tab].content else {
+                    panic!("local projects open at once");
+                };
+                workspace.update(cx, |workspace, cx| workspace.open(path, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn closing_tabs_and_windows_updates_the_saved_windows(cx: &mut gpui::TestAppContext) {
+        let (root, alpha, beta) = two_projects("close-state");
+        cx.update(app_state::init);
+        let first = open_shell(alpha.clone(), cx);
+        cx.dispatch_action(first.into(), OpenRecentProject { location: beta });
+        assert_eq!(app_state::load(), None, "written once changes settle");
+        settle(cx);
+        let state = app_state::load().unwrap();
+        assert_eq!(saved(&state), [(vec!["alpha".into(), "beta".into()], 1)]);
+        assert!(state.windows[0].bounds.is_some());
+
+        // Closing a project tab removes it.
+        cx.dispatch_action(first.into(), CloseProject);
+        settle(cx);
+        assert_eq!(
+            saved(&app_state::load().unwrap()),
+            [(vec!["alpha".into()], 0)]
+        );
+
+        // Closing one of two windows removes that one.
+        std::fs::create_dir_all(root.join("gamma")).unwrap();
+        cx.update(|cx| open_window(Location::Local(root.join("gamma")), None, cx));
+        cx.run_until_parked();
+        let second = *shells(cx).iter().find(|window| **window != first).unwrap();
+        assert_eq!(
+            saved(&cx.update(app_state::current)),
+            [(vec!["alpha".into()], 0), (vec!["gamma".into()], 0)]
+        );
+        close_window(second, cx);
+        assert_eq!(
+            saved(&app_state::load().unwrap()),
+            [(vec!["alpha".into()], 0)],
+            "saved at once"
+        );
+
+        // Closing the last window quits: it reopens next time.
+        close_window(first, cx);
+        assert!(cx.windows().is_empty());
+        assert_eq!(
+            saved(&app_state::load().unwrap()),
+            [(vec!["alpha".into()], 0)]
+        );
+        cleanup(root);
+    }
+
+    #[gpui::test]
+    fn quitting_keeps_every_window_and_a_launch_reopens_them(cx: &mut gpui::TestAppContext) {
+        let (root, alpha, beta) = two_projects("quit-state");
+        std::fs::create_dir_all(root.join("gamma")).unwrap();
+        cx.update(app_state::init);
+        let first = open_shell(alpha.clone(), cx);
+        cx.dispatch_action(first.into(), OpenRecentProject { location: beta });
+        let notes = root.join("beta").join("notes.txt");
+        std::fs::write(&notes, "notes\n").unwrap();
+        open_file(first, 1, &notes, cx);
+        cx.dispatch_action(first.into(), OpenRecentProject { location: alpha });
+        let main_py = root.join("alpha").join("main.py");
+        open_file(first, 0, &main_py, cx);
+        cx.update(|cx| open_window(Location::Local(root.join("gamma")), None, cx));
+        // A window on the welcome screen is not kept beside others.
+        cx.update(|cx| restore(AppState::default(), None, cx));
+        cx.run_until_parked();
+        assert_eq!(shells(cx).len(), 3);
+        let second = *shells(cx)
+            .iter()
+            .find(|window| tabs(**window, cx).0 == ["gamma"])
+            .unwrap();
+        second
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.dispatch_action(first.into(), Quit);
+        // The windows closing as the app goes down change nothing.
+        for window in shells(cx) {
+            close_window(window, cx);
+        }
+        let state = app_state::load().unwrap();
+        assert_eq!(
+            saved(&state),
+            [
+                (vec!["alpha".into(), "beta".into()], 0),
+                (vec!["gamma".into()], 0)
+            ]
+        );
+        assert_eq!(state.focused, 1, "gamma's window had focus");
+
+        // A launch without a project reopens them, focusing gamma's; each
+        // project's open files come back with it.
+        cx.update(|cx| restore(state, None, cx));
+        cx.run_until_parked();
+        let mut reopened: Vec<_> = shells(cx)
+            .into_iter()
+            .map(|window| (tabs(window, cx), window))
+            .collect();
+        reopened.sort_by(|a, b| a.0.cmp(&b.0));
+        let reopened_tabs: Vec<_> = reopened.iter().map(|(tabs, _)| tabs.clone()).collect();
+        assert_eq!(
+            reopened_tabs,
+            [
+                (vec!["alpha".into(), "beta".into()], 0),
+                (vec!["gamma".into()], 0)
+            ]
+        );
+        let active = cx
+            .update(|cx| cx.active_window())
+            .map(|window| window.window_id());
+        assert_eq!(active, Some(reopened[1].1.window_id()), "gamma's window");
+        let files =
+            |window: gpui::WindowHandle<Shell>, tab: usize, cx: &mut gpui::TestAppContext| {
+                window
+                    .read_with(cx, |shell, cx| match &shell.tabs[tab].content {
+                        Content::Workspace(workspace) => workspace.read(cx).tab_paths(),
+                        Content::Connecting(_) => panic!("local projects open at once"),
+                    })
+                    .unwrap()
+            };
+        let restored = reopened[0].1;
+        assert_eq!(files(restored, 0, cx), [main_py]);
+        assert_eq!(files(restored, 1, cx), [notes]);
+        // The project in the background restored its files without taking
+        // focus from the active one: keys still reach the window.
+        let alpha_has_focus = restored
+            .update(cx, |shell, window, cx| {
+                let Content::Workspace(workspace) = &shell.tabs[0].content else {
+                    panic!("alpha is local");
+                };
+                let editor = workspace.read(cx).active_editor().unwrap();
+                editor.focus_handle(cx).is_focused(window)
+            })
+            .unwrap();
+        assert!(alpha_has_focus);
+        cx.simulate_keystrokes(restored.into(), "ctrl-alt-]");
+        assert_eq!(tabs(restored, cx).1, 1);
+        for (_, window) in reopened {
+            close_window(window, cx);
+        }
+        cleanup(root);
+    }
+
+    #[gpui::test]
+    fn a_launch_with_nothing_saved_shows_the_welcome_screen(cx: &mut gpui::TestAppContext) {
+        cx.update(app_state::init);
+        cx.update(|cx| restore(AppState::default(), None, cx));
+        cx.run_until_parked();
+        let window = shells(cx)[0];
+        assert_eq!(tabs(window, cx), (Vec::new(), 0));
+        // Alone, the empty window is kept: it reopens as it was.
+        close_window(window, cx);
+        let state = app_state::load().unwrap();
+        assert_eq!(saved(&state), [(Vec::new(), 0)]);
+        if let Some(state) = crate::layout::state_root() {
+            std::fs::remove_dir_all(state).ok();
+        }
     }
 
     #[gpui::test]

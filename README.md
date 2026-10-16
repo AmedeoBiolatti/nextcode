@@ -28,7 +28,11 @@ Windows (MSVC Build Tools required), macOS, or Linux:
 cargo run --release -p next_code -- C:\path\to\your\project
 ```
 
-Replace the example path with an existing project folder. Without an argument, the current directory is opened.
+Replace the example path with an existing project folder (`.` is the
+current directory). Without an argument, the windows and project tabs that
+were open when the editor last closed come back (see
+[Window, menus and commands](#window-menus-and-commands)); the first time,
+or with nothing to reopen, a window with the welcome screen opens.
 
 For example, from PowerShell:
 
@@ -436,6 +440,24 @@ asks about unsaved files first.
 - The command bar (`Ctrl+Shift+P` or `F1`) lists every command available
   where focus is, with its shortcut; typed words filter it (in any order),
   `Enter` runs the command where focus was.
+
+Like VS Code (`window.restoreWindows: all`), a launch without a project
+reopens the windows that were open when the editor closed: each with its
+project tabs, active tab, size, position (moved onto a connected display
+if its monitor is gone) and maximized state, focusing the window that had
+focus. Each project then reopens its editor tabs (see
+[session restore](#split-editor-and-session-restore)); WSL and container
+projects reconnect as when opened from the recent list, and local folders
+that no longer exist are skipped. Closing a project tab, or a window while
+others remain, removes it; quitting (**File > Exit**, a termination
+signal on Linux, or closing the last window) keeps every window open at
+that moment. A window on the welcome screen is kept only when it is the
+only one. Naming a project on the command line (`next_code .`,
+`next_code <dir>`, `--wsl`, `--devcontainer`) opens just that project.
+The state is `windows.json` next to `recent.json`
+(`%LOCALAPPDATA%\next_code\` on Windows, `~/.local/share/next_code/` on
+Linux); `"restore_windows": false` in `settings.json` shows the welcome
+screen instead.
 
 Every menu item is a command, the same ones the palette runs. Menus are
 customizable: **File > Customize Menus…** writes the built-in menus to

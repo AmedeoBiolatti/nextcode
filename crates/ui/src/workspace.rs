@@ -1631,6 +1631,12 @@ impl Workspace {
         self.active_tab().and_then(Tab::editor).cloned()
     }
 
+    /// The files of every tab, pane by pane.
+    #[cfg(test)]
+    pub(crate) fn tab_paths(&self) -> Vec<PathBuf> {
+        self.all_tabs().map(|tab| tab.path.clone()).collect()
+    }
+
     fn toggle_file_finder(
         &mut self,
         _: &ToggleFileFinder,

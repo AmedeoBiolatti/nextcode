@@ -332,7 +332,7 @@ pub(crate) fn project_state_dir(project_key: &str) -> Option<PathBuf> {
 }
 
 #[cfg(not(test))]
-fn state_root() -> Option<PathBuf> {
+pub(crate) fn state_root() -> Option<PathBuf> {
     Some(dirs::data_local_dir()?.join("next_code"))
 }
 

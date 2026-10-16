@@ -157,6 +157,9 @@ impl Workspace {
     }
 
     /// Reopens the saved session, if any, in a workspace with no tabs yet.
+    /// Focus moves to the restored editor only if it was in the workspace:
+    /// a project tab in the background (several restored at launch, or a
+    /// remote one connecting) leaves it where it is.
     pub(super) fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.restore_session {
             return;
@@ -168,6 +171,9 @@ impl Workspace {
         if self.all_tabs().next().is_some() {
             return;
         }
+        let previous = window.focused(cx);
+        let had_focus =
+            self.focus_handle.is_focused(window) || self.focus_handle.contains_focused(window, cx);
         self.panes.clear();
         let tree = self.restore_node(&session.root, window, cx);
         match tree {
@@ -186,6 +192,9 @@ impl Workspace {
             window.focus(&self.focus_handle);
         } else {
             self.activate(pane, active, window, cx);
+        }
+        if !had_focus && let Some(previous) = previous {
+            window.focus(&previous);
         }
     }
 
