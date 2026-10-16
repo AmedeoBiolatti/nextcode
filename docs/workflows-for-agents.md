@@ -465,19 +465,26 @@ Rules of thumb:
 - A workflow opens as a tab (◈) next to project tabs: the file on the left
   (Ctrl+S saves), the dependency graph on the right (columns by
   dependency depth, live status colours, problems as a banner with line and
-  column while you type). `needs` edges are solid (green once the need is
-  ready); `after` edges are **dashed** (lit once the step finished, ready
-  or failed) and the card's kind line says `after`. A card with artifacts
-  shows `↗ N`; a stopping card shows its countdown.
+  column while you type). Steps are ordered for the fewest edge crossings
+  found, chains stay on one row, and an edge spanning several columns runs
+  between the cards it passes, never through them; edges leave and enter
+  cards horizontally, at a port of their own when a side has several.
+  `needs` edges are solid (green once the need is ready); `after` edges
+  are **dashed** (lit once the step finished, ready or failed) and the
+  card's kind line says `after`. A card with artifacts shows `↗ N`; a
+  stopping card shows its countdown.
 - Click a card: the editor jumps to the step; the details strip shows the
   state, reason, last output lines, **Artifacts** (each a link: a file
   opens in an editor tab of the step's project — a file on this machine in
   the project tab holding it, else its folder as a new tab; a URL in the
   browser; missing files are dimmed and marked `missing`; **Check again**
-  looks them up again) and Terminal / Continue / Restart / Retry.
+  looks them up again) and Terminal / Continue / Restart / Retry. With a
+  step on this machine, Terminal shows its terminal under the details;
+  drag the divider above them to resize that pane (double-click: maximize
+  it / back; the size is kept while the tab is open).
 - Toolbar: Run All (Shift+F10; saves first), Stop All (Ctrl+F2), Retry
-  Failed. Graph: opens fitted; Ctrl+scroll zooms; − / % / + / Fit in the
-  corner; drag or scroll pans.
+  Failed. Graph: opens fitted (and re-fits when its pane is resized);
+  Ctrl+scroll zooms; − / % / + / Fit in the corner; drag or scroll pans.
 - Agents with UI automation (`next_code --automation`, see README) can use
   the same: the command palette (`Ctrl+Shift+P`) and clicks.
 

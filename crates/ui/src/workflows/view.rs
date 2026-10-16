@@ -9,9 +9,10 @@
 //! a click goes there) over the last good graph, dimmed. Clicking a card
 //! selects it, puts the editor's cursor on its `"id"` and shows its
 //! details below the graph (state, wait or failure reason, last output
-//! lines, artifact links, Terminal / Continue / Restart or Retry); the
-//! card holding the editor's cursor is highlighted. Run All saves the file
-//! first.
+//! lines, artifact links, Terminal / Continue / Restart or Retry); with a
+//! terminal of this machine under them they become a pane of their own,
+//! resized by a divider. The card holding the editor's cursor is
+//! highlighted. Run All saves the file first.
 
 use std::{
     cell::Cell,
@@ -50,10 +51,16 @@ pub(super) const CONTEXT: &str = "WorkflowView";
 const METRICS: Metrics = Metrics {
     card_width: 200.,
     card_height: 76.,
-    column_gap: 56.,
+    column_gap: 64.,
     row_gap: 20.,
+    edge_gap: 14.,
     margin: 20.,
 };
+/// An edge's arrowhead (length, half its width) and the straight run out
+/// of the step it leaves, in layout pixels.
+const ARROW_LENGTH: f32 = 8.;
+const ARROW_HALF_WIDTH: f32 = 4.5;
+const EDGE_LEAD: f32 = 8.;
 /// The graph follows edits after this pause.
 const REPARSE_DELAY: Duration = Duration::from_millis(200);
 /// Output lines in the selected step's details.
@@ -61,6 +68,21 @@ const DETAIL_LINES: usize = 4;
 const HANDLE_WIDTH: f32 = 5.;
 /// Narrowest share of the width for either side of the split.
 const MIN_SPLIT: f32 = 0.2;
+/// While a step's terminal shows: the least height of the graph above it
+/// and of the step pane (details and terminal), and the pane's share of
+/// the height to start with.
+const MIN_GRAPH_HEIGHT: f32 = 90.;
+const MIN_STEP_HEIGHT: f32 = 240.;
+const STEP_SHARE: f32 = 0.45;
+
+/// A divider being dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Divider {
+    /// Between the editor and the graph.
+    Editor,
+    /// Between the graph and the step pane.
+    Steps,
+}
 
 /// What a problem in the file looks like in the banner.
 struct ShownProblem {
@@ -96,8 +118,16 @@ pub struct WorkflowView {
     last_cursor: Option<usize>,
     /// The editor's share of the width.
     split: f32,
-    resizing: bool,
+    /// While a terminal shows under the selected step's details: the step
+    /// pane's share of the graph side's height, and whether it is
+    /// maximized (the graph at its least height; a double-click on the
+    /// divider toggles it). Kept for as long as the tab is open.
+    step_share: f32,
+    step_maximized: bool,
+    resizing: Option<Divider>,
     split_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// The graph side: the graph, and the step pane under it.
+    side_bounds: Rc<Cell<Bounds<Pixels>>>,
     graph_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Where the graph is drawn and at what zoom when the user zoomed or
     /// panned; until then (`auto_fit`) it is fitted to its area.
@@ -188,6 +218,88 @@ fn state_of<'a>(active: Option<&'a ActiveRun>, id: &str) -> Option<(usize, &'a S
     Some((index, &active.run.steps()[index]))
 }
 
+/// A piece of an edge's stroke: straight, or a cubic curve to its first
+/// point with handles at the other two.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Piece<P> {
+    Line(P),
+    Curve(P, P, P),
+}
+
+impl<P> Piece<P> {
+    fn map<Q>(self, f: impl Fn(P) -> Q) -> Piece<Q> {
+        match self {
+            Self::Line(to) => Piece::Line(f(to)),
+            Self::Curve(to, a, b) => Piece::Curve(f(to), f(a), f(b)),
+        }
+    }
+}
+
+/// An edge as stroked: where it starts, its pieces, and its arrowhead's
+/// base and tip.
+#[derive(Debug, Clone, PartialEq)]
+struct Course<P> {
+    start: P,
+    pieces: Vec<Piece<P>>,
+    base: P,
+    tip: P,
+}
+
+impl<P: Copy> Course<P> {
+    fn map<Q>(&self, f: impl Fn(P) -> Q + Copy) -> Course<Q> {
+        Course {
+            start: f(self.start),
+            pieces: self.pieces.iter().map(|piece| piece.map(f)).collect(),
+            base: f(self.base),
+            tip: f(self.tip),
+        }
+    }
+}
+
+/// How the edge through layout `points` is stroked: a straight run of
+/// [`EDGE_LEAD`] out of its step, curves with horizontal handles between
+/// its points (straight where level, through the columns it passes), and
+/// a straight run of [`ARROW_LENGTH`] into the base of its arrowhead,
+/// whose tip is the last point: the line meets the head square on and
+/// stops there.
+fn edge_course(points: &[(f32, f32)]) -> Course<(f32, f32)> {
+    let (start, tip) = (points[0], points[points.len() - 1]);
+    let base = (tip.0 - ARROW_LENGTH, tip.1);
+    let mut course = Vec::with_capacity(points.len() + 2);
+    course.push((start.0 + EDGE_LEAD, start.1));
+    course.extend_from_slice(&points[1..points.len() - 1]);
+    course.push((base.0 - ARROW_LENGTH, base.1));
+    course.push(base);
+    let mut from = start;
+    let pieces = course
+        .into_iter()
+        .map(|to: (f32, f32)| {
+            let piece = if to.1 == from.1 || to.0 <= from.0 {
+                Piece::Line(to)
+            } else {
+                let handle = (to.0 - from.0) / 2.;
+                Piece::Curve(to, (from.0 + handle, from.1), (to.0 - handle, to.1))
+            };
+            from = to;
+            piece
+        })
+        .collect();
+    Course {
+        start,
+        pieces,
+        base,
+        tip,
+    }
+}
+
+/// The step pane's share of the graph side's `height` with its top
+/// `below` the side's bottom, leaving both it and the graph their least
+/// heights where the side has room.
+fn step_share(below: f32, height: f32) -> f32 {
+    let most = (height - HANDLE_WIDTH - MIN_GRAPH_HEIGHT).max(MIN_STEP_HEIGHT);
+    (below.clamp(MIN_STEP_HEIGHT, most) / height).min(1.)
+}
+
 fn button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -244,8 +356,11 @@ impl WorkflowView {
             cursor_step: None,
             last_cursor: None,
             split: 0.38,
-            resizing: false,
+            step_share: STEP_SHARE,
+            step_maximized: false,
+            resizing: None,
             split_bounds: Rc::default(),
+            side_bounds: Rc::default(),
             graph_bounds: Rc::default(),
             placement: Placement {
                 scale: 1.,
@@ -490,33 +605,49 @@ impl WorkflowView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.resizing {
-            let bounds = self.split_bounds.get();
-            let width = f32::from(bounds.size.width);
-            if width > 0. {
-                let offset = f32::from(event.position.x - bounds.origin.x);
-                self.split = (offset / width).clamp(MIN_SPLIT, 1. - MIN_SPLIT);
-                cx.notify();
+        match self.resizing {
+            Some(Divider::Editor) => {
+                let bounds = self.split_bounds.get();
+                let width = f32::from(bounds.size.width);
+                if width > 0. {
+                    let offset = f32::from(event.position.x - bounds.origin.x);
+                    self.split = (offset / width).clamp(MIN_SPLIT, 1. - MIN_SPLIT);
+                    cx.notify();
+                }
             }
-        } else if let Some(last) = self.panning {
-            if event.pressed_button != Some(MouseButton::Left) {
-                self.panning = None;
-                return;
+            Some(Divider::Steps) => {
+                let bounds = self.side_bounds.get();
+                let height = f32::from(bounds.size.height);
+                if height > 0. {
+                    let below = f32::from(bounds.bottom() - event.position.y) - HANDLE_WIDTH / 2.;
+                    self.step_share = step_share(below, height);
+                    self.step_maximized = false;
+                    cx.notify();
+                }
             }
-            let moved = event.position - last;
-            self.panning = Some(event.position);
-            let current = self.placement();
-            let offset = (
-                current.offset.0 + f32::from(moved.x),
-                current.offset.1 + f32::from(moved.y),
-            );
-            self.place(Placement { offset, ..current }, cx);
+            None => {
+                let Some(last) = self.panning else {
+                    return;
+                };
+                if event.pressed_button != Some(MouseButton::Left) {
+                    self.panning = None;
+                    return;
+                }
+                let moved = event.position - last;
+                self.panning = Some(event.position);
+                let current = self.placement();
+                let offset = (
+                    current.offset.0 + f32::from(moved.x),
+                    current.offset.1 + f32::from(moved.y),
+                );
+                self.place(Placement { offset, ..current }, cx);
+            }
         }
     }
 
     fn on_mouse_up(&mut self, cx: &mut Context<Self>) {
-        if self.resizing || self.panning.is_some() {
-            self.resizing = false;
+        if self.resizing.is_some() || self.panning.is_some() {
+            self.resizing = None;
             self.panning = None;
             cx.notify();
         }
@@ -812,7 +943,8 @@ impl WorkflowView {
                 px(placement.offset.1 + y * scale),
             )
         };
-        let edges: Vec<(Point<Pixels>, Point<Pixels>, bool, bool)> = layout
+        // Edges as drawn (graph area pixels), and their look.
+        let edges: Vec<(Course<Point<Pixels>>, bool, bool)> = layout
             .edges
             .iter()
             .map(|edge| {
@@ -821,7 +953,7 @@ impl WorkflowView {
                     Status::Failed(_) => edge.after,
                     _ => false,
                 };
-                (at(edge.start), at(edge.end), lit, edge.after)
+                (edge_course(&edge.points).map(at), lit, edge.after)
             })
             .collect();
         let cards: Vec<AnyElement> = workflow
@@ -840,34 +972,38 @@ impl WorkflowView {
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, _| {
-                        for (start, end, lit, after) in &edges {
-                            let (start, end) = (*start + bounds.origin, *end + bounds.origin);
+                        let origin = bounds.origin;
+                        for (course, lit, after) in &edges {
                             let color = match (*lit, *after) {
                                 (true, false) => theme::git_added(),
                                 (true, true) => theme::accent(),
                                 (false, _) => theme::muted(),
                             };
-                            let bend = ((end.x - start.x) / 2.).max(px(24. * scale));
                             let width = (if *lit { 2. } else { 1.5 }) * scale.max(0.6);
                             let mut path = PathBuilder::stroke(px(width));
                             if *after {
                                 path = path.dash_array(&[px(6. * scale), px(4. * scale)]);
                             }
-                            path.move_to(start);
-                            path.cubic_bezier_to(
-                                end,
-                                point(start.x + bend, start.y),
-                                point(end.x - bend, end.y),
-                            );
+                            path.move_to(course.start + origin);
+                            for piece in &course.pieces {
+                                match *piece {
+                                    Piece::Line(to) => path.line_to(to + origin),
+                                    Piece::Curve(to, a, b) => {
+                                        path.cubic_bezier_to(to + origin, a + origin, b + origin)
+                                    }
+                                }
+                            }
                             if let Ok(path) = path.build() {
                                 window.paint_path(path, color);
                             }
+                            let half = px(ARROW_HALF_WIDTH * scale);
+                            let (base, tip) = (course.base + origin, course.tip + origin);
                             let mut arrow = PathBuilder::fill();
                             arrow.add_polygon(
                                 &[
-                                    end,
-                                    point(end.x - px(7. * scale), end.y - px(4. * scale)),
-                                    point(end.x - px(7. * scale), end.y + px(4. * scale)),
+                                    tip,
+                                    point(base.x, base.y - half),
+                                    point(base.x, base.y + half),
                                 ],
                                 true,
                             );
@@ -886,12 +1022,15 @@ impl WorkflowView {
             .into_any_element()
     }
 
+    /// The selected step's details, and whether its terminal shows under
+    /// them: then they fill the step pane, the terminal taking the height
+    /// the details leave.
     fn render_details(
         &self,
         workflow: &Workflow,
         now: Instant,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> Option<(AnyElement, bool)> {
         let id = self.selected.as_deref()?;
         let step = workflow.steps.iter().find(|step| step.id == id)?;
         let workflows = self.workflows.read(cx);
@@ -986,9 +1125,13 @@ impl WorkflowView {
             .filter(|shown| *shown == id)
             .and(active.zip(run_index))
             .and_then(|(active, at)| active.terminal(at).cloned());
-        Some(
+        let shows_terminal = terminal.is_some();
+        Some((
             div()
-                .flex_none()
+                .when(shows_terminal, |details| {
+                    details.flex_1().min_h_0().overflow_hidden()
+                })
+                .when(!shows_terminal, |details| details.flex_none())
                 .flex()
                 .flex_col()
                 .border_t_1()
@@ -996,6 +1139,7 @@ impl WorkflowView {
                 .bg(theme::panel())
                 .child(
                     div()
+                        .flex_none()
                         .px_3()
                         .py_1p5()
                         .flex()
@@ -1068,15 +1212,16 @@ impl WorkflowView {
                 )
                 .children(terminal.map(|view| {
                     div()
-                        .h(px(220.))
-                        .flex_none()
+                        .flex_1()
+                        .min_h_0()
                         .flex()
                         .border_t_1()
                         .border_color(theme::border())
                         .child(div().flex_1().min_w_0().child(view))
                 }))
                 .into_any_element(),
-        )
+            shows_terminal,
+        ))
     }
 
     /// The step's artifacts as links: files open in an editor tab of the
@@ -1334,6 +1479,7 @@ impl Render for WorkflowView {
         let now = Instant::now();
         let workflow = self.graph.workflow.clone();
         let split_bounds = self.split_bounds.clone();
+        let side_bounds = self.side_bounds.clone();
         let graph_bounds = self.graph_bounds.clone();
         let graph = match &workflow {
             Some(workflow) if workflow.steps.is_empty() => div()
@@ -1363,6 +1509,7 @@ impl Render for WorkflowView {
         let details = workflow
             .as_ref()
             .and_then(|workflow| self.render_details(workflow, now, cx));
+        let shows_terminal = matches!(details, Some((_, true)));
         let editor = div()
             .flex_none()
             .w(relative(self.split))
@@ -1375,7 +1522,7 @@ impl Render for WorkflowView {
             .flex_none()
             .w(px(HANDLE_WIDTH))
             .h_full()
-            .bg(if self.resizing {
+            .bg(if self.resizing == Some(Divider::Editor) {
                 theme::accent()
             } else {
                 theme::border()
@@ -1385,7 +1532,7 @@ impl Render for WorkflowView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.resizing = true;
+                    this.resizing = Some(Divider::Editor);
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -1395,6 +1542,7 @@ impl Render for WorkflowView {
             .relative()
             .flex_1()
             .min_h_0()
+            .when(shows_terminal, |graph| graph.min_h(px(MIN_GRAPH_HEIGHT)))
             .overflow_hidden()
             .bg(theme::background())
             .on_scroll_wheel(cx.listener(Self::on_scroll))
@@ -1421,6 +1569,74 @@ impl Render for WorkflowView {
             .child(graph)
             .children(self.render_banner(cx))
             .children(self.render_zoom(cx));
+        // The graph, and under it the selected step's details; with its
+        // terminal they form a pane of their own, resized by the divider
+        // between them and the graph (a double-click maximizes it).
+        let side = div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(
+                canvas(
+                    move |laid_out, _, _| side_bounds.set(laid_out),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(graph_area);
+        let side = match details {
+            Some((details, true)) => {
+                let share = if self.step_maximized {
+                    1.
+                } else {
+                    self.step_share
+                };
+                side.child(
+                    div()
+                        .id("workflow-steps-split")
+                        .flex_none()
+                        .h(px(HANDLE_WIDTH))
+                        .w_full()
+                        .bg(if self.resizing == Some(Divider::Steps) {
+                            theme::accent()
+                        } else {
+                            theme::border()
+                        })
+                        .hover(|style| style.bg(theme::accent()))
+                        .cursor(CursorStyle::ResizeUpDown)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                if event.click_count >= 2 {
+                                    this.step_maximized = !this.step_maximized;
+                                    this.resizing = None;
+                                } else {
+                                    this.resizing = Some(Divider::Steps);
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("workflow-step-pane")
+                        .h(relative(share))
+                        .min_h(px(MIN_STEP_HEIGHT))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .child(details),
+                )
+            }
+            Some((details, false)) => side.child(details),
+            None => side,
+        };
         div()
             .key_context(CONTEXT)
             .on_action(cx.listener(Self::run_all_action))
@@ -1453,16 +1669,7 @@ impl Render for WorkflowView {
                     )
                     .child(editor)
                     .child(handle)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .child(graph_area)
-                            .children(details),
-                    ),
+                    .child(side),
             )
     }
 }
@@ -1489,5 +1696,51 @@ mod tests {
         .remove(0);
         assert_eq!(kind_hint(&step), "check · run · port 8000");
         assert_eq!(place(&step, None, None), "this machine");
+    }
+
+    #[test]
+    fn edges_meet_their_arrowheads_square_on() {
+        // From a port at (100, 50) through a column at y 120 into (464, 80).
+        let points = [(100., 50.), (164., 120.), (364., 120.), (464., 80.)];
+        let course = edge_course(&points);
+        assert_eq!((course.start, course.tip), (points[0], points[3]));
+        assert_eq!(
+            course.base,
+            (464. - ARROW_LENGTH, 80.),
+            "the stroke stops at the head"
+        );
+        assert_eq!(
+            course.pieces,
+            [
+                Piece::Line((100. + EDGE_LEAD, 50.)),
+                Piece::Curve((164., 120.), (136., 50.), (136., 120.)),
+                Piece::Line((364., 120.)),
+                Piece::Curve((448., 80.), (406., 120.), (406., 80.)),
+                Piece::Line((456., 80.)),
+            ]
+        );
+        // The last run into the head is level and an arrowhead long.
+        let Piece::Curve(curve_end, ..) = course.pieces[3] else {
+            unreachable!()
+        };
+        assert_eq!(course.base.0 - curve_end.0, ARROW_LENGTH);
+        // A level edge is straight all along.
+        let level = edge_course(&[(0., 10.), (64., 10.)]);
+        assert!(
+            level
+                .pieces
+                .iter()
+                .all(|piece| matches!(piece, Piece::Line(_)))
+        );
+    }
+
+    #[test]
+    fn the_step_pane_leaves_the_graph_room() {
+        // 600 tall: the pane may span 240 to 600 − 5 − 90.
+        assert_eq!(step_share(300., 600.), 0.5);
+        assert_eq!(step_share(10., 600.), 0.4);
+        assert_eq!(step_share(590., 600.), 505. / 600.);
+        // Too short for both: the pane takes it all.
+        assert_eq!(step_share(100., 200.), 1.);
     }
 }
