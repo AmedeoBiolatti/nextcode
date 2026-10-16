@@ -11,8 +11,8 @@ use terminal::{LinkTarget, find_links};
 const WINDOW: usize = 8 * 1024;
 /// Longest line kept for URL detection and display.
 const MAX_LINE: usize = 4 * 1024;
-/// Complete lines kept for display.
-const RECENT_LINES: usize = 6;
+/// Complete lines kept for display (a step's details scroll through them).
+const RECENT_LINES: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Escape {
@@ -190,22 +190,25 @@ impl OutputWatcher {
         seen
     }
 
-    /// The line being printed if it has text, else the last complete one.
+    /// The line being printed if it has text, else the last complete one,
+    /// trimmed.
     pub fn last_line(&self) -> &str {
-        self.last_lines(1).pop().unwrap_or_default()
+        self.last_lines(1).pop().unwrap_or_default().trim_start()
     }
 
     /// Up to `count` last lines (the one being printed included when it
-    /// has text), oldest first, trimmed.
+    /// has text), oldest first, with their indentation (trailing space
+    /// trimmed).
     pub fn last_lines(&self, count: usize) -> Vec<&str> {
-        let current = self.line.trim();
-        let current = (!current.is_empty() && current != "logout").then_some(current);
+        let current = self.line.trim_end();
+        let current =
+            (!current.trim_start().is_empty() && current.trim() != "logout").then_some(current);
         let complete = count.saturating_sub(usize::from(current.is_some()));
         let mut lines: Vec<&str> = self
             .recent
             .iter()
             .skip(self.recent.len().saturating_sub(complete))
-            .map(|line| line.trim())
+            .map(|line| line.trim_end())
             .collect();
         lines.extend(current);
         lines
@@ -318,7 +321,35 @@ mod tests {
         assert_eq!(watcher.last_lines(3), ["6", "7", "partial"]);
         watcher.push(b"\n");
         assert_eq!(watcher.last_lines(3), ["6", "7", "partial"]);
-        assert_eq!(watcher.last_lines(99).len(), RECENT_LINES);
+        assert_eq!(
+            watcher.last_lines(99),
+            ["1", "2", "3", "4", "5", "6", "7", "partial"]
+        );
         assert_eq!(watcher.last_line(), "partial");
+    }
+
+    #[test]
+    fn the_last_lines_keep_their_indentation_and_a_bounded_history() {
+        let mut watcher = OutputWatcher::new(None);
+        watcher.push(
+            b"Traceback:
+  File \"a.py\", line 1
+    boom()
+  ",
+        );
+        assert_eq!(
+            watcher.last_lines(9),
+            ["Traceback:", "  File \"a.py\", line 1", "    boom()"]
+        );
+        assert_eq!(watcher.last_line(), "boom()");
+        for index in 0..RECENT_LINES + 50 {
+            watcher.push(format!("line {index}\n").as_bytes());
+        }
+        let lines = watcher.last_lines(usize::MAX);
+        assert_eq!(lines.len(), RECENT_LINES);
+        assert_eq!(
+            lines.last(),
+            Some(&format!("line {}", RECENT_LINES + 49).as_str())
+        );
     }
 }

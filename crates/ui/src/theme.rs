@@ -162,13 +162,20 @@ impl<'de> Deserialize<'de> for SyntaxStyle {
 }
 
 /// Declares the `"ui"` colors: the resolved [`Ui`], the file's optional
-/// fields, and an accessor per color reading the current theme.
+/// fields, and an accessor per color reading the current theme. Colors
+/// after `derived:` may be left out even without `extends`: each falls
+/// back to its expression over the required colors (so themes written
+/// before it existed still load).
 macro_rules! ui_colors {
-    ($($(#[$doc:meta])* $key:ident),* $(,)?) => {
+    (
+        $($(#[$doc:meta])* $key:ident),* $(,)?;
+        derived: $($(#[$ddoc:meta])* $dkey:ident = $default:expr),* $(,)?
+    ) => {
         /// The UI colors of a theme.
         #[derive(Debug, Clone, PartialEq)]
         pub struct Ui {
             $($(#[$doc])* pub $key: Hsla,)*
+            $($(#[$ddoc])* pub $dkey: Hsla,)*
             /// Commit graph lanes, cycled.
             pub graph_lanes: Vec<Hsla>,
         }
@@ -177,6 +184,7 @@ macro_rules! ui_colors {
         #[serde(default, deny_unknown_fields)]
         struct UiFile {
             $($key: Option<Color>,)*
+            $($dkey: Option<Color>,)*
             graph_lanes: Option<Vec<Color>>,
         }
 
@@ -184,6 +192,7 @@ macro_rules! ui_colors {
             fn over(self, base: Self) -> Self {
                 Self {
                     $($key: self.$key.or(base.$key),)*
+                    $($dkey: self.$dkey.or(base.$dkey),)*
                     graph_lanes: self.graph_lanes.or(base.graph_lanes),
                 }
             }
@@ -193,13 +202,19 @@ macro_rules! ui_colors {
                     .graph_lanes
                     .filter(|lanes| !lanes.is_empty())
                     .ok_or("ui.graph_lanes is not set")?;
-                Ok(Ui {
+                let mut ui = Ui {
                     $($key: self
                         .$key
                         .ok_or(concat!("ui.", stringify!($key), " is not set"))?
                         .into(),)*
+                    $($dkey: Hsla::default(),)*
                     graph_lanes: graph_lanes.into_iter().map(Into::into).collect(),
-                })
+                };
+                $(
+                    let default: fn(&Ui) -> Hsla = $default;
+                    ui.$dkey = self.$dkey.map_or_else(|| default(&ui), Into::into);
+                )*
+                Ok(ui)
             }
         }
 
@@ -207,6 +222,12 @@ macro_rules! ui_colors {
             $(#[$doc])*
             pub fn $key() -> Hsla {
                 CURRENT.read().ui.$key
+            }
+        )*
+        $(
+            $(#[$ddoc])*
+            pub fn $dkey() -> Hsla {
+                CURRENT.read().ui.$dkey
             }
         )*
     };
@@ -272,7 +293,17 @@ ui_colors! {
     /// The gutter arrow at the paused (or selected frame's) line.
     debug_arrow,
     /// Run markers (▶) in the editor gutter, e.g. at tests.
-    run_marker,
+    run_marker;
+    derived:
+    /// Background of the lines holding a cursor in the focused editor.
+    current_line = |ui| ui.text.opacity(0.045),
+    /// Indentation guides in the editor, and the one of the block holding
+    /// the cursor.
+    indent_guide = |ui| ui.border,
+    indent_guide_active = |ui| ui.muted.opacity(0.7),
+    /// The editor's scrollbar thumb, and while hovered or dragged.
+    scrollbar_thumb = |ui| ui.text.opacity(0.12),
+    scrollbar_thumb_hover = |ui| ui.text.opacity(0.22),
 }
 
 /// The color of commit graph lane `index`.
@@ -985,6 +1016,21 @@ mod tests {
         );
         let err = load_in("P", &dir).unwrap_err();
         assert!(err.contains("is not set"), "{err}");
+    }
+
+    #[test]
+    fn a_theme_without_extends_may_leave_out_derived_colors() {
+        let mut file: Value = serde_json::from_str(BUILT_IN[0].1).unwrap();
+        file["name"] = "Old".into();
+        let ui = file["ui"].as_object_mut().unwrap();
+        ui.remove("current_line");
+        ui.remove("indent_guide");
+        let dir = Dir::new("derived", &[("old.json", &file.to_string())]);
+        let (theme, _) = load_ok("Old", &dir);
+        assert_eq!(theme.ui.indent_guide, theme.ui.border);
+        assert_eq!(theme.ui.current_line, theme.ui.text.opacity(0.045));
+        // Set ones are kept.
+        assert_eq!(theme.ui.scrollbar_thumb, fallback().ui.scrollbar_thumb);
     }
 
     #[test]

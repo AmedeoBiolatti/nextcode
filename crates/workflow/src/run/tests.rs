@@ -257,8 +257,11 @@ fn readiness_by_output_port_delay_manual_and_exit() {
     assert_eq!(run.steps()[2].status, Status::Ready);
 
     assert_eq!(run.steps()[3].detail, "Log in");
+    assert!(run.awaits_user(3));
+    assert!(!run.awaits_user(0) && !run.awaits_user(4));
     assert!(!run.continue_step(0, t), "not a manual step");
     assert!(run.continue_step(3, t));
+    assert!(!run.awaits_user(3));
     assert!(!run.continue_step(3, t), "already continued");
     assert_eq!(run.steps()[3].status, Status::Ready);
 

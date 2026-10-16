@@ -903,10 +903,12 @@ impl Workspace {
                 };
                 div()
                     .id(("tab", index))
+                    .relative()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .px_3()
+                    .pl_3()
+                    .pr_2()
                     .border_r_1()
                     .border_color(theme::border())
                     .cursor_pointer()
@@ -915,14 +917,21 @@ impl Workspace {
                     } else {
                         theme::muted()
                     })
+                    .when(!active, |tab| {
+                        tab.hover(|style| style.bg(theme::hover_row()).text_color(theme::text()))
+                    })
+                    // The active tab joins the editor below; an accent line
+                    // marks it in the focused pane.
                     .when(active, |tab| {
-                        tab.bg(theme::background())
-                            .border_b_2()
-                            .border_color(if focused {
-                                theme::accent()
-                            } else {
-                                theme::border()
-                            })
+                        tab.bg(theme::background()).mb(px(-1.)).child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .h(px(2.))
+                                .when(focused, |line| line.bg(theme::accent())),
+                        )
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.activate(pane_id, index, window, cx)
@@ -951,9 +960,13 @@ impl Workspace {
                     .child(
                         div()
                             .id(("close", index))
-                            .w(px(14.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(18.))
+                            .rounded_sm()
                             .text_color(theme::muted())
-                            .hover(|style| style.text_color(theme::text()))
+                            .hover(|style| style.bg(theme::hover_row()).text_color(theme::text()))
                             .child(if dirty { "●" } else { "×" })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();

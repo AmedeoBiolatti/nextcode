@@ -35,8 +35,8 @@ use std::{
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, Context, CursorStyle, Entity, FocusHandle, Focusable,
     Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, ScrollDelta,
-    ScrollWheelEvent, SharedString, Subscription, Task, Window, canvas, div, fill, point,
-    prelude::*, px, quad, relative, size,
+    ScrollHandle, ScrollWheelEvent, SharedString, Subscription, Task, Window, canvas, div, fill,
+    point, prelude::*, px, quad, relative, size, svg,
 };
 use text::Buffer;
 use workflow::{
@@ -76,16 +76,17 @@ const ARROW_HALF_WIDTH: f32 = 4.5;
 const EDGE_LEAD: f32 = 8.;
 /// The graph follows edits after this pause.
 const REPARSE_DELAY: Duration = Duration::from_millis(200);
-/// Output lines in the selected step's details.
-const DETAIL_LINES: usize = 4;
+/// Output lines the selected step's details scroll through (all the run
+/// keeps).
+const OUTPUT_LINES: usize = 500;
 const HANDLE_WIDTH: f32 = 5.;
 /// Narrowest share of the width for either side of the split.
 const MIN_SPLIT: f32 = 0.2;
-/// While a step's terminal shows: the least height of the graph above it
-/// and of the step pane (details and terminal), and the pane's share of
-/// the height to start with.
+/// While a step's output or terminal shows: the least height of the graph
+/// above it and of the step pane (details, then output or terminal), and
+/// the pane's share of the height to start with.
 const MIN_GRAPH_HEIGHT: f32 = 90.;
-const MIN_STEP_HEIGHT: f32 = 240.;
+const MIN_STEP_HEIGHT: f32 = 140.;
 const STEP_SHARE: f32 = 0.45;
 
 /// A divider being dragged.
@@ -146,8 +147,8 @@ pub struct WorkflowView {
     expanded: HashSet<String>,
     /// The editor's share of the width.
     split: f32,
-    /// While a terminal shows under the selected step's details: the step
-    /// pane's share of the graph side's height, and whether it is
+    /// While output or a terminal shows under the selected step's details:
+    /// the step pane's share of the graph side's height, and whether it is
     /// maximized (the graph at its least height; a double-click on the
     /// divider toggles it). Kept for as long as the tab is open.
     step_share: f32,
@@ -165,6 +166,10 @@ pub struct WorkflowView {
     panning: Option<Point<Pixels>>,
     /// A step without a project whose terminal shows under the details.
     host_terminal: Option<String>,
+    /// The selected step's output, and the step it was last scrolled for
+    /// (another step's starts at its end).
+    output_scroll: ScrollHandle,
+    output_for: Option<String>,
     notice: Option<SharedString>,
     /// The inputs form, while Run All waits for it.
     form: Option<(Entity<InputForm>, Subscription)>,
@@ -204,6 +209,42 @@ fn status_look(status: &Status) -> (&'static str, Hsla) {
         Status::Failed(_) => ("✗", theme::error()),
         Status::Stopped => ("■", theme::muted()),
     }
+}
+
+/// Manual gates (steps that wait for a person's Continue) at or under a
+/// node: how many, and whether one waits right now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Gates {
+    count: usize,
+    waiting: bool,
+}
+
+/// The colour of what waits for a person.
+fn gate_color() -> Hsla {
+    theme::warning()
+}
+
+/// A person, `side` square, in `color`: marks manual gates.
+fn person_icon(side: Pixels, color: Hsla) -> gpui::Svg {
+    svg()
+        .flex_none()
+        .size(side)
+        .path("icons/person.svg")
+        .text_color(color)
+}
+
+/// A card's state icon: its status glyph, or a person when it (or a step
+/// in its group) waits for one.
+fn state_icon(status: &Status, waiting: bool, scale: f32) -> AnyElement {
+    if waiting {
+        return person_icon(px(13. * scale), gate_color()).into_any_element();
+    }
+    let (icon, color) = status_look(status);
+    div()
+        .flex_none()
+        .text_color(color)
+        .child(icon)
+        .into_any_element()
 }
 
 /// What a step does, in a few words: `check · run · port 8000 · after`
@@ -251,11 +292,20 @@ fn state_of<'a>(active: Option<&'a ActiveRun>, path: &str) -> Option<(usize, &'a
     Some((index, &active.run.steps()[index]))
 }
 
+/// How a collapsed group's miniature draws one of its steps.
+#[derive(Debug, Clone, Copy)]
+struct MiniLook {
+    color: Hsla,
+    /// A group: outlined.
+    group: bool,
+    /// A manual gate, or a group holding one: ringed in the gate colour.
+    gate: bool,
+}
+
 /// A collapsed group's graph scaled into what is left of its card: a
-/// small rounded box per step in its state's colour (`looks`: colour and
-/// whether it is a group, outlined, by step), thin edges (dashed:
-/// `after`).
-fn miniature(graph: &GraphLayout, looks: Vec<(Hsla, bool)>) -> AnyElement {
+/// small rounded box per step in its state's colour (`looks`, by step),
+/// thin edges (dashed: `after`).
+fn miniature(graph: &GraphLayout, looks: Vec<MiniLook>) -> AnyElement {
     let nodes: Vec<Place> = graph.nodes.clone();
     let edges: Vec<(Vec<(f32, f32)>, bool)> = graph
         .edges
@@ -297,12 +347,27 @@ fn miniature(graph: &GraphLayout, looks: Vec<(Hsla, bool)>) -> AnyElement {
                     window.paint_path(path, theme::muted());
                 }
             }
-            for (node, &(color, group)) in nodes.iter().zip(&looks) {
+            for (node, look) in nodes.iter().zip(&looks) {
+                let MiniLook { color, group, gate } = *look;
                 let bounds = Bounds::new(
                     at((node.x, node.y)),
                     size(px(node.width * scale), px(node.height * scale)),
                 );
                 let radius = px((6. * scale).max(1.5));
+                if gate {
+                    let ring = px(2.);
+                    window.paint_quad(quad(
+                        Bounds::new(
+                            bounds.origin - point(ring, ring),
+                            bounds.size + size(ring * 2., ring * 2.),
+                        ),
+                        radius + ring,
+                        gpui::transparent_black(),
+                        px(1.5),
+                        gate_color(),
+                        BorderStyle::Solid,
+                    ));
+                }
                 if group {
                     window.paint_quad(quad(
                         bounds,
@@ -476,6 +541,8 @@ impl WorkflowView {
             auto_fit: true,
             panning: None,
             host_terminal: None,
+            output_scroll: ScrollHandle::new(),
+            output_for: None,
             notice: None,
             form: None,
             refocus: false,
@@ -974,17 +1041,24 @@ impl WorkflowView {
     /// laid out, its state's colour down the left and around it (the
     /// accent when selected), highlighted under the editor's cursor. A
     /// click selects a step; on a group it expands it too.
+    #[allow(clippy::too_many_arguments)]
     fn card_frame(
         &self,
         index: usize,
         place: Place,
         status: &Status,
+        waiting: bool,
         placement: Placement,
         content: impl IntoElement,
         cx: &Context<Self>,
     ) -> AnyElement {
         let node = &self.graph.nodes[index];
-        let (_, color) = status_look(status);
+        // What waits for a person takes the gate colour over its state's.
+        let color = if waiting {
+            gate_color()
+        } else {
+            status_look(status).1
+        };
         let selected = self.selected.as_deref() == Some(node.path.as_str());
         let scale = placement.scale;
         let size = |base: f32| px(base * scale);
@@ -1012,7 +1086,7 @@ impl WorkflowView {
             .border_1()
             .border_color(if selected {
                 theme::accent()
-            } else if *status == Status::Pending {
+            } else if *status == Status::Pending && !waiting {
                 theme::border()
             } else {
                 color
@@ -1058,8 +1132,37 @@ impl WorkflowView {
             .into_any_element()
     }
 
+    /// The manual gates at or under node `index`, and whether one waits
+    /// for its Continue in the current run.
+    fn gates(&self, index: usize, active: Option<&ActiveRun>) -> Gates {
+        let node = &self.graph.nodes[index];
+        if node.is_group() {
+            return node.children.iter().fold(Gates::default(), |sum, &child| {
+                let gates = self.gates(child, active);
+                Gates {
+                    count: sum.count + gates.count,
+                    waiting: sum.waiting || gates.waiting,
+                }
+            });
+        }
+        let manual = matches!(node.step.ready, Ready::Manual(_));
+        let waiting = manual
+            && active.is_some_and(|active| {
+                active
+                    .run
+                    .step(&node.path)
+                    .is_some_and(|at| active.run.awaits_user(at))
+            });
+        Gates {
+            count: usize::from(manual),
+            waiting,
+        }
+    }
+
     /// A step's card: its state, title and elapsed time, what it does (or
     /// how long its stop may still take), where it runs and its artifacts.
+    /// A manual gate shows a person by its title; while it waits, the card
+    /// takes the gate colour, says what it waits for and offers Continue.
     #[allow(clippy::too_many_arguments)]
     fn render_card(
         &self,
@@ -1074,7 +1177,7 @@ impl WorkflowView {
         let node = &self.graph.nodes[index];
         let step = &node.step;
         let state = state_of(active, &node.path);
-        let (icon, color) = status_look(status);
+        let gates = self.gates(index, active);
         let elapsed = state
             .and_then(|(_, state)| state.elapsed(now))
             .map(elapsed_text)
@@ -1088,6 +1191,19 @@ impl WorkflowView {
         if let Some((_, state)) = state.filter(|(_, state)| state.status == Status::Stopping) {
             detail = state.detail.clone();
         }
+        // A waiting gate says what it waits for (its prompt).
+        let detail_color = match state.filter(|_| gates.waiting) {
+            Some((_, state)) => {
+                detail = state.detail.clone();
+                gate_color()
+            }
+            None => theme::muted(),
+        };
+        let prompt = match &step.ready {
+            Ready::Manual(prompt) => prompt.clone(),
+            _ => String::new(),
+        };
+        let run_index = state.map(|(at, _)| at);
         let artifacts = step.artifacts.len();
         // Sizes, text and spacing follow the zoom; hit testing comes with
         // the elements being where they are drawn.
@@ -1110,7 +1226,7 @@ impl WorkflowView {
                     .gap(size(6.))
                     .text_size(size(14.))
                     .line_height(size(20.))
-                    .child(div().flex_none().text_color(color).child(icon))
+                    .child(state_icon(status, gates.waiting, scale))
                     .child(
                         div()
                             .flex_1()
@@ -1119,6 +1235,18 @@ impl WorkflowView {
                             .text_color(theme::text())
                             .child(step.label().to_owned()),
                     )
+                    .when(gates.count > 0 && !gates.waiting, |row| {
+                        let tooltip: SharedString = format!("Waits for you: {prompt}").into();
+                        row.child(
+                            div()
+                                .id(("gate-mark", index))
+                                .flex_none()
+                                .child(person_icon(size(12.), gate_color()))
+                                .tooltip(move |window, cx| {
+                                    Tooltip::view(tooltip.clone(), window, cx)
+                                }),
+                        )
+                    })
                     .child(
                         div()
                             .flex_none()
@@ -1127,7 +1255,7 @@ impl WorkflowView {
                             .child(elapsed),
                     ),
             )
-            .child(div().truncate().text_color(theme::muted()).child(detail))
+            .child(div().truncate().text_color(detail_color).child(detail))
             .child(
                 div()
                     .flex()
@@ -1154,9 +1282,58 @@ impl WorkflowView {
                                 .text_color(theme::muted())
                                 .child(format!("↗ {artifacts}")),
                         )
+                    })
+                    .when_some(run_index.filter(|_| gates.waiting), |line, at| {
+                        line.child(self.continue_chip(index, at, scale, cx))
                     }),
             );
-        self.card_frame(index, place, status, placement, content, cx)
+        self.card_frame(index, place, status, gates.waiting, placement, content, cx)
+    }
+
+    /// Continue on a card whose gate waits: approves it without opening
+    /// the step.
+    fn continue_chip(
+        &self,
+        index: usize,
+        run_index: usize,
+        scale: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let size = |base: f32| px(base * scale);
+        let background = gate_color();
+        // Dark text on a light amber (Dark theme), white on a deep one.
+        let foreground = if background.l > 0.55 {
+            gpui::rgb(0x1e1f22).into()
+        } else {
+            theme::on_accent()
+        };
+        div()
+            .id(("gate-continue", index))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(size(3.))
+            .px(size(5.))
+            .rounded(size(3.))
+            .bg(background)
+            .hover(|style| style.opacity(0.85))
+            .text_color(foreground)
+            .text_size(size(11.))
+            .line_height(size(15.))
+            .cursor_pointer()
+            .child(person_icon(size(10.), foreground))
+            .child("Continue")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let id = this.id.clone();
+                    this.workflows.update(cx, |workflows, cx| {
+                        workflows.continue_step(&id, run_index, cx);
+                    });
+                }),
+            )
+            .into_any_element()
     }
 
     /// A group's title line: its state, title, `▸`/`▾` and step count,
@@ -1170,7 +1347,7 @@ impl WorkflowView {
         now: Instant,
     ) -> gpui::Div {
         let node = &self.graph.nodes[index];
-        let (icon, color) = status_look(status);
+        let gates = self.gates(index, active);
         let elapsed = state_of(active, &node.path)
             .and_then(|(_, state)| state.elapsed(now))
             .map(elapsed_text)
@@ -1191,7 +1368,7 @@ impl WorkflowView {
             .gap(size(6.))
             .text_size(size(14.))
             .line_height(size(20.))
-            .child(div().flex_none().text_color(color).child(icon))
+            .child(state_icon(status, gates.waiting, scale))
             .child(
                 div()
                     .flex_1()
@@ -1200,6 +1377,28 @@ impl WorkflowView {
                     .text_color(theme::text())
                     .child(node.step.label().to_owned()),
             )
+            // Its manual gates, so a collapsed group tells it needs a
+            // person without being opened.
+            .when(gates.count > 0, |title| {
+                let tooltip: SharedString = match (gates.waiting, gates.count) {
+                    (true, _) => "A step inside waits for you".into(),
+                    (false, 1) => "1 step inside waits for a person".into(),
+                    (false, count) => format!("{count} steps inside wait for a person").into(),
+                };
+                title.child(
+                    div()
+                        .id(("group-gates", index))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(size(2.))
+                        .text_size(size(12.))
+                        .text_color(gate_color())
+                        .child(person_icon(size(12.), gate_color()))
+                        .child(gates.count.to_string())
+                        .tooltip(move |window, cx| Tooltip::view(tooltip.clone(), window, cx)),
+                )
+            })
             .child(
                 div()
                     .flex_none()
@@ -1231,19 +1430,27 @@ impl WorkflowView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let node = &self.graph.nodes[index];
-        let looks: Vec<(Hsla, bool)> = node
+        let looks: Vec<MiniLook> = node
             .children
             .iter()
             .map(|&child| {
                 let status = &statuses[child];
-                let color = if *status == Status::Pending {
+                let gates = self.gates(child, active);
+                let color = if gates.waiting {
+                    gate_color()
+                } else if *status == Status::Pending {
                     theme::border()
                 } else {
                     status_look(status).1
                 };
-                (color, self.graph.nodes[child].is_group())
+                MiniLook {
+                    color,
+                    group: self.graph.nodes[child].is_group(),
+                    gate: gates.count > 0,
+                }
             })
             .collect();
+        let waiting = self.gates(index, active).waiting;
         let scale = placement.scale;
         let size = |base: f32| px(base * scale);
         let content = div()
@@ -1256,7 +1463,15 @@ impl WorkflowView {
             .gap(size(2.))
             .child(self.group_title(index, &statuses[index], active, scale, now))
             .child(miniature(graph, looks));
-        self.card_frame(index, place, &statuses[index], placement, content, cx)
+        self.card_frame(
+            index,
+            place,
+            &statuses[index],
+            waiting,
+            placement,
+            content,
+            cx,
+        )
     }
 
     /// An expanded group's header over its box (the box is painted under
@@ -1535,7 +1750,7 @@ impl WorkflowView {
         let lines: Vec<String> = state
             .map(|(_, state)| {
                 state
-                    .last_lines(DETAIL_LINES)
+                    .last_lines(OUTPUT_LINES)
                     .into_iter()
                     .map(str::to_owned)
                     .collect()
@@ -1549,7 +1764,9 @@ impl WorkflowView {
         let on_host = active
             .zip(run_index)
             .is_some_and(|(active, at)| active.location(at).is_none());
-        let waiting_manual = status == Status::Running && matches!(step.ready, Ready::Manual(_));
+        let waiting_manual = active
+            .zip(run_index)
+            .is_some_and(|(active, at)| active.run.awaits_user(at));
         let failed = matches!(status, Status::Failed(_));
         let step_id = id.to_owned();
         let actions = div()
@@ -1607,12 +1824,16 @@ impl WorkflowView {
             .and(active.zip(run_index))
             .and_then(|(active, at)| active.terminal(at).cloned());
         let shows_terminal = terminal.is_some();
+        // The output scrolls in what the pane leaves under the details;
+        // the terminal, when shown, replaces it (it shows the same).
+        let shows_output = !shows_terminal && !lines.is_empty();
+        let resizable = shows_terminal || shows_output;
         Some((
             div()
-                .when(shows_terminal, |details| {
+                .when(resizable, |details| {
                     details.flex_1().min_h_0().overflow_hidden()
                 })
-                .when(!shows_terminal, |details| details.flex_none())
+                .when(!resizable, |details| details.flex_none())
                 .flex()
                 .flex_col()
                 .border_t_1()
@@ -1673,24 +1894,30 @@ impl WorkflowView {
                                     .child(selectable("step-reason", reason)),
                             )
                         })
-                        .when(!lines.is_empty(), |details| {
-                            // One block, so a selection can span the lines.
-                            details.child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(theme::background())
-                                    .font_family(theme::MONO_FONT)
-                                    .text_xs()
-                                    .text_color(theme::muted())
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .child(selectable("step-output", lines.join("\n"))),
-                            )
-                        })
                         .children(artifacts),
                 )
+                .when(shows_output, |details| {
+                    // One block, so a selection can span the lines.
+                    details.child(
+                        div()
+                            .id("step-output")
+                            .flex_1()
+                            .min_h_0()
+                            .mx_3()
+                            .mb_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(theme::background())
+                            .font_family(theme::MONO_FONT)
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .whitespace_nowrap()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.output_scroll)
+                            .child(selectable("step-output-text", lines.join("\n"))),
+                    )
+                })
                 .children(terminal.map(|view| {
                     div()
                         .flex_1()
@@ -1701,7 +1928,7 @@ impl WorkflowView {
                         .child(div().flex_1().min_w_0().child(view))
                 }))
                 .into_any_element(),
-            shows_terminal,
+            resizable,
         ))
     }
 
@@ -2173,8 +2400,18 @@ impl Render for WorkflowView {
                 ))
                 .into_any_element(),
         };
+        // The output follows what is printed while it is scrolled to its
+        // end (as of the last frame), and starts at the end for another
+        // step.
+        let (offset, most) = (self.output_scroll.offset(), self.output_scroll.max_offset());
+        if self.output_for != self.selected {
+            self.output_for = self.selected.clone();
+            self.output_scroll.scroll_to_bottom();
+        } else if -offset.y >= most.height - px(4.) {
+            self.output_scroll.scroll_to_bottom();
+        }
         let details = workflow.as_ref().and_then(|_| self.render_details(now, cx));
-        let shows_terminal = matches!(details, Some((_, true)));
+        let shows_pane = matches!(details, Some((_, true)));
         let editor = div()
             .flex_none()
             .w(relative(self.split))
@@ -2207,7 +2444,7 @@ impl Render for WorkflowView {
             .relative()
             .flex_1()
             .min_h_0()
-            .when(shows_terminal, |graph| graph.min_h(px(MIN_GRAPH_HEIGHT)))
+            .when(shows_pane, |graph| graph.min_h(px(MIN_GRAPH_HEIGHT)))
             .overflow_hidden()
             .bg(theme::background())
             .on_scroll_wheel(cx.listener(Self::on_scroll))
@@ -2402,11 +2639,11 @@ mod tests {
 
     #[test]
     fn the_step_pane_leaves_the_graph_room() {
-        // 600 tall: the pane may span 240 to 600 − 5 − 90.
+        // 600 tall: the pane may span 140 to 600 − 5 − 90.
         assert_eq!(step_share(300., 600.), 0.5);
-        assert_eq!(step_share(10., 600.), 0.4);
+        assert_eq!(step_share(10., 600.), 140. / 600.);
         assert_eq!(step_share(590., 600.), 505. / 600.);
         // Too short for both: the pane takes it all.
-        assert_eq!(step_share(100., 200.), 1.);
+        assert_eq!(step_share(100., 130.), 1.);
     }
 }

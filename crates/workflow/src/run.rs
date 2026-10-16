@@ -609,13 +609,18 @@ impl Run {
         !failed.is_empty()
     }
 
+    /// Whether step `index` is a manual gate waiting for the user's
+    /// Continue (its command and check, if any, are done).
+    pub fn awaits_user(&self, index: usize) -> bool {
+        self.steps.get(index).is_some_and(|state| {
+            state.status == Status::Running && state.phase == Phase::Waiting
+        }) && matches!(self.nodes[index].step.ready, Ready::Manual(_))
+            && !self.nodes[index].is_group()
+    }
+
     /// Continue on a step waiting for the user; false if it was not.
     pub fn continue_step(&mut self, index: usize, now: Instant) -> bool {
-        let waiting =
-            self.steps.get(index).is_some_and(|state| {
-                state.status == Status::Running && state.phase == Phase::Waiting
-            }) && matches!(self.nodes[index].step.ready, Ready::Manual(_))
-                && !self.nodes[index].is_group();
+        let waiting = self.awaits_user(index);
         if waiting {
             self.mark_ready(index, now);
             self.advance(now);

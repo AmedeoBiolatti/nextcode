@@ -15,6 +15,7 @@ mod debugger;
 mod diff_view;
 mod editor;
 mod file_finder;
+mod file_icons;
 mod file_tree;
 mod git_dialogs;
 mod git_log;
@@ -33,8 +34,8 @@ mod recent;
 mod revision_picker;
 mod run_config;
 mod search_panel;
-mod settings;
 mod selectable;
+mod settings;
 mod shell;
 mod startup;
 mod symbol_picker;
@@ -164,13 +165,13 @@ fn run() -> anyhow::Result<()> {
         Launch::Restore(state) => state.focused_tab(),
     }
     .map(workspace::Preload::start);
-    let application = Application::new();
+    let application = Application::new().with_assets(file_icons::Assets);
     startup::mark("gpui platform");
     application.run(move |cx: &mut App| {
         startup::mark("gpui ready");
         editor::bind_keys(cx);
-        shell::bind_keys(cx);
         selectable::bind_keys(cx);
+        shell::bind_keys(cx);
         command_palette::bind_keys(cx);
         workspace::bind_keys(cx);
         file_finder::bind_keys(cx);

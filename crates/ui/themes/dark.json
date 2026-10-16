@@ -37,7 +37,12 @@
     "debug_current_line": "#5c4d1f",
     "debug_frame_line": "#2f3d4f",
     "debug_arrow": "#f2c55c",
-    "run_marker": "#5fb865"
+    "run_marker": "#5fb865",
+    "current_line": "#26282e",
+    "indent_guide": "#34363b",
+    "indent_guide_active": "#50535a",
+    "scrollbar_thumb": "#bcbec426",
+    "scrollbar_thumb_hover": "#bcbec44d"
   },
   "terminal": {
     "foreground": "#bcbec4",

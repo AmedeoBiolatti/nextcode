@@ -8,7 +8,7 @@ use std::{
 use gpui::{Context, EventEmitter, SharedString, Window, div, prelude::*, px, uniform_list};
 use worktree::FileKind;
 
-use crate::{project::Project, theme};
+use crate::{file_icons, project::Project, theme};
 
 const INDENT: f32 = 14.;
 
@@ -21,12 +21,15 @@ struct Entry {
     path: PathBuf,
     name: SharedString,
     is_dir: bool,
+    /// A folder holding an `__init__.py`.
+    package: bool,
 }
 
 struct Row {
     path: PathBuf,
     name: SharedString,
     is_dir: bool,
+    package: bool,
     depth: usize,
 }
 
@@ -77,8 +80,16 @@ impl FileTree {
             self.children.clear();
         } else {
             for path in paths {
-                if let Some(parent) = path.parent() {
+                let parent = path.parent();
+                if let Some(parent) = parent {
                     self.children.remove(parent);
+                }
+                // An `__init__.py` makes its folder a package: re-read the
+                // listing showing that folder.
+                if path.file_name().is_some_and(|name| name == "__init__.py")
+                    && let Some(grandparent) = parent.and_then(Path::parent)
+                {
+                    self.children.remove(grandparent);
                 }
             }
         }
@@ -121,16 +132,27 @@ impl FileTree {
     }
 }
 
-/// Lists one directory; an unreadable one shows as empty.
+/// Lists one directory; an unreadable one shows as empty. Folders that
+/// could be Python packages are checked for an `__init__.py`.
 fn read_dir(project: &Project, dir: &Path) -> Vec<Entry> {
     project
         .read_dir(dir)
         .unwrap_or_default()
         .into_iter()
-        .map(|entry| Entry {
-            path: project.join(dir, &entry.name),
-            name: entry.name.into(),
-            is_dir: entry.is_dir,
+        .map(|entry| {
+            let path = project.join(dir, &entry.name);
+            let package = entry.is_dir
+                && file_icons::may_be_package(&entry.name)
+                && matches!(
+                    project.kind(&project.join(&path, "__init__.py")),
+                    Ok(Some(FileKind::File))
+                );
+            Entry {
+                path,
+                name: entry.name.into(),
+                is_dir: entry.is_dir,
+                package,
+            }
         })
         .collect()
 }
@@ -153,6 +175,7 @@ fn push_rows(
             path: entry.path.clone(),
             name: entry.name.clone(),
             is_dir: entry.is_dir,
+            package: entry.package,
             depth,
         });
         if recurse {
@@ -188,23 +211,42 @@ impl Render for FileTree {
                             .map(|index| {
                                 let row = &this.rows[index];
                                 let selected = this.selected.as_ref() == Some(&row.path);
-                                let icon = match (row.is_dir, this.expanded.contains(&row.path)) {
-                                    (true, true) => "▾ ",
-                                    (true, false) => "▸ ",
-                                    (false, _) => "  ",
+                                let open = row.is_dir && this.expanded.contains(&row.path);
+                                let chevron = match (row.is_dir, open) {
+                                    (true, true) => "▾",
+                                    (true, false) => "▸",
+                                    (false, _) => "",
+                                };
+                                let icon = if row.is_dir {
+                                    file_icons::folder(&row.name, open, row.package)
+                                } else {
+                                    file_icons::file(&row.name)
                                 };
                                 div()
                                     .id(index)
+                                    .w_full()
                                     .flex()
-                                    .pl(px(12. + INDENT * row.depth as f32))
+                                    .items_center()
+                                    .gap(px(5.))
+                                    .h(px(24.))
+                                    .pl(px(6. + INDENT * row.depth as f32))
                                     .pr_2()
                                     .cursor_pointer()
+                                    .whitespace_nowrap()
                                     .when(selected, |row| row.bg(theme::active_row()))
                                     .when(!selected, |row| {
                                         row.hover(|style| style.bg(theme::hover_row()))
                                     })
-                                    .child(div().text_color(theme::muted()).child(icon))
-                                    .child(row.name.clone())
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .w(px(10.))
+                                            .text_xs()
+                                            .text_color(theme::muted())
+                                            .child(chevron),
+                                    )
+                                    .child(icon)
+                                    .child(div().min_w_0().truncate().child(row.name.clone()))
                                     .on_click(
                                         cx.listener(move |this, _, _, cx| this.activate(index, cx)),
                                     )

@@ -5,11 +5,11 @@ use std::{ops::Range, sync::Arc, time::Duration};
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
-    FontStyle, FontWeight, Global, GlobalElementId, Hsla, InspectorElementId, KeyBinding,
-    KeyContext, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollWheelEvent, ShapedLine, SharedString, StrikethroughStyle, Style, Task, TextRun,
-    UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative,
-    size,
+    FontStyle, FontWeight, Global, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+    InspectorElementId, KeyBinding, KeyContext, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString,
+    StrikethroughStyle, Style, Task, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, relative, size,
 };
 use lsp::types::{
     DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -38,10 +38,12 @@ mod find;
 mod folds;
 pub(crate) mod format;
 mod go_to_line;
+mod indent_guides;
 mod inlay_hints;
 mod lines;
 mod navigation;
 mod rename;
+mod scrollbar;
 mod selections;
 pub(crate) mod semantic;
 mod server_edits;
@@ -438,6 +440,8 @@ pub struct Editor {
     fold_cache: Option<(u64, Range<usize>, Vec<folds::Region>)>,
     /// The mouse is over the gutter: fold chevrons show.
     gutter_hovered: bool,
+    /// The mouse is over the scrollbar: its thumb brightens.
+    scrollbar_hovered: bool,
     error: Option<SharedString>,
     /// Where the buffer's file lives; `None` for input fields.
     project: Option<Project>,
@@ -498,6 +502,8 @@ enum Drag {
     Select,
     /// Shift+Alt or middle drag: a column selection from (line, column).
     Column { line: usize, column: usize },
+    /// The scrollbar thumb, held `grab` below its top.
+    Scrollbar { grab: Pixels },
 }
 
 /// Most severe first, so `min` picks what to show.
@@ -585,6 +591,10 @@ struct EditorLayout {
     chevrons: [ShapedLine; 2],
     /// ▶ of run markers.
     run_marker: ShapedLine,
+    /// Indentation guides of the shown lines (not in input fields).
+    guides: Option<indent_guides::IndentGuides>,
+    /// When the rows don't fit.
+    scrollbar: Option<scrollbar::ScrollbarLayout>,
 }
 
 /// One visible screen row.
@@ -690,6 +700,7 @@ impl Editor {
             wrap_columns: None,
             fold_cache: None,
             gutter_hovered: false,
+            scrollbar_hovered: false,
             buffer,
             selections: SelectionSet::single(Selection::cursor(0)),
             history: Vec::new(),
@@ -1420,6 +1431,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.start_mouse(window);
+        if self.scrollbar_mouse_down(event.position, cx) {
+            return;
+        }
         if !self.single_line
             && !self.text_area
             && (self.debug_gutter_click(event.position, cx)
@@ -1493,7 +1507,11 @@ impl Editor {
         self.start_column_drag(event.position, cx);
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.drag, Some(Drag::Scrollbar { .. })) {
+            // The thumb dims again.
+            cx.notify();
+        }
         self.drag = None;
     }
 
@@ -1513,7 +1531,14 @@ impl Editor {
                 let selections = self.column_selection((line, column), head);
                 self.set_selections(selections, cx);
             }
+            Some(Drag::Scrollbar { grab }) => self.scrollbar_drag(event.position.y, grab, cx),
             None => {
+                let over_scrollbar = self.over_scrollbar(event.position);
+                if over_scrollbar != self.scrollbar_hovered {
+                    self.scrollbar_hovered = over_scrollbar;
+                    cx.notify();
+                }
+
                 let over_gutter = self.layout.as_ref().is_some_and(|layout| {
                     layout.bounds.contains(&event.position)
                         && event.position.x < layout.text_bounds.left()
@@ -1564,7 +1589,7 @@ impl Editor {
     /// over text.
     fn character_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
         let layout = self.layout.as_ref()?;
-        if !layout.text_bounds.contains(&position) {
+        if !layout.text_bounds.contains(&position) || self.over_scrollbar(position) {
             return None;
         }
         let (index, row) = layout.row_layout_at(position.y, self.scroll.y)?;
@@ -1587,8 +1612,9 @@ impl Editor {
     }
 
     fn clear_hover(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
-        if !hovered && self.gutter_hovered {
+        if !hovered && (self.gutter_hovered || self.scrollbar_hovered) {
             self.gutter_hovered = false;
+            self.scrollbar_hovered = false;
             cx.notify();
         }
         if !hovered && (self.hover.is_some() || self._hover_delay.is_some()) {
@@ -1973,6 +1999,34 @@ impl Editor {
         }
         self.autoscroll = false;
 
+        let guides = match (rows.first(), rows.last()) {
+            (Some(first), Some(last)) if !self.single_line && !self.text_area => {
+                let unit = if self.indent.tabs {
+                    1
+                } else {
+                    self.indent.width
+                };
+                Some(indent_guides::IndentGuides::new(
+                    &self.buffer,
+                    first.row.line..last.row.line + 1,
+                    Some(self.buffer.line_of(primary_head)),
+                    unit,
+                    self.language(),
+                ))
+            }
+            _ => None,
+        };
+        let scrollbar = (!self.single_line && !self.text_area)
+            .then(|| {
+                scrollbar::ScrollbarLayout::new(
+                    text_bounds,
+                    line_height,
+                    self.display.row_count(),
+                    self.scroll.y,
+                )
+            })
+            .flatten();
+
         let glyph = |glyph: &str| shape(glyph.into(), &[run(glyph.len(), muted)]);
         self.layout = Some(EditorLayout {
             bounds,
@@ -1989,6 +2043,8 @@ impl Editor {
             placeholder: glyph("⋯"),
             chevrons: [glyph("▸"), glyph("▾")],
             run_marker: shape("▶".into(), &[run("▶".len(), theme::run_marker())]),
+            guides,
+            scrollbar,
         });
     }
 
@@ -2012,9 +2068,30 @@ impl Editor {
             .into_iter()
             .flat_map(|(a, b)| [a..a + 1, b..b + 1])
             .collect();
+        // Lines of the cursors without a selection, across gutter and text.
+        let mut current_lines: Vec<usize> = if focused && !self.single_line && !self.text_area {
+            selections
+                .iter()
+                .filter(|s| s.is_empty())
+                .map(|s| self.buffer.line_of(s.head))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        current_lines.sort_unstable();
+        current_lines.dedup();
 
         for (i, row) in layout.rows.iter().enumerate() {
             let top = layout.row_top(i, self.scroll.y);
+            if current_lines.binary_search(&row.row.line).is_ok() {
+                window.paint_quad(fill(
+                    Bounds::from_corners(
+                        point(bounds.left(), top),
+                        point(bounds.right(), top + line_height),
+                    ),
+                    theme::current_line(),
+                ));
+            }
             if let Some(number) = &row.number {
                 let origin = point(layout.numbers_right - number.width, top);
                 number.paint(origin, line_height, window, cx).ok();
@@ -2052,6 +2129,24 @@ impl Editor {
                     let (start, end) = (row.row.range.start, row.row.range.end);
                     let last = row.row.last;
                     self.paint_debug_line(layout, row, top, window);
+                    if let Some(guides) = &layout.guides {
+                        let line_left = layout.text_bounds.left() - self.scroll.x;
+                        for column in guides.columns(row.row.line) {
+                            let x = (line_left + layout.em_width * column as f32).floor();
+                            if x < layout.text_bounds.left() {
+                                continue;
+                            }
+                            let color = if guides.is_active(row.row.line, column) {
+                                theme::indent_guide_active()
+                            } else {
+                                theme::indent_guide()
+                            };
+                            window.paint_quad(fill(
+                                Bounds::new(point(x, top), size(px(1.), line_height)),
+                                color,
+                            ));
+                        }
+                    }
                     // Backgrounds over the part of `range` on this row.
                     let mut highlight = |range: &Range<usize>, color: Hsla| {
                         if range.start > end || range.end < start || range.is_empty() {
@@ -2148,6 +2243,7 @@ impl Editor {
                 }
             },
         );
+        self.paint_scrollbar(layout, window);
     }
 }
 
@@ -2420,7 +2516,7 @@ impl IntoElement for EditorElement {
 
 impl Element for EditorElement {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    type PrepaintState = Option<Hitbox>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -2451,9 +2547,12 @@ impl Element for EditorElement {
         _: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) {
-        self.editor
-            .update(cx, |editor, _| editor.layout(bounds, window));
+    ) -> Option<Hitbox> {
+        self.editor.update(cx, |editor, _| {
+            editor.layout(bounds, window);
+            let track = editor.layout.as_ref()?.scrollbar.as_ref()?.track;
+            Some(window.insert_hitbox(track, HitboxBehavior::Normal))
+        })
     }
 
     fn paint(
@@ -2462,10 +2561,13 @@ impl Element for EditorElement {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut (),
-        _: &mut (),
+        scrollbar: &mut Option<Hitbox>,
         window: &mut Window,
         cx: &mut App,
     ) {
+        if let Some(scrollbar) = scrollbar {
+            window.set_cursor_style(CursorStyle::Arrow, scrollbar);
+        }
         let focus_handle = self.editor.read(cx).focus_handle.clone();
         window.handle_input(
             &focus_handle,
