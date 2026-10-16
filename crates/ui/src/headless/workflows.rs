@@ -7,10 +7,12 @@
 //! nobody sees (their last line is in `workflow_status`). URLs are
 //! reported, not opened. Steps in groups go by qualified ids
 //! (`group/step`); groups have status rows and events of their own.
+//! `workflow_run` takes the workflow's inputs as JSON (defaults for the
+//! others; the GUI form's remembered values are not used).
 
 use std::time::Instant;
 
-use workflow::{Artifact, ArtifactTarget, Ready, Status, StepNode};
+use workflow::{Artifact, ArtifactTarget, Input, InputKind, Ready, Status, StepNode};
 
 use super::*;
 use crate::{
@@ -180,6 +182,36 @@ fn artifact_json(artifact: &Artifact) -> Value {
     }
 }
 
+/// An input as declared: `{id, label, type, description, default,
+/// required, placeholder}`, plus `options` (`[{value, label}]`) for a
+/// choice and `min`, `max`, `integer` for a number.
+fn input_json(input: &Input) -> Value {
+    let mut value = json!({
+        "id": input.id,
+        "label": input.label(),
+        "type": input.type_name(),
+        "description": input.description,
+        "default": input.default.to_json(),
+        "required": input.required,
+        "placeholder": input.placeholder,
+    });
+    match &input.kind {
+        InputKind::Choice(options) => {
+            value["options"] = options
+                .iter()
+                .map(|option| json!({ "value": option.value, "label": option.label() }))
+                .collect();
+        }
+        InputKind::Number { min, max, integer } => {
+            value["min"] = json!(min);
+            value["max"] = json!(max);
+            value["integer"] = json!(integer);
+        }
+        InputKind::String | InputKind::Boolean => {}
+    }
+    value
+}
+
 /// Node `at` of a flattened workflow as listed: a step with its fields, or
 /// a group with its `steps` nested. `project` is where it runs (inherited
 /// from its groups).
@@ -239,6 +271,9 @@ fn list_json(workflows: &Workflows) -> Value {
                 "path": path_json(&found.path),
                 "source": found.source.label(),
                 "error": found.parsed.as_ref().err(),
+                "inputs": found.parsed.as_ref().map_or_else(|_| Vec::new(), |workflow| {
+                    workflow.inputs.iter().map(input_json).collect()
+                }),
                 "steps": steps,
                 "outcome": workflows.run_of(&found.id).map(|run| run.run.outcome().name()),
             })
@@ -325,6 +360,7 @@ fn status_json(workflows: &Workflows, id: &str, cx: &App) -> Result<Value, Strin
         "run": active.id,
         "workflow": found.name,
         "outcome": active.run.outcome().name(),
+        "inputs": active.inputs.to_json(),
         "steps": steps,
     }))
 }
@@ -373,7 +409,12 @@ impl Session {
                 };
                 match command.as_str() {
                     "workflow_run" => {
-                        let run = workflows.start(&found, cx)?;
+                        let inputs = match request.get("inputs") {
+                            None | Some(Value::Null) => Default::default(),
+                            Some(Value::Object(inputs)) => inputs.clone(),
+                            Some(_) => return Err("`inputs` must be an object".into()),
+                        };
+                        let run = workflows.start(&found, &inputs, cx)?;
                         Ok(json!({ "run": run, "id": found }))
                     }
                     "workflow_status" => status_json(workflows, &found, cx),

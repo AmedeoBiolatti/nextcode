@@ -252,11 +252,15 @@ fn a_failing_check_without_on_fail_fails_the_workflow(cx: &mut TestAppContext) {
         );
         (workflows.discovered()[0].id.clone(), invalid.id.clone())
     });
-    let refused = workflows.update(cx, |workflows, cx| workflows.start(&invalid, cx));
+    let refused = workflows.update(cx, |workflows, cx| {
+        workflows.start(&invalid, &Default::default(), cx)
+    });
     assert!(refused.unwrap_err().contains("cannot run"));
 
     workflows
-        .update(cx, |workflows, cx| workflows.start(&broken, cx))
+        .update(cx, |workflows, cx| {
+            workflows.start(&broken, &Default::default(), cx)
+        })
         .unwrap();
     wait_until(cx, "the check", |cx| {
         statuses(&workflows, cx) == ["failed", "stopped"]
@@ -558,6 +562,109 @@ fn groups_expand_in_place_and_stay_expanded_across_edits(cx: &mut TestAppContext
         ]
         .map(|id| (id.to_owned(), "ready".to_owned()))
     );
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cleanup(root);
+}
+
+#[gpui::test]
+fn run_all_asks_for_the_inputs_and_the_run_keeps_them(cx: &mut TestAppContext) {
+    let root = root("inputs");
+    let path = root.join("user").join("deploy.jsonc");
+    std::fs::write(
+        &path,
+        r#"{
+          "name": "Deploy",
+          "inputs": [
+            { "id": "env", "type": "choice", "options": ["dev", "staging", "prod"] },
+            { "id": "branch", "required": true },
+            { "id": "workers", "type": "number", "default": 4, "max": 64 }
+          ],
+          "steps": [{ "id": "show", "run": "echo deploying-${inputs.env}-${inputs.workers}" }]
+        }"#,
+    )
+    .unwrap();
+    cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
+    cx.run_until_parked();
+    let window = cx.windows()[0].downcast::<Shell>().unwrap();
+    let workflows = window
+        .update(cx, |_, window, cx| for_window(window, cx))
+        .unwrap();
+    workflows.update(cx, |workflows, _| {
+        workflows.user_dir = Some(root.join("user"))
+    });
+    let view = window
+        .update(cx, |shell, window, cx| {
+            shell.open_workflow(&Source::User, &path, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    cx.run_until_parked();
+
+    // Run All shows the form; nothing runs until it is valid and run.
+    view.update(cx, |view, cx| view.run_all(cx));
+    cx.run_until_parked();
+    let form = view.read_with(cx, |view, _| view.form()).expect("the form");
+    assert!(form.read_with(cx, |form, _| form.state().values().is_none()));
+    form.update(cx, |form, cx| form.submit(cx));
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |view, _| view.form().is_some()));
+    assert!(workflows.read_with(cx, |workflows, _| workflows.runs().is_empty()));
+    form.update(cx, |form, cx| {
+        form.type_text(1, "feature", cx);
+        form.type_text(2, "8", cx);
+        form.choose(0, 2, cx);
+    });
+    cx.run_until_parked();
+    // Run All with the form open is its Run.
+    view.update(cx, |view, cx| view.run_all(cx));
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |view, _| view.form().is_none()));
+    let id = workflow_id(&Source::User, &path);
+    let last_line = |cx: &mut TestAppContext| {
+        workflows.read_with(cx, |workflows, _| {
+            workflows.runs()[0].run.steps()[0].last_line().to_owned()
+        })
+    };
+    wait_until(cx, "the step's output", |cx| {
+        statuses(&workflows, cx) == ["ready"] && last_line(cx) == "deploying-prod-8"
+    });
+    let summary = |cx: &mut TestAppContext| {
+        workflows.read_with(cx, |workflows, _| workflows.runs()[0].inputs.summary())
+    };
+    assert_eq!(summary(cx), "env=prod · branch=feature · workers=8");
+
+    // Restart reuses them.
+    let generation = |cx: &mut TestAppContext| {
+        workflows.read_with(cx, |workflows, _| {
+            workflows.runs()[0].run.steps()[0].generation()
+        })
+    };
+    let before = generation(cx);
+    workflows.update(cx, |workflows, cx| workflows.restart_step(&id, 0, cx));
+    wait_until(cx, "the restarted step", |cx| {
+        generation(cx) > before
+            && statuses(&workflows, cx) == ["ready"]
+            && last_line(cx) == "deploying-prod-8"
+    });
+    assert_eq!(last_line(cx), "deploying-prod-8");
+    assert_eq!(summary(cx), "env=prod · branch=feature · workers=8");
+
+    // The next Run All starts with them; Cancel leaves the run alone.
+    view.update(cx, |view, cx| view.run_all(cx));
+    cx.run_until_parked();
+    let form = view.read_with(cx, |view, _| view.form()).expect("the form");
+    assert_eq!(
+        form.read_with(cx, |form, _| form.state().values().unwrap().summary()),
+        "env=prod · branch=feature · workers=8"
+    );
+    form.update(cx, |_, cx| cx.emit(super::form::InputFormEvent::Cancelled));
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |view, _| view.form().is_none()));
+    assert_eq!(summary(cx), "env=prod · branch=feature · workers=8");
+
     window
         .update(cx, |_, window, _| window.remove_window())
         .unwrap();

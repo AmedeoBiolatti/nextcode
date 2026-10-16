@@ -1130,7 +1130,11 @@ fn tool_button(
 pub(crate) struct Tooltip(SharedString);
 
 impl Tooltip {
-    pub(crate) fn view(text: &'static str, _: &mut Window, cx: &mut App) -> gpui::AnyView {
+    pub(crate) fn view(
+        text: impl Into<SharedString>,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyView {
         cx.new(|_| Self(text.into())).into()
     }
 }

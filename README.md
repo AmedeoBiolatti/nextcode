@@ -408,6 +408,55 @@ invalid: it is listed with the error and cannot run.
       { "id": "serve", "needs": ["migrate"], "run": "uv run uvicorn app:app", "ready": { "port": 8000 } } ] }
   ```
 
+Inputs: a top-level `"inputs"` array declares parameters each run gets,
+read in steps as `${inputs.<id>}`:
+
+```jsonc
+"inputs": [
+  { "id": "env", "label": "Environment", "type": "choice",
+    "options": ["dev", "staging", { "value": "prod", "label": "Production" }],
+    "default": "dev", "description": "Where to deploy" },
+  { "id": "branch", "type": "string", "default": "main", "placeholder": "branch name", "required": true },
+  { "id": "workers", "type": "number", "default": 4, "min": 1, "max": 64, "integer": true },
+  { "id": "clean", "type": "boolean", "default": false }
+]
+```
+
+| Key | Meaning |
+|---|---|
+| `id` | required, unique; no `/`, `.`, `{`, `}`, `$`, spaces |
+| `type` | `string` (default; a textbox), `number` (a textbox checked as a number), `boolean` (a checkbox), `choice` (a dropdown) |
+| `label`, `description` | the form's label (default: the id) and helper text |
+| `default` | of the input's type and valid for it; without one `""`, empty, `false`, the first option |
+| `required` | `string`/`number`: must not be empty |
+| `placeholder` | `string`/`number`: shown in the empty textbox |
+| `options` | `choice`: strings or `{ "value", "label" }` |
+| `min`, `max`, `integer` | `number`: inclusive bounds, whole numbers only |
+
+Unknown keys, keys of another type, duplicate ids, invalid defaults and
+`${inputs.<id>}` naming no input are validation errors (located in the
+file). `${inputs.<id>}` works in `run`, `check`, `cwd`, `env` values,
+artifact paths and `project` strings, at any depth (groups' too); values
+are fixed when the run starts and inserted as they are (strings and
+options as written, numbers in their shortest form, `true`/`false`, an
+empty number as nothing; no `${` in values). Restart and Retry Failed
+reuse the run's values. Run All (toolbar, Shift+F10, palette "Run
+Workflow: …") on a workflow with inputs first shows a form over the
+graph: label, control, description and what is wrong with the value per
+input, prefilled with the values the workflow last ran with (kept per
+workflow file in `workflow_inputs.json` in the local data dir; values
+that no longer fit — an option removed, a bound or type changed — fall
+back to the default), Reset to defaults, Cancel (Escape) and Run (Enter;
+disabled while a value is invalid). Tab moves between fields, Space
+toggles a checkbox; a dropdown opens with a click, Space, Up or Down
+(Up/Down, Enter picks, Escape closes). Workflows without inputs run at
+once. The toolbar shows the current run's values (`env=dev ·
+branch=main`; the whole text on hover). Headless `workflow_run` takes
+`"inputs": { "env": "prod", "workers": 8 }` (strings that parse are fine
+for numbers and booleans); the others get their defaults (not the form's
+remembered values), and invalid, unknown or missing required values fail
+it with every problem listed (``input `workers`: must be ≤ 64``).
+
 States: pending → waiting (needs/after) → starting (opening the project,
 the check) → running → ready | failed | stopped, with stopping (Ctrl+C
 sent, grace running) before stopped (or failed for a timeout). A failed
@@ -475,7 +524,8 @@ through the project (its tab opens first when a restored workflow tab
 needs it). Workflows run in the window that started them.
 
 Headless: `workflows_list` (groups with their `steps` nested, each entry
-with `kind` and qualified `path`), `workflow_run`, `workflow_status` (a
+with `kind` and qualified `path`; each workflow's `inputs`), `workflow_run`
+(`inputs`), `workflow_status` (the run's `inputs`; a
 row per step and group: qualified `id`, `kind`, `parent`), `workflow_stop`,
 `workflow_continue`, `workflow_restart` (a group: all its steps),
 `workflow_retry` (optional `step`: that step or a group's failed steps),

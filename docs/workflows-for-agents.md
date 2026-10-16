@@ -39,6 +39,9 @@ Validate it, then run it:
 {"id": 2, "cmd": "workflow_run", "name": "Dev stack"}
 ```
 
+With `inputs` (§3.5) pass values: `{"cmd": "workflow_run", "name": "Deploy",
+"inputs": {"env": "prod", "workers": 8}}`.
+
 ---
 
 ## 2. Where files live
@@ -56,8 +59,9 @@ trailing commas are allowed in both).
 
 ## 3. File format
 
-Top level: `{ "name": string?, "steps": [Step, ...] }`. `name` defaults to
-the file name without extension. Other top-level keys (`$schema`,
+Top level: `{ "name": string?, "inputs": [Input, ...]?, "steps": [Step, ...] }`.
+`name` defaults to the file name without extension; `inputs` (§3.5) are
+the parameters a run asks for. Other top-level keys (`$schema`,
 `description`, …) are ignored.
 
 ### Step fields
@@ -190,6 +194,62 @@ A step with `steps` is a group: one node in the graph made of a sub-graph.
   group reruns its failed steps; Stop All is unchanged. The run's outcome
   counts the steps that do something (not groups).
 
+### 3.5 Inputs
+
+`inputs` declares parameters every run gets: the GUI asks for them in a
+form before it starts, headless takes them in `workflow_run`. Steps read
+them as `${inputs.<id>}`.
+
+```jsonc
+"inputs": [
+  { "id": "env", "label": "Environment", "type": "choice",
+    "options": ["dev", "staging", { "value": "prod", "label": "Production" }],
+    "default": "dev", "description": "Where to deploy" },
+  { "id": "branch", "type": "string", "default": "main", "placeholder": "branch name", "required": true },
+  { "id": "workers", "type": "number", "default": 4, "min": 1, "max": 64, "integer": true },
+  { "id": "clean", "type": "boolean", "default": false }
+],
+"steps": [
+  { "id": "deploy", "project": { "wsl": "Ubuntu", "path": "~/src/${inputs.env}" },
+    "env": { "BRANCH": "${inputs.branch}" },
+    "run": "./deploy.sh --env ${inputs.env} -j ${inputs.workers} --clean=${inputs.clean}" }
+]
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `id` | string, **required**, unique | `${inputs.<id>}` names it; no `/`, `.`, `{`, `}`, `$` or spaces |
+| `type` | `string` (default), `number`, `boolean`, `choice` | The control: textbox, number textbox, checkbox, dropdown |
+| `label` | string | Shown in the form; default `id` |
+| `description` | string | Helper text under the field |
+| `default` | of the type | What a run gets when not given a value, and what the form starts with. Without it: `""`, empty (number), `false`, the first option. Must be valid (a choice's option, within `min`/`max`, …) |
+| `required` | bool (`string`, `number`) | A string must not be empty (spaces count as empty), a number must be given |
+| `placeholder` | string (`string`, `number`) | Shown in an empty textbox |
+| `options` | [string or `{ "value", "label"? }`] (`choice`, **required**) | The dropdown's entries; values unique; `label` defaults to the value |
+| `min`, `max` | number (`number`) | Bounds, inclusive |
+| `integer` | bool (`number`) | Whole numbers only |
+
+- Unknown keys, keys of another type (`min` on a string, `options`
+  without `"type": "choice"`), duplicate ids and invalid defaults are
+  validation errors located at the input (its key: `"default"`, `"id"`, …).
+- `${inputs.<id>}` works in `run`, `check`, `cwd`, `env` values, artifact
+  paths and every string of `project` (paths, distro, `config`), at any
+  depth (a group's `project`/`cwd`/`env` too, inherited as usual). An
+  unknown id is a validation error at the variable. Elsewhere (`title`,
+  `terminal`, `onFail`, `ready`) it stays literal.
+- Values are fixed when the run starts and inserted as they are (quote
+  them for the shell when they may hold spaces): strings and choices as
+  written, numbers in their shortest form (`8`, `0.5`), booleans `true` /
+  `false`, an empty number as nothing. Values must not contain `${` (they
+  are put in before the other variables). Restart and Retry reuse the
+  run's values; a new run (Run All, `workflow_run`) takes new ones.
+- Headless takes JSON values (`"workers": 8`, `"clean": true`); strings
+  that parse are accepted for numbers and booleans (`"8"`, `"true"`).
+  Inputs not given get their **defaults**; the GUI form's remembered
+  values are not used. Unknown ids, invalid values and missing required
+  ones fail `workflow_run` with every problem:
+  ``Deploy cannot run: unknown input `colour` (inputs: env, branch, workers, clean); input `env`: `qa` is not one of dev, staging, prod; input `branch`: required; input `workers`: must be ≤ 64``.
+
 ---
 
 ## 4. How commands run
@@ -211,9 +271,9 @@ Consequences for authors:
 - Variables expanded in `run`, `check`, `cwd`, `env` values and artifact
   paths: `${workspaceFolder}` (project root; home folder without a
   project), `${userHome}`, `${env:NAME}` (the environment **where the step
-  runs**), and the step-result variables below. Put secrets in the
-  environment and reference them as `${env:NAME}`; never write them in the
-  file.
+  runs**), the step-result variables below and the inputs (§3.5;
+  `project` too). Put secrets in the environment and reference them as
+  `${env:NAME}`; never write them in the file.
 - JSON escaping: backslashes double (`"C:\\src"`, regex `"ready in \\d+ ms"`).
 - A `run` command that keeps running (a server) must use `output` or
   `port` readiness; with the default `exit` it never becomes ready.
@@ -375,6 +435,24 @@ Recipes:
   Restart `api` (GUI: select the group, Restart; headless:
   `workflow_restart` with `"step": "api"`) rebuilds, migrates and serves
   again; `api/migrate` alone restarts one step.
+- **One workflow, several targets:** a `choice` input for the
+  environment and a `string` for the branch instead of a copy of the file
+  per target; the GUI asks before each run (remembering the last
+  choice), an agent passes them:
+  ```jsonc
+  "inputs": [
+    { "id": "env", "type": "choice", "options": ["dev", "staging", "prod"], "default": "dev" },
+    { "id": "branch", "default": "main", "required": true }
+  ],
+  "steps": [
+    { "id": "checkout", "project": { "wsl": "Ubuntu", "path": "~/src/app" },
+      "run": "git fetch && git switch '${inputs.branch}'" },
+    { "id": "deploy", "needs": ["checkout"], "project": { "wsl": "Ubuntu", "path": "~/src/app" },
+      "env": { "TARGET": "${inputs.env}" }, "run": "./deploy.sh",
+      "artifacts": ["logs/deploy-${inputs.env}.log"] }
+  ]
+  ```
+  `{"cmd": "workflow_run", "name": "Deploy", "inputs": {"env": "staging", "branch": "fix-42"}}`.
 
 Checklist before handing a workflow over:
 
@@ -387,7 +465,9 @@ Checklist before handing a workflow over:
 7. Steps that must run whatever happened before use `after`, not `needs`.
 8. Groups hold only steps and defaults (`project`, `cwd`, `env`); their
    steps' `needs`/`after` name siblings.
-9. `workflows_list` reports `"error": null` for it.
+9. Inputs have defaults that make a safe run (`dev`, not `prod`); values
+   that may hold spaces are quoted in `run`.
+10. `workflows_list` reports `"error": null` for it.
 
 ---
 
@@ -454,9 +534,9 @@ Workflows are named by `"name"`, `"path"` or `"id"` (from
 
 | Command | Params | Result |
 |---|---|---|
-| `workflows_list` | – | array of `{id, name, path, source, error, steps, outcome}`; each step `{id, path, kind: "step", title, needs, after, project, run, check, ready, stop_grace_s, artifacts[{label, path} or {label, url}]}`, each group `{id, path, kind: "group", title, needs, after, project, steps[…]}` (nested). `path` is the qualified id; `project` is where it runs (inherited from its groups) |
-| `workflow_run` | name/path/id | `{run, id}`; starts afresh (a run of it still going is stopped first, each command with its grace) |
-| `workflow_status` | name/path/id | `{run, workflow, outcome, steps[…]}` (error if it has not run): one row per step and group in file order, groups before their steps. Step rows: `{id, kind: "step", parent, title, status, reason, detail, blocked, last_line, check_output, exit_code, exited, elapsed_ms, location, terminal, artifacts[{label, name, path or url, resolved, exists}], artifacts_error}`; group rows: `{id, kind: "group", parent, title, status, reason, detail, blocked, elapsed_ms, steps[qualified ids]}`. `id`/`parent` are qualified ids (`parent` null at the top). `resolved`/`exists` are `null` until the artifacts were checked; `artifacts_error` says why they could not be |
+| `workflows_list` | – | array of `{id, name, path, source, error, inputs, steps, outcome}`; `inputs` as declared: `{id, label, type, description, default, required, placeholder}` plus `options[{value, label}]` (choice) or `min`, `max`, `integer` (number); each step `{id, path, kind: "step", title, needs, after, project, run, check, ready, stop_grace_s, artifacts[{label, path} or {label, url}]}`, each group `{id, path, kind: "group", title, needs, after, project, steps[…]}` (nested). `path` is the qualified id; `project` is where it runs (inherited from its groups); `${inputs.…}` show unexpanded |
+| `workflow_run` | name/path/id, `inputs`? (`{"<id>": value}`) | `{run, id}`; starts afresh (a run of it still going is stopped first, each command with its grace). Inputs not given get their defaults; invalid ones are an error listing each (§3.5) |
+| `workflow_status` | name/path/id | `{run, workflow, outcome, inputs, steps[…]}` (error if it has not run); `inputs` the run's values by id (`{"env": "prod", "workers": 8}`). One row per step and group in file order, groups before their steps. Step rows: `{id, kind: "step", parent, title, status, reason, detail, blocked, last_line, check_output, exit_code, exited, elapsed_ms, location, terminal, artifacts[{label, name, path or url, resolved, exists}], artifacts_error}`; group rows: `{id, kind: "group", parent, title, status, reason, detail, blocked, elapsed_ms, steps[qualified ids]}`. `id`/`parent` are qualified ids (`parent` null at the top). `resolved`/`exists` are `null` until the artifacts were checked; `artifacts_error` says why they could not be |
 | `workflow_continue` | name, `step` | `null`; error `the step is not waiting for Continue` unless it is a running `manual` step |
 | `workflow_restart` | name, `step` | bool (its old command is stopped with its grace first; a group: every step in it) |
 | `workflow_retry` | name, `step`? | bool: without `step` reruns every failed step; with it that step if it failed, or a group's failed steps (`false` if none had failed) |
@@ -576,8 +656,22 @@ Rules of thumb:
   drag the divider above them to resize that pane (double-click: maximize
   it / back; the size is kept while the tab is open).
 - Toolbar: Run All (Shift+F10; saves first), Stop All (Ctrl+F2), Retry
-  Failed. Graph: opens fitted (and re-fits when its pane is resized);
-  Ctrl+scroll zooms; − / % / + / Fit in the corner; drag or scroll pans.
+  Failed, and the current run's inputs (`env=prod · branch=main`,
+  selectable; the whole text on hover when cut). Graph: opens fitted (and
+  re-fits when its pane is resized); Ctrl+scroll zooms; − / % / + / Fit
+  in the corner; drag or scroll pans.
+- **Inputs form:** Run All (toolbar, Shift+F10, palette **Run Workflow:**)
+  on a workflow with `inputs` first shows a form over the graph: a row
+  per input (label, `*` when required, the control, its description, what
+  is wrong with its value in red). It starts with the values the workflow
+  last ran with (kept per workflow file across restarts) where they still
+  fit — an option removed, a bound changed, a type changed fall back to
+  the default — else the defaults; **Reset to defaults** restores those.
+  Tab / Shift+Tab move between fields, Space toggles a checkbox, a
+  dropdown opens with a click, Space, Up or Down (Up/Down move, Enter
+  picks, Escape closes it); Enter (or Run All again) runs once every value
+  is valid (Run is disabled before), Escape or Cancel closes the form
+  without running. Workflows without inputs run at once.
 - Agents with UI automation (`next_code --automation`, see README) can use
   the same: the command palette (`Ctrl+Shift+P`) and clicks.
 
@@ -607,7 +701,8 @@ Rules of thumb:
 
 - JSONC only (no YAML).
 - `openUrls` matches complete lines only; headless reports URLs instead of opening them.
-- One run per workflow per window; Run All restarts it.
+- One run per workflow per window; Run All restarts it (asking for its inputs again).
+- Inputs are plain values (no file pickers, multi-select or inputs depending on other inputs); values cannot contain `${`.
 - Steps without a project run on the editor's machine; headless on a WSL project runs them on that machine (where next_code runs), not inside WSL.
 - `${env:…}` reads the environment where the step runs, at start; changes later are not seen.
 - `${steps.<id>.artifacts.…}` paths are those of the producing step's machine/container; nothing is copied between machines.

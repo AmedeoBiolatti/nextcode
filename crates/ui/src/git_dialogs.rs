@@ -44,7 +44,13 @@ fn frame() -> gpui::Div {
         .text_color(theme::text())
 }
 
-fn button(id: &'static str, label: SharedString, primary: bool) -> gpui::Stateful<gpui::Div> {
+/// A dialog button; `primary` in the accent colour. Also the workflow
+/// inputs form's.
+pub(crate) fn button(
+    id: &'static str,
+    label: SharedString,
+    primary: bool,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .px_3()

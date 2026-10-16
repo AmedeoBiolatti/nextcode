@@ -2,7 +2,9 @@
 //! graph on the right (Azure DevOps style: columns by dependency depth,
 //! cards with state, solid edges from each need to the steps needing it,
 //! dashed ones from each step to those running `after` it), and a
-//! toolbar with the workflow's state, Run All, Stop All and Retry Failed.
+//! toolbar with the workflow's state, the current run's inputs, Run All,
+//! Stop All and Retry Failed. Run All on a workflow with `inputs` first
+//! shows their form over the graph (see `form`).
 //!
 //! The graph follows the buffer, 200 ms after the last edit: a file that
 //! does not parse shows its problems in a banner (with line and column;
@@ -38,15 +40,17 @@ use gpui::{
 };
 use text::Buffer;
 use workflow::{
-    ArtifactTarget, GraphLayout, Metrics, Outcome, Ready, Status, Step, StepNode, StepSpan,
-    StepState, View as Placement, Workflow, layout::Node as Place,
+    ArtifactTarget, GraphLayout, InputValues, Metrics, Outcome, Ready, Status, Step, StepNode,
+    StepSpan, StepState, View as Placement, Workflow, layout::Node as Place,
 };
 
 use super::{
-    ActiveRun, RetryFailed, RunAll, Source, StopAll, Workflows, file_stem, location_of,
-    outcome_color, outcome_text, workflow_id,
+    ActiveRun, RetryFailed, RunAll, Source, StopAll, Workflows, file_stem,
+    form::{self, InputForm, InputFormEvent},
+    location_of, outcome_color, outcome_text, workflow_id,
 };
 use crate::{
+    debugger::panel::Tooltip,
     editor::{Editor, EditorEvent},
     project::Project,
     selectable::selectable,
@@ -162,6 +166,10 @@ pub struct WorkflowView {
     /// A step without a project whose terminal shows under the details.
     host_terminal: Option<String>,
     notice: Option<SharedString>,
+    /// The inputs form, while Run All waits for it.
+    form: Option<(Entity<InputForm>, Subscription)>,
+    /// Give the editor the focus back on the next frame (the form had it).
+    refocus: bool,
     _reparse: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -469,6 +477,8 @@ impl WorkflowView {
             panning: None,
             host_terminal: None,
             notice: None,
+            form: None,
+            refocus: false,
             _reparse: None,
             _subscriptions: subscriptions,
         };
@@ -609,8 +619,13 @@ impl WorkflowView {
         }
     }
 
-    /// Run All: saves the file if it has edits, then runs it afresh.
+    /// Run All: saves the file if it has edits, then runs it afresh; a
+    /// workflow with inputs asks for them first (with the form open, Run
+    /// All is its Run).
     pub fn run_all(&mut self, cx: &mut Context<Self>) {
+        if let Some((form, _)) = &self.form {
+            return form.update(cx, |form, cx| form.submit(cx));
+        }
         self.notice = None;
         let editor = self.editor.clone();
         if editor.read(cx).buffer().is_dirty() && !editor.update(cx, |editor, cx| editor.save(cx)) {
@@ -619,18 +634,51 @@ impl WorkflowView {
         }
         let text = editor.read(cx).text();
         match workflow::parse(&text, &file_stem(&self.path)) {
-            Ok(parsed) => {
+            Ok(parsed) if parsed.inputs.is_empty() => {
                 let id = self.id.clone();
                 self.workflows.update(cx, |workflows, cx| {
-                    workflows.start_parsed(id, Arc::new(parsed), cx);
+                    workflows.start_parsed(id, Arc::new(parsed), InputValues::default(), cx);
                 });
             }
+            Ok(parsed) => self.open_form(Arc::new(parsed), cx),
             Err(error) => {
                 let first = error.lines().next().unwrap_or_default();
                 self.notice = Some(format!("Cannot run: {first}").into());
             }
         }
         self.reparse(cx);
+    }
+
+    /// Shows the inputs form for `workflow`, prefilled with the values it
+    /// last ran with; its Run starts it (and remembers them).
+    fn open_form(&mut self, workflow: Arc<Workflow>, cx: &mut Context<Self>) {
+        let remembered = form::remembered(&self.id);
+        let form = cx.new(|cx| InputForm::new(workflow, remembered.as_ref(), cx));
+        let subscription = cx.subscribe(&form, |this, _, event, cx| {
+            match event {
+                InputFormEvent::Run(workflow, values) => {
+                    let id = this.id.clone();
+                    if let Err(err) = form::remember(&id, values) {
+                        this.notice = Some(format!("Could not remember the inputs: {err}").into());
+                    }
+                    let (workflow, values) = (workflow.clone(), values.clone());
+                    this.workflows.update(cx, |workflows, cx| {
+                        workflows.start_parsed(id, workflow, values, cx);
+                    });
+                }
+                InputFormEvent::Cancelled => {}
+            }
+            this.form = None;
+            this.refocus = true;
+            cx.notify();
+        });
+        self.form = Some((form, subscription));
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(super) fn form(&self) -> Option<Entity<InputForm>> {
+        self.form.as_ref().map(|(form, _)| form.clone())
     }
 
     fn stop_all(&mut self, cx: &mut Context<Self>) {
@@ -796,6 +844,10 @@ impl WorkflowView {
                 .iter()
                 .any(|step| matches!(step.status, Status::Failed(_)))
         });
+        // The run's inputs, `env=dev · branch=main` (all of it on hover).
+        let inputs = active
+            .map(|active| active.inputs.summary())
+            .filter(|summary| !summary.is_empty());
         div()
             .flex_none()
             .h(px(34.))
@@ -826,6 +878,22 @@ impl WorkflowView {
                     .text_color(theme::muted())
                     .child(selectable("workflow-path", self.path.display().to_string())),
             )
+            .children(inputs.map(|summary| {
+                let full = SharedString::from(summary);
+                let tooltip = full.clone();
+                div()
+                    .id("workflow-inputs-summary")
+                    .flex_shrink()
+                    .min_w_0()
+                    .max_w(px(360.))
+                    .px_1p5()
+                    .rounded_sm()
+                    .bg(theme::hover_row())
+                    .truncate()
+                    .text_xs()
+                    .tooltip(move |window, cx| Tooltip::view(tooltip.clone(), window, cx))
+                    .child(selectable("workflow-inputs-text", full))
+            }))
             .children(self.notice.clone().map(|notice| {
                 div()
                     .flex_none()
@@ -2071,7 +2139,10 @@ impl Focusable for WorkflowView {
 }
 
 impl Render for WorkflowView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.refocus) {
+            window.focus(&self.editor.focus_handle(cx));
+        }
         let now = Instant::now();
         let workflow = self.graph.workflow.clone();
         let split_bounds = self.split_bounds.clone();
@@ -2162,7 +2233,8 @@ impl Render for WorkflowView {
             )
             .child(graph)
             .children(self.render_banner(cx))
-            .children(self.render_zoom(cx));
+            .children(self.render_zoom(cx))
+            .children(self.form.as_ref().map(|(form, _)| form.clone()));
         // The graph, and under it the selected step's details; with its
         // terminal they form a pane of their own, resized by the divider
         // between them and the graph (a double-click maximizes it).

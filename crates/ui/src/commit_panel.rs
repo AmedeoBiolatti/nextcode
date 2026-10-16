@@ -424,8 +424,9 @@ fn row_text(id: &'static str, text: impl Into<SharedString>) -> SelectableText {
         .right_click_through()
 }
 
-/// A checkbox drawn in the theme's colors.
-fn checkbox(check: Check) -> gpui::Div {
+/// A checkbox drawn in the theme's colors (also the workflow inputs
+/// form's).
+pub(crate) fn checkbox(check: Check) -> gpui::Div {
     let on = check != Check::Unchecked;
     div()
         .size(px(13.))

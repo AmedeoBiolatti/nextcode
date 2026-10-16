@@ -9,9 +9,11 @@
 //! and commands, interrupt and kill them, check artifacts) and feeds the
 //! results back. [`layout`] places the steps of a workflow's graph (a
 //! group as a card, or expanded around its own graph), [`source`] maps
-//! steps to their text and [`vars`] reads `${steps.…}` variables.
+//! steps to their text, [`vars`] reads `${steps.…}` variables and
+//! [`inputs`] the parameters a run asks for (`${inputs.…}`).
 
 pub mod file;
+pub mod inputs;
 pub mod layout;
 pub mod output;
 pub mod run;
@@ -23,8 +25,11 @@ pub use file::{
     Artifact, ArtifactTarget, DEFAULT_STOP_GRACE_S, MAX_STOP_GRACE_S, ProjectSpec, Ready, Step,
     TEMPLATE, Workflow, check, parse,
 };
+pub use inputs::{Choice, Input, InputKind, InputValue, InputValues};
 pub use layout::{GraphLayout, Metrics, View, layout_workflow};
 pub use output::{AnsiStripper, OutputWatcher, urls_in};
 pub use run::{ArtifactState, Change, CheckResult, Effect, Outcome, Run, Status, StepState};
-pub use source::{Problem, StepSpan, path_at, span_of, step_at, step_spans};
+pub use source::{
+    InputSpan, Problem, StepSpan, input_spans, path_at, span_of, step_at, step_spans,
+};
 pub use tree::{StepNode, flatten};

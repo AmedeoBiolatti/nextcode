@@ -1,8 +1,9 @@
 //! Where things are in a workflow file's text: each step object's byte
 //! range, its `"id"`, the ids its `needs` and `after` list, and the steps
-//! of a group inside it. Read from the raw text with a tolerant scanner
-//! (comments, trailing commas, unfinished files), so an editor can map
-//! steps to lines and back even while the file does not parse.
+//! of a group inside it; each input object's range, `"id"` and keys. Read
+//! from the raw text with a tolerant scanner (comments, trailing commas,
+//! unfinished files), so an editor can map steps to lines and back even
+//! while the file does not parse.
 
 /// One element of a `steps` array (the top level's or a group's), in
 /// file order.
@@ -28,6 +29,29 @@ impl StepSpan {
     /// Where its `"id"` is, else where it starts.
     pub fn id_or_start(&self) -> usize {
         self.id_offset.unwrap_or(self.start)
+    }
+}
+
+/// One element of the top-level `inputs` array, in file order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputSpan {
+    /// Byte range of the object, braces included (to the end of the text
+    /// when it is not closed).
+    pub start: usize,
+    pub end: usize,
+    /// The `id` value, if it is a string.
+    pub id: Option<String>,
+    /// Each key of the object and where it starts.
+    pub keys: Vec<(String, usize)>,
+}
+
+impl InputSpan {
+    /// Where key `key` is, else where the object starts.
+    pub fn key_or_start(&self, key: &str) -> usize {
+        self.keys
+            .iter()
+            .find(|(known, _)| known == key)
+            .map_or(self.start, |(_, at)| *at)
     }
 }
 
@@ -86,6 +110,9 @@ enum Role {
     Step(usize),
     Needs(usize),
     After(usize),
+    /// The top-level `inputs` array.
+    Inputs,
+    Input(usize),
     Other,
 }
 
@@ -101,17 +128,31 @@ struct Frame {
 /// element, objects or not, so indices match the array's), each with the
 /// elements of its own `steps` (a group's) nested the same way.
 pub fn step_spans(text: &str) -> Vec<StepSpan> {
+    scan(text).0
+}
+
+/// The elements of the top-level `inputs` array, in order (one per
+/// element, objects or not).
+pub fn input_spans(text: &str) -> Vec<InputSpan> {
+    scan(text).1
+}
+
+/// [`step_spans`] and [`input_spans`] in one pass.
+pub(crate) fn scan(text: &str) -> (Vec<StepSpan>, Vec<InputSpan>) {
     let bytes = text.as_bytes();
     // Every span, in the order they start, with its parent's index.
     let mut spans: Vec<(StepSpan, Option<usize>)> = Vec::new();
+    let mut inputs: Vec<InputSpan> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
     let mut i = 0;
 
     // The role of a value starting at `start`; takes the parent object's
-    // key, and opens a span for an element of a `steps` array.
+    // key, and opens a span for an element of a `steps` or `inputs`
+    // array.
     fn begin_value(
         stack: &mut [Frame],
         spans: &mut Vec<(StepSpan, Option<usize>)>,
+        inputs: &mut Vec<InputSpan>,
         start: usize,
         end: usize,
     ) -> (Role, Option<(String, usize)>) {
@@ -125,6 +166,16 @@ pub fn step_spans(text: &str) -> Vec<StepSpan> {
             key.as_ref().map(|(key, _)| key.as_str()),
         ) {
             (Role::Root, true, Some("steps")) => Role::Steps(None),
+            (Role::Root, true, Some("inputs")) => Role::Inputs,
+            (Role::Inputs, false, _) => {
+                inputs.push(InputSpan {
+                    start,
+                    end,
+                    id: None,
+                    keys: Vec::new(),
+                });
+                Role::Input(inputs.len() - 1)
+            }
             (Role::Step(index), true, Some("steps")) => Role::Steps(Some(index)),
             (Role::Steps(parent), false, _) => {
                 spans.push((
@@ -173,7 +224,7 @@ pub fn step_spans(text: &str) -> Vec<StepSpan> {
             }
             b'{' | b'[' => {
                 let object = bytes[i] == b'{';
-                let (role, _) = begin_value(&mut stack, &mut spans, i, text.len());
+                let (role, _) = begin_value(&mut stack, &mut spans, &mut inputs, i, text.len());
                 stack.push(Frame {
                     object,
                     role,
@@ -183,10 +234,10 @@ pub fn step_spans(text: &str) -> Vec<StepSpan> {
                 i += 1;
             }
             b'}' | b']' => {
-                if let Some(frame) = stack.pop()
-                    && let Role::Step(index) = frame.role
-                {
-                    spans[index].0.end = i + 1;
+                match stack.pop().map(|frame| frame.role) {
+                    Some(Role::Step(index)) => spans[index].0.end = i + 1,
+                    Some(Role::Input(index)) => inputs[index].end = i + 1,
+                    _ => {}
                 }
                 i += 1;
             }
@@ -216,13 +267,19 @@ pub fn step_spans(text: &str) -> Vec<StepSpan> {
                     && top.object
                     && top.expecting_key
                 {
+                    if let Role::Input(index) = top.role {
+                        inputs[index].keys.push((value.clone(), start));
+                    }
                     top.key = Some((value, start));
                     top.expecting_key = false;
                     continue;
                 }
                 let parent = stack.last().map(|top| top.role);
-                let (role, key) = begin_value(&mut stack, &mut spans, start, i);
+                let (role, key) = begin_value(&mut stack, &mut spans, &mut inputs, start, i);
                 match (parent, role, key) {
+                    (Some(Role::Input(index)), _, Some((key, _))) if key == "id" => {
+                        inputs[index].id = Some(value);
+                    }
                     (Some(Role::Step(index)), _, Some((key, key_at))) if key == "id" => {
                         spans[index].0.id = Some(value);
                         spans[index].0.id_offset = Some(key_at);
@@ -243,7 +300,7 @@ pub fn step_spans(text: &str) -> Vec<StepSpan> {
                 {
                     i += 1;
                 }
-                begin_value(&mut stack, &mut spans, start, i);
+                begin_value(&mut stack, &mut spans, &mut inputs, start, i);
             }
         }
     }
@@ -263,7 +320,7 @@ pub fn step_spans(text: &str) -> Vec<StepSpan> {
             None => top.insert(0, span),
         }
     }
-    top
+    (top, inputs)
 }
 
 /// The span at `path` (indices in the top-level `steps`, then in each
@@ -416,6 +473,31 @@ mod tests {
         let ids: Vec<Option<&str>> = spans.iter().map(|span| span.id.as_deref()).collect();
         assert_eq!(ids, [None, Some("x")]);
         assert_eq!(&text[spans[0].start..spans[0].end], "1");
+    }
+
+    #[test]
+    fn inputs_are_mapped_with_their_keys() {
+        let text = r#"{
+  "inputs": [
+    { "id": "env", "type": "choice", "default": "qa" },
+    "stray",
+    { "type": "number", "options": { "id": "inner" } }
+  ],
+  "steps": [{ "id": "a", "env": { "inputs": [{ "id": "no" }] } }]
+}"#;
+        let inputs = input_spans(text);
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs[0].id.as_deref(), Some("env"));
+        let keys: Vec<&str> = inputs[0].keys.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["id", "type", "default"]);
+        assert!(text[inputs[0].key_or_start("default")..].starts_with("\"default\""));
+        assert!(text[inputs[0].start..inputs[0].end].ends_with('}'));
+        assert_eq!(&text[inputs[1].start..inputs[1].end], "\"stray\"");
+        // Nested objects' ids are not the input's.
+        assert_eq!(inputs[2].id, None);
+        assert_eq!(inputs[2].key_or_start("missing"), inputs[2].start);
+        // The steps are mapped as before.
+        assert_eq!(step_spans(text)[0].id.as_deref(), Some("a"));
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! The workflow file: JSON with comments and trailing commas,
-//! `{ "name": "...", "steps": [ ... ] }`, parsed into [`Workflow`] and
-//! validated (ids, `needs` and `after`, what each step does and when it is
-//! ready, its artifacts and `${steps.…}` variables). A step with `steps`
-//! of its own is a group: its `needs` and `after` gate all its steps,
-//! which inherit its `project`, `cwd` and `env`; ids are unique among
-//! siblings, `needs` and `after` name siblings.
+//! `{ "name": "...", "inputs"?: [ ... ], "steps": [ ... ] }`, parsed into
+//! [`Workflow`] and validated (inputs, ids, `needs` and `after`, what each
+//! step does and when it is ready, its artifacts, `${steps.…}` and
+//! `${inputs.…}` variables). A step with `steps` of its own is a group:
+//! its `needs` and `after` gate all its steps, which inherit its
+//! `project`, `cwd` and `env`; ids are unique among siblings, `needs` and
+//! `after` name siblings.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -14,6 +15,7 @@ use std::{
 use serde_json::{Map, Value};
 
 use crate::{
+    inputs::{self, Input, InputValues},
     source::{self, Problem},
     tree,
     vars::{self, ArtifactRef, StepField},
@@ -28,7 +30,29 @@ pub const MAX_STOP_GRACE_S: u64 = 3600;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workflow {
     pub name: String,
+    /// What a run asks for, in order (see [`crate::inputs`]).
+    pub inputs: Vec<Input>,
     pub steps: Vec<Step>,
+}
+
+impl Workflow {
+    /// A copy with every `${inputs.<id>}` in its steps (at any depth:
+    /// `run`, `check`, `cwd`, `env` values, artifact paths, `project`)
+    /// replaced by its value; what a run of it does.
+    pub fn with_inputs(&self, values: &InputValues) -> Workflow {
+        let mut resolved = self.clone();
+        if !values.is_empty() {
+            let replace = |text: &mut String| {
+                if text.contains("${inputs.") {
+                    *text = inputs::substitute(text, values);
+                }
+            };
+            for step in &mut resolved.steps {
+                step.map_texts(&replace);
+            }
+        }
+        resolved
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +150,35 @@ impl Step {
             .chain(self.artifacts.iter().map(|artifact| artifact.target.text()))
     }
 
+    /// [`Step::texts`] and the `project`'s: where `${inputs.…}` works.
+    pub fn input_texts(&self) -> impl Iterator<Item = &str> {
+        self.texts()
+            .chain(self.project.iter().flat_map(ProjectSpec::texts))
+    }
+
+    /// Applies `change` to each of [`Step::input_texts`], in this step and
+    /// every step inside it.
+    fn map_texts(&mut self, change: &impl Fn(&mut String)) {
+        for text in [&mut self.run, &mut self.check, &mut self.cwd]
+            .into_iter()
+            .flatten()
+        {
+            change(text);
+        }
+        self.env.values_mut().for_each(change);
+        for artifact in &mut self.artifacts {
+            match &mut artifact.target {
+                ArtifactTarget::Path(text) | ArtifactTarget::Url(text) => change(text),
+            }
+        }
+        if let Some(project) = &mut self.project {
+            project.map_texts(change);
+        }
+        for step in &mut self.steps {
+            step.map_texts(change);
+        }
+    }
+
     /// The artifact a `${steps.<id>.artifacts.…}` variable names.
     pub fn artifact(&self, by: &ArtifactRef) -> Option<usize> {
         match by {
@@ -214,6 +267,37 @@ pub enum ProjectSpec {
     Typed(String),
 }
 
+impl ProjectSpec {
+    /// Its paths, distro and config.
+    pub fn texts(&self) -> Vec<&str> {
+        match self {
+            Self::Local(path) | Self::Typed(path) => vec![path],
+            Self::Wsl { distro, path } => vec![distro, path],
+            Self::DevContainer { folder, config } => {
+                let mut texts = folder.texts();
+                texts.extend(config.as_deref());
+                texts
+            }
+        }
+    }
+
+    fn map_texts(&mut self, change: &impl Fn(&mut String)) {
+        match self {
+            Self::Local(path) | Self::Typed(path) => change(path),
+            Self::Wsl { distro, path } => {
+                change(distro);
+                change(path);
+            }
+            Self::DevContainer { folder, config } => {
+                folder.map_texts(change);
+                if let Some(config) = config {
+                    change(config);
+                }
+            }
+        }
+    }
+}
+
 /// The keys a step may have.
 const STEP_KEYS: &[&str] = &[
     "id",
@@ -271,13 +355,15 @@ enum At {
     /// Where this text first occurs in that step (else in its groups,
     /// innermost first: it may inherit it).
     Text(StepPath, String),
+    /// The input at this index in `inputs`: at this key, else the input.
+    Input(usize, Option<&'static str>),
 }
 
 /// [`parse`], with each problem located in `text` where possible: JSON
 /// syntax errors where the parser stopped, step problems at the step,
-/// unknown `needs`/`after` at the id, `${steps.…}` problems at the
-/// variable, duplicates and cycles at the step's `"id"` (nested steps
-/// included).
+/// unknown `needs`/`after` at the id, `${steps.…}` and `${inputs.…}`
+/// problems at the variable, duplicates and cycles at the step's `"id"`
+/// (nested steps included), input problems at the key they are about.
 pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> {
     let value: Value = match serde_json::from_str(&devcontainer::jsonc::to_json(text)) {
         Ok(value) => value,
@@ -308,6 +394,22 @@ pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> 
             fallback_name.to_owned()
         }
     };
+    let (inputs, input_ids) = match root.remove("inputs") {
+        None => (Vec::new(), Vec::new()),
+        Some(Value::Array(values)) => {
+            let (inputs, ids, problems) = inputs::parse(values);
+            errors.extend(
+                problems
+                    .into_iter()
+                    .map(|(index, (message, key))| (message, At::Input(index, key))),
+            );
+            (inputs, ids)
+        }
+        Some(_) => {
+            errors.push(("`inputs` must be an array of inputs".to_owned(), At::File));
+            (Vec::new(), Vec::new())
+        }
+    };
     let steps = match root.remove("steps") {
         Some(Value::Array(steps)) => steps,
         Some(_) => return Err(file_problem("`steps` must be an array")),
@@ -315,13 +417,18 @@ pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> 
     };
     // `$schema`, `description` and other documentation keys are allowed.
     let steps = parse_steps(steps, &[], &mut errors);
-    if errors.is_empty() {
+    if errors.iter().all(|(_, at)| matches!(at, At::Input(..))) {
         errors.extend(validate(&steps));
+        errors.extend(validate_input_refs(&steps, &input_ids));
     }
     if errors.is_empty() {
-        return Ok(Workflow { name, steps });
+        return Ok(Workflow {
+            name,
+            inputs,
+            steps,
+        });
     }
-    let spans = source::step_spans(text);
+    let (spans, input_spans) = source::scan(text);
     Err(errors
         .into_iter()
         .map(|(message, at)| {
@@ -344,6 +451,9 @@ pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> 
                             .map(|at| span.start + at)
                     })
                     .or_else(|| source::span_at(&spans, &path).map(|span| span.id_or_start())),
+                At::Input(index, key) => input_spans
+                    .get(index)
+                    .map(|span| key.map_or(span.start, |key| span.key_or_start(key))),
             };
             Problem { message, offset }
         })
@@ -952,6 +1062,54 @@ fn validate_variables(steps: &[Step]) -> Vec<(String, At)> {
     errors
 }
 
+/// `${inputs.<id>}` variables name a declared input; checked in every
+/// step and group (each in what it writes itself).
+fn validate_input_refs(steps: &[Step], ids: &[String]) -> Vec<(String, At)> {
+    fn visit(
+        steps: &[Step],
+        ids: &[String],
+        path: &mut Vec<usize>,
+        qualified: &str,
+        errors: &mut Vec<(String, At)>,
+    ) {
+        for (index, step) in steps.iter().enumerate() {
+            let name = match qualified {
+                "" => step.id.clone(),
+                group => format!("{group}/{}", step.id),
+            };
+            path.push(index);
+            for text in step.input_texts() {
+                for found in inputs::input_refs(text) {
+                    let (problem, needle) = match found {
+                        Err(err) => (err, text.find("${inputs.").map(|at| &text[at..])),
+                        Ok(found) if ids.iter().any(|id| id == found.id) => continue,
+                        Ok(found) => {
+                            let known = match ids {
+                                [] => "the workflow has no `inputs`".to_owned(),
+                                ids => format!("inputs: {}", ids.join(", ")),
+                            };
+                            (
+                                format!("`{}` names no input `{}` ({known})", found.text, found.id),
+                                Some(found.text),
+                            )
+                        }
+                    };
+                    let at = match needle {
+                        Some(needle) => At::Text(path.clone(), needle.to_owned()),
+                        None => At::StepId(path.clone()),
+                    };
+                    errors.push((format!("`{name}`: {problem}"), at));
+                }
+            }
+            visit(&step.steps, ids, path, &name, errors);
+            path.pop();
+        }
+    }
+    let mut errors = Vec::new();
+    visit(steps, ids, &mut Vec::new(), "", &mut errors);
+    errors
+}
+
 /// A new workflow file: every field shown and explained.
 pub const TEMPLATE: &str = r#"// A workflow starts a development environment in one go: checks, commands
 // in the terminals of several projects (opened as needed, dev containers
@@ -961,6 +1119,27 @@ pub const TEMPLATE: &str = r#"// A workflow starts a development environment in 
 // palette has "Run Workflow: <name>" too.
 {
   "name": "My environment",
+  // Asked for when it runs (a small form; the last values are
+  // remembered): string, number (min, max, integer), boolean or choice;
+  // ${inputs.<id>} puts the value into run, check, cwd, env, artifacts
+  // and project.
+  "inputs": [
+    {
+      "id": "profile",
+      "label": "Profile",
+      "type": "choice",
+      "options": ["dev", "staging", { "value": "prod", "label": "Production" }],
+      "default": "dev",
+      "description": "Settings the API starts with"
+    },
+    {
+      "id": "branch",
+      "type": "string",
+      "default": "main",
+      "placeholder": "branch name",
+      "required": true
+    }
+  ],
   "steps": [
     {
       // Unique id, used by `needs`, `after` and ${steps.<id>.…}.
@@ -988,7 +1167,7 @@ pub const TEMPLATE: &str = r#"// A workflow starts a development environment in 
       // exit (default) | output (regex) | port | manual | delay_ms.
       "ready": { "port": 8000 },
       "timeout_s": 300,
-      "env": { "LOG_LEVEL": "debug" },
+      "env": { "LOG_LEVEL": "debug", "PROFILE": "${inputs.profile}" },
       // Relative to the project; ${workspaceFolder}, ${userHome} and
       // ${env:NAME} work in run, check, cwd and env.
       "cwd": "."
@@ -997,7 +1176,7 @@ pub const TEMPLATE: &str = r#"// A workflow starts a development environment in 
       "id": "web",
       "needs": ["api"],
       "project": { "wsl": "Ubuntu", "path": "~/web" },
-      "run": "npm run dev",
+      "run": "git switch ${inputs.branch} && npm run dev",
       "ready": { "output": "ready in \\d+ ms" },
       // http(s) URLs the command prints until it is ready open in the
       // browser (each once).
@@ -1617,5 +1796,158 @@ mod tests {
              this step or of its groups\n`g/b`: `${steps.top.status}` refers to `top`, which is \
              not in the `needs` or `after` of this step or of its groups"
         );
+    }
+
+    #[test]
+    fn inputs_are_declared_referenced_and_substituted_at_any_depth() {
+        let workflow = parse(
+            r#"{
+              "inputs": [
+                { "id": "env", "type": "choice", "options": ["dev", "prod"], "default": "dev" },
+                { "id": "workers", "type": "number", "default": 4 },
+                { "id": "clean", "type": "boolean" },
+              ],
+              "steps": [
+                { "id": "a", "run": "deploy ${inputs.env} -j ${inputs.workers}",
+                  "check": "test ${inputs.clean}", "cwd": "out/${inputs.env}",
+                  "env": { "ENV": "${inputs.env}" },
+                  "artifacts": ["logs/${inputs.env}.log"],
+                  "project": { "wsl": "Ubuntu", "path": "~/${inputs.env}" } },
+                { "id": "g", "project": { "devcontainer": { "local": "C:/${inputs.env}" },
+                  "config": "${inputs.env}.json" },
+                  "steps": [{ "id": "inner", "steps": [
+                    { "id": "deep", "run": "echo ${inputs.env}-${inputs.workers} ${env:HOME}" }] }] }
+              ]
+            }"#,
+            "f",
+        )
+        .unwrap();
+        assert_eq!(workflow.inputs.len(), 3);
+        let mut values = inputs::defaults(&workflow.inputs);
+        assert_eq!(values.summary(), "env=dev · workers=4 · clean=false");
+        values = inputs::resolve(
+            &workflow.inputs,
+            serde_json::json!({ "env": "prod", "workers": 8 })
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        let resolved = workflow.with_inputs(&values);
+        let a = &resolved.steps[0];
+        assert_eq!(a.run.as_deref(), Some("deploy prod -j 8"));
+        assert_eq!(a.check.as_deref(), Some("test false"));
+        assert_eq!(a.cwd.as_deref(), Some("out/prod"));
+        assert_eq!(a.env["ENV"], "prod");
+        assert_eq!(a.artifacts[0].target.text(), "logs/prod.log");
+        assert_eq!(
+            a.project,
+            Some(ProjectSpec::Wsl {
+                distro: "Ubuntu".into(),
+                path: "~/prod".into()
+            })
+        );
+        let g = &resolved.steps[1];
+        assert_eq!(
+            g.project,
+            Some(ProjectSpec::DevContainer {
+                folder: Box::new(ProjectSpec::Local("C:/prod".into())),
+                config: Some("prod.json".into())
+            })
+        );
+        assert_eq!(
+            g.steps[0].steps[0].run.as_deref(),
+            Some("echo prod-8 ${env:HOME}"),
+            "other variables stay"
+        );
+        // The file's own steps are unchanged.
+        assert_eq!(
+            workflow.steps[0].run.as_deref(),
+            Some("deploy ${inputs.env} -j ${inputs.workers}")
+        );
+        assert!(parse(r#"{"steps": []}"#, "f").unwrap().inputs.is_empty());
+    }
+
+    #[test]
+    fn input_problems_point_at_where_they_are() {
+        let located = |text: &str| -> Vec<(String, Option<(usize, usize)>)> {
+            check(text, "f")
+                .unwrap_err()
+                .into_iter()
+                .map(|problem| {
+                    let place = problem.line_column(text);
+                    (problem.message, place)
+                })
+                .collect()
+        };
+        let text = r#"{
+  "inputs": [
+    { "id": "env", "type": "choice", "options": ["dev"], "default": "qa" },
+    { "id": "n", "type": "number", "max": 64, "default": 100 },
+    { "id": "env" },
+    { "id": "x", "colour": 1 }
+  ],
+  "steps": [{ "id": "a", "run": "x" }]
+}"#;
+        assert_eq!(
+            located(text),
+            [
+                (
+                    "input `env`: `default` `qa` is not one of dev".to_owned(),
+                    Some((3, 58))
+                ),
+                (
+                    "input `n`: `default` must be ≤ 64".to_owned(),
+                    Some((4, 47))
+                ),
+                ("duplicate input id `env`".to_owned(), Some((5, 7))),
+                (
+                    format!(
+                        "input `x`: unknown key `colour` (known: {})",
+                        inputs::INPUT_KEYS.join(", ")
+                    ),
+                    Some((6, 5))
+                ),
+            ]
+        );
+        // Unknown inputs in steps, at the variable (in a group's project
+        // and a nested step too).
+        let text = r#"{
+  "inputs": [{ "id": "env" }],
+  "steps": [
+    { "id": "a", "run": "echo ${inputs.env} ${inputs.nope}" },
+    { "id": "g", "project": { "local": "C:/${inputs.where}" }, "steps": [
+      { "id": "b", "run": "y", "env": { "X": "${inputs.}" } }] }
+  ]
+}"#;
+        assert_eq!(
+            located(text),
+            [
+                (
+                    "`a`: `${inputs.nope}` names no input `nope` (inputs: env)".to_owned(),
+                    Some((4, 45))
+                ),
+                (
+                    "`g`: `${inputs.where}` names no input `where` (inputs: env)".to_owned(),
+                    Some((5, 44))
+                ),
+                (
+                    "`g/b`: `${inputs.}` names no input".to_owned(),
+                    Some((6, 47))
+                ),
+            ]
+        );
+        assert_eq!(
+            steps(r#"{"steps": [{"id": "a", "run": "${inputs.env}"}]}"#).unwrap_err(),
+            "`a`: `${inputs.env}` names no input `env` (the workflow has no `inputs`)"
+        );
+        assert_eq!(
+            steps(r#"{"inputs": {}, "steps": []}"#).unwrap_err(),
+            "`inputs` must be an array of inputs"
+        );
+        // Step problems are reported with input problems.
+        let both =
+            steps(r#"{"inputs": [{"id": "a", "type": "x"}], "steps": [{"id": "s"}]}"#).unwrap_err();
+        assert!(both.contains("unknown type `x`"), "{both}");
+        assert!(both.contains("needs `run`, `check` or `ready`"), "{both}");
     }
 }

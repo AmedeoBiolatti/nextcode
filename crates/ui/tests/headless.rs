@@ -2325,6 +2325,114 @@ fn headless_mode_runs_a_workflow_with_a_group() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// A workflow with inputs: listed with their specs, run with values (a
+/// step in a group echoes them), defaults for the others, every problem
+/// with the values reported.
+#[test]
+fn headless_mode_runs_a_workflow_with_inputs() {
+    let root = std::env::temp_dir().join(format!("next_code_wf_inputs_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    for dir in ["main/.next_code/workflows", "config"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let root = if cfg!(windows) {
+        root
+    } else {
+        root.canonicalize().unwrap()
+    };
+    let main = root.join("main");
+    let deploy = json!({
+        "name": "Deploy",
+        "inputs": [
+            { "id": "env", "label": "Environment", "type": "choice",
+              "options": ["dev", { "value": "prod", "label": "Production" }], "default": "dev" },
+            { "id": "branch", "type": "string", "required": true, "placeholder": "branch name" },
+            { "id": "workers", "type": "number", "default": 4, "min": 1, "max": 64, "integer": true },
+            { "id": "clean", "type": "boolean" }
+        ],
+        "steps": [{
+            "id": "svc", "project": { "local": main }, "env": { "BRANCH": "${inputs.branch}" },
+            "steps": [{ "id": "show", "run": "echo ${inputs.env}-${inputs.workers}-${inputs.clean}" }]
+        }]
+    });
+    fs::write(
+        main.join(".next_code/workflows/deploy.jsonc"),
+        format!("{deploy:#}"),
+    )
+    .unwrap();
+    let mut headless = Headless::launch(
+        &[main.as_os_str()],
+        &[("XDG_CONFIG_HOME", &root.join("config"))],
+    );
+    let ready = headless.next(|line| line["event"].is_string());
+    assert_eq!(ready["event"], "ready", "{ready}");
+
+    let list = headless.call(json!({ "cmd": "workflows_list" }));
+    let listed = list["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|found| found["name"] == "Deploy")
+        .unwrap()
+        .clone();
+    assert_eq!(listed["error"], Value::Null, "{listed}");
+    let inputs = &listed["inputs"];
+    assert_eq!(inputs[0]["label"], "Environment");
+    assert_eq!(inputs[0]["type"], "choice");
+    assert_eq!(
+        inputs[0]["options"],
+        json!([{ "value": "dev", "label": "dev" }, { "value": "prod", "label": "Production" }])
+    );
+    assert_eq!(inputs[1]["required"], true);
+    assert_eq!(inputs[1]["placeholder"], "branch name");
+    assert_eq!(inputs[2]["default"], 4);
+    assert_eq!(inputs[2]["max"], 64.0);
+    assert_eq!(inputs[3]["default"], false);
+
+    // Every problem at once; nothing runs.
+    let refused = headless.call(json!({
+        "cmd": "workflow_run", "name": "Deploy",
+        "inputs": { "env": "qa", "workers": 100, "colour": "red" }
+    }));
+    assert_eq!(refused["ok"], false, "{refused}");
+    let error = refused["error"].as_str().unwrap();
+    for problem in [
+        "unknown input `colour`",
+        "input `env`: `qa` is not one of dev, prod",
+        "input `branch`: required",
+        "input `workers`: must be ≤ 64",
+    ] {
+        assert!(error.contains(problem), "{problem}: {error}");
+    }
+    let not_object =
+        headless.call(json!({ "cmd": "workflow_run", "name": "Deploy", "inputs": [1] }));
+    assert_eq!(
+        not_object["error"], "`inputs` must be an object",
+        "{not_object}"
+    );
+
+    // Strings parse for numbers and booleans; the rest get defaults.
+    let run = headless.call(json!({
+        "cmd": "workflow_run", "name": "Deploy",
+        "inputs": { "branch": "feature", "workers": "8", "clean": "true" }
+    }));
+    assert_eq!(run["ok"], true, "{run}");
+    let show = step_event(&mut headless, "svc/show", "ready");
+    assert_eq!(show["status"], "ready", "{show}");
+    let status = status_until(&mut headless, "deploy.jsonc", |status| {
+        status["steps"][1]["last_line"] == "dev-8-true"
+    });
+    assert_eq!(
+        status["inputs"],
+        json!({ "env": "dev", "branch": "feature", "workers": 8, "clean": true }),
+        "{status}"
+    );
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
 /// A workflow step in a dev container: the container is brought up for
 /// the step, its command runs in a pty inside, and its port is seen
 /// through the agent.

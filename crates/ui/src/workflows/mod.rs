@@ -13,7 +13,9 @@
 //! Each workflow file opens as a window tab, a [`WorkflowView`]: the file
 //! in an editor beside a live graph of its steps (`view`), with Run All,
 //! Stop All and per-step actions. Run > Open Workflow… picks one
-//! ([`WorkflowPicker`]).
+//! ([`WorkflowPicker`]). A workflow with `inputs` asks for them first in a
+//! form over the graph (`form`); a run keeps its values (Retry and
+//! Restart reuse them).
 //!
 //! Commands: `run` steps start in a terminal tab of their project (named
 //! by `terminal`, else the title); without a project they run on this
@@ -33,7 +35,7 @@ use gpui::{
     Window, WindowId, actions,
 };
 use terminal::{Output, OutputTap};
-use workflow::{Effect, Outcome, ProjectSpec, Run, Status, Workflow};
+use workflow::{Effect, InputValues, Outcome, ProjectSpec, Run, Status, Workflow};
 
 use crate::{
     project::{Location, Project},
@@ -43,6 +45,7 @@ use crate::{
 };
 
 mod commands;
+mod form;
 mod picker;
 mod view;
 
@@ -70,6 +73,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-f2", StopAll, ctx),
     ]);
     picker::bind_keys(cx);
+    form::bind_keys(cx);
 }
 
 /// Marks workflow tabs in the tab bar.
@@ -303,6 +307,8 @@ pub struct ActiveRun {
     /// [`Discovered::id`] of its file.
     pub workflow_id: String,
     pub run: Run,
+    /// What it was started with (its steps have them substituted).
+    pub inputs: InputValues,
     steps: Vec<StepRuntime>,
     /// The outcome last reported to listeners.
     reported: Outcome,
@@ -499,8 +505,15 @@ impl Workflows {
         })
     }
 
-    /// Starts workflow `id` as last read.
-    pub fn start(&mut self, id: &str, cx: &mut Context<Self>) -> Result<u64, String> {
+    /// Starts workflow `id` as last read, with `inputs` (JSON by input id;
+    /// the others get their defaults); every invalid or missing value is
+    /// an error.
+    pub fn start(
+        &mut self,
+        id: &str,
+        inputs: &serde_json::Map<String, serde_json::Value>,
+        cx: &mut Context<Self>,
+    ) -> Result<u64, String> {
         let found = self
             .find(id)
             .ok_or_else(|| format!("no workflow `{id}`"))?
@@ -508,21 +521,25 @@ impl Workflows {
         let workflow = found
             .parsed
             .map_err(|err| format!("{} cannot run: {err}", found.name))?;
-        Ok(self.start_parsed(found.id, workflow, cx))
+        let values = workflow::inputs::resolve(&workflow.inputs, inputs)
+            .map_err(|problems| format!("{} cannot run: {}", found.name, problems.join("; ")))?;
+        Ok(self.start_parsed(found.id, workflow, values, cx))
     }
 
-    /// Starts `workflow` afresh as the workflow with id `workflow_id` (see
-    /// [`workflow_id`]); a run of it already going is stopped first (with
-    /// each step's grace) and its terminals reused: a step whose old
-    /// command still stops starts once that command is gone.
+    /// Starts `workflow` afresh with `inputs` as the workflow with id
+    /// `workflow_id` (see [`workflow_id`]); a run of it already going is
+    /// stopped first (with each step's grace) and its terminals reused: a
+    /// step whose old command still stops starts once that command is
+    /// gone.
     pub fn start_parsed(
         &mut self,
         workflow_id: String,
         workflow: Arc<Workflow>,
+        inputs: InputValues,
         cx: &mut Context<Self>,
     ) -> u64 {
         let now = Instant::now();
-        let mut run = Run::new((*workflow).clone());
+        let mut run = Run::new(workflow.with_inputs(&inputs));
         // The previous run's terminals are reused (replaced by title).
         let previous = self
             .runs
@@ -555,6 +572,7 @@ impl Workflows {
             id: id_number,
             workflow_id,
             run,
+            inputs,
             steps,
             reported: Outcome::Idle,
         });
