@@ -1,7 +1,10 @@
 //! The workflow file: JSON with comments and trailing commas,
 //! `{ "name": "...", "steps": [ ... ] }`, parsed into [`Workflow`] and
 //! validated (ids, `needs` and `after`, what each step does and when it is
-//! ready, its artifacts and `${steps.…}` variables).
+//! ready, its artifacts and `${steps.…}` variables). A step with `steps`
+//! of its own is a group: its `needs` and `after` gate all its steps,
+//! which inherit its `project`, `cwd` and `env`; ids are unique among
+//! siblings, `needs` and `after` name siblings.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -12,6 +15,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     source::{self, Problem},
+    tree,
     vars::{self, ArtifactRef, StepField},
 };
 
@@ -29,7 +33,7 @@ pub struct Workflow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
-    /// Unique within the workflow; `needs` refers to it.
+    /// Unique among its siblings (no `/`); `needs` refers to it.
     pub id: String,
     pub title: Option<String>,
     /// Steps that must be ready before this one starts.
@@ -59,12 +63,42 @@ pub struct Step {
     pub stop_grace_s: u64,
     /// Files and links it produces.
     pub artifacts: Vec<Artifact>,
+    /// A group's steps (empty for a step that does something).
+    pub steps: Vec<Step>,
 }
 
 impl Step {
     /// The title, else the id.
     pub fn label(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.id)
+    }
+
+    /// A group: it has steps of its own.
+    pub fn is_group(&self) -> bool {
+        !self.steps.is_empty()
+    }
+
+    /// A copy without its `steps`.
+    pub fn shallow(&self) -> Step {
+        Step {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            needs: self.needs.clone(),
+            after: self.after.clone(),
+            project: self.project.clone(),
+            run: self.run.clone(),
+            terminal: self.terminal.clone(),
+            check: self.check.clone(),
+            on_fail: self.on_fail.clone(),
+            ready: self.ready.clone(),
+            timeout_s: self.timeout_s,
+            open_urls: self.open_urls,
+            env: self.env.clone(),
+            cwd: self.cwd.clone(),
+            stop_grace_s: self.stop_grace_s,
+            artifacts: self.artifacts.clone(),
+            steps: Vec::new(),
+        }
     }
 
     /// The terminal tab's name.
@@ -198,6 +232,12 @@ const STEP_KEYS: &[&str] = &[
     "cwd",
     "stop_grace_s",
     "artifacts",
+    "steps",
+];
+
+/// The keys a group (a step with `steps`) may have.
+const GROUP_KEYS: &[&str] = &[
+    "id", "title", "needs", "after", "steps", "project", "env", "cwd",
 ];
 
 /// Parses and validates a workflow file; `fallback_name` names it when it
@@ -213,25 +253,31 @@ pub fn parse(text: &str, fallback_name: &str) -> Result<Workflow, String> {
     })
 }
 
+/// A step by its position: the index in the top-level `steps`, then in
+/// each group's.
+type StepPath = Vec<usize>;
+
 /// What a problem found while parsing is about.
 enum At {
     File,
-    /// The `steps` element at this index.
-    Step(usize),
+    /// The step at this path.
+    Step(StepPath),
     /// That step's `"id"`.
-    StepId(usize),
+    StepId(StepPath),
     /// One of that step's `needs`.
-    Need(usize, String),
+    Need(StepPath, String),
     /// One of that step's `after`.
-    After(usize, String),
-    /// Where this text first occurs in that step.
-    Text(usize, String),
+    After(StepPath, String),
+    /// Where this text first occurs in that step (else in its groups,
+    /// innermost first: it may inherit it).
+    Text(StepPath, String),
 }
 
 /// [`parse`], with each problem located in `text` where possible: JSON
 /// syntax errors where the parser stopped, step problems at the step,
 /// unknown `needs`/`after` at the id, `${steps.…}` problems at the
-/// variable, duplicates and cycles at the step's `"id"`.
+/// variable, duplicates and cycles at the step's `"id"` (nested steps
+/// included).
 pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> {
     let value: Value = match serde_json::from_str(&devcontainer::jsonc::to_json(text)) {
         Ok(value) => value,
@@ -268,17 +314,7 @@ pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> 
         None => return Err(file_problem("missing `steps`")),
     };
     // `$schema`, `description` and other documentation keys are allowed.
-    let steps: Vec<Step> = steps
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, step)| match parse_step(step) {
-            Ok(step) => Some(step),
-            Err(err) => {
-                errors.push((format!("step {}: {err}", index + 1), At::Step(index)));
-                None
-            }
-        })
-        .collect();
+    let steps = parse_steps(steps, &[], &mut errors);
     if errors.is_empty() {
         errors.extend(validate(&steps));
     }
@@ -291,23 +327,23 @@ pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> 
         .map(|(message, at)| {
             let offset = match at {
                 At::File => None,
-                At::Step(index) => spans.get(index).map(|span| span.start),
-                At::StepId(index) => spans
-                    .get(index)
-                    .map(|span| span.id_offset.unwrap_or(span.start)),
-                At::Need(index, id) => spans
-                    .get(index)
-                    .map(|span| listed_at(span, &span.needs, &id)),
-                At::After(index, id) => spans
-                    .get(index)
-                    .map(|span| listed_at(span, &span.after, &id)),
-                At::Text(index, needle) => spans.get(index).map(|span| {
-                    text.get(span.start..span.end)
-                        .and_then(|inside| inside.find(&needle))
-                        .map(|at| span.start + at)
-                        .or(span.id_offset)
-                        .unwrap_or(span.start)
-                }),
+                At::Step(path) => source::span_at(&spans, &path).map(|span| span.start),
+                At::StepId(path) => source::span_at(&spans, &path).map(|span| span.id_or_start()),
+                At::Need(path, id) => {
+                    source::span_at(&spans, &path).map(|span| listed_at(span, &span.needs, &id))
+                }
+                At::After(path, id) => {
+                    source::span_at(&spans, &path).map(|span| listed_at(span, &span.after, &id))
+                }
+                At::Text(path, needle) => (1..=path.len())
+                    .rev()
+                    .filter_map(|depth| source::span_at(&spans, &path[..depth]))
+                    .find_map(|span| {
+                        text.get(span.start..span.end)
+                            .and_then(|inside| inside.find(&needle))
+                            .map(|at| span.start + at)
+                    })
+                    .or_else(|| source::span_at(&spans, &path).map(|span| span.id_or_start())),
             };
             Problem { message, offset }
         })
@@ -321,11 +357,41 @@ fn listed_at(span: &source::StepSpan, listed: &[(String, usize)], id: &str) -> u
         .iter()
         .find(|(listed, _)| listed == id)
         .map(|(_, at)| *at)
-        .or(span.id_offset)
-        .unwrap_or(span.start)
+        .unwrap_or_else(|| span.id_or_start())
 }
 
-fn parse_step(value: Value) -> Result<Step, String> {
+/// `step 3`, or `step 2.1` for the first step of the second one's group.
+fn step_number(path: &[usize]) -> String {
+    let numbers: Vec<String> = path.iter().map(|index| (index + 1).to_string()).collect();
+    format!("step {}", numbers.join("."))
+}
+
+/// The elements of a `steps` array at `path` (empty: the top level); the
+/// ones with problems are left out (and the problems noted).
+fn parse_steps(values: Vec<Value>, path: &[usize], errors: &mut Vec<(String, At)>) -> Vec<Step> {
+    values
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let mut at = path.to_vec();
+            at.push(index);
+            match parse_step(value, &at, errors) {
+                Ok(step) => Some(step),
+                Err(err) => {
+                    errors.push((format!("{}: {err}", step_number(&at)), At::Step(at)));
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// The step at `path`; problems in a group's steps are noted in `errors`.
+fn parse_step(
+    value: Value,
+    path: &[usize],
+    errors: &mut Vec<(String, At)>,
+) -> Result<Step, String> {
     let Value::Object(mut map) = value else {
         return Err("a step is an object".into());
     };
@@ -340,6 +406,27 @@ fn parse_step(value: Value) -> Result<Step, String> {
         return Err("`id` must not be empty".into());
     }
     let at = |err: String| format!("`{id}`: {err}");
+    if id.contains('/') {
+        return Err(at(
+            "an id must not contain `/` (it joins a group's id and its steps')".into(),
+        ));
+    }
+    let group = match map.remove("steps") {
+        None => None,
+        Some(Value::Array(steps)) if steps.is_empty() => {
+            return Err(at("a group needs at least one step in `steps`".into()));
+        }
+        Some(Value::Array(steps)) => Some(steps),
+        Some(_) => return Err(at("`steps` must be an array of steps".into())),
+    };
+    if group.is_some()
+        && let Some(key) = map.keys().find(|key| !GROUP_KEYS.contains(&key.as_str()))
+    {
+        return Err(at(format!(
+            "a group cannot have `{key}` (a group has {}; its steps do the work)",
+            GROUP_KEYS.join(", ")
+        )));
+    }
     let needs = id_list(&mut map, "needs").map_err(at)?;
     let after = id_list(&mut map, "after").map_err(at)?;
     for (i, id) in after.iter().enumerate() {
@@ -423,8 +510,10 @@ fn parse_step(value: Value) -> Result<Step, String> {
         Some(_) => return Err(at("`env` must be an object".into())),
     };
 
-    let problem = if run.is_none() && check.is_none() && ready.is_none() {
-        Some("needs `run`, `check` or `ready`")
+    let problem = if group.is_some() {
+        None
+    } else if run.is_none() && check.is_none() && ready.is_none() {
+        Some("needs `run`, `check` or `ready` (or `steps`: a group)")
     } else if run.is_none() && matches!(ready, Some(Ready::Exit | Ready::Output(_))) {
         Some("`ready.exit` and `ready.output` need `run`")
     } else if run.is_none() && open_urls {
@@ -441,6 +530,7 @@ fn parse_step(value: Value) -> Result<Step, String> {
     if let Some(problem) = problem {
         return Err(at(problem.into()));
     }
+    let steps = group.map_or_else(Vec::new, |steps| parse_steps(steps, path, errors));
     Ok(Step {
         id,
         title,
@@ -458,6 +548,7 @@ fn parse_step(value: Value) -> Result<Step, String> {
         cwd,
         stop_grace_s: stop_grace_s.unwrap_or(DEFAULT_STOP_GRACE_S),
         artifacts,
+        steps,
     })
 }
 
@@ -628,38 +719,94 @@ pub fn project_spec(value: Value) -> Result<ProjectSpec, String> {
     Ok(spec)
 }
 
-/// Unique ids, known `needs`, no cycles.
+/// Ids unique among siblings, `needs` and `after` naming siblings, valid
+/// `${steps.…}` variables, no cycles (at every level).
 fn validate(steps: &[Step]) -> Vec<(String, At)> {
     let mut errors = Vec::new();
+    check_ids(steps, &mut Vec::new(), None, &mut errors);
+    if !errors.is_empty() {
+        return errors;
+    }
+    errors.extend(validate_variables(steps));
+    check_cycles(steps, &mut Vec::new(), None, &mut errors);
+    errors
+}
+
+/// ` in group `api`` for the steps of group `api` (qualified), else
+/// nothing.
+fn in_group(group: Option<&str>) -> String {
+    group.map_or_else(String::new, |group| format!(" in group `{group}`"))
+}
+
+fn child_path(path: &[usize], index: usize) -> StepPath {
+    let mut child = path.to_vec();
+    child.push(index);
+    child
+}
+
+/// Unique ids and known `needs` and `after` among `steps` (at `path`, in
+/// `group`), then the same in each group.
+fn check_ids(
+    steps: &[Step],
+    path: &mut Vec<usize>,
+    group: Option<&str>,
+    errors: &mut Vec<(String, At)>,
+) {
+    let in_group = in_group(group);
     let mut index: HashMap<&str, usize> = HashMap::new();
     for (i, step) in steps.iter().enumerate() {
         if index.insert(&step.id, i).is_some() {
-            errors.push((format!("duplicate step id `{}`", step.id), At::StepId(i)));
+            errors.push((
+                format!("duplicate step id `{}`{in_group}", step.id),
+                At::StepId(child_path(path, i)),
+            ));
         }
     }
     for (i, step) in steps.iter().enumerate() {
         for need in &step.needs {
             if !index.contains_key(need.as_str()) {
                 errors.push((
-                    format!("`{}` needs unknown step `{need}`", step.id),
-                    At::Need(i, need.clone()),
+                    format!("`{}` needs unknown step `{need}`{in_group}", step.id),
+                    At::Need(child_path(path, i), need.clone()),
                 ));
             }
         }
         for after in &step.after {
             if !index.contains_key(after.as_str()) {
                 errors.push((
-                    format!("`{}` runs after unknown step `{after}`", step.id),
-                    At::After(i, after.clone()),
+                    format!("`{}` runs after unknown step `{after}`{in_group}", step.id),
+                    At::After(child_path(path, i), after.clone()),
                 ));
             }
         }
     }
-    if !errors.is_empty() {
-        return errors;
+    for (i, step) in steps.iter().enumerate() {
+        if step.is_group() {
+            let qualified = match group {
+                Some(group) => format!("{group}/{}", step.id),
+                None => step.id.clone(),
+            };
+            path.push(i);
+            check_ids(&step.steps, path, Some(&qualified), errors);
+            path.pop();
+        }
     }
-    errors.extend(validate_variables(steps, &index));
-    // Depth-first search; `path` is the current chain for the message.
+}
+
+/// The first dependency cycle among `steps` (ids known), then in each
+/// group.
+fn check_cycles(
+    steps: &[Step],
+    path: &mut Vec<usize>,
+    group: Option<&str>,
+    errors: &mut Vec<(String, At)>,
+) {
+    let index: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| (step.id.as_str(), i))
+        .collect();
+    // Depth-first search; `chain` is the current chain for the message.
     #[derive(Clone, Copy, PartialEq)]
     enum Mark {
         New,
@@ -671,13 +818,13 @@ fn validate(steps: &[Step]) -> Vec<(String, At)> {
         steps: &[Step],
         index: &HashMap<&str, usize>,
         marks: &mut [Mark],
-        path: &mut Vec<usize>,
+        chain: &mut Vec<usize>,
     ) -> Option<(String, usize)> {
         match marks[at] {
             Mark::Done => return None,
             Mark::Active => {
-                let start = path.iter().position(|&p| p == at).unwrap_or(0);
-                let mut cycle: Vec<&str> = path[start..]
+                let start = chain.iter().position(|&p| p == at).unwrap_or(0);
+                let mut cycle: Vec<&str> = chain[start..]
                     .iter()
                     .map(|&p| steps[p].id.as_str())
                     .collect();
@@ -687,71 +834,117 @@ fn validate(steps: &[Step]) -> Vec<(String, At)> {
             Mark::New => {}
         }
         marks[at] = Mark::Active;
-        path.push(at);
+        chain.push(at);
         for need in steps[at].upstream() {
-            if let Some(cycle) = visit(index[need], steps, index, marks, path) {
+            if let Some(cycle) = visit(index[need], steps, index, marks, chain) {
                 return Some(cycle);
             }
         }
-        path.pop();
+        chain.pop();
         marks[at] = Mark::Done;
         None
     }
     let mut marks = vec![Mark::New; steps.len()];
     for at in 0..steps.len() {
         if let Some((cycle, at)) = visit(at, steps, &index, &mut marks, &mut Vec::new()) {
-            errors.push((cycle, At::StepId(at)));
+            errors.push((
+                format!("{cycle}{}", in_group(group)),
+                At::StepId(child_path(path, at)),
+            ));
             break;
         }
     }
-    errors
+    for (i, step) in steps.iter().enumerate() {
+        if step.is_group() {
+            let qualified = match group {
+                Some(group) => format!("{group}/{}", step.id),
+                None => step.id.clone(),
+            };
+            path.push(i);
+            check_cycles(&step.steps, path, Some(&qualified), errors);
+            path.pop();
+        }
+    }
 }
 
-/// `${steps.<id>.…}` variables name a step in `needs` or `after`, a known
-/// field, and an artifact that step declares.
-fn validate_variables(steps: &[Step], index: &HashMap<&str, usize>) -> Vec<(String, At)> {
+/// `${steps.<id>.…}` variables name a step its `needs` or `after` list
+/// (or an enclosing group's), a known field (a group only has `status`),
+/// and an artifact that step declares. Checked in each step that does
+/// something, with what it inherits from its groups.
+fn validate_variables(steps: &[Step]) -> Vec<(String, At)> {
+    let nodes = tree::flatten_steps(steps);
+    let ids: Vec<&str> = nodes.iter().map(|node| node.step.id.as_str()).collect();
     let mut errors = Vec::new();
-    for (i, step) in steps.iter().enumerate() {
-        let upstream: Vec<&str> = step.upstream().collect();
-        let ids: Vec<&str> = index.keys().copied().collect();
-        for text in step.texts() {
+    for (at, node) in nodes.iter().enumerate() {
+        if node.is_group() {
+            continue;
+        }
+        let scope = tree::scope(&nodes, at);
+        let position = || {
+            let mut position = Vec::with_capacity(node.depth + 1);
+            let mut current = Some(at);
+            while let Some(index) = current {
+                position.push(nodes[index].index);
+                current = nodes[index].parent;
+            }
+            position.reverse();
+            position
+        };
+        for text in node.step.texts() {
             for found in vars::step_refs(text, &ids) {
                 let problem = match found {
                     Err(err) => Some((err, text.find("${steps.").map(|at| &text[at..]))),
                     Ok(found) => {
-                        let problem = if !upstream.contains(&found.step) {
-                            Some(format!(
+                        let target = scope
+                            .iter()
+                            .find(|(id, _)| *id == found.step)
+                            .map(|&(_, target)| &nodes[target]);
+                        let problem = match (target, &found.field) {
+                            (None, _) if node.depth == 0 => Some(format!(
                                 "`{}` refers to `{}`, which is not in this step's `needs` or \
                                  `after`",
                                 found.text, found.step
-                            ))
-                        } else if let StepField::Artifact(by) = &found.field {
-                            let producer = &steps[index[found.step]];
-                            match (producer.artifact(by), by) {
-                                (Some(_), _) => None,
-                                (None, ArtifactRef::Label(label)) => Some(format!(
-                                    "`{}`: `{}` has no artifact labelled `{label}`",
+                            )),
+                            (None, _) => Some(format!(
+                                "`{}` refers to `{}`, which is not in the `needs` or `after` of \
+                                 this step or of its groups",
+                                found.text, found.step
+                            )),
+                            (Some(target), StepField::ExitCode | StepField::Artifact(_))
+                                if target.is_group() =>
+                            {
+                                Some(format!(
+                                    "`{}`: `{}` is a group (a group only has `status`)",
                                     found.text, found.step
-                                )),
-                                (None, ArtifactRef::Index(_)) => Some(format!(
-                                    "`{}`: `{}` has {} artifact(s), numbered from 0",
-                                    found.text,
-                                    found.step,
-                                    producer.artifacts.len()
-                                )),
+                                ))
                             }
-                        } else {
-                            None
+                            (Some(target), StepField::Artifact(by)) => {
+                                let producer = &target.step;
+                                match (producer.artifact(by), by) {
+                                    (Some(_), _) => None,
+                                    (None, ArtifactRef::Label(label)) => Some(format!(
+                                        "`{}`: `{}` has no artifact labelled `{label}`",
+                                        found.text, found.step
+                                    )),
+                                    (None, ArtifactRef::Index(_)) => Some(format!(
+                                        "`{}`: `{}` has {} artifact(s), numbered from 0",
+                                        found.text,
+                                        found.step,
+                                        producer.artifacts.len()
+                                    )),
+                                }
+                            }
+                            (Some(_), _) => None,
                         };
                         problem.map(|problem| (problem, Some(found.text)))
                     }
                 };
                 if let Some((problem, needle)) = problem {
                     let at = match needle {
-                        Some(needle) => At::Text(i, needle.to_owned()),
-                        None => At::StepId(i),
+                        Some(needle) => At::Text(position(), needle.to_owned()),
+                        None => At::StepId(position()),
                     };
-                    errors.push((format!("`{}`: {problem}", step.id), at));
+                    errors.push((format!("`{}`: {problem}", node.path), at));
                 }
             }
         }
@@ -837,6 +1030,21 @@ pub const TEMPLATE: &str = r#"// A workflow starts a development environment in 
       // ${steps.<id>.artifacts.<label or index>} read a step listed in
       // `needs` or `after`.
       "run": "uv run python report.py ${steps.tests.artifacts.junit} ${steps.tests.exit_code}"
+    },
+    {
+      // A group: `steps` of its own, drawn as one card with a miniature of
+      // them (click it to expand). Its `needs`/`after` gate all its steps,
+      // which inherit its `project`, `cwd` and `env`; ids inside are its
+      // own (elsewhere `services/db`), their `needs`/`after` name
+      // siblings. Steps outside wait for the whole group.
+      "id": "services",
+      "title": "Services",
+      "needs": ["vpn"],
+      "project": { "wsl": "Ubuntu", "path": "~/services" },
+      "steps": [
+        { "id": "db", "run": "docker compose up db", "ready": { "port": 5432 } },
+        { "id": "seed", "needs": ["db"], "run": "./seed.sh" }
+      ]
     }
   ]
 }
@@ -1031,7 +1239,8 @@ mod tests {
     #[test]
     fn the_template_is_a_valid_workflow() {
         let workflow = parse(TEMPLATE, "template").unwrap();
-        assert_eq!(workflow.steps.len(), 6);
+        assert_eq!(workflow.steps.len(), 7);
+        assert_eq!(workflow.steps[6].steps.len(), 2, "a group");
         assert_eq!(workflow.steps[5].after, ["tests"]);
         assert_eq!(workflow.steps[4].stop_grace_s, 30);
     }
@@ -1240,5 +1449,173 @@ mod tests {
             "{\"steps\": [\n  {\"id\": \"b\", \"run\": \"y\",\n   \"after\": [\"zz\"]}\n]}";
         let problems = check(unknown, "f").unwrap_err();
         assert_eq!(problems[0].line_column(unknown), Some((3, 14)));
+    }
+
+    #[test]
+    fn groups_hold_steps_and_pass_on_their_defaults() {
+        let workflow = parse(
+            r#"{"steps": [
+              {"id": "db", "run": "d"},
+              {"id": "api", "title": "API", "needs": "db", "project": "C:/api",
+               "env": {"A": "1"}, "cwd": "srv", "steps": [
+                {"id": "build", "run": "b"},
+                {"id": "db", "needs": "build", "run": "migrate"},
+                {"id": "inner", "after": "db", "steps": [{"id": "x", "check": "x"}]}
+              ]}
+            ]}"#,
+            "f",
+        )
+        .unwrap();
+        let api = &workflow.steps[1];
+        assert!(api.is_group() && !workflow.steps[0].is_group());
+        assert_eq!(api.label(), "API");
+        assert_eq!(api.steps.len(), 3);
+        assert_eq!(api.steps[1].id, "db", "ids are unique among siblings");
+        assert_eq!(api.steps[2].steps[0].id, "x");
+        assert_eq!(api.cwd.as_deref(), Some("srv"));
+        assert!(
+            api.steps[0].env.is_empty(),
+            "as written; flattening inherits"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_groups() {
+        let error = |text: &str| steps(text).unwrap_err();
+        let group = |extra: &str| {
+            error(&format!(
+                r#"{{"steps": [{{"id": "g", {extra} "steps": [{{"id": "a", "run": "x"}}]}}]}}"#
+            ))
+        };
+        for key in [
+            r#""run": "x","#,
+            r#""check": "x","#,
+            r#""ready": {"exit": true},"#,
+            r#""timeout_s": 5,"#,
+            r#""openUrls": true,"#,
+            r#""terminal": "t","#,
+            r#""stop_grace_s": 5,"#,
+            r#""artifacts": [],"#,
+        ] {
+            let message = group(key);
+            assert!(message.contains("a group cannot have"), "{key}: {message}");
+        }
+        let message = group(r#""onFail": "x","#);
+        assert!(
+            message.contains("a group cannot have `onFail`"),
+            "{message}"
+        );
+        assert!(
+            error(r#"{"steps": [{"id": "g", "steps": []}]}"#)
+                .contains("a group needs at least one step")
+        );
+        assert!(
+            error(r#"{"steps": [{"id": "g", "steps": {}}]}"#).contains("`steps` must be an array")
+        );
+        assert_eq!(
+            error(r#"{"steps": [{"id": "a/b", "run": "x"}]}"#),
+            "step 1: `a/b`: an id must not contain `/` (it joins a group's id and its steps')"
+        );
+        // Problems inside a group are numbered by their place.
+        assert_eq!(
+            error(r#"{"steps": [{"id": "g", "steps": [{"id": "a", "run": "x"}, {"id": "b"}]}]}"#),
+            "step 1.2: `b`: needs `run`, `check` or `ready` (or `steps`: a group)"
+        );
+        // Siblings only: `needs` cannot reach out of (or into) a group.
+        assert_eq!(
+            error(
+                r#"{"steps": [{"id": "top", "run": "t"},
+                  {"id": "g", "steps": [{"id": "a", "needs": "top", "run": "x"}]},
+                  {"id": "after", "needs": "a", "run": "y"}]}"#
+            ),
+            "`after` needs unknown step `a`\n`a` needs unknown step `top` in group `g`"
+        );
+        assert_eq!(
+            error(
+                r#"{"steps": [{"id": "g", "steps": [
+                  {"id": "a", "run": "x"}, {"id": "a", "run": "y"},
+                  {"id": "h", "steps": [{"id": "z", "after": "q", "run": "z"}]}]}]}"#
+            ),
+            "duplicate step id `a` in group `g`\n`z` runs after unknown step `q` in group `g/h`"
+        );
+        assert_eq!(
+            error(
+                r#"{"steps": [{"id": "g", "steps": [
+                  {"id": "a", "needs": "b", "run": "x"}, {"id": "b", "after": "a", "run": "y"}]}]}"#
+            ),
+            "dependency cycle: a → b → a in group `g`"
+        );
+    }
+
+    #[test]
+    fn nested_problems_point_at_where_they_are() {
+        let text = "{\"steps\": [\n  {\"id\": \"top\", \"run\": \"t\"},\n  {\"id\": \"g\", \"steps\": [\n    {\"id\": \"a\", \"run\": \"x\"},\n    {\"id\": \"b\", \"needs\": [\"nope\"], \"run\": \"y\"}\n  ]}\n]}";
+        let problems = check(text, "f").unwrap_err();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].line_column(text), Some((5, 27)), "at `nope`");
+        let text = "{\"steps\": [{\"id\": \"g\", \"steps\": [\n  {\"id\": \"a\", \"run\": \"x\"},\n  {\"id\": \"a\", \"run\": \"y\"}]}]}";
+        let problems = check(text, "f").unwrap_err();
+        assert_eq!(
+            problems[0].line_column(text),
+            Some((3, 4)),
+            "the second `\"id\"`"
+        );
+        let text = "{\"steps\": [{\"id\": \"g\", \"steps\": [\n  {\"id\": \"a\", \"timeout_s\": 0, \"run\": \"x\"}]}]}";
+        let problems = check(text, "f").unwrap_err();
+        assert_eq!(
+            problems[0].line_column(text),
+            Some((2, 3)),
+            "the nested step"
+        );
+        // An inherited variable is found in the group that holds it.
+        let text = "{\"steps\": [{\"id\": \"g\",\n \"env\": {\"V\": \"${steps.zz.status}\"},\n \"steps\": [{\"id\": \"a\", \"run\": \"x\"}]}]}";
+        let problems = check(text, "f").unwrap_err();
+        assert!(
+            problems[0]
+                .message
+                .starts_with("`g/a`: `${steps.zz.status}` refers to `zz`")
+        );
+        assert_eq!(problems[0].line_column(text), Some((2, 16)));
+    }
+
+    #[test]
+    fn variables_reach_siblings_and_what_enclosing_groups_wait_for() {
+        let ok = steps(
+            r#"{"steps": [
+              {"id": "eval", "run": "e", "artifacts": [{"label": "m", "path": "m.json"}]},
+              {"id": "g", "after": "eval", "steps": [
+                {"id": "build", "run": "b"},
+                {"id": "use", "needs": "build", "run":
+                  "x ${steps.eval.artifacts.m} ${steps.eval.exit_code} ${steps.build.status}"}
+              ]},
+              {"id": "report", "after": "g", "run": "r ${steps.g.status}"}
+            ]}"#,
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+        let error = |text: &str| steps(text).unwrap_err();
+        assert_eq!(
+            error(
+                r#"{"steps": [{"id": "g", "steps": [{"id": "a", "run": "x"}]},
+                  {"id": "r", "after": "g", "run": "${steps.g.exit_code}"}]}"#
+            ),
+            "`r`: `${steps.g.exit_code}`: `g` is a group (a group only has `status`)"
+        );
+        assert_eq!(
+            error(
+                r#"{"steps": [{"id": "g", "steps": [{"id": "a", "run": "x"}]},
+                  {"id": "r", "needs": "g", "run": "${steps.g.artifacts.0}"}]}"#
+            ),
+            "`r`: `${steps.g.artifacts.0}`: `g` is a group (a group only has `status`)"
+        );
+        // A sibling not listed, or a step outside the group.
+        assert_eq!(
+            error(
+                r#"{"steps": [{"id": "top", "run": "t"}, {"id": "g", "steps": [
+                  {"id": "a", "run": "x"}, {"id": "b", "run": "${steps.a.status} ${steps.top.status}"}]}]}"#
+            ),
+            "`g/b`: `${steps.a.status}` refers to `a`, which is not in the `needs` or `after` of \
+             this step or of its groups\n`g/b`: `${steps.top.status}` refers to `top`, which is \
+             not in the `needs` or `after` of this step or of its groups"
+        );
     }
 }

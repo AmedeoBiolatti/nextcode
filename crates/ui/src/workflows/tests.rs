@@ -447,3 +447,120 @@ fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestApp
     cx.run_until_parked();
     cleanup(root);
 }
+
+const GROUPED: &str = r#"{
+  "name": "Grouped",
+  "steps": [
+    { "id": "check", "check": "exit 0" },
+    { "id": "svc", "needs": ["check"], "steps": [
+      { "id": "build", "check": "exit 0" },
+      { "id": "inner", "needs": ["build"], "steps": [
+        { "id": "x", "check": "exit 0" }
+      ] }
+    ] },
+    { "id": "report", "after": ["svc"], "check": "exit 0" }
+  ]
+}
+"#;
+
+#[gpui::test]
+fn groups_expand_in_place_and_stay_expanded_across_edits(cx: &mut TestAppContext) {
+    let root = root("groups");
+    let path = root.join("user").join("grouped.jsonc");
+    std::fs::write(&path, GROUPED).unwrap();
+    cx.update(crate::app_state::init);
+    cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
+    cx.run_until_parked();
+    let window = cx.windows()[0].downcast::<Shell>().unwrap();
+    let view = window
+        .update(cx, |shell, window, cx| {
+            shell.open_workflow(&Source::User, &path, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    cx.run_until_parked();
+    let boxes = |cx: &mut TestAppContext| -> Vec<(String, (f32, f32))> {
+        view.read_with(cx, |view, _| view.boxes())
+    };
+    let card = (200., 76.);
+    let ids = |boxes: &[(String, (f32, f32))]| -> Vec<String> {
+        boxes.iter().map(|(id, _)| id.clone()).collect()
+    };
+    // Collapsed: a group is a card like the others.
+    let collapsed = boxes(cx);
+    assert_eq!(ids(&collapsed), ["check", "svc", "report"]);
+    assert!(collapsed.iter().all(|(_, size)| *size == card));
+    let toggle = |path: &'static str, cx: &mut TestAppContext| {
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| view.toggle_group(path, window, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+    };
+    // Expanded: a bigger box around its steps, one level at a time.
+    toggle("svc", cx);
+    let open = boxes(cx);
+    assert_eq!(
+        ids(&open),
+        ["check", "svc", "svc/build", "svc/inner", "report"]
+    );
+    let svc = open[1].1;
+    assert!(svc.0 > card.0 && svc.1 > card.1, "{svc:?}");
+    assert_eq!(open[3].1, card, "the inner group is still collapsed");
+    toggle("svc/inner", cx);
+    assert_eq!(
+        ids(&boxes(cx)),
+        [
+            "check",
+            "svc",
+            "svc/build",
+            "svc/inner",
+            "svc/inner/x",
+            "report"
+        ]
+    );
+    // The click selected the group and put the cursor on its `"id"`.
+    assert_eq!(cursor_step(&view, cx).as_deref(), Some("svc/inner"));
+    let editor = view.read_with(cx, |view, _| view.editor());
+    let inside_x = GROUPED.find("\"x\", \"check\"").unwrap();
+    editor.update(cx, |editor, cx| editor.set_cursor(inside_x, cx));
+    cx.run_until_parked();
+    assert_eq!(cursor_step(&view, cx).as_deref(), Some("svc/inner/x"));
+
+    // Edits keep the groups expanded.
+    let edited = GROUPED.replace(
+        r#""report", "after": ["svc"], "check": "exit 0""#,
+        r#""report", "after": ["svc"], "check": "exit 0 ""#,
+    );
+    editor.update(cx, |editor, cx| editor.set_text(&edited, cx));
+    settle(cx);
+    assert_eq!(ids(&boxes(cx)).len(), 6);
+
+    // Collapsing the outer group hides its steps again.
+    toggle("svc", cx);
+    assert_eq!(ids(&boxes(cx)), ["check", "svc", "report"]);
+
+    // A run shows every step's state and each group's, by qualified id.
+    view.update(cx, |view, cx| view.run_all(cx));
+    wait_until(cx, "every check", |cx| {
+        view.read_with(cx, |view, cx| view.outcome(cx)) == Outcome::Ready
+    });
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.cards(cx)),
+        [
+            "check",
+            "svc",
+            "svc/build",
+            "svc/inner",
+            "svc/inner/x",
+            "report"
+        ]
+        .map(|id| (id.to_owned(), "ready".to_owned()))
+    );
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cleanup(root);
+}

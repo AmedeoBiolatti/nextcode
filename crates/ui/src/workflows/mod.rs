@@ -522,18 +522,18 @@ impl Workflows {
         cx: &mut Context<Self>,
     ) -> u64 {
         let now = Instant::now();
+        let mut run = Run::new((*workflow).clone());
         // The previous run's terminals are reused (replaced by title).
         let previous = self
             .runs
             .iter()
             .position(|run| run.workflow_id == workflow_id);
-        let mut steps: Vec<StepRuntime> =
-            workflow.steps.iter().map(|_| Default::default()).collect();
+        let mut steps: Vec<StepRuntime> = run.nodes().iter().map(|_| Default::default()).collect();
         if let Some(index) = previous {
             let mut old = self.runs.remove(index);
             old.run.drain(now);
-            for (index, step) in workflow.steps.iter().enumerate() {
-                if let Some(at) = old.run.step(&step.id) {
+            for (index, node) in run.nodes().iter().enumerate() {
+                if let Some(at) = old.run.step(&node.path) {
                     steps[index].command = old.steps[at].command.clone();
                 }
             }
@@ -541,11 +541,14 @@ impl Workflows {
         }
         let id_number = self.next_run;
         self.next_run += 1;
-        let mut run = Run::new((*workflow).clone());
-        for (index, step) in workflow.steps.iter().enumerate() {
-            if self.still_stopping(&workflow_id, &step.id) {
-                run.hold(index);
-            }
+        let held: Vec<usize> = (0..run.nodes().len())
+            .filter(|&index| {
+                let node = &run.nodes()[index];
+                !node.is_group() && self.still_stopping(&workflow_id, &node.path)
+            })
+            .collect();
+        for index in held {
+            run.hold(index);
         }
         run.start(now);
         self.runs.push(ActiveRun {
@@ -561,7 +564,7 @@ impl Workflows {
     }
 
     /// Whether a replaced run of workflow `workflow_id` still stops its
-    /// step `step`'s command.
+    /// step `step`'s command (`step`: qualified id).
     fn still_stopping(&self, workflow_id: &str, step: &str) -> bool {
         self.draining.iter().any(|old| {
             old.workflow_id == workflow_id
@@ -580,8 +583,7 @@ impl Workflows {
             for step in 0..self.runs[index].run.steps().len() {
                 let active = &self.runs[index];
                 if !active.run.is_held(step)
-                    || self
-                        .still_stopping(&active.workflow_id, &active.run.workflow().steps[step].id)
+                    || self.still_stopping(&active.workflow_id, &active.run.nodes()[step].path)
                 {
                     continue;
                 }
@@ -644,6 +646,14 @@ impl Workflows {
 
     pub fn retry_failed(&mut self, workflow_id: &str, cx: &mut Context<Self>) -> bool {
         self.with_run(workflow_id, cx, |run, now| run.retry_failed(now))
+    }
+
+    /// Retry on step `step`: it starts again if it failed; a group's
+    /// failed steps do. False if none had failed.
+    pub fn retry_step(&mut self, workflow_id: &str, step: usize, cx: &mut Context<Self>) -> bool {
+        let mut retried = false;
+        self.with_run(workflow_id, cx, |run, now| retried = run.retry(step, now));
+        retried
     }
 
     /// Continue on a manual step; false if it was not waiting.
@@ -826,7 +836,7 @@ impl Workflows {
             let workflow = active.run.workflow().name.clone();
             for change in changes {
                 let detail = active.run.steps()[change.step].detail.clone();
-                let step = active.run.workflow().steps[change.step].id.clone();
+                let step = active.run.nodes()[change.step].path.clone();
                 cx.emit(WorkflowsEvent::Step {
                     run: active.id,
                     workflow: workflow.clone(),
@@ -855,7 +865,7 @@ impl Workflows {
         let run_id = self.runs[index].id;
         match effect {
             Effect::OpenProject { step, generation } => {
-                let spec = self.runs[index].run.workflow().steps[step].project.clone();
+                let spec = self.runs[index].run.nodes()[step].step.project.clone();
                 let location = spec.as_ref().map(location_of).transpose();
                 match location {
                     Ok(location) => {
@@ -941,7 +951,7 @@ impl Workflows {
                 cx.emit(WorkflowsEvent::UrlOpened {
                     run: active.id,
                     workflow: active.run.workflow().name.clone(),
-                    step: active.run.workflow().steps[step].id.clone(),
+                    step: active.run.nodes()[step].path.clone(),
                     url,
                 });
             }

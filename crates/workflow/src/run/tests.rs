@@ -745,3 +745,216 @@ fn a_chain_with_a_failure_ends_failed_once_the_last_step_finished() {
     );
     assert_eq!(run.outcome(), Outcome::Failed);
 }
+
+const SERVICE: &str = r#"{"steps": [
+    {"id": "db", "run": "d"},
+    {"id": "svc", "needs": "db", "steps": [
+        {"id": "build", "run": "b"},
+        {"id": "migrate", "needs": "build", "run": "m"},
+        {"id": "lint", "run": "l"}
+    ]},
+    {"id": "web", "needs": "svc", "run": "w"},
+    {"id": "report", "after": "svc", "run": "r ${steps.svc.status}"}
+]}"#;
+
+/// Exits step `index`'s command (started by an effect already taken).
+fn exit(run: &mut Run, index: usize, code: i32, t: Instant) {
+    let generation = generation(run, index);
+    run.exited(index, generation, Some(code), t);
+}
+
+#[test]
+fn a_group_gates_its_steps_and_takes_its_state_from_them() {
+    let t = Instant::now();
+    let mut run = run(SERVICE);
+    let paths: Vec<&str> = run.nodes().iter().map(|node| node.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "db",
+            "svc",
+            "svc/build",
+            "svc/migrate",
+            "svc/lint",
+            "web",
+            "report"
+        ]
+    );
+    assert_eq!(run.step("svc/lint"), Some(4));
+    assert_eq!(run.step("lint"), None);
+    assert_eq!(statuses(&run), ["pending"; 7]);
+    run.start(t);
+    assert_eq!(
+        statuses(&run),
+        [
+            "running", "waiting", "waiting", "waiting", "waiting", "waiting", "waiting"
+        ]
+    );
+    assert_eq!(run.steps()[1].detail, "needs db");
+    assert_eq!(
+        run.steps()[2].detail,
+        "needs db",
+        "the group's needs gate it"
+    );
+    assert_eq!(run.steps()[3].detail, "needs build, db");
+    assert_eq!(run.steps()[5].detail, "needs svc");
+    assert_eq!(run.steps()[6].detail, "after svc");
+    run.take_effects();
+    exit(&mut run, 0, 0, t);
+    assert_eq!(
+        statuses(&run),
+        [
+            "ready", "running", "running", "waiting", "running", "waiting", "waiting"
+        ]
+    );
+    assert_eq!(run.steps()[1].detail, "0 of 3 ready");
+    assert!(run.steps()[1].started.is_some());
+    exit(&mut run, 2, 0, t);
+    exit(&mut run, 4, 1, t);
+    assert_eq!(run.steps()[1].status, Status::Running, "migrate still runs");
+    exit(&mut run, 3, 0, t);
+    assert_eq!(
+        run.steps()[1].status,
+        Status::Failed("1 of 3 steps failed".into())
+    );
+    assert!(run.steps()[1].finished.is_some());
+    // Outside steps wait for the group like for a step.
+    assert_eq!(run.steps()[5].detail, "blocked: svc did not get ready");
+    assert_eq!(run.steps()[6].status, Status::Running);
+    assert_eq!(run.definition(6).run.as_deref(), Some("r failed"));
+    exit(&mut run, 6, 0, t);
+    assert_eq!(run.outcome(), Outcome::Failed);
+    let changes: Vec<(usize, &str)> = run
+        .take_changes()
+        .iter()
+        .map(|change| (change.step, change.status.name()))
+        .filter(|(step, _)| *step == 1)
+        .collect();
+    assert_eq!(changes, [(1, "waiting"), (1, "running"), (1, "failed")]);
+
+    // Retry on the group: its failed steps only.
+    assert!(!run.retry(2, t), "build did not fail");
+    assert!(run.retry(1, t));
+    assert_eq!(
+        statuses(&run),
+        [
+            "ready", "running", "ready", "ready", "running", "waiting", "ready"
+        ]
+    );
+    assert_eq!(run.steps()[5].detail, "needs svc");
+    assert_eq!(run.outcome(), Outcome::Running);
+    exit(&mut run, 4, 0, t);
+    assert_eq!(run.steps()[1].status, Status::Ready);
+    assert_eq!(run.steps()[5].status, Status::Running);
+    exit(&mut run, 5, 0, t);
+    assert_eq!(run.outcome(), Outcome::Ready);
+
+    // Restart on the group: every step in it.
+    run.take_effects();
+    run.restart(1, t);
+    assert_eq!(
+        statuses(&run),
+        [
+            "ready", "running", "running", "waiting", "running", "ready", "ready"
+        ]
+    );
+    let effects = run.take_effects();
+    assert_eq!(started(&effects, 2), generation(&run, 2));
+    assert_eq!(started(&effects, 4), generation(&run, 4));
+    assert_eq!(run.outcome(), Outcome::Running);
+}
+
+#[test]
+fn groups_stop_and_block_like_steps() {
+    let t = Instant::now();
+    let mut run = run(r#"{"steps": [
+        {"id": "g", "steps": [
+            {"id": "a", "run": "a"},
+            {"id": "b", "needs": "a", "run": "b"}
+        ]},
+        {"id": "z", "after": "g", "run": "z"}
+    ]}"#);
+    run.start(t);
+    run.take_effects();
+    assert_eq!(statuses(&run), ["running", "running", "waiting", "waiting"]);
+    run.stop_all(t);
+    assert_eq!(
+        statuses(&run),
+        ["stopping", "stopping", "stopped", "stopped"]
+    );
+    assert_eq!(run.take_effects(), [Effect::InterruptCommand { step: 1 }]);
+    run.exited(1, generation(&run, 1) - 1, Some(130), t);
+    assert_eq!(statuses(&run), ["stopped"; 4]);
+    assert_eq!(run.outcome(), Outcome::Stopped);
+
+    // A group whose need can never get ready: blocked, and so is what
+    // runs after it.
+    let mut run = run_blocked();
+    run.start(t);
+    let g = generation(&run, 0);
+    run.check_finished(
+        0,
+        g,
+        CheckResult::Exited {
+            code: Some(1),
+            output: String::new(),
+        },
+        t,
+    );
+    assert_eq!(statuses(&run), ["failed", "waiting", "waiting", "waiting"]);
+    assert!(run.steps()[1].is_blocked());
+    assert_eq!(run.steps()[1].detail, "blocked: vpn did not get ready");
+    assert_eq!(run.steps()[3].detail, "blocked: g can never run");
+    assert_eq!(run.outcome(), Outcome::Failed);
+    run.retry_failed(t);
+    assert_eq!(
+        statuses(&run),
+        ["starting", "waiting", "waiting", "waiting"]
+    );
+    assert!(!run.steps()[1].is_blocked());
+    assert_eq!(run.steps()[1].detail, "needs vpn");
+    assert_eq!(run.steps()[3].detail, "after g");
+}
+
+fn run_blocked() -> Run {
+    run(r#"{"steps": [
+        {"id": "vpn", "check": "c", "onFail": "Connect"},
+        {"id": "g", "needs": "vpn", "steps": [{"id": "a", "run": "a"}]},
+        {"id": "z", "after": "g", "run": "z"}
+    ]}"#)
+}
+
+#[test]
+fn steps_in_groups_inherit_and_read_what_their_groups_wait_for() {
+    let t = Instant::now();
+    let mut run = run(r#"{"steps": [
+        {"id": "eval", "run": "e"},
+        {"id": "g", "after": "eval", "project": {"local": "/p"}, "env": {"K": "group", "L": "l"},
+         "steps": [
+            {"id": "inner", "steps": [
+                {"id": "use", "env": {"K": "own"}, "run": "u ${steps.eval.exit_code} ${steps.eval.status}"}
+            ]}
+        ]}
+    ]}"#);
+    run.start(t);
+    run.take_effects();
+    assert_eq!(run.steps()[3].detail, "after eval");
+    exit(&mut run, 0, 3, t);
+    assert_eq!(
+        run.take_effects(),
+        [Effect::OpenProject {
+            step: 3,
+            generation: generation(&run, 3)
+        }],
+        "the group's project"
+    );
+    let use_step = run.definition(3);
+    assert_eq!(use_step.run.as_deref(), Some("u 3 failed"));
+    assert_eq!(use_step.env["K"], "own");
+    assert_eq!(use_step.env["L"], "l");
+    assert_eq!(
+        statuses(&run),
+        ["failed", "running", "running", "starting"],
+        "groups run while a step in them starts"
+    );
+}

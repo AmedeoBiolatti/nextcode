@@ -66,7 +66,7 @@ Unknown keys are **errors** (they catch typos). Allowed keys:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `id` | string, **required**, unique | Referenced by `needs`, `after` and `${steps.<id>.…}`; used in commands (`step`) |
+| `id` | string, **required**, unique among its siblings, no `/` | Referenced by `needs`, `after` and `${steps.<id>.…}`; used in commands (`step`) by qualified id (`group/step` inside groups, §3.4) |
 | `title` | string | Shown in the UI; default `id` |
 | `needs` | string or [string] | Step ids that must be **ready** first. No `needs`/`after` = starts immediately. Independent steps run in parallel |
 | `after` | string or [string] | Step ids that must have **finished** first: ready **or failed** (§5.1). Use it for a step that must run even when the other one failed (a report after an evaluation). An id may not be in both `needs` and `after`, nor twice in `after` |
@@ -82,6 +82,7 @@ Unknown keys are **errors** (they catch typos). Allowed keys:
 | `openUrls` | bool | http(s) URLs printed by `run` open in the browser (once each) until ready + 3 s. Needs `run` |
 | `env` | object of string/number/bool | Extra environment for `run`/`check` |
 | `cwd` | string | Working directory, relative to the project root (home folder without a project) |
+| `steps` | [Step, ...], non-empty | Makes the step a **group** of these steps (§3.4) |
 
 ### 3.1 `project` shapes
 
@@ -133,6 +134,61 @@ Exactly one key:
   (headless) repeats it on demand.
 - A missing file is not an error: it shows as missing (dimmed in the UI,
   `"exists": false` headless).
+
+### 3.4 Groups
+
+A step with `steps` is a group: one node in the graph made of a sub-graph.
+
+```jsonc
+{ "id": "api", "title": "API service", "needs": ["vpn"],
+  "project": { "devcontainer": "C:/src/api" }, "env": { "PROFILE": "dev" }, "cwd": "backend",
+  "steps": [
+    { "id": "build", "run": "uv sync" },
+    { "id": "migrate", "needs": ["build"], "run": "uv run alembic upgrade head" },
+    { "id": "serve", "needs": ["migrate"], "run": "uv run uvicorn app:app --port 8000",
+      "ready": { "port": 8000 }, "env": { "LOG_LEVEL": "debug" } }
+  ] }
+```
+
+- **Keys:** `id`, `title`, `needs`, `after`, `steps`, and the defaults
+  `project`, `cwd`, `env`. Anything else (`run`, `check`, `onFail`,
+  `ready`, `timeout_s`, `openUrls`, `terminal`, `stop_grace_s`,
+  `artifacts`) is an error (`a group cannot have …`), as is an empty
+  `steps`. Groups nest to any depth.
+- **Inheritance:** every step inside (at any depth) gets the nearest
+  group's `project` and `cwd` unless it sets its own; `env` is merged
+  (outer groups, then inner ones, then the step; the step wins).
+- **Scoping:** ids are unique among siblings only (two groups may both
+  have a `build`), never contain `/`. `needs`/`after` inside a group name
+  its other steps; a step cannot reach out of its group or into another
+  one: make the **group** need what it needs. Errors say where:
+  `` `a` needs unknown step `top` in group `svc` ``; cycles are checked per
+  group.
+- **Qualified ids:** outside the file a step in a group is `group/step`
+  (`api/migrate`, deeper `a/b/c`); top-level ids stay as they are. Events,
+  `workflow_status` and the `step` parameter of `workflow_continue`,
+  `workflow_restart`, `workflow_retry`, `workflow_check_artifacts` use
+  them; a bare `migrate` is not found.
+- **Gating:** the group's `needs`/`after` gate all its steps: a step
+  without sibling dependencies starts once the group may start (its
+  `detail` shows the group's wait, e.g. `needs vpn`).
+- **Derived state:** `pending` before the run; `waiting` for its own
+  `needs`/`after` (blocked when they can never be met: `blocked: vpn did
+  not get ready`); `running` while a step in it starts or runs
+  (`stopping` when its only active steps stop); `ready` when every step
+  is; `failed` (`reason`: `2 of 5 steps failed`) when no step in it can
+  progress and some failed; `stopped` after Stop All. Steps outside wait
+  for a group by this state with the usual rules (§5.1): `needs api` wants
+  it ready, `after api` wants it finished (ready or failed).
+- **Variables:** `${steps.<id>.…}` in a step reads what its own
+  `needs`/`after` list, then what each enclosing group lists (by the id
+  at that level, the nearest first). `${steps.<group>.status}` reads a
+  group's state; groups have no `exit_code` or `artifacts` (an error).
+  Variables in a group's `env`/`cwd` are checked in each step that
+  inherits them.
+- **Actions:** Restart on a group restarts every step in it; Retry on a
+  group reruns its failed steps; Stop All is unchanged. The run's outcome
+  counts the steps that do something (not groups).
 
 ---
 
@@ -300,6 +356,25 @@ Recipes:
   exit; a timeout or Stop then waits up to 120 s for it. A `report` step
   that must not run after a **stopped** evaluation needs nothing more
   (`after` blocks on stopped steps).
+- **Per-service group: build → migrate → serve.** One group per service
+  carries its `project`, `cwd` and `env` once; inside, a chain; outside,
+  other steps need the whole service:
+  ```jsonc
+  { "id": "db", "project": { "wsl": "Ubuntu", "path": "~/infra" },
+    "run": "docker compose up postgres", "ready": { "port": 5432 } },
+  { "id": "api", "needs": ["db"], "project": { "devcontainer": "C:/src/api" },
+    "env": { "DATABASE_URL": "postgresql://localhost:5432/dev" }, "steps": [
+      { "id": "build", "run": "uv sync" },
+      { "id": "migrate", "needs": ["build"], "run": "uv run alembic upgrade head" },
+      { "id": "serve", "needs": ["migrate"], "run": "uv run uvicorn app:app --port 8000",
+        "ready": { "port": 8000 }, "terminal": "API" } ] },
+  { "id": "web", "needs": ["api"], "project": { "devcontainer": "C:/src/web" },
+    "run": "npm run dev", "ready": { "output": "ready in \\d+ ms" } },
+  { "id": "smoke", "after": ["api", "web"], "run": "pytest smoke --api-state ${steps.api.status}" }
+  ```
+  Restart `api` (GUI: select the group, Restart; headless:
+  `workflow_restart` with `"step": "api"`) rebuilds, migrates and serves
+  again; `api/migrate` alone restarts one step.
 
 Checklist before handing a workflow over:
 
@@ -310,7 +385,9 @@ Checklist before handing a workflow over:
 5. Commands that checkpoint or drain on Ctrl+C have `stop_grace_s`.
 6. No secrets in the file; use `${env:NAME}`.
 7. Steps that must run whatever happened before use `after`, not `needs`.
-8. `workflows_list` reports `"error": null` for it.
+8. Groups hold only steps and defaults (`project`, `cwd`, `env`); their
+   steps' `needs`/`after` name siblings.
+9. `workflows_list` reports `"error": null` for it.
 
 ---
 
@@ -320,7 +397,7 @@ Checklist before handing a workflow over:
 `steps` or an `error` (one problem per line):
 
 ```json
-{"id":"/tmp/wfh|/tmp/wfh/.next_code/workflows/bad.jsonc","name":"bad","path":"/tmp/wfh/.next_code/workflows/bad.jsonc","source":"/tmp/wfh","error":"step 2: unknown key `colour` (known: id, title, needs, after, project, run, terminal, check, onFail, ready, timeout_s, openUrls, env, cwd, stop_grace_s, artifacts)","steps":[],"outcome":null}
+{"id":"/tmp/wfh|/tmp/wfh/.next_code/workflows/bad.jsonc","name":"bad","path":"/tmp/wfh/.next_code/workflows/bad.jsonc","source":"/tmp/wfh","error":"step 2: unknown key `colour` (known: id, title, needs, after, project, run, terminal, check, onFail, ready, timeout_s, openUrls, env, cwd, stop_grace_s, artifacts, steps)","steps":[],"outcome":null}
 ```
 
 Notes:
@@ -340,6 +417,11 @@ Notes:
   `needs` and `after` alike). Re-list after each fix.
 - In the GUI the same problems appear as a banner with line and column
   over the graph while the file is edited.
+- Inside groups, steps are numbered by position (`step 2.1: …` is the
+  first step of the second one) and graph problems name the group
+  (`` `a` needs unknown step `b` in group `api` ``, `` duplicate step id
+  `x` in group `api/db` ``); `${steps.…}` problems name the step by
+  qualified id. Line and column point into the nested step.
 
 ---
 
@@ -368,16 +450,16 @@ opened: open or relay them yourself.
 ### Commands
 
 Workflows are named by `"name"`, `"path"` or `"id"` (from
-`workflows_list`). Steps by `"step": "<step id>"`.
+`workflows_list`). Steps by `"step": "<qualified id>"` (`svc`, `api/migrate`).
 
 | Command | Params | Result |
 |---|---|---|
-| `workflows_list` | – | array of `{id, name, path, source, error, steps[{id, title, needs, after, project, run, check, ready, stop_grace_s, artifacts[{label, path} or {label, url}]}], outcome}` |
+| `workflows_list` | – | array of `{id, name, path, source, error, steps, outcome}`; each step `{id, path, kind: "step", title, needs, after, project, run, check, ready, stop_grace_s, artifacts[{label, path} or {label, url}]}`, each group `{id, path, kind: "group", title, needs, after, project, steps[…]}` (nested). `path` is the qualified id; `project` is where it runs (inherited from its groups) |
 | `workflow_run` | name/path/id | `{run, id}`; starts afresh (a run of it still going is stopped first, each command with its grace) |
-| `workflow_status` | name/path/id | `{run, workflow, outcome, steps[{id, title, status, reason, detail, blocked, last_line, check_output, exit_code, exited, elapsed_ms, location, terminal, artifacts[{label, name, path or url, resolved, exists}], artifacts_error}]}` (error if it has not run). `resolved`/`exists` are `null` until the artifacts were checked; `artifacts_error` says why they could not be |
+| `workflow_status` | name/path/id | `{run, workflow, outcome, steps[…]}` (error if it has not run): one row per step and group in file order, groups before their steps. Step rows: `{id, kind: "step", parent, title, status, reason, detail, blocked, last_line, check_output, exit_code, exited, elapsed_ms, location, terminal, artifacts[{label, name, path or url, resolved, exists}], artifacts_error}`; group rows: `{id, kind: "group", parent, title, status, reason, detail, blocked, elapsed_ms, steps[qualified ids]}`. `id`/`parent` are qualified ids (`parent` null at the top). `resolved`/`exists` are `null` until the artifacts were checked; `artifacts_error` says why they could not be |
 | `workflow_continue` | name, `step` | `null`; error `the step is not waiting for Continue` unless it is a running `manual` step |
-| `workflow_restart` | name, `step` | bool (its old command is stopped with its grace first) |
-| `workflow_retry` | name | bool (reruns failed steps) |
+| `workflow_restart` | name, `step` | bool (its old command is stopped with its grace first; a group: every step in it) |
+| `workflow_retry` | name, `step`? | bool: without `step` reruns every failed step; with it that step if it failed, or a group's failed steps (`false` if none had failed) |
 | `workflow_stop` | name | bool (Ctrl+C, kill after each step's `stop_grace_s`; again while steps are `stopping`: kill now) |
 | `workflow_check_artifacts` | name, `step` | bool: `false` if the step has no artifacts or never got to where it runs; else they are looked up again — read `workflow_status` after a moment |
 
@@ -387,7 +469,7 @@ Workflows are named by `"name"`, `"path"` or `"id"` (from
 
 | type | fields |
 |---|---|
-| `step` | `run`, `workflow`, `step`, `status` (incl. `stopping`), `reason` (failed only), `detail` (what it waits for, e.g. `needs svc`, `after eval`, `waiting for output /…/`, the manual prompt, `blocked: …`, `stopping (20 s left)`) |
+| `step` | `run`, `workflow`, `step` (qualified id; groups too), `status` (incl. `stopping`), `reason` (failed only; a group's `N of M steps failed`), `detail` (what it waits for, e.g. `needs svc`, `after eval`, `waiting for output /…/`, the manual prompt, `blocked: …`, `stopping (20 s left)`; a running group's `2 of 3 ready`) |
 | `outcome` | `run`, `workflow`, `outcome` |
 | `url` | `run`, `workflow`, `step`, `url` |
 
@@ -473,6 +555,17 @@ Rules of thumb:
   are **dashed** (lit once the step finished, ready or failed) and the
   card's kind line says `after`. A card with artifacts shows `↗ N`; a
   stopping card shows its countdown.
+- A **group** is a card of the same size: state, title, `▸ N steps`,
+  elapsed time, and a miniature of its graph (its steps as small boxes in
+  their state colours, nested groups outlined, edges dashed for `after`).
+  Click it to select it and expand it in place: a box around its graph of
+  real cards (click them as usual; edges attach to the box's sides).
+  Click the box's header (`▾`) to collapse it. Several groups (nested
+  ones too) can be open at once; they stay open while the tab is, across
+  edits, and the graph re-fits unless you zoomed. A selected group's
+  details show its state, its steps counted by state, Restart, Retry
+  Failed and Expand/Collapse. With the cursor inside a collapsed group's
+  step, the group is highlighted.
 - Click a card: the editor jumps to the step; the details strip shows the
   state, reason, last output lines, **Artifacts** (each a link: a file
   opens in an editor tab of the step's project — a file on this machine in
@@ -520,3 +613,7 @@ Rules of thumb:
 - `${steps.<id>.artifacts.…}` paths are those of the producing step's machine/container; nothing is copied between machines.
 - Artifacts are checked for existence only (not size or freshness); a file left over from an earlier run counts as present.
 - There is no per-step Stop: Stop All stops everything (a step can be Restarted).
+- Groups only group: no `run`/`check`/`ready` of their own, no artifacts;
+  a step cannot depend on a step inside another group (depend on the
+  group). The miniature of a collapsed group draws nested groups as
+  single boxes.

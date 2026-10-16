@@ -1,10 +1,11 @@
 //! Where things are in a workflow file's text: each step object's byte
-//! range, its `"id"` and the ids its `needs` and `after` list. Read from
-//! the raw text with a tolerant scanner (comments, trailing commas,
-//! unfinished files), so an editor can map steps to lines and back even
-//! while the file does not parse.
+//! range, its `"id"`, the ids its `needs` and `after` list, and the steps
+//! of a group inside it. Read from the raw text with a tolerant scanner
+//! (comments, trailing commas, unfinished files), so an editor can map
+//! steps to lines and back even while the file does not parse.
 
-/// One element of the top-level `steps` array, in file order.
+/// One element of a `steps` array (the top level's or a group's), in
+/// file order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepSpan {
     /// Byte range of the object, braces included (to the end of the text
@@ -19,6 +20,15 @@ pub struct StepSpan {
     pub needs: Vec<(String, usize)>,
     /// Each string in `after` and where it starts.
     pub after: Vec<(String, usize)>,
+    /// The elements of its own `steps` array (a group's), in order.
+    pub steps: Vec<StepSpan>,
+}
+
+impl StepSpan {
+    /// Where its `"id"` is, else where it starts.
+    pub fn id_or_start(&self) -> usize {
+        self.id_offset.unwrap_or(self.start)
+    }
 }
 
 /// A problem in a workflow file and where it is, when known.
@@ -71,7 +81,8 @@ pub fn offset_of(text: &str, line: usize, column: usize) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     Root,
-    Steps,
+    /// A `steps` array: the top level's (`None`) or a step's.
+    Steps(Option<usize>),
     Step(usize),
     Needs(usize),
     After(usize),
@@ -87,18 +98,20 @@ struct Frame {
 }
 
 /// The elements of the top-level `steps` array, in order (one per
-/// element, objects or not, so indices match the array's).
+/// element, objects or not, so indices match the array's), each with the
+/// elements of its own `steps` (a group's) nested the same way.
 pub fn step_spans(text: &str) -> Vec<StepSpan> {
     let bytes = text.as_bytes();
-    let mut spans: Vec<StepSpan> = Vec::new();
+    // Every span, in the order they start, with its parent's index.
+    let mut spans: Vec<(StepSpan, Option<usize>)> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
     let mut i = 0;
 
     // The role of a value starting at `start`; takes the parent object's
-    // key, and opens a span for an element of `steps`.
+    // key, and opens a span for an element of a `steps` array.
     fn begin_value(
         stack: &mut [Frame],
-        spans: &mut Vec<StepSpan>,
+        spans: &mut Vec<(StepSpan, Option<usize>)>,
         start: usize,
         end: usize,
     ) -> (Role, Option<(String, usize)>) {
@@ -111,16 +124,21 @@ pub fn step_spans(text: &str) -> Vec<StepSpan> {
             top.object,
             key.as_ref().map(|(key, _)| key.as_str()),
         ) {
-            (Role::Root, true, Some("steps")) => Role::Steps,
-            (Role::Steps, false, _) => {
-                spans.push(StepSpan {
-                    start,
-                    end,
-                    id: None,
-                    id_offset: None,
-                    needs: Vec::new(),
-                    after: Vec::new(),
-                });
+            (Role::Root, true, Some("steps")) => Role::Steps(None),
+            (Role::Step(index), true, Some("steps")) => Role::Steps(Some(index)),
+            (Role::Steps(parent), false, _) => {
+                spans.push((
+                    StepSpan {
+                        start,
+                        end,
+                        id: None,
+                        id_offset: None,
+                        needs: Vec::new(),
+                        after: Vec::new(),
+                        steps: Vec::new(),
+                    },
+                    parent,
+                ));
                 Role::Step(spans.len() - 1)
             }
             (Role::Step(index), true, Some("needs")) => Role::Needs(index),
@@ -168,7 +186,7 @@ pub fn step_spans(text: &str) -> Vec<StepSpan> {
                 if let Some(frame) = stack.pop()
                     && let Role::Step(index) = frame.role
                 {
-                    spans[index].end = i + 1;
+                    spans[index].0.end = i + 1;
                 }
                 i += 1;
             }
@@ -206,11 +224,11 @@ pub fn step_spans(text: &str) -> Vec<StepSpan> {
                 let (role, key) = begin_value(&mut stack, &mut spans, start, i);
                 match (parent, role, key) {
                     (Some(Role::Step(index)), _, Some((key, key_at))) if key == "id" => {
-                        spans[index].id = Some(value);
-                        spans[index].id_offset = Some(key_at);
+                        spans[index].0.id = Some(value);
+                        spans[index].0.id_offset = Some(key_at);
                     }
-                    (_, Role::Needs(index), _) => spans[index].needs.push((value, start)),
-                    (_, Role::After(index), _) => spans[index].after.push((value, start)),
+                    (_, Role::Needs(index), _) => spans[index].0.needs.push((value, start)),
+                    (_, Role::After(index), _) => spans[index].0.after.push((value, start)),
                     _ => {}
                 }
             }
@@ -229,14 +247,74 @@ pub fn step_spans(text: &str) -> Vec<StepSpan> {
             }
         }
     }
-    spans
+    // Children start after their parents: nest them from the last one.
+    let mut top = Vec::new();
+    let mut slots: Vec<Option<StepSpan>> = Vec::with_capacity(spans.len());
+    let parents: Vec<Option<usize>> = spans.iter().map(|(_, parent)| *parent).collect();
+    slots.extend(spans.into_iter().map(|(span, _)| Some(span)));
+    for index in (0..slots.len()).rev() {
+        let span = slots[index].take().expect("each span is moved once");
+        match parents[index] {
+            Some(parent) => slots[parent]
+                .as_mut()
+                .expect("a parent comes before its children")
+                .steps
+                .insert(0, span),
+            None => top.insert(0, span),
+        }
+    }
+    top
 }
 
-/// The step whose object contains byte `offset`.
-pub fn step_at(spans: &[StepSpan], offset: usize) -> Option<&StepSpan> {
-    spans
+/// The span at `path` (indices in the top-level `steps`, then in each
+/// group's).
+pub fn span_at<'a>(spans: &'a [StepSpan], path: &[usize]) -> Option<&'a StepSpan> {
+    let (first, rest) = path.split_first()?;
+    let span = spans.get(*first)?;
+    if rest.is_empty() {
+        Some(span)
+    } else {
+        span_at(&span.steps, rest)
+    }
+}
+
+/// The steps whose objects contain byte `offset`, from the top-level one
+/// down to the innermost (empty: none).
+pub fn step_at(spans: &[StepSpan], offset: usize) -> Vec<&StepSpan> {
+    let mut chain = Vec::new();
+    let mut level = spans;
+    while let Some(span) = level
         .iter()
         .find(|span| span.start <= offset && offset < span.end.max(span.start + 1))
+    {
+        chain.push(span);
+        level = &span.steps;
+    }
+    chain
+}
+
+/// The span of the step with qualified id `path` (`group/child`).
+pub fn span_of<'a>(spans: &'a [StepSpan], path: &str) -> Option<&'a StepSpan> {
+    let mut level = spans;
+    let mut found = None;
+    for id in path.split('/') {
+        let span = level.iter().find(|span| span.id.as_deref() == Some(id))?;
+        found = Some(span);
+        level = &span.steps;
+    }
+    found
+}
+
+/// The qualified id (`group/child`) of the innermost step whose object
+/// contains byte `offset`; `None` outside every step or when a step on
+/// the way has no id.
+pub fn path_at(spans: &[StepSpan], offset: usize) -> Option<String> {
+    let chain = step_at(spans, offset);
+    if chain.is_empty() {
+        return None;
+    }
+    let ids: Option<Vec<&str>> = chain.iter().map(|span| span.id.as_deref()).collect();
+    Some(ids?.join("/"))
 }
 
 #[cfg(test)]
@@ -278,8 +356,50 @@ mod tests {
         assert_eq!(&FILE[spans[2].needs[1].1..spans[2].needs[1].1 + 3], "\"b\"");
         // The cursor anywhere inside a step's object finds it.
         let inside_b = FILE.find("\"ready\"").unwrap();
-        assert_eq!(step_at(&spans, inside_b).unwrap().id.as_deref(), Some("b"));
-        assert_eq!(step_at(&spans, FILE.find("\"name\"").unwrap()), None);
+        let chain = step_at(&spans, inside_b);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id.as_deref(), Some("b"));
+        assert_eq!(path_at(&spans, inside_b).as_deref(), Some("b"));
+        assert!(step_at(&spans, FILE.find("\"name\"").unwrap()).is_empty());
+        assert_eq!(path_at(&spans, 0), None);
+    }
+
+    #[test]
+    fn groups_nest_their_steps() {
+        let text = r#"{"steps": [
+  {"id": "svc", "needs": ["x"], "steps": [
+    {"id": "build", "run": "b"},
+    {"id": "inner", "steps": [{"id": "deep", "after": "build", "run": "d"}]}
+  ]},
+  {"id": "x", "env": {"steps": [{"id": "no"}]}, "run": "x"}
+]}"#;
+        let spans = step_spans(text);
+        let ids = |spans: &[StepSpan]| -> Vec<Option<String>> {
+            spans.iter().map(|span| span.id.clone()).collect()
+        };
+        assert_eq!(ids(&spans), [Some("svc".into()), Some("x".into())]);
+        assert_eq!(
+            ids(&spans[0].steps),
+            [Some("build".into()), Some("inner".into())]
+        );
+        assert!(spans[1].steps.is_empty(), "`steps` in env is not a group");
+        assert_eq!(spans[0].needs[0].0, "x");
+        let deep = span_at(&spans, &[0, 1, 0]).unwrap();
+        assert_eq!(deep.id.as_deref(), Some("deep"));
+        assert_eq!(deep.after[0].0, "build");
+        assert_eq!(span_of(&spans, "svc/inner/deep"), Some(deep));
+        assert_eq!(span_of(&spans, "svc/deep"), None);
+        let inside = text.find("\"d\"").unwrap();
+        assert_eq!(path_at(&spans, inside).as_deref(), Some("svc/inner/deep"));
+        let chain: Vec<_> = step_at(&spans, inside)
+            .iter()
+            .map(|span| span.id.clone().unwrap())
+            .collect();
+        assert_eq!(chain, ["svc", "inner", "deep"]);
+        // On the group's own text: the group.
+        let own = text.find("\"needs\"").unwrap();
+        assert_eq!(path_at(&spans, own).as_deref(), Some("svc"));
+        assert_eq!(&text[deep.start..deep.end].chars().last(), &Some('}'));
     }
 
     #[test]

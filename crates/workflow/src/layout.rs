@@ -24,10 +24,18 @@
 //! several edges spreads them over distinct ports. Pure geometry in
 //! logical pixels; deterministic, and polynomial but for the bounded
 //! search (workflows are small).
+//!
+//! Steps may differ in size (an expanded group is a box around its own
+//! graph): a column is as wide as its widest step, steps sit at its left
+//! edge, and an edge leaving a narrower one runs level to the column's
+//! right edge first. [`layout_workflow`] lays out each level of groups
+//! this way, inner levels first: a collapsed group is a card (with its
+//! graph laid out apart, for a miniature), an expanded one a box sized to
+//! its graph plus a header.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::Workflow;
+use crate::{Step, Workflow};
 
 /// Card size and spacing.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,8 +47,10 @@ pub struct Metrics {
     pub row_gap: f32,
     /// Between an edge passing a column and the cards or edges next to it.
     pub edge_gap: f32,
-    /// Around the whole graph.
+    /// Around the whole graph (and a group's graph inside its box).
     pub margin: f32,
+    /// The title bar of an expanded group's box, above its graph.
+    pub group_header: f32,
 }
 
 impl Default for Metrics {
@@ -52,6 +62,7 @@ impl Default for Metrics {
             row_gap: 20.,
             edge_gap: 14.,
             margin: 24.,
+            group_header: 30.,
         }
     }
 }
@@ -62,16 +73,26 @@ pub struct NodeSpec<'a> {
     pub id: &'a str,
     pub needs: &'a [String],
     pub after: &'a [String],
+    /// Width and height of its box.
+    pub size: (f32, f32),
 }
 
-/// A step's place: its column (depth), row in the column, and top-left
-/// corner.
+/// A step's place: its column (depth), row in the column, top-left
+/// corner and size.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Node {
     pub column: usize,
     pub row: usize,
     pub x: f32,
     pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Node {
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
+    }
 }
 
 /// `from` (a need, or a step `to` runs after) → `to`.
@@ -81,11 +102,23 @@ pub struct Edge {
     pub to: usize,
     /// An `after` edge (`to` starts once `from` finished, ready or not).
     pub after: bool,
-    /// Where it runs, left to right: its port on `from`'s right side, two
-    /// points per column it crosses (where it enters and leaves the
-    /// column, at one height, between the cards there), and its port on
-    /// `to`'s left side. Drawn with horizontal tangents at every point.
+    /// Where it runs, left to right: its port on `from`'s right side (and
+    /// the right edge of `from`'s column, level with it, when `from` is
+    /// narrower), two points per column it crosses (where it enters and
+    /// leaves the column, at one height, between the cards there), and its
+    /// port on `to`'s left side. Drawn with horizontal tangents at every
+    /// point.
     pub points: Vec<(f32, f32)>,
+}
+
+/// A group's own graph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Inner {
+    /// Expanded: laid out inside the group's box, under its header, in
+    /// the coordinates of the whole graph. Collapsed: at the origin, its
+    /// groups as plain cards, for a miniature scaled into the card.
+    pub expanded: bool,
+    pub layout: GraphLayout,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,19 +131,50 @@ pub struct GraphLayout {
     pub width: f32,
     pub height: f32,
     pub metrics: Metrics,
+    /// By step index: a group's graph ([`layout_workflow`] only).
+    pub inner: Vec<Option<Inner>>,
 }
 
 impl GraphLayout {
-    /// The step whose card contains `(x, y)` (edges only run between
-    /// cards).
+    /// The step whose box contains `(x, y)` (edges only run between
+    /// boxes).
     pub fn step_at(&self, x: f32, y: f32) -> Option<usize> {
-        let metrics = &self.metrics;
-        self.nodes.iter().position(|node| {
-            x >= node.x
-                && x <= node.x + metrics.card_width
-                && y >= node.y
-                && y <= node.y + metrics.card_height
-        })
+        self.nodes.iter().position(|node| node.contains(x, y))
+    }
+
+    /// The steps under `(x, y)` from this level down: a step, or an
+    /// expanded group and (unless on its header or padding) what is under
+    /// the point in its graph. Empty: none.
+    pub fn hit(&self, x: f32, y: f32) -> Vec<usize> {
+        let mut path = Vec::new();
+        let mut level = self;
+        while let Some(at) = level.step_at(x, y) {
+            path.push(at);
+            match &level.inner.get(at) {
+                Some(Some(inner)) if inner.expanded => level = &inner.layout,
+                _ => break,
+            }
+        }
+        path
+    }
+
+    /// Moved by `(dx, dy)`, expanded groups' graphs included.
+    fn translate(&mut self, dx: f32, dy: f32) {
+        for node in &mut self.nodes {
+            node.x += dx;
+            node.y += dy;
+        }
+        for edge in &mut self.edges {
+            for point in &mut edge.points {
+                point.0 += dx;
+                point.1 += dy;
+            }
+        }
+        for inner in self.inner.iter_mut().flatten() {
+            if inner.expanded {
+                inner.layout.translate(dx, dy);
+            }
+        }
     }
 }
 
@@ -192,7 +256,8 @@ fn layered(nodes: &[NodeSpec]) -> Result<(Layered, Vec<Route>), String> {
         return Err(format!("dependency cycle among {}", stuck.join(", ")));
     }
 
-    Ok(Layered::new(&depth, &needs))
+    let heights: Vec<f32> = nodes.iter().map(|node| node.size.1).collect();
+    Ok(Layered::new(&depth, &needs, heights))
 }
 
 /// Lays out `nodes`; a duplicate id, an unknown need or a cycle is an
@@ -203,8 +268,6 @@ pub fn layout(nodes: &[NodeSpec], metrics: Metrics) -> Result<GraphLayout, Strin
     let pos = graph.positions();
     let center = graph.heights(&pos, &metrics);
 
-    let column_pitch = metrics.card_width + metrics.column_gap;
-    let column_x = |column: usize| metrics.margin + column as f32 * column_pitch;
     let columns: Vec<Vec<usize>> = graph
         .layers
         .iter()
@@ -216,22 +279,43 @@ pub fn layout(nodes: &[NodeSpec], metrics: Metrics) -> Result<GraphLayout, Strin
                 .collect()
         })
         .collect();
+    // Each column as wide as its widest step; where each starts.
+    let column_width: Vec<f32> = columns
+        .iter()
+        .map(|members| {
+            members
+                .iter()
+                .map(|&at| nodes[at].size.0)
+                .fold(0f32, f32::max)
+        })
+        .collect();
+    let mut column_x = Vec::with_capacity(columns.len());
+    let mut x = metrics.margin;
+    for width in &column_width {
+        column_x.push(x);
+        x += width + metrics.column_gap;
+    }
     let mut placed = vec![
         Node {
             column: 0,
             row: 0,
             x: 0.,
             y: 0.,
+            width: 0.,
+            height: 0.,
         };
         nodes.len()
     ];
     for (column, members) in columns.iter().enumerate() {
         for (row, &at) in members.iter().enumerate() {
+            let (width, height) = nodes[at].size;
             placed[at] = Node {
                 column,
                 row,
-                x: column_x(column),
-                y: center[at] - metrics.card_height / 2.,
+                x: column_x[column],
+                y: center[at] - height / 2.,
+                width,
+                height,
             };
         }
     }
@@ -239,7 +323,16 @@ pub fn layout(nodes: &[NodeSpec], metrics: Metrics) -> Result<GraphLayout, Strin
     // side, by the neighbouring item.
     let side_ports = |neighbors: &[Vec<usize>]| -> Vec<Vec<(usize, f32)>> {
         (0..nodes.len())
-            .map(|at| ports(center[at], &neighbors[at], &center, &pos, &metrics))
+            .map(|at| {
+                ports(
+                    center[at],
+                    nodes[at].size.1,
+                    &neighbors[at],
+                    &center,
+                    &pos,
+                    &metrics,
+                )
+            })
             .collect()
     };
     let (out_ports, in_ports) = (side_ports(&graph.succs), side_ports(&graph.preds));
@@ -256,15 +349,18 @@ pub fn layout(nodes: &[NodeSpec], metrics: Metrics) -> Result<GraphLayout, Strin
             let first = route.dummies.first().copied().unwrap_or(route.to);
             let last = route.dummies.last().copied().unwrap_or(route.from);
             let (from, to) = (placed[route.from], placed[route.to]);
-            let mut points = Vec::with_capacity(2 + 2 * route.dummies.len());
-            points.push((
-                from.x + metrics.card_width,
-                port(&out_ports[route.from], first),
-            ));
+            let mut points = Vec::with_capacity(3 + 2 * route.dummies.len());
+            let out = port(&out_ports[route.from], first);
+            points.push((from.x + from.width, out));
+            let column_right = column_x[from.column] + column_width[from.column];
+            if from.x + from.width < column_right {
+                points.push((column_right, out));
+            }
             for &dummy in &route.dummies {
-                let x = column_x(graph.column[dummy]);
+                let column = graph.column[dummy];
+                let x = column_x[column];
                 points.push((x, center[dummy]));
-                points.push((x + metrics.card_width, center[dummy]));
+                points.push((x + column_width[column], center[dummy]));
             }
             points.push((to.x, port(&in_ports[route.to], last)));
             Edge {
@@ -275,15 +371,11 @@ pub fn layout(nodes: &[NodeSpec], metrics: Metrics) -> Result<GraphLayout, Strin
             }
         })
         .collect();
-    let column_count = graph.layers.len();
     let bottom = (0..graph.column.len())
-        .map(|item| center[item] + graph.half(item, &metrics))
+        .map(|item| center[item] + graph.half(item))
         .fold(metrics.margin, f32::max);
-    let width = if column_count == 0 {
-        0.
-    } else {
-        column_count as f32 * metrics.card_width + (column_count - 1) as f32 * metrics.column_gap
-    };
+    let width = column_width.iter().sum::<f32>()
+        + column_width.len().saturating_sub(1) as f32 * metrics.column_gap;
     Ok(GraphLayout {
         nodes: placed,
         edges,
@@ -291,6 +383,7 @@ pub fn layout(nodes: &[NodeSpec], metrics: Metrics) -> Result<GraphLayout, Strin
         width: 2. * metrics.margin + width,
         height: bottom + metrics.margin,
         metrics,
+        inner: vec![None; nodes.len()],
     })
 }
 
@@ -344,6 +437,8 @@ impl Heuristic {
 /// are the steps, then the dummies.
 struct Layered {
     steps: usize,
+    /// By step: its box's height.
+    step_heights: Vec<f32>,
     /// By item.
     column: Vec<usize>,
     preds: Vec<Vec<usize>>,
@@ -356,10 +451,15 @@ impl Layered {
     /// Steps in file order, then dummies in edge order, per column; the
     /// routes in edge order (by step, in the order of its `needs`, then
     /// `after`).
-    fn new(depth: &[usize], needs: &[Vec<(usize, bool)>]) -> (Self, Vec<Route>) {
+    fn new(
+        depth: &[usize],
+        needs: &[Vec<(usize, bool)>],
+        step_heights: Vec<f32>,
+    ) -> (Self, Vec<Route>) {
         let steps = depth.len();
         let mut graph = Self {
             steps,
+            step_heights,
             column: depth.to_vec(),
             preds: vec![Vec::new(); steps],
             succs: vec![Vec::new(); steps],
@@ -401,12 +501,12 @@ impl Layered {
         item >= self.steps
     }
 
-    /// Half an item's height: a card's, or nothing for a dummy.
-    fn half(&self, item: usize, metrics: &Metrics) -> f32 {
+    /// Half an item's height: its step's box's, or nothing for a dummy.
+    fn half(&self, item: usize) -> f32 {
         if self.is_dummy(item) {
             0.
         } else {
-            metrics.card_height / 2.
+            self.step_heights[item] / 2.
         }
     }
 
@@ -418,7 +518,7 @@ impl Layered {
         } else {
             metrics.row_gap
         };
-        self.half(upper, metrics) + self.half(lower, metrics) + gap
+        self.half(upper) + self.half(lower) + gap
     }
 
     /// Each item's row in its column.
@@ -692,7 +792,7 @@ impl Layered {
                 .collect();
         let extent = |center: &[f32]| {
             (0..count).fold((f32::INFINITY, f32::NEG_INFINITY), |(top, bottom), item| {
-                let half = self.half(item, metrics);
+                let half = self.half(item);
                 (
                     top.min(center[item] - half),
                     bottom.max(center[item] + half),
@@ -971,13 +1071,15 @@ fn reorder(layer: &mut [usize], neighbors: &[Vec<usize>], pos: &mut [usize], heu
     }
 }
 
-/// The ports on one side of a card centered at `center`, as (neighbouring
-/// item, height): one edge in the middle; several spread evenly in the
-/// order of their neighbours, the group shifted (within [`PORT_SPAN`])
-/// towards them, so an edge to a neighbour level with the card stays
-/// straight.
+/// The ports on one side of a box `height` tall centered at `center`, as
+/// (neighbouring item, height): one edge in the middle; several spread
+/// evenly in the order of their neighbours, the group shifted (within
+/// [`PORT_SPAN`] of a card) towards them, so an edge to a neighbour level
+/// with the card stays straight. A box taller than a card (an expanded
+/// group) lets its ports move along all but its ends, a lone one too.
 fn ports(
     center: f32,
+    height: f32,
     neighbors: &[usize],
     centers: &[f32],
     pos: &[usize],
@@ -986,11 +1088,20 @@ fn ports(
     let mut sorted = neighbors.to_vec();
     sorted.sort_by_key(|&n| pos[n]);
     let count = sorted.len();
-    if count <= 1 {
+    let tall = height > metrics.card_height;
+    let room = if tall {
+        height - metrics.card_height * (1. - PORT_SPAN)
+    } else {
+        metrics.card_height * PORT_SPAN
+    };
+    if count == 0 || (count == 1 && !tall) {
         return sorted.into_iter().map(|n| (n, center)).collect();
     }
-    let room = metrics.card_height * PORT_SPAN;
-    let pitch = (metrics.card_height / 6.).min(room / (count - 1) as f32);
+    let pitch = if count == 1 {
+        0.
+    } else {
+        (metrics.card_height / 6.).min(room / (count - 1) as f32)
+    };
     let spread = pitch * (count - 1) as f32;
     let at = |k: usize| center - spread / 2. + pitch * k as f32;
     // The shift closest to none among those minimizing the total distance
@@ -1018,18 +1129,81 @@ fn ports(
         .collect()
 }
 
-/// [`layout`] for a parsed workflow (which is valid, so this succeeds).
-pub fn layout_workflow(workflow: &Workflow, metrics: Metrics) -> Result<GraphLayout, String> {
-    let specs: Vec<NodeSpec> = workflow
-        .steps
+/// [`layout`] for a parsed workflow (which is valid, so this succeeds),
+/// level by level: each group whose qualified id (`group/step`) is in
+/// `expanded` is a box around its own graph (under a header), any other a
+/// card with its graph laid out apart for a miniature.
+pub fn layout_workflow(
+    workflow: &Workflow,
+    metrics: Metrics,
+    expanded: &HashSet<String>,
+) -> Result<GraphLayout, String> {
+    layout_level(&workflow.steps, "", metrics, Some(expanded))
+}
+
+/// One level: `steps` (inside group `prefix`, empty at the top); without
+/// `expanded`, a miniature's (groups are plain cards).
+fn layout_level(
+    steps: &[Step],
+    prefix: &str,
+    metrics: Metrics,
+    expanded: Option<&HashSet<String>>,
+) -> Result<GraphLayout, String> {
+    let card = (metrics.card_width, metrics.card_height);
+    let mut inner: Vec<Option<Inner>> = Vec::with_capacity(steps.len());
+    let mut sizes: Vec<(f32, f32)> = Vec::with_capacity(steps.len());
+    for step in steps {
+        let Some(expanded) = expanded.filter(|_| step.is_group()) else {
+            inner.push(None);
+            sizes.push(card);
+            continue;
+        };
+        let path = if prefix.is_empty() {
+            step.id.clone()
+        } else {
+            format!("{prefix}/{}", step.id)
+        };
+        if expanded.contains(&path) {
+            let graph = layout_level(&step.steps, &path, metrics, Some(expanded))?;
+            sizes.push((
+                graph.width.max(metrics.card_width),
+                metrics.group_header + graph.height,
+            ));
+            inner.push(Some(Inner {
+                expanded: true,
+                layout: graph,
+            }));
+        } else {
+            let graph = layout_level(&step.steps, &path, metrics, None)?;
+            sizes.push(card);
+            inner.push(Some(Inner {
+                expanded: false,
+                layout: graph,
+            }));
+        }
+    }
+    let specs: Vec<NodeSpec> = steps
         .iter()
-        .map(|step| NodeSpec {
+        .zip(&sizes)
+        .map(|(step, &size)| NodeSpec {
             id: &step.id,
             needs: &step.needs,
             after: &step.after,
+            size,
         })
         .collect();
-    layout(&specs, metrics)
+    let mut graph = layout(&specs, metrics)?;
+    for (node, inner) in graph.nodes.iter().zip(&mut inner) {
+        if let Some(inner) = inner
+            && inner.expanded
+        {
+            inner
+                .layout
+                .translate(node.x, node.y + metrics.group_header);
+        }
+    }
+    graph.inner = inner;
+    Ok(graph)
 }
 
 /// How a graph of some size shows in a viewport: drawn at `offset` (the
@@ -1126,6 +1300,7 @@ mod tests {
         row_gap: 10.,
         edge_gap: 8.,
         margin: 5.,
+        group_header: 12.,
     };
 
     /// A login chain, a fan, and a long edge from the first step to the
@@ -1195,7 +1370,12 @@ mod tests {
         let specs: Vec<NodeSpec> = steps
             .iter()
             .zip(&lists)
-            .map(|((id, _), (needs, after))| NodeSpec { id, needs, after })
+            .map(|((id, _), (needs, after))| NodeSpec {
+                id,
+                needs,
+                after,
+                size: (M.card_width, M.card_height),
+            })
             .collect();
         f(&specs)
     }
@@ -1245,17 +1425,24 @@ mod tests {
     }
 
     /// What every layout promises: edges, drawn with horizontal tangents
-    /// at their points, never enter a card; they leave their step's right
+    /// at their points, never enter a box; they leave their step's right
     /// side and enter the left side of the one needing it at a port of
-    /// their own; cards neither overlap nor leave the graph.
+    /// their own; boxes neither overlap nor leave the graph. The same in
+    /// each expanded group's graph, which stays inside the group's box
+    /// under its header.
     fn assert_clean(layout: &GraphLayout) {
+        assert_clean_at(layout, (0., 0.));
+    }
+
+    /// [`assert_clean`] for a graph whose top-left corner is `origin`.
+    fn assert_clean_at(layout: &GraphLayout, origin: Point) {
         let m = layout.metrics;
         let inside = |(x, y): Point| {
             layout.nodes.iter().position(|node| {
                 x > node.x + 0.01
-                    && x < node.x + m.card_width - 0.01
+                    && x < node.x + node.width - 0.01
                     && y > node.y + 0.01
-                    && y < node.y + m.card_height - 0.01
+                    && y < node.y + node.height - 0.01
             })
         };
         let mut ports: Vec<(bool, usize, f32)> = Vec::new();
@@ -1263,13 +1450,13 @@ mod tests {
             let (from, to) = (layout.nodes[edge.from], layout.nodes[edge.to]);
             let (start, end) = (edge.points[0], edge.points[edge.points.len() - 1]);
             assert!(
-                near(start.0, from.x + m.card_width)
+                near(start.0, from.x + from.width)
                     && start.1 > from.y
-                    && start.1 < from.y + m.card_height,
+                    && start.1 < from.y + from.height,
                 "{edge:?}"
             );
             assert!(
-                near(end.0, to.x) && end.1 > to.y && end.1 < to.y + m.card_height,
+                near(end.0, to.x) && end.1 > to.y && end.1 < to.y + to.height,
                 "{edge:?}"
             );
             for (out, step, y) in [(true, edge.from, start.1), (false, edge.to, end.1)] {
@@ -1295,19 +1482,39 @@ mod tests {
                         bezier(a.0, a.0 + handle, b.0 - handle, b.0),
                         bezier(a.1, a.1, b.1, b.1),
                     );
-                    assert_eq!(inside(point), None, "{edge:?} enters a card at {point:?}");
+                    assert_eq!(inside(point), None, "{edge:?} enters a box at {point:?}");
+                    assert!(
+                        point.0 >= origin.0 && point.0 <= origin.0 + layout.width,
+                        "{edge:?} leaves the graph at {point:?}"
+                    );
                 }
             }
         }
         for column in &layout.columns {
             for pair in column.windows(2) {
                 let (upper, lower) = (layout.nodes[pair[0]], layout.nodes[pair[1]]);
-                assert!(lower.y >= upper.y + m.card_height + m.row_gap - 0.01);
+                assert!(lower.y >= upper.y + upper.height + m.row_gap - 0.01);
             }
         }
         for node in &layout.nodes {
-            assert!(node.y >= m.margin - 0.01);
-            assert!(node.y + m.card_height <= layout.height - m.margin + 0.01);
+            assert!(node.y >= origin.1 + m.margin - 0.01);
+            assert!(node.y + node.height <= origin.1 + layout.height - m.margin + 0.01);
+            assert!(node.x >= origin.0 + m.margin - 0.01);
+            assert!(node.x + node.width <= origin.0 + layout.width - m.margin + 0.01);
+        }
+        for (node, inner) in layout.nodes.iter().zip(&layout.inner) {
+            let Some(inner) = inner else {
+                continue;
+            };
+            if !inner.expanded {
+                assert_eq!((node.width, node.height), (m.card_width, m.card_height));
+                assert_clean_at(&inner.layout, (0., 0.));
+                continue;
+            }
+            let graph = &inner.layout;
+            assert!(near(node.width, graph.width.max(m.card_width)));
+            assert!(near(node.height, m.group_header + graph.height));
+            assert_clean_at(graph, (node.x, node.y + m.group_header));
         }
     }
 
@@ -1706,5 +1913,166 @@ mod tests {
             offset: (-50., 0.),
         };
         assert_eq!(half.clamped((1000., 100.), (600., 400.)).offset.0, 0.);
+    }
+
+    /// [`graph`] with some steps' boxes resized: `(index, (width, height))`.
+    fn graph_sized(steps: &[(&str, &str)], sizes: &[(usize, (f32, f32))]) -> GraphLayout {
+        with_specs(steps, |specs| {
+            let specs: Vec<NodeSpec> = specs
+                .iter()
+                .enumerate()
+                .map(|(at, spec)| NodeSpec {
+                    size: sizes
+                        .iter()
+                        .find(|(index, _)| *index == at)
+                        .map_or(spec.size, |&(_, size)| size),
+                    ..*spec
+                })
+                .collect();
+            layout(&specs, M).unwrap()
+        })
+    }
+
+    #[test]
+    fn columns_take_their_widest_step_and_rows_their_heights() {
+        // `big` shares column 1 with `small` and the long edge a → end.
+        let steps = [
+            ("a", ""),
+            ("big", "a"),
+            ("small", "a"),
+            ("c", "big small"),
+            ("end", "c a"),
+        ];
+        let layout = graph_sized(&steps, &[(1, (300., 200.))]);
+        assert_eq!(
+            ids(&steps, &layout),
+            [vec!["a"], vec!["big", "small"], vec!["c"], vec!["end"]]
+        );
+        let node = |at: usize| layout.nodes[at];
+        assert_eq!((node(1).x, node(2).x), (155., 155.), "left-aligned");
+        assert_eq!((node(1).width, node(1).height), (300., 200.));
+        assert_eq!(node(2).width, 100.);
+        assert_eq!(node(3).x, 155. + 300. + 50., "after the widest");
+        assert!(
+            node(2).y >= node(1).y + 200. + 10. - 0.01,
+            "below the tall box"
+        );
+        assert_eq!(layout.width, 2. * 5. + 100. + 300. + 100. + 100. + 3. * 50.);
+        // Out of the narrow step level to the column's edge, then on.
+        let small_to_c = layout
+            .edges
+            .iter()
+            .find(|edge| (edge.from, edge.to) == (2, 3))
+            .unwrap();
+        assert_eq!(small_to_c.points.len(), 3);
+        assert_eq!(small_to_c.points[0].0, 255.);
+        assert_eq!(small_to_c.points[1], (455., small_to_c.points[0].1));
+        // The long edge passes column 1 over its full width.
+        let long = layout
+            .edges
+            .iter()
+            .find(|edge| (edge.from, edge.to) == (0, 4))
+            .unwrap();
+        assert_eq!((long.points[1].0, long.points[2].0), (155., 455.));
+        // Hit anywhere in the big box, not just a card's size of it.
+        assert_eq!(layout.step_at(node(1).x + 250., node(1).y + 150.), Some(1));
+        assert_eq!(layout.hit(node(1).x + 250., node(1).y + 150.), [1]);
+        assert_clean(&layout);
+        assert_eq!(graph_sized(&steps, &[(1, (300., 200.))]), layout);
+    }
+
+    const GROUPS: &str = r#"{"steps": [
+      {"id": "db", "run": "d"},
+      {"id": "svc", "needs": "db", "steps": [
+        {"id": "build", "run": "b"},
+        {"id": "inner", "needs": "build", "steps": [
+          {"id": "x", "run": "x"},
+          {"id": "y", "after": "x", "run": "y"}
+        ]},
+        {"id": "lint", "run": "l"}
+      ]},
+      {"id": "web", "after": "svc", "run": "w"},
+      {"id": "other", "steps": [{"id": "o", "run": "o"}]}
+    ]}"#;
+
+    fn expanded(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    #[test]
+    fn collapsed_groups_are_cards_with_a_miniature_graph() {
+        let workflow = crate::parse(GROUPS, "f").unwrap();
+        let layout = layout_workflow(&workflow, M, &expanded(&[])).unwrap();
+        assert!(
+            layout
+                .nodes
+                .iter()
+                .all(|node| (node.width, node.height) == (M.card_width, M.card_height))
+        );
+        assert_eq!(layout.inner[0], None);
+        let svc = layout.inner[1].as_ref().unwrap();
+        assert!(!svc.expanded);
+        assert_eq!(svc.layout.nodes.len(), 3);
+        assert_eq!(svc.layout.edges.len(), 1, "build → inner");
+        assert!(
+            svc.layout.inner.iter().all(Option::is_none),
+            "a miniature's groups are plain cards"
+        );
+        assert!(svc.layout.nodes[0].x < 10., "at the origin");
+        assert!(layout.inner[3].is_some());
+        assert_clean(&layout);
+    }
+
+    #[test]
+    fn expanded_groups_are_boxes_around_their_graphs() {
+        let workflow = crate::parse(GROUPS, "f").unwrap();
+        let open = expanded(&["svc", "svc/inner", "other"]);
+        let layout = layout_workflow(&workflow, M, &open).unwrap();
+        assert_clean(&layout);
+        let svc_box = layout.nodes[1];
+        let svc = layout.inner[1].as_ref().unwrap();
+        assert!(svc.expanded);
+        assert!(svc_box.width > M.card_width && svc_box.height > M.card_height);
+        // Its graph sits under the header, in the whole graph's
+        // coordinates; `inner` (expanded too) inside it.
+        let build = svc.layout.nodes[0];
+        assert_eq!(build.x, svc_box.x + M.margin);
+        assert!(build.y >= svc_box.y + M.group_header + M.margin - 0.01);
+        let inner_box = svc.layout.nodes[1];
+        let inner = svc.layout.inner[1].as_ref().unwrap();
+        assert!(inner.expanded);
+        let y = inner.layout.nodes[1];
+        assert!(
+            y.x > inner_box.x
+                && y.x + y.width < inner_box.x + inner_box.width
+                && y.y > inner_box.y + M.group_header
+                && y.y + y.height < inner_box.y + inner_box.height
+        );
+        // Hits go down to the step under the point; a header is its group.
+        assert_eq!(layout.hit(y.x + 5., y.y + 5.), [1, 1, 1]);
+        assert_eq!(layout.hit(svc_box.x + 5., svc_box.y + 5.), [1]);
+        assert_eq!(layout.hit(inner_box.x + 5., inner_box.y + 2.), [1, 1]);
+        // Edges in and out attach to the box's sides; `web` sits past it.
+        let edge = |from: usize, to: usize| {
+            layout
+                .edges
+                .iter()
+                .find(|edge| (edge.from, edge.to) == (from, to))
+                .unwrap()
+        };
+        assert_eq!(edge(0, 1).points.last().unwrap().0, svc_box.x);
+        assert_eq!(edge(1, 2).points[0].0, svc_box.x + svc_box.width);
+        assert!(edge(1, 2).after);
+        assert_eq!(layout.nodes[2].x, svc_box.x + svc_box.width + M.column_gap);
+        // Another group expanded at once; collapsing one changes only it.
+        let other = layout.inner[3].as_ref().unwrap();
+        assert!(other.expanded);
+        let fewer = layout_workflow(&workflow, M, &expanded(&["svc", "svc/inner"])).unwrap();
+        assert!(!fewer.inner[3].as_ref().unwrap().expanded);
+        assert_eq!(fewer.nodes[3].height, M.card_height);
+        assert_clean(&fewer);
+        for _ in 0..3 {
+            assert_eq!(layout_workflow(&workflow, M, &open).unwrap(), layout);
+        }
     }
 }

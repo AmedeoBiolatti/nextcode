@@ -5,11 +5,12 @@
 //! projects open them without a window (local folders at once, WSL and
 //! dev containers like `Project::open`), and commands run in terminals
 //! nobody sees (their last line is in `workflow_status`). URLs are
-//! reported, not opened.
+//! reported, not opened. Steps in groups go by qualified ids
+//! (`group/step`); groups have status rows and events of their own.
 
 use std::time::Instant;
 
-use workflow::{Artifact, ArtifactTarget, Ready, Status};
+use workflow::{Artifact, ArtifactTarget, Ready, Status, StepNode};
 
 use super::*;
 use crate::{
@@ -179,6 +180,43 @@ fn artifact_json(artifact: &Artifact) -> Value {
     }
 }
 
+/// Node `at` of a flattened workflow as listed: a step with its fields, or
+/// a group with its `steps` nested. `project` is where it runs (inherited
+/// from its groups).
+fn node_json(nodes: &[StepNode], at: usize) -> Value {
+    let node = &nodes[at];
+    let step = &node.step;
+    let project = step.project.as_ref().map(|spec| {
+        crate::workflows::location_of(spec).map_or_else(|err| err, |location| location.to_string())
+    });
+    if node.is_group() {
+        return json!({
+            "id": step.id,
+            "path": node.path,
+            "kind": "group",
+            "title": step.title,
+            "needs": step.needs,
+            "after": step.after,
+            "project": project,
+            "steps": node.children.iter().map(|&child| node_json(nodes, child)).collect::<Vec<_>>(),
+        });
+    }
+    json!({
+        "id": step.id,
+        "path": node.path,
+        "kind": "step",
+        "title": step.title,
+        "needs": step.needs,
+        "after": step.after,
+        "project": project,
+        "run": step.run,
+        "check": step.check,
+        "ready": ready_json(&step.ready),
+        "stop_grace_s": step.stop_grace_s,
+        "artifacts": step.artifacts.iter().map(artifact_json).collect::<Vec<_>>(),
+    })
+}
+
 fn list_json(workflows: &Workflows) -> Value {
     let list: Vec<Value> = workflows
         .discovered()
@@ -188,26 +226,10 @@ fn list_json(workflows: &Workflows) -> Value {
                 .parsed
                 .as_ref()
                 .map(|workflow| {
-                    workflow
-                        .steps
-                        .iter()
-                        .map(|step| {
-                            json!({
-                                "id": step.id,
-                                "title": step.title,
-                                "needs": step.needs,
-                                "after": step.after,
-                                "project": step.project.as_ref().map(|spec| {
-                                    crate::workflows::location_of(spec)
-                                        .map_or_else(|err| err, |location| location.to_string())
-                                }),
-                                "run": step.run,
-                                "check": step.check,
-                                "ready": ready_json(&step.ready),
-                                "stop_grace_s": step.stop_grace_s,
-                                "artifacts": step.artifacts.iter().map(artifact_json).collect::<Vec<_>>(),
-                            })
-                        })
+                    let nodes = workflow::flatten(workflow);
+                    (0..nodes.len())
+                        .filter(|&at| nodes[at].parent.is_none())
+                        .map(|at| node_json(&nodes, at))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -233,14 +255,35 @@ fn status_json(workflows: &Workflows, id: &str, cx: &App) -> Result<Value, Strin
         .run_of(id)
         .ok_or_else(|| format!("{} has not run", found.name))?;
     let now = Instant::now();
-    let steps: Vec<Value> = active
-        .run
-        .workflow()
-        .steps
+    let nodes = active.run.nodes();
+    let steps: Vec<Value> = nodes
         .iter()
         .zip(active.run.steps())
         .enumerate()
-        .map(|(index, (step, state))| {
+        .map(|(index, (node, state))| {
+            let step = &node.step;
+            let parent = node.parent.map(|parent| nodes[parent].path.as_str());
+            let reason = match &state.status {
+                Status::Failed(reason) => Some(reason.as_str()),
+                _ => None,
+            };
+            let elapsed_ms = state
+                .elapsed(now)
+                .map(|elapsed| elapsed.as_millis() as u64);
+            if node.is_group() {
+                return json!({
+                    "id": node.path,
+                    "kind": "group",
+                    "parent": parent,
+                    "title": step.label(),
+                    "status": state.status.name(),
+                    "reason": reason,
+                    "detail": state.detail,
+                    "blocked": state.is_blocked(),
+                    "elapsed_ms": elapsed_ms,
+                    "steps": node.children.iter().map(|&child| nodes[child].path.as_str()).collect::<Vec<_>>(),
+                });
+            }
             let checked = state.artifacts.as_ref().and_then(|checked| checked.as_ref().ok());
             let artifacts: Vec<Value> = active
                 .run
@@ -258,20 +301,19 @@ fn status_json(workflows: &Workflows, id: &str, cx: &App) -> Result<Value, Strin
                 })
                 .collect();
             json!({
-                "id": step.id,
+                "id": node.path,
+                "kind": "step",
+                "parent": parent,
                 "title": step.label(),
                 "status": state.status.name(),
-                "reason": match &state.status {
-                    Status::Failed(reason) => Some(reason.as_str()),
-                    _ => None,
-                },
+                "reason": reason,
                 "detail": state.detail,
                 "blocked": state.is_blocked(),
                 "last_line": state.last_line(),
                 "check_output": state.check_output,
                 "exit_code": state.exit.flatten(),
                 "exited": state.exit.is_some(),
-                "elapsed_ms": state.elapsed(now).map(|elapsed| elapsed.as_millis() as u64),
+                "elapsed_ms": elapsed_ms,
                 "location": active.location(index).map(ToString::to_string),
                 "terminal": active.terminal(index).map(|view| view.read(cx).run_name().map(str::to_owned)),
                 "artifacts": artifacts,
@@ -336,7 +378,13 @@ impl Session {
                     }
                     "workflow_status" => status_json(workflows, &found, cx),
                     "workflow_stop" => Ok(json!(workflows.stop(&found, cx))),
-                    "workflow_retry" => Ok(json!(workflows.retry_failed(&found, cx))),
+                    "workflow_retry" => match request.get("step") {
+                        Some(_) => {
+                            let step = step(&request)?;
+                            Ok(json!(workflows.retry_step(&found, step, cx)))
+                        }
+                        None => Ok(json!(workflows.retry_failed(&found, cx))),
+                    },
                     "workflow_restart" => {
                         let step = step(&request)?;
                         Ok(json!(workflows.restart_step(&found, step, cx)))

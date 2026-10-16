@@ -384,6 +384,29 @@ invalid: it is listed with the error and cannot run.
   `env`, artifact paths: what a step listed in `needs` or `after` left,
   replaced when this step starts. Paths are as seen where the producing
   step runs (another machine or container may not see them).
+- `steps` (a group): a step with `steps` of its own is a group of them.
+  A group takes `id`, `title`, `needs`, `after`, `steps` and defaults its
+  steps inherit unless they set their own: `project`, `cwd`, `env`
+  (merged, the step's values winning); nothing else (no `run`, `check`,
+  `ready`, …), and at least one step. Groups nest. Ids are unique among
+  siblings and contain no `/`; `needs`/`after` inside a group name its
+  other steps only. A group's `needs`/`after` gate all its steps; steps
+  outside wait for the group like for a step, by its state: running while
+  a step in it runs, ready when all are, failed (`2 of 5 steps failed`)
+  when none can progress and some failed, waiting/blocked on its own
+  `needs`/`after`, stopped. `${steps.<id>.…}` in a step reads its
+  siblings in its `needs`/`after` and what its groups list in theirs (by
+  their id at that level); `${steps.<group>.status}` reads a group (it has
+  no exit code or artifacts). Elsewhere steps are named by qualified id:
+  `api/migrate` (events, `workflow_status`, `workflow_restart`, …).
+
+  ```jsonc
+  { "id": "api", "needs": ["vpn"], "project": { "devcontainer": "C:/src/api" },
+    "env": { "PROFILE": "dev" }, "steps": [
+      { "id": "build", "run": "uv sync" },
+      { "id": "migrate", "needs": ["build"], "run": "uv run alembic upgrade head" },
+      { "id": "serve", "needs": ["migrate"], "run": "uv run uvicorn app:app", "ready": { "port": 8000 } } ] }
+  ```
 
 States: pending → waiting (needs/after) → starting (opening the project,
 the check) → running → ready | failed | stopped, with stopping (Ctrl+C
@@ -393,8 +416,9 @@ dependents; a stopped one blocks both; others keep going. When nothing
 can progress and not every step is ready, the run is Failed (finished
 with failures; the failed steps keep their reason). Restart reruns one
 step (its old command is stopped with its grace first, then it starts in
-the same terminal; dependents that already run are left alone); Retry
-Failed reruns failed steps; Stop All stops every command the run started
+the same terminal; dependents that already run are left alone), on a
+group every step in it; Retry Failed reruns failed steps (on a group:
+its failed steps); Stop All stops every command the run started
 (project tabs and containers stay); Run All starts afresh (steps whose
 old command still stops start once it is gone).
 
@@ -430,18 +454,33 @@ machine's terminal inside the workflow tab), Continue, Restart/Retry. A
 terminal inside the tab fills the details' pane, which a divider
 separates from the graph: drag it to resize (the graph keeps 90 px, the
 pane 240 px), double-click it to maximize the pane and back; the size is
-kept per tab while it is open (not saved with the window). The
-toolbar shows the
+kept per tab while it is open (not saved with the window). A group is a
+card of the same size: its state, title, `▸ N steps` and elapsed time
+over a miniature of its graph (its steps as small boxes in their state's
+colors, nested groups outlined, thin edges, dashed for `after`).
+Clicking it selects it and expands it in place into a box around its
+graph of real cards (selectable, with their details, terminals and
+actions); clicking the box's header (`▾`) collapses it. Several groups
+can be expanded at once, nested ones too; columns widen and rows grow to
+fit an expanded box and edges attach to its sides. A selected group's
+details show its state, its steps counted by state, Restart, Retry
+Failed and Expand/Collapse. Groups stay expanded while the tab is open,
+across edits; the graph re-fits on each expand/collapse unless you
+zoomed. The cursor inside a collapsed group's step highlights the group.
+The toolbar shows the
 state (Idle, Running, All ready, Failed, Stopped), Run All (saves the file
 first if edited, then runs what was saved; Shift+F10), Stop All (Ctrl+F2)
 and Retry Failed. Workflow files in remote projects are read and written
 through the project (its tab opens first when a restored workflow tab
 needs it). Workflows run in the window that started them.
 
-Headless: `workflows_list`, `workflow_run`, `workflow_status`,
-`workflow_stop`, `workflow_continue`, `workflow_restart`, `workflow_retry`,
-`workflow_check_artifacts` and `workflow_event` notifications (see
-`crates/ui/src/headless.rs`).
+Headless: `workflows_list` (groups with their `steps` nested, each entry
+with `kind` and qualified `path`), `workflow_run`, `workflow_status` (a
+row per step and group: qualified `id`, `kind`, `parent`), `workflow_stop`,
+`workflow_continue`, `workflow_restart` (a group: all its steps),
+`workflow_retry` (optional `step`: that step or a group's failed steps),
+`workflow_check_artifacts` and `workflow_event` notifications (groups
+report their state changes too; see `crates/ui/src/headless.rs`).
 Other projects open without a window and URLs are reported, not opened.
 
 [docs/workflows-for-agents.md](docs/workflows-for-agents.md) is the full

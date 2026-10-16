@@ -294,6 +294,7 @@ mod tests {
             cwd: cwd.map(Into::into),
             stop_grace_s: workflow::DEFAULT_STOP_GRACE_S,
             artifacts: Vec::new(),
+            steps: Vec::new(),
         }
     }
 

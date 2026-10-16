@@ -13,9 +13,17 @@
 //! terminal of this machine under them they become a pane of their own,
 //! resized by a divider. The card holding the editor's cursor is
 //! highlighted. Run All saves the file first.
+//!
+//! A group is a card like the others with a miniature of its graph (its
+//! steps coloured by state). Clicking it selects it (its details: state,
+//! counts by state, Restart / Retry Failed for its steps) and expands it
+//! in place into a box around its graph of real cards; clicking the box's
+//! header collapses it. Groups stay expanded (by qualified id) while the
+//! tab is open, across edits; the graph re-fits unless the user zoomed.
 
 use std::{
     cell::Cell,
+    collections::HashSet,
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -23,15 +31,15 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, Context, CursorStyle, Entity, FocusHandle, Focusable, Hsla,
-    MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, ScrollDelta,
-    ScrollWheelEvent, SharedString, Subscription, Task, Window, canvas, div, point, prelude::*, px,
-    relative,
+    AnyElement, App, BorderStyle, Bounds, Context, CursorStyle, Entity, FocusHandle, Focusable,
+    Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, ScrollDelta,
+    ScrollWheelEvent, SharedString, Subscription, Task, Window, canvas, div, fill, point,
+    prelude::*, px, quad, relative, size,
 };
 use text::Buffer;
 use workflow::{
-    ArtifactTarget, GraphLayout, Metrics, Outcome, Ready, Status, Step, StepSpan, StepState,
-    View as Placement, Workflow,
+    ArtifactTarget, GraphLayout, Metrics, Outcome, Ready, Status, Step, StepNode, StepSpan,
+    StepState, View as Placement, Workflow, layout::Node as Place,
 };
 
 use super::{
@@ -55,6 +63,7 @@ const METRICS: Metrics = Metrics {
     row_gap: 20.,
     edge_gap: 14.,
     margin: 20.,
+    group_header: 30.,
 };
 /// An edge's arrowhead (length, half its width) and the straight run out
 /// of the step it leaves, in layout pixels.
@@ -95,13 +104,26 @@ struct ShownProblem {
 /// The graph as last parsed from the buffer.
 #[derive(Default)]
 struct Graph {
-    /// The last valid workflow, and its layout.
+    /// The last valid workflow, its steps flattened (groups included,
+    /// with what they inherit), and its layout.
     workflow: Option<Arc<Workflow>>,
+    nodes: Vec<StepNode>,
     layout: Option<GraphLayout>,
     /// Where each step is in the current text.
     spans: Vec<StepSpan>,
     /// Problems of the current text (the graph is the last good one).
     problems: Vec<ShownProblem>,
+}
+
+/// What the canvas under the cards paints: expanded groups' boxes, then
+/// the edges of every level.
+#[derive(Default)]
+struct Strokes {
+    /// (box, border colour, selected) per expanded group, outer ones
+    /// first.
+    boxes: Vec<(Bounds<Pixels>, Hsla, bool)>,
+    /// (course, lit, after) per edge.
+    edges: Vec<(Course<Point<Pixels>>, bool, bool)>,
 }
 
 pub struct WorkflowView {
@@ -111,11 +133,13 @@ pub struct WorkflowView {
     path: PathBuf,
     editor: Entity<Editor>,
     graph: Graph,
-    /// The selected step, by id.
+    /// The selected step (or group), by qualified id.
     selected: Option<String>,
-    /// The step whose text holds the editor's cursor.
+    /// The step whose text holds the editor's cursor, by qualified id.
     cursor_step: Option<String>,
     last_cursor: Option<usize>,
+    /// Groups shown expanded, by qualified id.
+    expanded: HashSet<String>,
     /// The editor's share of the width.
     split: f32,
     /// While a terminal shows under the selected step's details: the step
@@ -198,7 +222,7 @@ fn kind_hint(step: &Step) -> String {
 }
 
 /// Where a step runs: its project tab's name, or this machine.
-fn place(step: &Step, active: Option<&ActiveRun>, run_index: Option<usize>) -> String {
+fn place_text(step: &Step, active: Option<&ActiveRun>, run_index: Option<usize>) -> String {
     if let Some(location) = active.zip(run_index).and_then(|(run, at)| run.location(at)) {
         return tab_title(location);
     }
@@ -211,11 +235,85 @@ fn place(step: &Step, active: Option<&ActiveRun>, run_index: Option<usize>) -> S
     }
 }
 
-/// The run's state of the step with id `id` (the run may predate edits).
-fn state_of<'a>(active: Option<&'a ActiveRun>, id: &str) -> Option<(usize, &'a StepState)> {
+/// The run's state of the step with qualified id `path` (the run may
+/// predate edits).
+fn state_of<'a>(active: Option<&'a ActiveRun>, path: &str) -> Option<(usize, &'a StepState)> {
     let active = active?;
-    let index = active.run.step(id)?;
+    let index = active.run.step(path)?;
     Some((index, &active.run.steps()[index]))
+}
+
+/// A collapsed group's graph scaled into what is left of its card: a
+/// small rounded box per step in its state's colour (`looks`: colour and
+/// whether it is a group, outlined, by step), thin edges (dashed:
+/// `after`).
+fn miniature(graph: &GraphLayout, looks: Vec<(Hsla, bool)>) -> AnyElement {
+    let nodes: Vec<Place> = graph.nodes.clone();
+    let edges: Vec<(Vec<(f32, f32)>, bool)> = graph
+        .edges
+        .iter()
+        .map(|edge| (edge.points.clone(), edge.after))
+        .collect();
+    let content = (graph.width.max(1.), graph.height.max(1.));
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+            let scale = (width / content.0).min(height / content.1);
+            if scale <= 0. {
+                return;
+            }
+            let left = f32::from(bounds.origin.x) + (width - content.0 * scale) / 2.;
+            let top = f32::from(bounds.origin.y) + (height - content.1 * scale) / 2.;
+            let at = |(x, y): (f32, f32)| point(px(left + x * scale), px(top + y * scale));
+            for (points, after) in &edges {
+                let mut path = PathBuilder::stroke(px(1.));
+                if *after {
+                    path = path.dash_array(&[px(3.), px(2.)]);
+                }
+                path.move_to(at(points[0]));
+                for pair in points.windows(2) {
+                    let (from, to) = (at(pair[0]), at(pair[1]));
+                    if from.y == to.y || to.x <= from.x {
+                        path.line_to(to);
+                    } else {
+                        let handle = (to.x - from.x) / 2.;
+                        path.cubic_bezier_to(
+                            to,
+                            point(from.x + handle, from.y),
+                            point(to.x - handle, to.y),
+                        );
+                    }
+                }
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, theme::muted());
+                }
+            }
+            for (node, &(color, group)) in nodes.iter().zip(&looks) {
+                let bounds = Bounds::new(
+                    at((node.x, node.y)),
+                    size(px(node.width * scale), px(node.height * scale)),
+                );
+                let radius = px((6. * scale).max(1.5));
+                if group {
+                    window.paint_quad(quad(
+                        bounds,
+                        radius,
+                        color.opacity(0.35),
+                        px(1.5),
+                        color,
+                        BorderStyle::Solid,
+                    ));
+                } else {
+                    window.paint_quad(fill(bounds, color.opacity(0.9)).corner_radii(radius));
+                }
+            }
+        },
+    )
+    .flex_1()
+    .min_h_0()
+    .w_full()
+    .into_any_element()
 }
 
 /// A piece of an edge's stroke: straight, or a cubic curve to its first
@@ -355,6 +453,7 @@ impl WorkflowView {
             selected: None,
             cursor_step: None,
             last_cursor: None,
+            expanded: HashSet::new(),
             split: 0.38,
             step_share: STEP_SHARE,
             step_maximized: false,
@@ -412,8 +511,9 @@ impl WorkflowView {
         self.graph.spans = workflow::step_spans(&text);
         match workflow::check(&text, &file_stem(&self.path)) {
             Ok(parsed) => {
-                self.graph.layout = workflow::layout_workflow(&parsed, METRICS).ok();
+                self.graph.nodes = workflow::flatten(&parsed);
                 self.graph.workflow = Some(Arc::new(parsed));
+                self.relayout();
                 self.graph.problems.clear();
             }
             Err(problems) => {
@@ -432,6 +532,14 @@ impl WorkflowView {
         cx.notify();
     }
 
+    /// Lays the graph out again (with the groups expanded as they are).
+    fn relayout(&mut self) {
+        self.graph.layout =
+            self.graph.workflow.as_ref().and_then(|workflow| {
+                workflow::layout_workflow(workflow, METRICS, &self.expanded).ok()
+            });
+    }
+
     /// Highlights the card of the step the editor's cursor is in.
     fn cursor_moved(&mut self, cx: &mut Context<Self>) {
         let cursor = self.editor.read(cx).cursor();
@@ -439,31 +547,52 @@ impl WorkflowView {
             return;
         }
         self.last_cursor = Some(cursor);
-        let step = workflow::step_at(&self.graph.spans, cursor).and_then(|span| span.id.clone());
+        let step = workflow::path_at(&self.graph.spans, cursor);
         if step != self.cursor_step {
             self.cursor_step = step;
             cx.notify();
         }
     }
 
-    /// Where step `id`'s `"id"` is in the text.
-    fn step_offset(&self, id: &str) -> Option<usize> {
-        self.graph
-            .spans
-            .iter()
-            .find(|span| span.id.as_deref() == Some(id))
-            .map(|span| span.id_offset.unwrap_or(span.start))
+    /// Where step `path`'s `"id"` (qualified) is in the text.
+    fn step_offset(&self, path: &str) -> Option<usize> {
+        workflow::span_of(&self.graph.spans, path).map(StepSpan::id_or_start)
     }
 
-    /// Selects step `id` and puts the editor's cursor on its `"id"`.
-    pub(crate) fn select(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = Some(id.to_owned());
-        if let Some(offset) = self.step_offset(id) {
+    /// Selects step (or group) `path` and puts the editor's cursor on its
+    /// `"id"`.
+    pub(crate) fn select(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = Some(path.to_owned());
+        if let Some(offset) = self.step_offset(path) {
             self.editor
                 .update(cx, |editor, cx| editor.set_cursor(offset, cx));
             window.focus(&self.editor.focus_handle(cx));
         }
         cx.notify();
+    }
+
+    /// Expands group `path` (collapses it when expanded) and selects it.
+    pub(crate) fn toggle_group(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.expanded.remove(path) {
+            self.expanded.insert(path.to_owned());
+        }
+        self.relayout();
+        self.select(path, window, cx);
+    }
+
+    /// Whether the editor's cursor is in step `index`'s text, or in a
+    /// step of collapsed group `index`.
+    fn under_cursor(&self, index: usize) -> bool {
+        let Some(cursor) = self.cursor_step.as_deref() else {
+            return false;
+        };
+        let node = &self.graph.nodes[index];
+        cursor == node.path
+            || (node.is_group()
+                && !self.expanded.contains(&node.path)
+                && cursor
+                    .strip_prefix(node.path.as_str())
+                    .is_some_and(|rest| rest.starts_with('/')))
     }
 
     /// Puts the editor's cursor on the first problem.
@@ -773,31 +902,115 @@ impl WorkflowView {
         )
     }
 
+    /// The frame every card shares, around `content`: placed and sized as
+    /// laid out, its state's colour down the left and around it (the
+    /// accent when selected), highlighted under the editor's cursor. A
+    /// click selects a step; on a group it expands it too.
+    fn card_frame(
+        &self,
+        index: usize,
+        place: Place,
+        status: &Status,
+        placement: Placement,
+        content: impl IntoElement,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let node = &self.graph.nodes[index];
+        let (_, color) = status_look(status);
+        let selected = self.selected.as_deref() == Some(node.path.as_str());
+        let scale = placement.scale;
+        let size = |base: f32| px(base * scale);
+        let path = node.path.clone();
+        let group = node.is_group();
+        let face = if self.under_cursor(index) {
+            theme::active_row()
+        } else {
+            theme::panel()
+        };
+        // Inside the border, corners follow its inner curve.
+        let radius = size(6.);
+        let inner = (radius - px(if selected { 2. } else { 1. })).max(px(0.));
+        div()
+            .id(("workflow-card", index))
+            .absolute()
+            .left(px(placement.offset.0 + place.x * scale))
+            .top(px(placement.offset.1 + place.y * scale))
+            .w(size(place.width))
+            .h(size(place.height))
+            .flex()
+            .overflow_hidden()
+            .rounded(radius)
+            .bg(face)
+            .border_1()
+            .border_color(if selected {
+                theme::accent()
+            } else if *status == Status::Pending {
+                theme::border()
+            } else {
+                color
+            })
+            .when(selected, |card| card.border_2())
+            .shadow_sm()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    if group {
+                        this.toggle_group(&path, window, cx);
+                    } else {
+                        this.select(&path, window, cx);
+                    }
+                }),
+            )
+            // The state's colour: `overflow_hidden` clips to a rectangle,
+            // not the rounded corners, and a radius is capped at half the
+            // width, so the strip is wide enough to round like the card
+            // and the face covers all but its left edge.
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(size(4.) + inner * 2.)
+                    .rounded_l(inner)
+                    .bg(color),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .ml(size(4.))
+                    .rounded_r(inner)
+                    .bg(face)
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
+    /// A step's card: its state, title and elapsed time, what it does (or
+    /// how long its stop may still take), where it runs and its artifacts.
+    #[allow(clippy::too_many_arguments)]
     fn render_card(
         &self,
         index: usize,
-        step: &Step,
+        place: Place,
+        status: &Status,
         active: Option<&ActiveRun>,
         placement: Placement,
         now: Instant,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let layout = self
-            .graph
-            .layout
-            .as_ref()
-            .expect("cards come from a layout");
-        let node = layout.nodes[index];
-        let state = state_of(active, &step.id);
-        let status = state.map_or(Status::Pending, |(_, state)| state.status.clone());
-        let (icon, color) = status_look(&status);
+        let node = &self.graph.nodes[index];
+        let step = &node.step;
+        let state = state_of(active, &node.path);
+        let (icon, color) = status_look(status);
         let elapsed = state
             .and_then(|(_, state)| state.elapsed(now))
             .map(elapsed_text)
             .unwrap_or_default();
-        let selected = self.selected.as_deref() == Some(step.id.as_str());
-        let under_cursor = self.cursor_step.as_deref() == Some(step.id.as_str());
-        let id = step.id.clone();
         let mut detail = step.id.clone();
         let kind = kind_hint(step);
         if !kind.is_empty() {
@@ -812,130 +1025,232 @@ impl WorkflowView {
         // the elements being where they are drawn.
         let scale = placement.scale;
         let size = |base: f32| px(base * scale);
-        div()
-            .id(("workflow-card", index))
-            .absolute()
-            .left(px(placement.offset.0 + node.x * scale))
-            .top(px(placement.offset.1 + node.y * scale))
-            .w(size(METRICS.card_width))
-            .h(size(METRICS.card_height))
+        let content = div()
+            .flex_1()
+            .min_w_0()
+            .px(size(8.))
+            .py(size(4.))
             .flex()
-            .overflow_hidden()
-            .rounded(size(6.))
-            .bg(if under_cursor {
-                theme::active_row()
-            } else {
-                theme::panel()
+            .flex_col()
+            .justify_between()
+            .text_size(size(12.))
+            .line_height(size(17.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(size(6.))
+                    .text_size(size(14.))
+                    .line_height(size(20.))
+                    .child(div().flex_none().text_color(color).child(icon))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme::text())
+                            .child(step.label().to_owned()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(size(12.))
+                            .text_color(theme::muted())
+                            .child(elapsed),
+                    ),
+            )
+            .child(div().truncate().text_color(theme::muted()).child(detail))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(size(6.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme::accent_text())
+                            .child(place_text(step, active, state.map(|(at, _)| at))),
+                    )
+                    .when(artifacts > 0, |line| {
+                        line.child(
+                            div()
+                                .flex_none()
+                                .px(size(4.))
+                                .rounded(size(3.))
+                                .border_1()
+                                .border_color(theme::border())
+                                .text_size(size(11.))
+                                .line_height(size(14.))
+                                .text_color(theme::muted())
+                                .child(format!("↗ {artifacts}")),
+                        )
+                    }),
+            );
+        self.card_frame(index, place, status, placement, content, cx)
+    }
+
+    /// A group's title line: its state, title, `▸`/`▾` and step count,
+    /// and elapsed time.
+    fn group_title(
+        &self,
+        index: usize,
+        status: &Status,
+        active: Option<&ActiveRun>,
+        scale: f32,
+        now: Instant,
+    ) -> gpui::Div {
+        let node = &self.graph.nodes[index];
+        let (icon, color) = status_look(status);
+        let elapsed = state_of(active, &node.path)
+            .and_then(|(_, state)| state.elapsed(now))
+            .map(elapsed_text)
+            .unwrap_or_default();
+        let count = match node.children.len() {
+            1 => "1 step".to_owned(),
+            count => format!("{count} steps"),
+        };
+        let chevron = if self.expanded.contains(&node.path) {
+            "▾"
+        } else {
+            "▸"
+        };
+        let size = |base: f32| px(base * scale);
+        div()
+            .flex()
+            .items_center()
+            .gap(size(6.))
+            .text_size(size(14.))
+            .line_height(size(20.))
+            .child(div().flex_none().text_color(color).child(icon))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme::text())
+                    .child(node.step.label().to_owned()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(size(12.))
+                    .text_color(theme::muted())
+                    .child(format!("{chevron} {count}")),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(size(12.))
+                    .text_color(theme::muted())
+                    .child(elapsed),
+            )
+    }
+
+    /// A collapsed group: a card with its title line over a miniature of
+    /// its graph, its steps coloured by state.
+    #[allow(clippy::too_many_arguments)]
+    fn render_group_card(
+        &self,
+        index: usize,
+        place: Place,
+        graph: &GraphLayout,
+        statuses: &[Status],
+        active: Option<&ActiveRun>,
+        placement: Placement,
+        now: Instant,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let node = &self.graph.nodes[index];
+        let looks: Vec<(Hsla, bool)> = node
+            .children
+            .iter()
+            .map(|&child| {
+                let status = &statuses[child];
+                let color = if *status == Status::Pending {
+                    theme::border()
+                } else {
+                    status_look(status).1
+                };
+                (color, self.graph.nodes[child].is_group())
             })
-            .border_1()
-            .border_color(if selected {
-                theme::accent()
-            } else if status == Status::Pending {
-                theme::border()
-            } else {
-                color
+            .collect();
+        let scale = placement.scale;
+        let size = |base: f32| px(base * scale);
+        let content = div()
+            .flex_1()
+            .min_w_0()
+            .px(size(8.))
+            .py(size(4.))
+            .flex()
+            .flex_col()
+            .gap(size(2.))
+            .child(self.group_title(index, &statuses[index], active, scale, now))
+            .child(miniature(graph, looks));
+        self.card_frame(index, place, &statuses[index], placement, content, cx)
+    }
+
+    /// An expanded group's header over its box (the box is painted under
+    /// the cards): a click collapses it and selects it.
+    #[allow(clippy::too_many_arguments)]
+    fn render_group_header(
+        &self,
+        index: usize,
+        place: Place,
+        status: &Status,
+        active: Option<&ActiveRun>,
+        placement: Placement,
+        now: Instant,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let path = self.graph.nodes[index].path.clone();
+        let scale = placement.scale;
+        let size = |base: f32| px(base * scale);
+        div()
+            .id(("workflow-group", index))
+            .absolute()
+            .left(px(placement.offset.0 + place.x * scale))
+            .top(px(placement.offset.1 + place.y * scale))
+            .w(size(place.width))
+            .h(size(METRICS.group_header))
+            .px(size(10.))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .rounded_t(size(8.))
+            .when(self.under_cursor(index), |header| {
+                header.bg(theme::active_row())
             })
-            .when(selected, |card| card.border_2())
-            .shadow_sm()
+            .hover(|style| style.bg(theme::hover_row()))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    this.select(&id, window, cx);
+                    this.toggle_group(&path, window, cx);
                 }),
             )
-            .child(div().flex_none().w(size(4.)).h_full().bg(color))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .px(size(8.))
-                    .py(size(4.))
-                    .flex()
-                    .flex_col()
-                    .justify_between()
-                    .text_size(size(12.))
-                    .line_height(size(17.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(size(6.))
-                            .text_size(size(14.))
-                            .line_height(size(20.))
-                            .child(div().flex_none().text_color(color).child(icon))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme::text())
-                                    .child(step.label().to_owned()),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(size(12.))
-                                    .text_color(theme::muted())
-                                    .child(elapsed),
-                            ),
-                    )
-                    .child(div().truncate().text_color(theme::muted()).child(detail))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(size(6.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme::accent_text())
-                                    .child(place(step, active, state.map(|(at, _)| at))),
-                            )
-                            .when(artifacts > 0, |line| {
-                                line.child(
-                                    div()
-                                        .flex_none()
-                                        .px(size(4.))
-                                        .rounded(size(3.))
-                                        .border_1()
-                                        .border_color(theme::border())
-                                        .text_size(size(11.))
-                                        .line_height(size(14.))
-                                        .text_color(theme::muted())
-                                        .child(format!("↗ {artifacts}")),
-                                )
-                            }),
-                    ),
-            )
+            .child(self.group_title(index, status, active, scale, now))
             .into_any_element()
     }
 
-    fn render_graph(
+    /// One level of the graph (`members`: its steps' node indices in the
+    /// layout's order): its cards into `cards`, its edges and expanded
+    /// groups' boxes into `strokes`, then each expanded group's level.
+    #[allow(clippy::too_many_arguments)]
+    fn render_level(
         &self,
-        workflow: &Workflow,
+        layout: &GraphLayout,
+        members: &[usize],
+        statuses: &[Status],
+        active: Option<&ActiveRun>,
+        placement: Placement,
         now: Instant,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(layout) = &self.graph.layout else {
-            return div().into_any_element();
-        };
-        let workflows = self.workflows.read(cx);
-        let active = workflows.run_of(&self.id);
-        // Needs edges light up once the need is ready; dashed `after`
-        // edges once the step finished, ready or failed.
-        let statuses: Vec<Status> = workflow
-            .steps
-            .iter()
-            .map(|step| {
-                state_of(active, &step.id)
-                    .map_or(Status::Pending, |(_, state)| state.status.clone())
-            })
-            .collect();
-        let placement = self.placement();
+        cx: &Context<Self>,
+        cards: &mut Vec<AnyElement>,
+        strokes: &mut Strokes,
+    ) {
         let scale = placement.scale;
         let at = |(x, y): (f32, f32)| {
             point(
@@ -943,25 +1258,99 @@ impl WorkflowView {
                 px(placement.offset.1 + y * scale),
             )
         };
-        // Edges as drawn (graph area pixels), and their look.
-        let edges: Vec<(Course<Point<Pixels>>, bool, bool)> = layout
-            .edges
+        // Needs edges light up once the need is ready; dashed `after`
+        // edges once the step finished, ready or failed.
+        for edge in &layout.edges {
+            let lit = match &statuses[members[edge.from]] {
+                Status::Ready => true,
+                Status::Failed(_) => edge.after,
+                _ => false,
+            };
+            strokes
+                .edges
+                .push((edge_course(&edge.points).map(at), lit, edge.after));
+        }
+        for (at_level, (&index, &place)) in members.iter().zip(&layout.nodes).enumerate() {
+            let status = &statuses[index];
+            match layout.inner.get(at_level).and_then(Option::as_ref) {
+                Some(inner) if inner.expanded => {
+                    let node = &self.graph.nodes[index];
+                    let color = if *status == Status::Pending {
+                        theme::border()
+                    } else {
+                        status_look(status).1
+                    };
+                    let selected = self.selected.as_deref() == Some(node.path.as_str());
+                    let bounds = Bounds::new(
+                        at((place.x, place.y)),
+                        size(px(place.width * scale), px(place.height * scale)),
+                    );
+                    strokes.boxes.push((bounds, color, selected));
+                    cards.push(
+                        self.render_group_header(index, place, status, active, placement, now, cx),
+                    );
+                    self.render_level(
+                        &inner.layout,
+                        &node.children,
+                        statuses,
+                        active,
+                        placement,
+                        now,
+                        cx,
+                        cards,
+                        strokes,
+                    );
+                }
+                Some(inner) => cards.push(self.render_group_card(
+                    index,
+                    place,
+                    &inner.layout,
+                    statuses,
+                    active,
+                    placement,
+                    now,
+                    cx,
+                )),
+                None => {
+                    cards.push(self.render_card(index, place, status, active, placement, now, cx))
+                }
+            }
+        }
+    }
+
+    fn render_graph(&self, now: Instant, cx: &mut Context<Self>) -> AnyElement {
+        let Some(layout) = &self.graph.layout else {
+            return div().into_any_element();
+        };
+        let workflows = self.workflows.read(cx);
+        let active = workflows.run_of(&self.id);
+        let statuses: Vec<Status> = self
+            .graph
+            .nodes
             .iter()
-            .map(|edge| {
-                let lit = match &statuses[edge.from] {
-                    Status::Ready => true,
-                    Status::Failed(_) => edge.after,
-                    _ => false,
-                };
-                (edge_course(&edge.points).map(at), lit, edge.after)
+            .map(|node| {
+                state_of(active, &node.path)
+                    .map_or(Status::Pending, |(_, state)| state.status.clone())
             })
             .collect();
-        let cards: Vec<AnyElement> = workflow
-            .steps
-            .iter()
-            .enumerate()
-            .map(|(index, step)| self.render_card(index, step, active, placement, now, cx))
+        let placement = self.placement();
+        let scale = placement.scale;
+        let top: Vec<usize> = (0..self.graph.nodes.len())
+            .filter(|&index| self.graph.nodes[index].parent.is_none())
             .collect();
+        let mut cards = Vec::new();
+        let mut strokes = Strokes::default();
+        self.render_level(
+            layout,
+            &top,
+            &statuses,
+            active,
+            placement,
+            now,
+            cx,
+            &mut cards,
+            &mut strokes,
+        );
         div()
             .absolute()
             .top_0()
@@ -973,7 +1362,32 @@ impl WorkflowView {
                     |_, _, _| (),
                     move |bounds, _, window, _| {
                         let origin = bounds.origin;
-                        for (course, lit, after) in &edges {
+                        for (bounds, color, selected) in &strokes.boxes {
+                            let shifted = Bounds::new(bounds.origin + origin, bounds.size);
+                            let (border, width) = if *selected {
+                                (theme::accent(), 2.)
+                            } else {
+                                (*color, 1.5)
+                            };
+                            window.paint_quad(quad(
+                                shifted,
+                                px(8. * scale),
+                                theme::panel().opacity(0.55),
+                                px(width),
+                                border,
+                                BorderStyle::Solid,
+                            ));
+                            // The header's rule.
+                            let rule = Bounds::new(
+                                point(
+                                    shifted.origin.x,
+                                    shifted.origin.y + px(METRICS.group_header * scale),
+                                ),
+                                size(shifted.size.width, px(1.)),
+                            );
+                            window.paint_quad(fill(rule, theme::border()));
+                        }
+                        for (course, lit, after) in &strokes.edges {
                             let color = match (*lit, *after) {
                                 (true, false) => theme::git_added(),
                                 (true, true) => theme::accent(),
@@ -1024,15 +1438,14 @@ impl WorkflowView {
 
     /// The selected step's details, and whether its terminal shows under
     /// them: then they fill the step pane, the terminal taking the height
-    /// the details leave.
-    fn render_details(
-        &self,
-        workflow: &Workflow,
-        now: Instant,
-        cx: &mut Context<Self>,
-    ) -> Option<(AnyElement, bool)> {
+    /// the details leave. A group's: see [`Self::render_group_details`].
+    fn render_details(&self, now: Instant, cx: &mut Context<Self>) -> Option<(AnyElement, bool)> {
         let id = self.selected.as_deref()?;
-        let step = workflow.steps.iter().find(|step| step.id == id)?;
+        let index = workflow::tree::find(&self.graph.nodes, id)?;
+        if self.graph.nodes[index].is_group() {
+            return Some((self.render_group_details(index, now, cx), false));
+        }
+        let step = &self.graph.nodes[index].step;
         let workflows = self.workflows.read(cx);
         let active = workflows.run_of(&self.id);
         let state = state_of(active, id);
@@ -1070,7 +1483,7 @@ impl WorkflowView {
             .is_some_and(|(active, at)| active.location(at).is_none());
         let waiting_manual = status == Status::Running && matches!(step.ready, Ready::Manual(_));
         let failed = matches!(status, Status::Failed(_));
-        let step_id = step.id.clone();
+        let step_id = id.to_owned();
         let actions = div()
             .flex()
             .flex_none()
@@ -1174,7 +1587,7 @@ impl WorkflowView {
                                             "step-place",
                                             format!(
                                                 "{elapsed}  {}",
-                                                place(step, active, run_index)
+                                                place_text(step, active, run_index)
                                             ),
                                         )),
                                 )
@@ -1222,6 +1635,159 @@ impl WorkflowView {
                 .into_any_element(),
             shows_terminal,
         ))
+    }
+
+    /// A group's details: its state (and why, when it failed or waits),
+    /// its steps counted by state, and Restart (every step in it), Retry
+    /// Failed (its failed steps) and Expand / Collapse.
+    fn render_group_details(
+        &self,
+        index: usize,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let node = &self.graph.nodes[index];
+        let path = node.path.clone();
+        let workflows = self.workflows.read(cx);
+        let active = workflows.run_of(&self.id);
+        let state = state_of(active, &path);
+        let status = state.map_or(Status::Pending, |(_, state)| state.status.clone());
+        let (icon, color) = status_look(&status);
+        let elapsed = state
+            .and_then(|(_, state)| state.elapsed(now))
+            .map(elapsed_text)
+            .unwrap_or_default();
+        let reason = match (&status, state) {
+            (Status::Failed(reason), _) => reason.clone(),
+            (_, Some((_, state))) => state.detail.clone(),
+            (_, None) => "Not started: Run All runs the workflow.".into(),
+        };
+        // Its steps by state, in a fixed order.
+        const ORDER: [&str; 8] = [
+            "ready", "running", "starting", "stopping", "waiting", "failed", "stopped", "pending",
+        ];
+        let mut counts = [0usize; ORDER.len()];
+        for &child in &node.children {
+            let name = state_of(active, &self.graph.nodes[child].path)
+                .map_or("pending", |(_, state)| state.status.name());
+            if let Some(at) = ORDER.iter().position(|known| *known == name) {
+                counts[at] += 1;
+            }
+        }
+        let summary: Vec<String> = ORDER
+            .iter()
+            .zip(counts)
+            .filter(|(_, count)| *count > 0)
+            .map(|(name, count)| format!("{count} {name}"))
+            .collect();
+        let run_index = state.map(|(at, _)| at);
+        let any_failed = active.zip(run_index).is_some_and(|(active, at)| {
+            let nodes = active.run.nodes();
+            workflow::tree::subtree(nodes, at).any(|inside| {
+                !nodes[inside].is_group()
+                    && matches!(active.run.steps()[inside].status, Status::Failed(_))
+            })
+        });
+        let expanded = self.expanded.contains(&path);
+        let failed = matches!(status, Status::Failed(_));
+        let actions = div()
+            .flex()
+            .flex_none()
+            .gap_1()
+            .when_some(run_index, |actions, at| {
+                actions.child(button("group-restart", "Restart").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let id = this.id.clone();
+                        this.workflows
+                            .update(cx, |workflows, cx| workflows.restart_step(&id, at, cx));
+                    },
+                )))
+            })
+            .when_some(run_index.filter(|_| any_failed), |actions, at| {
+                actions.child(button("group-retry", "Retry Failed").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let id = this.id.clone();
+                        this.workflows
+                            .update(cx, |workflows, cx| workflows.retry_step(&id, at, cx));
+                    },
+                )))
+            })
+            .child(
+                button("group-toggle", if expanded { "Collapse" } else { "Expand" }).on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.toggle_group(&path, window, cx);
+                    }),
+                ),
+            )
+            .child(
+                button("step-details-close", "×").on_click(cx.listener(|this, _, _, cx| {
+                    this.selected = None;
+                    cx.notify();
+                })),
+            );
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_1p5()
+            .border_t_1()
+            .border_color(theme::border())
+            .bg(theme::panel())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_none().text_color(color).child(icon))
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(selectable("step-label", node.step.label().to_owned())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(color)
+                            .child(selectable("step-status", status.name())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(selectable(
+                                "step-place",
+                                format!("{elapsed}  group of {}", node.children.len()),
+                            )),
+                    )
+                    .child(actions),
+            )
+            .when(!reason.is_empty(), |details| {
+                details.child(
+                    div()
+                        .text_xs()
+                        .text_color(if failed {
+                            theme::error()
+                        } else {
+                            theme::text()
+                        })
+                        .child(selectable("step-reason", reason)),
+                )
+            })
+            .when(!summary.is_empty(), |details| {
+                details.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(selectable("group-counts", summary.join(" · "))),
+                )
+            })
+            .into_any_element()
     }
 
     /// The step's artifacts as links: files open in an editor tab of the
@@ -1351,20 +1917,50 @@ impl WorkflowView {
         )
     }
 
-    /// The steps' (id, state) as shown (tests).
+    /// The steps' and groups' (qualified id, state) as shown (tests).
     #[cfg(test)]
     pub(crate) fn cards(&self, cx: &App) -> Vec<(String, String)> {
         let workflows = self.workflows.read(cx);
         let active = workflows.run_of(&self.id);
         self.graph
-            .workflow
+            .nodes
             .iter()
-            .flat_map(|workflow| &workflow.steps)
-            .map(|step| {
-                let status = state_of(active, &step.id).map_or("pending", |(_, s)| s.status.name());
-                (step.id.clone(), status.to_owned())
+            .map(|node| {
+                let status =
+                    state_of(active, &node.path).map_or("pending", |(_, s)| s.status.name());
+                (node.path.clone(), status.to_owned())
             })
             .collect()
+    }
+
+    /// The boxes shown, as (qualified id, layout size), expanded groups'
+    /// steps included (tests).
+    #[cfg(test)]
+    pub(crate) fn boxes(&self) -> Vec<(String, (f32, f32))> {
+        fn level(
+            view: &WorkflowView,
+            layout: &GraphLayout,
+            members: &[usize],
+            boxes: &mut Vec<(String, (f32, f32))>,
+        ) {
+            for (at, (&index, place)) in members.iter().zip(&layout.nodes).enumerate() {
+                let node = &view.graph.nodes[index];
+                boxes.push((node.path.clone(), (place.width, place.height)));
+                if let Some(Some(inner)) = layout.inner.get(at)
+                    && inner.expanded
+                {
+                    level(view, &inner.layout, &node.children, boxes);
+                }
+            }
+        }
+        let mut boxes = Vec::new();
+        if let Some(layout) = &self.graph.layout {
+            let top: Vec<usize> = (0..self.graph.nodes.len())
+                .filter(|&index| self.graph.nodes[index].parent.is_none())
+                .collect();
+            level(self, layout, &top, &mut boxes);
+        }
+        boxes
     }
 
     /// The problems shown, with their places (tests).
@@ -1493,7 +2089,7 @@ impl Render for WorkflowView {
                     "No steps yet: add some to `steps`.",
                 ))
                 .into_any_element(),
-            Some(workflow) => self.render_graph(workflow, now, cx),
+            Some(_) => self.render_graph(now, cx),
             None => div()
                 .size_full()
                 .flex()
@@ -1506,9 +2102,7 @@ impl Render for WorkflowView {
                 ))
                 .into_any_element(),
         };
-        let details = workflow
-            .as_ref()
-            .and_then(|workflow| self.render_details(workflow, now, cx));
+        let details = workflow.as_ref().and_then(|_| self.render_details(now, cx));
         let shows_terminal = matches!(details, Some((_, true)));
         let editor = div()
             .flex_none()
@@ -1695,7 +2289,7 @@ mod tests {
         .steps
         .remove(0);
         assert_eq!(kind_hint(&step), "check · run · port 8000");
-        assert_eq!(place(&step, None, None), "this machine");
+        assert_eq!(place_text(&step, None, None), "this machine");
     }
 
     #[test]

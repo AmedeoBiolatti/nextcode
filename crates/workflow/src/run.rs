@@ -12,12 +12,19 @@
 //! (Stop All, Restart, Run All, `timeout_s`, the workflow failing) goes
 //! through Stopping: Ctrl+C, then a kill if it has not exited after the
 //! step's `stop_grace_s`.
+//!
+//! Steps are indexed as [`tree::flatten`] lists them, groups included. A
+//! group's `needs` and `after` gate each of its steps; its state follows
+//! from its steps' (see [`Run::steps`]), and steps outside wait for it by
+//! that state like for any step's. The outcome counts the steps that do
+//! something.
 
 use std::time::{Duration, Instant};
 
 use crate::{
     file::{Ready, Step, Workflow},
     output::OutputWatcher,
+    tree::{self, StepNode},
     vars::{self, StepField, StepRef},
 };
 
@@ -295,17 +302,57 @@ pub enum CheckResult {
 
 pub struct Run {
     workflow: Workflow,
+    /// The steps, groups included, flattened.
+    nodes: Vec<StepNode>,
+    /// The steps that do something (not groups), by index.
+    leaves: Vec<usize>,
     steps: Vec<StepState>,
     effects: Vec<Effect>,
     changes: Vec<Change>,
     outcome: Outcome,
 }
 
+/// A group's state as its steps make it.
+struct Derived {
+    status: Status,
+    detail: String,
+    blocked: bool,
+    awaiting_retry: bool,
+    artifacts_pending: bool,
+    started: Option<Instant>,
+}
+
+/// What a waiting step's detail says: what it waits for, or (`blocked`)
+/// `blocked: a, b did not get ready; c was stopped`.
+fn waiting_detail(waiting: String, stuck: Vec<(&str, &'static str)>) -> (String, bool) {
+    if stuck.is_empty() {
+        return (waiting, false);
+    }
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (id, why) in stuck {
+        match groups.iter_mut().find(|(reason, _)| *reason == why) {
+            Some((_, ids)) => ids.push(id),
+            None => groups.push((why, vec![id])),
+        }
+    }
+    let groups: Vec<String> = groups
+        .into_iter()
+        .map(|(why, ids)| format!("{} {why}", ids.join(", ")))
+        .collect();
+    (format!("blocked: {}", groups.join("; ")), true)
+}
+
 impl Run {
     pub fn new(workflow: Workflow) -> Self {
-        let steps = workflow.steps.iter().map(|_| StepState::new()).collect();
+        let nodes = tree::flatten(&workflow);
+        let steps = nodes.iter().map(|_| StepState::new()).collect();
+        let leaves = (0..nodes.len())
+            .filter(|&at| !nodes[at].is_group())
+            .collect();
         Self {
             workflow,
+            nodes,
+            leaves,
             steps,
             effects: Vec::new(),
             changes: Vec::new(),
@@ -317,21 +364,35 @@ impl Run {
         &self.workflow
     }
 
+    /// The steps, groups included, in [`tree::flatten`]'s order: indices
+    /// of [`Run::steps`], effects and changes.
+    pub fn nodes(&self) -> &[StepNode] {
+        &self.nodes
+    }
+
+    /// Each step's state, by node index. A group's: Pending before the
+    /// run; Waiting for its own `needs`/`after` (blocked when they can
+    /// never be met); Running while a step in it starts or runs
+    /// (Stopping when its only active steps stop); Ready when all its
+    /// steps are; Failed (`N of M steps failed`) when none can progress
+    /// and some failed; Stopped when stopped.
     pub fn steps(&self) -> &[StepState] {
         &self.steps
     }
 
+    /// The step with qualified id `id` (`group/step`; a top-level id as
+    /// is).
     pub fn step(&self, id: &str) -> Option<usize> {
-        self.workflow.steps.iter().position(|step| step.id == id)
+        tree::find(&self.nodes, id)
     }
 
     /// Step `index` as it runs: once it started, with its `${steps.…}`
-    /// variables replaced.
+    /// variables replaced; with what it inherits from its groups.
     pub fn definition(&self, index: usize) -> &Step {
         self.steps[index]
             .resolved
             .as_ref()
-            .unwrap_or(&self.workflow.steps[index])
+            .unwrap_or(&self.nodes[index].step)
     }
 
     pub fn outcome(&self) -> Outcome {
@@ -340,7 +401,9 @@ impl Run {
 
     /// Whether anything is waiting, starting, running or stopping.
     pub fn is_active(&self) -> bool {
-        self.steps.iter().any(|step| step.status.is_active())
+        self.leaves
+            .iter()
+            .any(|&index| self.steps[index].status.is_active())
     }
 
     /// Effects to perform, in order.
@@ -355,16 +418,18 @@ impl Run {
 
     /// Steps waiting for a port: `(step, generation, port)`.
     pub fn port_watches(&self) -> Vec<(usize, u64, u16)> {
-        self.steps
+        self.leaves
             .iter()
-            .enumerate()
-            .filter_map(|(index, state)| match self.workflow.steps[index].ready {
-                Ready::Port(port)
-                    if state.status == Status::Running && state.phase == Phase::Waiting =>
-                {
-                    Some((index, state.generation, port))
+            .filter_map(|&index| {
+                let state = &self.steps[index];
+                match self.nodes[index].step.ready {
+                    Ready::Port(port)
+                        if state.status == Status::Running && state.phase == Phase::Waiting =>
+                    {
+                        Some((index, state.generation, port))
+                    }
+                    _ => None,
                 }
-                _ => None,
             })
             .collect()
     }
@@ -372,7 +437,8 @@ impl Run {
     /// Run All: every step starts afresh; one whose command still runs
     /// is stopped first and starts once that command is gone.
     pub fn start(&mut self, now: Instant) {
-        for index in 0..self.steps.len() {
+        for at in 0..self.leaves.len() {
+            let index = self.leaves[at];
             if self.steps[index].command.is_some() {
                 self.stop_command(index, Then::Restart, now);
             } else {
@@ -398,7 +464,8 @@ impl Run {
 
     fn stop_everything(&mut self, kill_stopping: bool, now: Instant) {
         let mut stopped = false;
-        for index in 0..self.steps.len() {
+        for at in 0..self.leaves.len() {
+            let index = self.leaves[at];
             let state = &mut self.steps[index];
             if state.status == Status::Stopping {
                 if let Some(stop) = &mut state.stop
@@ -416,6 +483,7 @@ impl Run {
                 stopped = true;
             }
         }
+        self.derive_groups(now);
         if stopped || matches!(self.outcome, Outcome::Running | Outcome::Ready) {
             self.outcome = Outcome::Stopped;
         }
@@ -424,7 +492,7 @@ impl Run {
     /// Ctrl+C to the step's command: Stopping until it exits or its grace
     /// ends, then `then`. Without a live command, `then` at once.
     fn stop_command(&mut self, index: usize, then: Then, now: Instant) {
-        let grace = self.workflow.steps[index].stop_grace();
+        let grace = self.nodes[index].step.stop_grace();
         let state = &mut self.steps[index];
         if state.status == Status::Stopping {
             if let Some(stop) = &mut state.stop {
@@ -489,17 +557,22 @@ impl Run {
         state.detail = format!("{before}stopping ({seconds} s left)");
     }
 
-    /// Restarts one step (whatever its state): its command, if it still
-    /// runs, is stopped first; then it waits for its needs again and starts
-    /// in the same terminal.
+    /// Restarts one step (whatever its state), or every step of a group:
+    /// its command, if it still runs, is stopped first; then it waits for
+    /// its needs again and starts in the same terminal.
     pub fn restart(&mut self, index: usize, now: Instant) {
         if index >= self.steps.len() {
             return;
         }
-        if self.steps[index].command.is_some() {
-            self.stop_command(index, Then::Restart, now);
-        } else {
-            self.reset(index, now);
+        for index in tree::subtree(&self.nodes, index) {
+            if self.nodes[index].is_group() {
+                continue;
+            }
+            if self.steps[index].command.is_some() {
+                self.stop_command(index, Then::Restart, now);
+            } else {
+                self.reset(index, now);
+            }
         }
         self.outcome = Outcome::Running;
         self.advance(now);
@@ -507,8 +580,24 @@ impl Run {
 
     /// Retry: every failed step starts again.
     pub fn retry_failed(&mut self, now: Instant) {
-        let failed: Vec<usize> = (0..self.steps.len())
-            .filter(|&index| matches!(self.steps[index].status, Status::Failed(_)))
+        self.retry_in(0..self.steps.len(), now);
+    }
+
+    /// Retry for step `index`: it starts again if it failed; for a group,
+    /// every failed step in it. False if none had failed.
+    pub fn retry(&mut self, index: usize, now: Instant) -> bool {
+        if index >= self.steps.len() {
+            return false;
+        }
+        self.retry_in(tree::subtree(&self.nodes, index), now)
+    }
+
+    fn retry_in(&mut self, nodes: std::ops::Range<usize>, now: Instant) -> bool {
+        let failed: Vec<usize> = nodes
+            .filter(|&index| {
+                !self.nodes[index].is_group()
+                    && matches!(self.steps[index].status, Status::Failed(_))
+            })
             .collect();
         for &index in &failed {
             self.reset(index, now);
@@ -517,6 +606,7 @@ impl Run {
             self.outcome = Outcome::Running;
             self.advance(now);
         }
+        !failed.is_empty()
     }
 
     /// Continue on a step waiting for the user; false if it was not.
@@ -524,7 +614,8 @@ impl Run {
         let waiting =
             self.steps.get(index).is_some_and(|state| {
                 state.status == Status::Running && state.phase == Phase::Waiting
-            }) && matches!(self.workflow.steps[index].ready, Ready::Manual(_));
+            }) && matches!(self.nodes[index].step.ready, Ready::Manual(_))
+                && !self.nodes[index].is_group();
         if waiting {
             self.mark_ready(index, now);
             self.advance(now);
@@ -557,7 +648,7 @@ impl Run {
 
     /// Back to Waiting with a new generation (its command is gone).
     fn reset(&mut self, index: usize, now: Instant) {
-        let step = &self.workflow.steps[index];
+        let step = &self.nodes[index].step;
         let pattern = match &step.ready {
             Ready::Output(pattern) => Some(pattern.as_str()),
             _ => None,
@@ -598,7 +689,7 @@ impl Run {
             status,
         });
         // What it produced: steps waiting for it wait for the check too.
-        if finished && state.placed && !self.workflow.steps[index].artifacts.is_empty() {
+        if finished && state.placed && !self.nodes[index].step.artifacts.is_empty() {
             state.artifacts_pending = true;
             self.effects.push(Effect::CheckArtifacts {
                 step: index,
@@ -609,27 +700,24 @@ impl Run {
 
     /// What keeps waiting step `index` from starting: steps still on their
     /// way (`needs …; after …`), and steps that can never get there
-    /// (`(id, why)`).
+    /// (`(id, why)`). A step waits for its own `needs` and `after` and its
+    /// groups'.
     fn blockers(&self, index: usize) -> (String, Vec<(&str, &'static str)>) {
-        let step = &self.workflow.steps[index];
+        let (gate_needs, gate_after) = tree::gates(&self.nodes, index);
         let mut needs: Vec<&str> = Vec::new();
         let mut after: Vec<&str> = Vec::new();
         let mut stuck: Vec<(&str, &'static str)> = Vec::new();
-        for need in &step.needs {
-            let Some(state) = self.step(need).map(|at| &self.steps[at]) else {
-                continue;
-            };
+        for need in gate_needs {
+            let (id, state) = (self.nodes[need].step.id.as_str(), &self.steps[need]);
             match &state.status {
                 Status::Ready if !state.artifacts_pending => {}
-                Status::Failed(_) | Status::Stopped => stuck.push((need, "did not get ready")),
-                Status::Waiting if state.blocked => stuck.push((need, "can never run")),
-                _ => needs.push(need),
+                Status::Failed(_) | Status::Stopped => stuck.push((id, "did not get ready")),
+                Status::Waiting if state.blocked => stuck.push((id, "can never run")),
+                _ => needs.push(id),
             }
         }
-        for id in &step.after {
-            let Some(state) = self.step(id).map(|at| &self.steps[at]) else {
-                continue;
-            };
+        for at in gate_after {
+            let (id, state) = (self.nodes[at].step.id.as_str(), &self.steps[at]);
             match &state.status {
                 Status::Failed(_) if state.awaiting_retry => stuck.push((id, "waits for Retry")),
                 Status::Ready | Status::Failed(_) if !state.artifacts_pending => {}
@@ -649,12 +737,13 @@ impl Run {
     }
 
     /// Starts every waiting step whose needs are ready and whose `after`
-    /// steps finished; notes what holds or blocks the others; then settles
-    /// the outcome.
+    /// steps finished; notes what holds or blocks the others; keeps the
+    /// groups' states up with their steps'; then settles the outcome.
     fn advance(&mut self, now: Instant) {
         loop {
-            let mut changed = false;
-            for index in 0..self.steps.len() {
+            let mut changed = self.derive_groups(now);
+            for at in 0..self.leaves.len() {
+                let index = self.leaves[at];
                 if self.steps[index].status != Status::Waiting {
                     continue;
                 }
@@ -670,24 +759,7 @@ impl Run {
                     changed = true;
                     continue;
                 }
-                let blocked = !stuck.is_empty();
-                let detail = if blocked {
-                    // `a, b did not get ready; c was stopped`.
-                    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
-                    for (id, why) in stuck {
-                        match groups.iter_mut().find(|(reason, _)| *reason == why) {
-                            Some((_, ids)) => ids.push(id),
-                            None => groups.push((why, vec![id])),
-                        }
-                    }
-                    let groups: Vec<String> = groups
-                        .into_iter()
-                        .map(|(why, ids)| format!("{} {why}", ids.join(", ")))
-                        .collect();
-                    format!("blocked: {}", groups.join("; "))
-                } else {
-                    waiting
-                };
+                let (detail, blocked) = waiting_detail(waiting, stuck);
                 let state = &mut self.steps[index];
                 state.detail = detail;
                 if state.blocked != blocked {
@@ -702,17 +774,113 @@ impl Run {
         self.settle();
     }
 
+    /// Each group's state from its steps' (inner groups first); true if a
+    /// status or whether one is blocked changed.
+    fn derive_groups(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        for index in (0..self.nodes.len()).rev() {
+            if !self.nodes[index].is_group() {
+                continue;
+            }
+            let derived = self.derive(index);
+            let state = &mut self.steps[index];
+            changed |= state.blocked != derived.blocked;
+            state.blocked = derived.blocked;
+            state.awaiting_retry = derived.awaiting_retry;
+            state.artifacts_pending = derived.artifacts_pending;
+            state.detail = derived.detail;
+            state.started = derived.started;
+            if !matches!(
+                derived.status,
+                Status::Ready | Status::Failed(_) | Status::Stopped
+            ) {
+                state.finished = None;
+            }
+            if state.status != derived.status {
+                self.set_status(index, derived.status, now);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Group `index`'s state as its steps (and its own `needs` and
+    /// `after`) make it.
+    fn derive(&self, index: usize) -> Derived {
+        let children = &self.nodes[index].children;
+        let states = || children.iter().map(|&child| &self.steps[child]);
+        let total = children.len();
+        let count = |wanted: fn(&Status) -> bool| states().filter(|s| wanted(&s.status)).count();
+        let ready = count(|status| *status == Status::Ready);
+        let mut derived = Derived {
+            status: Status::Pending,
+            detail: String::new(),
+            blocked: false,
+            awaiting_retry: states()
+                .any(|s| s.awaiting_retry && matches!(s.status, Status::Failed(_))),
+            artifacts_pending: states().any(|s| s.artifacts_pending),
+            started: states().filter_map(|s| s.started).min(),
+        };
+        let progressing = states().any(|s| match s.status {
+            Status::Pending => true,
+            Status::Waiting => !s.blocked,
+            _ => false,
+        });
+        if count(|status| *status == Status::Pending) == total {
+            derived.started = None;
+        } else if ready == total {
+            derived.status = Status::Ready;
+        } else if count(|status| matches!(status, Status::Starting | Status::Running)) > 0 {
+            derived.status = Status::Running;
+            derived.detail = format!("{ready} of {total} ready");
+        } else if count(|status| *status == Status::Stopping) > 0 {
+            derived.status = Status::Stopping;
+            derived.detail = "stopping".into();
+        } else if progressing {
+            let (waiting, stuck) = self.blockers(index);
+            if waiting.is_empty() && stuck.is_empty() {
+                // Its steps wait for each other (or for their previous
+                // commands to end).
+                derived.status = Status::Running;
+                derived.detail = format!("{ready} of {total} ready");
+            } else {
+                derived.status = Status::Waiting;
+                (derived.detail, derived.blocked) = waiting_detail(waiting, stuck);
+            }
+        } else {
+            let failed = count(|status| matches!(status, Status::Failed(_)));
+            if failed > 0 {
+                derived.status = Status::Failed(format!("{failed} of {total} steps failed"));
+            } else if count(|status| *status == Status::Stopped) > 0 {
+                derived.status = Status::Stopped;
+            } else {
+                // Its steps can never start: what it waits for cannot get
+                // there.
+                let (waiting, stuck) = self.blockers(index);
+                derived.status = Status::Waiting;
+                derived.blocked = true;
+                derived.detail = if stuck.is_empty() {
+                    "blocked".into()
+                } else {
+                    waiting_detail(waiting, stuck).0
+                };
+            }
+        }
+        derived
+    }
+
     /// Ready when every step is; failed (with failures) when nothing can
-    /// progress any more.
+    /// progress any more (groups follow their steps).
     fn settle(&mut self) {
         if self.outcome != Outcome::Running {
             return;
         }
-        if self.steps.iter().all(|state| state.status == Status::Ready) {
+        let leaves = || self.leaves.iter().map(|&index| &self.steps[index]);
+        if leaves().all(|state| state.status == Status::Ready) {
             self.outcome = Outcome::Ready;
             return;
         }
-        let progressing = self.steps.iter().any(|state| match state.status {
+        let progressing = leaves().any(|state| match state.status {
             Status::Pending | Status::Starting | Status::Running | Status::Stopping => true,
             Status::Waiting => !state.blocked,
             Status::Ready | Status::Failed(_) | Status::Stopped => false,
@@ -730,7 +898,7 @@ impl Run {
         }
         let generation = self.steps[index].generation;
         self.set_status(index, Status::Starting, now);
-        if self.workflow.steps[index].project.is_some() {
+        if self.nodes[index].step.project.is_some() {
             self.steps[index].phase = Phase::Project;
             self.steps[index].detail = "opening the project".into();
             self.effects.push(Effect::OpenProject {
@@ -743,16 +911,19 @@ impl Run {
     }
 
     /// Step `index` with its `${steps.…}` variables replaced by what the
-    /// steps it waits for left.
+    /// steps it (or a group it is in) waits for left.
     fn resolve(&self, index: usize) -> Result<Step, String> {
-        let step = &self.workflow.steps[index];
+        let step = &self.nodes[index].step;
         if !step.texts().any(|text| text.contains("${steps.")) {
             return Ok(step.clone());
         }
-        let ids: Vec<&str> = step.upstream().collect();
+        let scope = tree::scope(&self.nodes, index);
+        let ids: Vec<&str> = scope.iter().map(|&(id, _)| id).collect();
         let value = |found: &StepRef| -> Result<String, String> {
-            let at = self
-                .step(found.step)
+            let at = scope
+                .iter()
+                .find(|&&(id, _)| id == found.step)
+                .map(|&(_, at)| at)
                 .ok_or_else(|| format!("`{}`: no step `{}`", found.text, found.step))?;
             let state = &self.steps[at];
             match &found.field {
@@ -763,7 +934,7 @@ impl Run {
                     .map(|code| code.to_string())
                     .unwrap_or_default()),
                 StepField::Artifact(by) => {
-                    let artifact = self.workflow.steps[at].artifact(by).ok_or_else(|| {
+                    let artifact = self.nodes[at].step.artifact(by).ok_or_else(|| {
                         format!("`{}`: `{}` has no such artifact", found.text, found.step)
                     })?;
                     match &state.artifacts {
@@ -807,7 +978,7 @@ impl Run {
     fn after_project(&mut self, index: usize, now: Instant) {
         let generation = self.steps[index].generation;
         self.steps[index].placed = true;
-        if self.workflow.steps[index].check.is_some() {
+        if self.nodes[index].step.check.is_some() {
             self.steps[index].phase = Phase::Check;
             self.steps[index].detail = "checking".into();
             self.effects.push(Effect::RunCheck {
@@ -820,7 +991,7 @@ impl Run {
     }
 
     fn launch(&mut self, index: usize, now: Instant) {
-        let step = &self.workflow.steps[index];
+        let step = &self.nodes[index].step;
         let generation = self.steps[index].generation;
         let has_command = step.run.is_some();
         let state = &mut self.steps[index];
@@ -928,7 +1099,7 @@ impl Run {
             return;
         };
         self.steps[index].check_output = (!last.is_empty()).then(|| last.clone());
-        match self.workflow.steps[index].on_fail.clone() {
+        match self.nodes[index].step.on_fail.clone() {
             Some(message) => {
                 self.steps[index].awaiting_retry = true;
                 self.fail(index, message, now);
@@ -980,7 +1151,7 @@ impl Run {
         if !current {
             return;
         }
-        let step = &self.workflow.steps[index];
+        let step = &self.nodes[index].step;
         let state = &self.steps[index];
         let waiting = state.status == Status::Running && state.phase == Phase::Waiting;
         // Until ready, plus a moment: servers often print their address
@@ -1025,7 +1196,7 @@ impl Run {
         let code_text = code.map_or("unknown exit code".to_owned(), |code| {
             format!("exit code {code}")
         });
-        match (&self.workflow.steps[index].ready, code) {
+        match (&self.nodes[index].step.ready, code) {
             (Ready::Exit, Some(0)) => self.mark_ready(index, now),
             (Ready::Exit, _) => self.fail(index, format!("failed ({code_text})"), now),
             // A command that ends before its prompt is answered: the prompt
@@ -1045,7 +1216,7 @@ impl Run {
         let waiting = self.current(index, generation)
             && self.steps[index].status == Status::Running
             && self.steps[index].phase == Phase::Waiting
-            && matches!(self.workflow.steps[index].ready, Ready::Port(_));
+            && matches!(self.nodes[index].step.ready, Ready::Port(_));
         if waiting && listening {
             self.mark_ready(index, now);
             self.advance(now);
@@ -1076,7 +1247,7 @@ impl Run {
         let Some(state) = self.steps.get(index) else {
             return false;
         };
-        let wanted = state.placed && !self.workflow.steps[index].artifacts.is_empty();
+        let wanted = state.placed && !self.nodes[index].step.artifacts.is_empty();
         if wanted {
             self.effects.push(Effect::CheckArtifacts {
                 step: index,
@@ -1089,7 +1260,8 @@ impl Run {
     /// Delays, timeouts and stop graces up to `now`.
     pub fn tick(&mut self, now: Instant) {
         let mut changed = false;
-        for index in 0..self.steps.len() {
+        for at in 0..self.leaves.len() {
+            let index = self.leaves[at];
             let state = &self.steps[index];
             if state.status == Status::Stopping {
                 if state.stop.as_ref().is_some_and(|stop| stop.deadline <= now) {
@@ -1108,9 +1280,7 @@ impl Run {
                 changed = true;
                 continue;
             }
-            let timeout = self.workflow.steps[index]
-                .timeout_s
-                .map(Duration::from_secs);
+            let timeout = self.nodes[index].step.timeout_s.map(Duration::from_secs);
             if let (Some(timeout), Some(started)) = (timeout, state.started)
                 && now.saturating_duration_since(started) >= timeout
             {
@@ -1137,7 +1307,8 @@ impl Run {
                 if !matches!(state.status, Status::Starting | Status::Running) {
                     return [stop, None, None];
                 }
-                let timeout = self.workflow.steps[index]
+                let timeout = self.nodes[index]
+                    .step
                     .timeout_s
                     .zip(state.started)
                     .map(|(seconds, started)| started + Duration::from_secs(seconds));

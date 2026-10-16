@@ -2199,6 +2199,132 @@ fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// A group of two steps, one failing (exit 1), and a step after the
+/// group: the steps inherit the group's project, events and status name
+/// them by qualified id (`svc/bad`) and include the group's own state,
+/// the step after it reads its status; Retry on the group reruns its
+/// failed step.
+#[test]
+fn headless_mode_runs_a_workflow_with_a_group() {
+    let root = std::env::temp_dir().join(format!("next_code_wf_group_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    for dir in ["main/.next_code/workflows", "config"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let root = if cfg!(windows) {
+        root
+    } else {
+        root.canonicalize().unwrap()
+    };
+    let main = root.join("main");
+    let grouped = json!({
+        "name": "Grouped",
+        "steps": [
+            {
+                "id": "svc", "title": "Service", "project": { "local": main },
+                "steps": [
+                    { "id": "ok", "run": "echo fine" },
+                    { "id": "bad", "run": "echo broken; exit 1" }
+                ]
+            },
+            {
+                "id": "report", "after": "svc", "project": { "local": main },
+                "run": "echo report-${steps.svc.status}"
+            }
+        ]
+    });
+    fs::write(
+        main.join(".next_code/workflows/grouped.jsonc"),
+        format!("{grouped:#}"),
+    )
+    .unwrap();
+    let mut headless = Headless::launch(
+        &[main.as_os_str()],
+        &[("XDG_CONFIG_HOME", &root.join("config"))],
+    );
+    let ready = headless.next(|line| line["event"].is_string());
+    assert_eq!(ready["event"], "ready", "{ready}");
+
+    let list = headless.call(json!({ "cmd": "workflows_list" }));
+    let listed = list["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|found| found["name"] == "Grouped")
+        .unwrap()
+        .clone();
+    assert_eq!(listed["error"], Value::Null, "{listed}");
+    let svc = &listed["steps"][0];
+    assert_eq!(svc["kind"], "group", "{listed}");
+    assert_eq!(svc["steps"][1]["path"], "svc/bad");
+    assert_eq!(svc["steps"][1]["kind"], "step");
+    assert!(
+        svc["steps"][0]["project"]
+            .as_str()
+            .unwrap()
+            .ends_with("main"),
+        "inherited: {listed}"
+    );
+    assert_eq!(listed["steps"][1]["after"], json!(["svc"]));
+
+    let run = headless.call(json!({ "cmd": "workflow_run", "name": "Grouped" }));
+    assert_eq!(run["ok"], true, "{run}");
+    let bad = step_event(&mut headless, "svc/bad", "failed");
+    assert_eq!(bad["reason"], "failed (exit code 1)", "{bad}");
+    let group = step_event(&mut headless, "svc", "failed");
+    assert_eq!(group["reason"], "1 of 2 steps failed", "{group}");
+    let report = step_event(&mut headless, "report", "ready");
+    assert_eq!(report["status"], "ready", "{report}");
+    let outcome = headless.next(|line| {
+        line["type"] == "outcome" && line["workflow"] == "Grouped" && line["outcome"] != "running"
+    });
+    assert_eq!(outcome["outcome"], "failed", "{outcome}");
+
+    let status = status_until(&mut headless, "grouped.jsonc", |status| {
+        status["steps"][3]["last_line"] == "report-failed"
+    });
+    let rows = status["steps"].as_array().unwrap();
+    let ids: Vec<&str> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["svc", "svc/ok", "svc/bad", "report"], "{status}");
+    let kinds: Vec<&str> = rows
+        .iter()
+        .map(|row| row["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["group", "step", "step", "step"]);
+    assert_eq!(rows[0]["status"], "failed");
+    assert_eq!(rows[0]["title"], "Service");
+    assert_eq!(rows[0]["reason"], "1 of 2 steps failed");
+    assert_eq!(rows[0]["steps"], json!(["svc/ok", "svc/bad"]));
+    assert_eq!(rows[0]["parent"], Value::Null);
+    assert_eq!(rows[1]["parent"], "svc");
+    assert_eq!(rows[1]["status"], "ready");
+    assert_eq!(rows[1]["last_line"], "fine");
+    assert!(
+        rows[1]["location"].as_str().unwrap().ends_with("main"),
+        "{status}"
+    );
+    assert_eq!(rows[2]["exit_code"], 1);
+    assert_eq!(status["outcome"], "failed");
+
+    // Steps go by qualified id; Retry on the group reruns its failed step.
+    let unknown =
+        headless.call(json!({ "cmd": "workflow_restart", "name": "Grouped", "step": "bad" }));
+    assert_eq!(unknown["ok"], false, "{unknown}");
+    let retried =
+        headless.call(json!({ "cmd": "workflow_retry", "name": "Grouped", "step": "svc" }));
+    assert_eq!(retried["result"], true, "{retried}");
+    let again = step_event(&mut headless, "svc/bad", "waiting");
+    assert_eq!(again["status"], "waiting", "{again}");
+    step_event(&mut headless, "svc/bad", "failed");
+    let retried =
+        headless.call(json!({ "cmd": "workflow_retry", "name": "Grouped", "step": "svc/ok" }));
+    assert_eq!(retried["result"], false, "`ok` did not fail: {retried}");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
 /// A workflow step in a dev container: the container is brought up for
 /// the step, its command runs in a pty inside, and its port is seen
 /// through the agent.
