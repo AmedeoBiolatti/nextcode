@@ -32,12 +32,13 @@ fn started(effects: &[Effect], index: usize) -> u64 {
         .expect("a StartCommand")
 }
 
-const CHAIN: &str = r#"{"steps": [
-    {"id": "a", "run": "a"},
-    {"id": "b", "run": "b"},
-    {"id": "c", "needs": ["a", "b"], "run": "c"},
-    {"id": "d", "needs": ["c"], "run": "d"}
-]}"#;
+const CHAIN: &str = r#"
+steps:
+  a: {run: a}
+  b: {run: b}
+  c: {depends_on: [a, b], run: c}
+  d: {depends_on: [c], run: d}
+"#;
 
 #[test]
 fn independent_steps_start_together_and_needs_wait() {
@@ -92,7 +93,10 @@ fn independent_steps_start_together_and_needs_wait() {
 fn projects_open_and_checks_run_before_the_command() {
     let t = Instant::now();
     let mut run =
-        run(r#"{"steps": [{"id": "a", "project": {"local": "/p"}, "check": "c", "run": "r"}]}"#);
+        run(r#"
+steps:
+  a: {project: {local: /p}, check: c, run: r}
+"#);
     run.start(t);
     let g = generation(&run, 0);
     assert_eq!(
@@ -132,7 +136,10 @@ fn projects_open_and_checks_run_before_the_command() {
     assert_eq!(statuses(&run), ["running"]);
 
     let mut failing =
-        self::run(r#"{"steps": [{"id": "a", "project": {"local": "/p"}, "run": "r"}]}"#);
+        self::run(r#"
+steps:
+  a: {project: {local: /p}, run: r}
+"#);
     failing.start(t);
     failing.project_failed(0, generation(&failing, 0), "no such folder", t);
     assert_eq!(
@@ -145,11 +152,12 @@ fn projects_open_and_checks_run_before_the_command() {
 #[test]
 fn a_failed_check_with_on_fail_waits_for_retry() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-            {"id": "vpn", "check": "ping", "onFail": "Connect the VPN"},
-            {"id": "other", "run": "x", "ready": {"port": 80}},
-            {"id": "app", "needs": ["vpn"], "run": "app"}
-        ]}"#);
+    let mut run = run(r#"
+steps:
+  vpn: {check: ping, on_fail: Connect the VPN}
+  other: {run: x, ready: {port: 80}}
+  app: {depends_on: [vpn], run: app}
+"#);
     run.start(t);
     run.take_effects();
     run.check_finished(
@@ -199,11 +207,12 @@ fn a_failed_check_with_on_fail_waits_for_retry() {
 #[test]
 fn a_failed_check_without_on_fail_fails_the_workflow() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-            {"id": "server", "run": "serve", "ready": {"output": "up"}},
-            {"id": "docker", "check": "docker info"},
-            {"id": "app", "needs": ["docker"], "run": "app"}
-        ]}"#);
+    let mut run = run(r#"
+steps:
+  server: {run: serve, ready: {output: up}}
+  docker: {check: docker info}
+  app: {depends_on: [docker], run: app}
+"#);
     run.start(t);
     let server = started(&run.take_effects(), 0);
     run.check_finished(
@@ -229,13 +238,14 @@ fn a_failed_check_without_on_fail_fails_the_workflow() {
 #[test]
 fn readiness_by_output_port_delay_manual_and_exit() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-            {"id": "out", "run": "s", "ready": {"output": "Listening on (\\d+)"}},
-            {"id": "port", "run": "s", "ready": {"port": 8000}},
-            {"id": "delay", "run": "s", "ready": {"delay_ms": 500}},
-            {"id": "gate", "ready": {"manual": "Log in"}},
-            {"id": "build", "run": "make"}
-        ]}"#);
+    let mut run = run(r#"
+steps:
+  out: {run: s, ready: {output: Listening on (\d+)}}
+  port: {run: s, ready: {port: 8000}}
+  delay: {run: s, ready: {delay: 500ms}}
+  gate: {ready: {manual: Log in}}
+  build: {run: make}
+"#);
     run.start(t);
     run.output(0, generation(&run, 0), b"\x1b[32mListening", t);
     assert_eq!(run.steps()[0].status, Status::Running);
@@ -293,12 +303,12 @@ fn readiness_by_output_port_delay_manual_and_exit() {
 #[test]
 fn timeouts_stop_the_command_then_fail_the_step() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-            {"id": "slow", "run": "s", "ready": {"output": "never"}, "timeout_s": 10},
-            {"id": "next", "needs": ["slow"], "run": "x"},
-            {"id": "deaf", "run": "s", "ready": {"output": "never"}, "timeout_s": 10,
-             "stop_grace_s": 5}
-        ]}"#);
+    let mut run = run(r#"
+steps:
+  slow: {run: s, ready: {output: never}, timeout: 10s}
+  next: {depends_on: [slow], run: x}
+  deaf: {run: s, ready: {output: never}, timeout: 10s, stop_grace_period: 5s}
+"#);
     run.start(t);
     let effects = run.take_effects();
     let (slow, deaf) = (started(&effects, 0), started(&effects, 2));
@@ -309,7 +319,7 @@ fn timeouts_stop_the_command_then_fail_the_step() {
     assert_eq!(statuses(&run), ["stopping", "waiting", "stopping"]);
     assert_eq!(
         run.steps()[0].detail,
-        "timed out after 10 s; stopping (3 s left)"
+        "timed out after 10s; stopping (3 s left)"
     );
     assert_eq!(
         run.take_effects(),
@@ -329,7 +339,7 @@ fn timeouts_stop_the_command_then_fail_the_step() {
     run.exited(0, slow, Some(130), t + secs(11));
     assert_eq!(
         run.steps()[0].status,
-        Status::Failed("timed out after 10 s".into())
+        Status::Failed("timed out after 10s".into())
     );
     assert_eq!(run.steps()[0].elapsed(t + secs(60)), Some(secs(11)));
     assert_eq!(run.steps()[1].detail, "blocked: slow did not get ready");
@@ -338,13 +348,13 @@ fn timeouts_stop_the_command_then_fail_the_step() {
     run.tick(t + Duration::from_millis(12_500));
     assert_eq!(
         run.steps()[2].detail,
-        "timed out after 10 s; stopping (3 s left)"
+        "timed out after 10s; stopping (3 s left)"
     );
     run.tick(t + secs(15));
     assert_eq!(run.take_effects(), [Effect::KillCommand { step: 2 }]);
     assert_eq!(
         run.steps()[2].status,
-        Status::Failed("timed out after 10 s".into())
+        Status::Failed("timed out after 10s".into())
     );
     run.exited(2, deaf, None, t + secs(15));
     assert_eq!(
@@ -358,12 +368,13 @@ fn timeouts_stop_the_command_then_fail_the_step() {
 #[test]
 fn stop_all_gives_commands_their_grace_and_a_second_stop_kills() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-            {"id": "server", "run": "s", "ready": {"port": 80}},
-            {"id": "build", "run": "make"},
-            {"id": "eval", "needs": ["build"], "run": "x", "stop_grace_s": 60},
-            {"id": "deaf", "run": "y", "ready": {"output": "never"}}
-        ]}"#);
+    let mut run = run(r#"
+steps:
+  server: {run: s, ready: {port: 80}}
+  build: {run: make}
+  eval: {depends_on: [build], run: x, stop_grace_period: 1m}
+  deaf: {run: y, ready: {output: never}}
+"#);
     run.start(t);
     let mut effects = run.take_effects();
     let server = started(&effects, 0);
@@ -421,10 +432,11 @@ fn stop_all_gives_commands_their_grace_and_a_second_stop_kills() {
 #[test]
 fn restart_and_run_all_wait_for_the_old_command_to_end() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-            {"id": "a", "run": "s", "ready": {"output": "up"}},
-            {"id": "b", "needs": ["a"], "run": "t", "ready": {"output": "up"}}
-        ]}"#);
+    let mut run = run(r#"
+steps:
+  a: {run: s, ready: {output: up}}
+  b: {depends_on: [a], run: t, ready: {output: up}}
+"#);
     run.start(t);
     let first = started(&run.take_effects(), 0);
     run.restart(0, t);
@@ -471,7 +483,11 @@ fn restart_and_run_all_wait_for_the_old_command_to_end() {
 #[test]
 fn held_steps_wait_for_the_previous_runs_command() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [{"id": "a", "run": "s"}, {"id": "b", "run": "t"}]}"#);
+    let mut run = run(r#"
+steps:
+  a: {run: s}
+  b: {run: t}
+"#);
     run.hold(0);
     run.start(t);
     assert_eq!(statuses(&run), ["waiting", "running"]);
@@ -485,14 +501,20 @@ fn held_steps_wait_for_the_previous_runs_command() {
     assert!(!run.is_held(0));
 }
 
-const EVAL: &str = r#"{"steps": [
-    {"id": "eval", "run": "python eval.py", "stop_grace_s": 30,
-     "artifacts": [{"label": "metrics", "path": "out/metrics.json"}, "https://board/${env:RUN}"]},
-    {"id": "report", "after": ["eval"],
-     "run": "report --code ${steps.eval.exit_code} --status ${steps.eval.status} --in ${steps.eval.artifacts.metrics}",
-     "env": {"BOARD": "${steps.eval.artifacts.1}"}},
-    {"id": "publish", "needs": ["eval"], "run": "publish"}
-]}"#;
+const EVAL: &str = r#"
+steps:
+  eval:
+    run: python eval.py
+    stop_grace_period: 30s
+    artifacts: [{label: metrics, path: out/metrics.json}, 'https://board/${env:RUN}']
+
+  report:
+    depends_on: {eval: completed}
+    run: report --code ${steps.eval.exit_code} --status ${steps.eval.status} --in ${steps.eval.artifacts.metrics}
+    env: {BOARD: '${steps.eval.artifacts.1}'}
+
+  publish: {depends_on: [eval], run: publish}
+"#;
 
 fn checked(paths: &[(&str, bool)]) -> Result<Vec<ArtifactState>, String> {
     Ok(paths
@@ -561,13 +583,14 @@ fn after_runs_once_the_step_failed_with_its_results() {
 #[test]
 fn after_a_stopped_blocked_or_retry_waiting_step_is_blocked() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-            {"id": "eval", "run": "e"},
-            {"id": "report", "after": ["eval"], "run": "r"},
-            {"id": "gate", "check": "c", "onFail": "Fix it"},
-            {"id": "late", "needs": ["gate"], "run": "l"},
-            {"id": "tidy", "after": ["late", "gate"], "run": "t"}
-        ]}"#);
+    let mut run = run(r#"
+steps:
+  eval: {run: e}
+  report: {depends_on: {eval: completed}, run: r}
+  gate: {check: c, on_fail: Fix it}
+  late: {depends_on: [gate], run: l}
+  tidy: {depends_on: {late: completed, gate: completed}, run: t}
+"#);
     run.start(t);
     let eval = started(&run.take_effects(), 0);
     let fail_check = |run: &mut Run, code| {
@@ -606,10 +629,11 @@ fn after_a_stopped_blocked_or_retry_waiting_step_is_blocked() {
     // After a stopped step: blocked (here after Stop All and a Restart of
     // the waiting step).
     let mut single = self::run(
-        r#"{"steps": [
-            {"id": "eval", "run": "e"},
-            {"id": "report", "after": ["eval"], "run": "r"}
-        ]}"#,
+        r#"
+steps:
+  eval: {run: e}
+  report: {depends_on: {eval: completed}, run: r}
+"#,
     );
     single.start(t);
     let eval = started(&single.take_effects(), 0);
@@ -656,10 +680,11 @@ fn failed_step_variables_fail_the_step_that_reads_them() {
 #[test]
 fn a_step_that_never_got_where_it_runs_has_no_artifacts_to_check() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-            {"id": "eval", "project": {"local": "/p"}, "run": "e", "artifacts": ["x"]},
-            {"id": "report", "after": ["eval"], "run": "r ${steps.eval.exit_code}"}
-        ]}"#);
+    let mut run = run(r#"
+steps:
+  eval: {project: {local: /p}, run: e, artifacts: [x]}
+  report: {depends_on: {eval: completed}, run: 'r ${steps.eval.exit_code}'}
+"#);
     run.start(t);
     run.take_effects();
     run.project_failed(0, generation(&run, 0), "gone", t);
@@ -675,10 +700,11 @@ fn a_step_that_never_got_where_it_runs_has_no_artifacts_to_check() {
 #[test]
 fn urls_open_once_until_the_step_is_ready() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-            {"id": "web", "run": "s", "openUrls": true, "ready": {"output": "compiled"}},
-            {"id": "quiet", "run": "s", "ready": {"output": "x"}}
-        ]}"#);
+    let mut run = run(r#"
+steps:
+  web: {run: s, open_urls: true, ready: {output: compiled}}
+  quiet: {run: s, ready: {output: x}}
+"#);
     run.start(t);
     run.take_effects();
     let g = generation(&run, 0);
@@ -726,11 +752,12 @@ fn urls_open_once_until_the_step_is_ready() {
 #[test]
 fn a_chain_with_a_failure_ends_failed_once_the_last_step_finished() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-        {"id": "prepare", "run": "p"},
-        {"id": "eval", "needs": ["prepare"], "run": "e", "artifacts": [{"label": "m", "path": "m"}]},
-        {"id": "report", "after": "eval", "run": "r ${steps.eval.artifacts.m}", "artifacts": ["r"]}
-    ]}"#);
+    let mut run = run(r#"
+steps:
+  prepare: {run: p}
+  eval: {depends_on: [prepare], run: e, artifacts: [{label: m, path: m}]}
+  report: {depends_on: {eval: completed}, run: 'r ${steps.eval.artifacts.m}', artifacts: [r]}
+"#);
     run.start(t);
     let p = started(&run.take_effects(), 0);
     run.exited(0, p, Some(0), t);
@@ -749,16 +776,20 @@ fn a_chain_with_a_failure_ends_failed_once_the_last_step_finished() {
     assert_eq!(run.outcome(), Outcome::Failed);
 }
 
-const SERVICE: &str = r#"{"steps": [
-    {"id": "db", "run": "d"},
-    {"id": "svc", "needs": "db", "steps": [
-        {"id": "build", "run": "b"},
-        {"id": "migrate", "needs": "build", "run": "m"},
-        {"id": "lint", "run": "l"}
-    ]},
-    {"id": "web", "needs": "svc", "run": "w"},
-    {"id": "report", "after": "svc", "run": "r ${steps.svc.status}"}
-]}"#;
+const SERVICE: &str = r#"
+steps:
+  db: {run: d}
+
+  svc:
+    depends_on: [db]
+    steps:
+      build: {run: b}
+      migrate: {depends_on: [build], run: m}
+      lint: {run: l}
+
+  web: {depends_on: [svc], run: w}
+  report: {depends_on: {svc: completed}, run: 'r ${steps.svc.status}'}
+"#;
 
 /// Exits step `index`'s command (started by an effect already taken).
 fn exit(run: &mut Run, index: usize, code: i32, t: Instant) {
@@ -870,13 +901,15 @@ fn a_group_gates_its_steps_and_takes_its_state_from_them() {
 #[test]
 fn groups_stop_and_block_like_steps() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-        {"id": "g", "steps": [
-            {"id": "a", "run": "a"},
-            {"id": "b", "needs": "a", "run": "b"}
-        ]},
-        {"id": "z", "after": "g", "run": "z"}
-    ]}"#);
+    let mut run = run(r#"
+steps:
+  g:
+    steps:
+      a: {run: a}
+      b: {depends_on: [a], run: b}
+
+  z: {depends_on: {g: completed}, run: z}
+"#);
     run.start(t);
     run.take_effects();
     assert_eq!(statuses(&run), ["running", "running", "waiting", "waiting"]);
@@ -920,25 +953,35 @@ fn groups_stop_and_block_like_steps() {
 }
 
 fn run_blocked() -> Run {
-    run(r#"{"steps": [
-        {"id": "vpn", "check": "c", "onFail": "Connect"},
-        {"id": "g", "needs": "vpn", "steps": [{"id": "a", "run": "a"}]},
-        {"id": "z", "after": "g", "run": "z"}
-    ]}"#)
+    run(r#"
+steps:
+  vpn: {check: c, on_fail: Connect}
+
+  g:
+    depends_on: [vpn]
+    steps:
+      a: {run: a}
+
+  z: {depends_on: {g: completed}, run: z}
+"#)
 }
 
 #[test]
 fn steps_in_groups_inherit_and_read_what_their_groups_wait_for() {
     let t = Instant::now();
-    let mut run = run(r#"{"steps": [
-        {"id": "eval", "run": "e"},
-        {"id": "g", "after": "eval", "project": {"local": "/p"}, "env": {"K": "group", "L": "l"},
-         "steps": [
-            {"id": "inner", "steps": [
-                {"id": "use", "env": {"K": "own"}, "run": "u ${steps.eval.exit_code} ${steps.eval.status}"}
-            ]}
-        ]}
-    ]}"#);
+    let mut run = run(r#"
+steps:
+  eval: {run: e}
+
+  g:
+    depends_on: {eval: completed}
+    project: {local: /p}
+    env: {K: group, L: l}
+    steps:
+      inner:
+        steps:
+          use: {env: {K: own}, run: 'u ${steps.eval.exit_code} ${steps.eval.status}'}
+"#);
     run.start(t);
     run.take_effects();
     assert_eq!(run.steps()[3].detail, "after eval");

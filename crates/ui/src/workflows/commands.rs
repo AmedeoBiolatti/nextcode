@@ -18,7 +18,7 @@ use workflow::{ArtifactState, ArtifactTarget, CheckResult, Step};
 
 use crate::project::Project;
 
-/// How long a check may run without `timeout_s`.
+/// How long a check may run without `timeout`.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 const ENV_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -202,7 +202,7 @@ pub(crate) fn run_check(step: &Step, project: Option<&Project>) -> CheckResult {
     let result = Place::of(project).and_then(|place| {
         let line = place.line(step, check)?;
         let (program, args) = place.check_program(line);
-        let timeout = step.timeout_s.map_or(CHECK_TIMEOUT, Duration::from_secs);
+        let timeout = step.timeout.unwrap_or(CHECK_TIMEOUT);
         // Without a project the check runs here, in the home folder.
         let host = Project::local(PathBuf::from(&place.root));
         project
@@ -277,22 +277,21 @@ mod tests {
         Step {
             id: "s".into(),
             title: None,
-            needs: Vec::new(),
-            after: Vec::new(),
+            depends_on: Vec::new(),
             project: None,
             run: Some("serve".into()),
             terminal: None,
             check: None,
             on_fail: None,
             ready: workflow::Ready::Exit,
-            timeout_s: None,
+            timeout: None,
             open_urls: false,
             env: env
                 .iter()
                 .map(|&(name, value)| (name.to_owned(), value.to_owned()))
                 .collect::<BTreeMap<_, _>>(),
             cwd: cwd.map(Into::into),
-            stop_grace_s: workflow::DEFAULT_STOP_GRACE_S,
+            stop_grace: workflow::DEFAULT_STOP_GRACE,
             artifacts: Vec::new(),
             steps: Vec::new(),
         }

@@ -1,13 +1,14 @@
 //! A workflow's steps as one flat list in file order, groups before their
 //! steps (pre-order), each with its qualified id (`group/step`), its
-//! parent and children, its `needs` and `after` resolved among its
-//! siblings, and what it inherits from its groups (`project`, `cwd`, and
-//! `env` merged, its own values winning). A run schedules the steps that
-//! do something (leaves); a group's state follows from its steps'.
+//! parent and children, its `depends_on` resolved among its siblings
+//! (split by condition), and what it inherits from its groups and the
+//! workflow (`project`, `cwd`, and `env` merged, its own values winning).
+//! A run schedules the steps that do something (leaves); a group's state
+//! follows from its steps'.
 
-use std::ops::Range;
+use std::{collections::BTreeMap, ops::Range};
 
-use crate::file::{Step, Workflow};
+use crate::file::{Condition, Step, Workflow};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepNode {
@@ -21,7 +22,8 @@ pub struct StepNode {
     pub index: usize,
     /// A group's steps (empty for a step that does something).
     pub children: Vec<usize>,
-    /// The siblings it lists in `needs` and in `after`.
+    /// The siblings its `depends_on` wants ready (`needs`) and finished,
+    /// ready or failed (`after`: `condition: completed`).
     pub needs: Vec<usize>,
     pub after: Vec<usize>,
     /// 0 at the top level.
@@ -33,7 +35,7 @@ impl StepNode {
         !self.children.is_empty()
     }
 
-    /// The siblings it waits for: `needs`, then `after`.
+    /// The siblings it waits for: the ready ones, then the completed ones.
     pub fn upstream(&self) -> impl Iterator<Item = usize> + '_ {
         self.needs.iter().chain(&self.after).copied()
     }
@@ -41,20 +43,26 @@ impl StepNode {
 
 /// The workflow's steps, flattened (see the module).
 pub fn flatten(workflow: &Workflow) -> Vec<StepNode> {
-    flatten_steps(&workflow.steps)
+    flatten_steps(&workflow.steps, &workflow.env)
 }
 
-/// [`flatten`] for a list of top-level steps (ids not found among the
-/// siblings are left out of `needs` and `after`; validation reports them).
-pub fn flatten_steps(steps: &[Step]) -> Vec<StepNode> {
+/// [`flatten`] for a list of top-level steps and the workflow's `env`
+/// (ids not found among the siblings are left out of `needs` and `after`;
+/// validation reports them).
+pub fn flatten_steps(steps: &[Step], env: &BTreeMap<String, String>) -> Vec<StepNode> {
     let mut nodes = Vec::new();
-    add(&mut nodes, steps, None);
+    add(&mut nodes, steps, None, env);
     nodes
 }
 
 /// Adds `steps` (children of `parent`) and what they hold; returns their
 /// indices.
-fn add(nodes: &mut Vec<StepNode>, steps: &[Step], parent: Option<usize>) -> Vec<usize> {
+fn add(
+    nodes: &mut Vec<StepNode>,
+    steps: &[Step],
+    parent: Option<usize>,
+    env: &BTreeMap<String, String>,
+) -> Vec<usize> {
     let mut indices = Vec::with_capacity(steps.len());
     for (index, step) in steps.iter().enumerate() {
         let mut effective = step.shallow();
@@ -75,7 +83,15 @@ fn add(nodes: &mut Vec<StepNode>, steps: &[Step], parent: Option<usize>) -> Vec<
                 }
                 (format!("{}/{}", from.path, step.id), from.depth + 1)
             }
-            None => (step.id.clone(), 0),
+            None => {
+                for (name, value) in env {
+                    effective
+                        .env
+                        .entry(name.clone())
+                        .or_insert_with(|| value.clone());
+                }
+                (step.id.clone(), 0)
+            }
         };
         let at = nodes.len();
         nodes.push(StepNode {
@@ -90,22 +106,24 @@ fn add(nodes: &mut Vec<StepNode>, steps: &[Step], parent: Option<usize>) -> Vec<
         });
         indices.push(at);
         if !step.steps.is_empty() {
-            nodes[at].children = add(nodes, &step.steps, Some(at));
+            nodes[at].children = add(nodes, &step.steps, Some(at), env);
         }
     }
     for &at in &indices {
-        let resolve = |ids: &[String]| -> Vec<usize> {
-            ids.iter()
+        let resolve = |condition: Condition| -> Vec<usize> {
+            nodes[at]
+                .step
+                .depending(condition)
                 .filter_map(|id| {
                     indices
                         .iter()
                         .copied()
-                        .find(|&sibling| nodes[sibling].step.id == *id)
+                        .find(|&sibling| nodes[sibling].step.id == id)
                 })
                 .collect()
         };
-        let needs = resolve(&nodes[at].step.needs);
-        let after = resolve(&nodes[at].step.after);
+        let needs = resolve(Condition::Ready);
+        let after = resolve(Condition::Completed);
         nodes[at].needs = needs;
         nodes[at].after = after;
     }
@@ -128,7 +146,7 @@ pub fn subtree(nodes: &[StepNode], at: usize) -> Range<usize> {
 }
 
 /// The steps `${steps.<id>.…}` in node `at` may read, nearest first: the
-/// siblings its `needs` and `after` list, then those each enclosing group
+/// siblings its `depends_on` lists, then those each enclosing group
 /// lists; by their id at that level.
 pub fn scope(nodes: &[StepNode], at: usize) -> Vec<(&str, usize)> {
     let mut scope = Vec::new();
@@ -142,8 +160,8 @@ pub fn scope(nodes: &[StepNode], at: usize) -> Vec<(&str, usize)> {
     scope
 }
 
-/// Its own `needs`, then each enclosing group's (what must be ready
-/// before it starts), and the same for `after`.
+/// What must be ready before it starts (its own, then each enclosing
+/// group's), and what must have finished.
 pub fn gates(nodes: &[StepNode], at: usize) -> (Vec<usize>, Vec<usize>) {
     let (mut needs, mut after) = (Vec::new(), Vec::new());
     let mut node = Some(at);
@@ -162,18 +180,25 @@ mod tests {
     #[test]
     fn groups_flatten_in_order_with_qualified_ids_and_inherit_defaults() {
         let workflow = crate::parse(
-            r#"{"steps": [
-              {"id": "db", "run": "d"},
-              {"id": "api", "needs": "db", "project": {"local": "C:/api"},
-               "env": {"A": "1", "B": "group"}, "cwd": "srv", "steps": [
-                {"id": "build", "run": "b", "env": {"B": "own"}},
-                {"id": "serve", "needs": "build", "run": "s", "cwd": "."},
-                {"id": "more", "after": "serve", "project": "C:/other", "steps": [
-                  {"id": "x", "run": "x"}
-                ]}
-              ]},
-              {"id": "web", "after": ["api"], "run": "w"}
-            ]}"#,
+            r#"
+env: {W: top, B: workflow}
+steps:
+  db: {run: d}
+  api:
+    depends_on: db
+    project: {local: C:/api}
+    env: {A: "1", B: group}
+    cwd: srv
+    steps:
+      build: {run: b, env: {B: own}}
+      serve: {depends_on: build, run: s, cwd: .}
+      more:
+        depends_on: {serve: completed}
+        project: C:/other
+        steps:
+          x: {run: x}
+  web: {depends_on: {api: completed}, run: w}
+"#,
             "f",
         )
         .unwrap();
@@ -217,6 +242,8 @@ mod tests {
             "the nearest group's project"
         );
         assert_eq!(nodes[5].step.env["B"], "group");
+        assert_eq!(nodes[5].step.env["W"], "top", "the workflow's env");
+        assert_eq!(nodes[0].step.env["B"], "workflow");
         assert_eq!(nodes[5].step.cwd.as_deref(), Some("srv"));
         assert_eq!(subtree(&nodes, 1), 1..6);
         assert_eq!(subtree(&nodes, 4), 4..6);

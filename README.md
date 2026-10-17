@@ -291,57 +291,95 @@ and runs).
 
 ## Workflows
 
-A workflow is one JSONC file that starts a multi-project development
+A workflow is one YAML file that starts a multi-project development
 environment: preconditions, commands in the terminals of several projects
 (opened as needed, dev containers included), ordering with readiness
 conditions, browser links and manual gates. Files are found in
-`<config>/next_code/workflows/*.json[c]` (next to `settings.json`;
+`<config>/next_code/workflows/*.yaml` (or `.yml`; next to `settings.json`;
 `%APPDATA%\next_code\workflows` on Windows) and in each open project's
-`.next_code/workflows/*.json[c]`. They are read again before every Run All.
+`.next_code/workflows/*.yaml`. They are read again before every Run All.
+The format borrows what other tools made familiar: steps keyed by id with
+`depends_on` and its conditions, durations and `x-` keys with anchors from
+Docker Compose, `inputs` from GitHub Actions, `${…}` variables from VS
+Code. JSON works too (it is YAML).
 
-```jsonc
-{
-  "name": "Fleet dev",
-  "steps": [
-    // A process on this machine (PowerShell on Windows); exit 0 passes.
-    { "id": "vpn", "title": "VPN", "check": "if (-not (Test-Connection -Count 1 -Quiet intranet.corp)) { exit 1 }",
-      "onFail": "Connect the VPN, then press Retry." },
-    { "id": "api", "needs": ["vpn"], "project": { "devcontainer": "C:/src/api" },
-      "run": "uv run uvicorn app:app --port 8000", "terminal": "API",
-      "ready": { "port": 8000 }, "timeout_s": 600 },
-    { "id": "worker", "needs": ["vpn"],
-      "project": { "devcontainer": { "wsl": "Ubuntu", "path": "~/src/worker" } },
-      "run": "uv run worker", "ready": { "output": "worker started" } },
-    { "id": "web", "needs": ["api"], "project": { "devcontainer": "C:/src/web" },
-      "run": "npm run dev", "ready": { "output": "ready in \\d+ ms" }, "openUrls": true },
-    { "id": "login", "needs": ["web"], "ready": { "manual": "Log in in the browser, then Continue." } },
-    { "id": "tools", "needs": ["login", "worker"], "project": { "wsl": "Ubuntu", "path": "~/src/tools" },
-      "run": "./sync.sh --env dev", "env": { "TOKEN": "${env:FLEET_TOKEN}" }, "cwd": "scripts" },
-    // Checkpoints on Ctrl+C: 120 s before a stop kills it.
-    { "id": "eval", "needs": ["api"], "project": { "devcontainer": "C:/src/api" },
-      "run": "uv run python eval.py", "stop_grace_s": 120,
-      "artifacts": [{ "label": "metrics", "path": "out/metrics.json" }] },
-    // Runs once `eval` finished, also when it failed.
-    { "id": "report", "after": "eval", "project": { "devcontainer": "C:/src/api" },
-      "run": "uv run python report.py ${steps.eval.exit_code} ${steps.eval.artifacts.metrics}" }
-  ]
-}
+```yaml
+name: Fleet dev
+steps:
+  # A process on this machine (PowerShell on Windows); exit 0 passes.
+  vpn:
+    title: VPN
+    check: if (-not (Test-Connection -Count 1 -Quiet intranet.corp)) { exit 1 }
+    on_fail: Connect the VPN, then press Retry.
+  api:
+    depends_on: [vpn]
+    project: {devcontainer: C:/src/api}
+    run: uv run uvicorn app:app --port 8000
+    terminal: API
+    ready: {port: 8000}
+    timeout: 10m
+  worker:
+    depends_on: [vpn]
+    project: {devcontainer: {wsl: Ubuntu, path: ~/src/worker}}
+    run: uv run worker
+    ready: {output: worker started}
+  web:
+    depends_on: [api]
+    project: {devcontainer: C:/src/web}
+    run: npm run dev
+    ready: {output: 'ready in \d+ ms'}
+    open_urls: true
+  login:
+    depends_on: [web]
+    ready: {manual: 'Log in in the browser, then Continue.'}
+  tools:
+    depends_on: [login, worker]
+    project: {wsl: Ubuntu, path: ~/src/tools}
+    run: ./sync.sh --env dev
+    env: {TOKEN: '${env:FLEET_TOKEN}'}
+    cwd: scripts
+  # Checkpoints on Ctrl+C: 2 minutes before a stop kills it.
+  eval:
+    depends_on: [api]
+    project: {devcontainer: C:/src/api}
+    run: uv run python eval.py
+    stop_grace_period: 2m
+    artifacts: [{label: metrics, path: out/metrics.json}]
+  # Runs once `eval` finished, also when it failed.
+  report:
+    depends_on: {eval: completed}
+    project: {devcontainer: C:/src/api}
+    run: uv run python report.py ${steps.eval.exit_code} ${steps.eval.artifacts.metrics}
 ```
 
-Step fields: `id` (required, unique), `title`, `needs` (ids; a step starts
-when they are all ready, independent steps run in parallel), `after` (ids
-that must have finished, ready or failed), `project`, `run`, `terminal`,
-`check`, `onFail`, `ready`, `timeout_s`, `stop_grace_s`, `artifacts`,
-`openUrls`, `env`, `cwd`. Unknown keys, unknown `needs`/`after`, ids in
-both, duplicate ids, cycles (through `needs` and `after`) and `${steps.…}`
-variables naming a step outside `needs`/`after` make the workflow
-invalid: it is listed with the error and cannot run.
+Top level: `name` (default: the file name), `description`, `inputs`,
+`env` (environment every step gets; a group's and a step's own win),
+`steps`, and `x-…` keys holding shared parts for YAML anchors
+(`x-api: &api {project: …}`, then `<<: *api` in steps, as in Compose
+files). Step fields (the step's id is its key in `steps`): `title`,
+`depends_on`, `project`, `run`, `terminal`, `check`, `on_fail`, `ready`,
+`timeout`, `stop_grace_period`, `artifacts`, `open_urls`, `env`, `cwd`.
+`depends_on` is an id, a list of ids (each must be ready; independent
+steps run in parallel), or a mapping of ids to a condition: `ready` (the
+default) or `completed` (finished, ready or failed), also as Compose's
+`{condition: completed}`. Durations are Compose's: `90s`, `10m`, `1h30m`,
+`500ms` (a plain number is seconds). Unknown keys, unknown dependencies,
+cycles and `${steps.…}` variables naming a step outside `depends_on` make
+the workflow invalid: it is listed with the error (located at the key or
+value it is about) and cannot run. Keys of the old JSON format say what
+they became; `restart`, `healthcheck`, `if`, `env_file` and `ready.http`
+are reserved for planned features (see the manual).
 
-- `project`: `{ "local": "C:/src/p" }`, `{ "wsl": "Ubuntu", "path": "~/p" }`,
-  `{ "devcontainer": <folder>, "config"?: "<devcontainer.json>" }` (folder: a
-  path string or the `wsl` shape), a typed location (`"Ubuntu:~/p"`,
-  `"devcontainer:C:\\src\\p"`), or the editor's own shape from
-  `recent.json` (`{"Local": ...}`, `{"Wsl": {...}}`, `{"DevContainer": {...}}`).
+Files of the old JSON format (`.json`/`.jsonc` with a `steps` array) are
+listed with a problem and do not run; their tab has **Convert to YAML**
+(headless: `workflow_convert`), which writes `<name>.yaml` beside the old
+file with its comments kept and renames the old file to `.bak`.
+
+- `project`: `{local: C:/src/p}`, `{wsl: Ubuntu, path: ~/p}`,
+  `{devcontainer: <folder>, config: <devcontainer.json>}` (folder: a
+  path string or the `wsl` shape), a typed location (`'Ubuntu:~/p'`,
+  `'devcontainer:C:\src\p'`), or the editor's own shape from
+  `recent.json` (`{Local: ...}`, `{Wsl: {...}}`, `{DevContainer: {...}}`).
   Without it the step runs on the editor's machine, with no project tab.
 - `run`: runs as the program of a terminal tab (named `terminal`, else the
   title, else the id) in the project's Terminal panel, after the project
@@ -353,88 +391,96 @@ invalid: it is listed with the error and cannot run.
   workflow's tab (Terminal button). `.venv` is not activated (use `uv run`).
 - `check`: a process where the step runs (PowerShell `-NoProfile` on
   Windows, `sh -c` elsewhere), before `run`; exit 0 passes. Failing with
-  `onFail`: the step shows Failed with that message and Retry; without it
+  `on_fail`: the step shows Failed with that message and Retry; without it
   the workflow fails and everything it started is stopped.
-- `ready`: `{ "exit": true }` (the default with `run`: exit code 0; without
-  `run`, the check passing), `{ "output": "<regex>" }` (the command's output,
-  ANSI codes stripped, across chunks and lines), `{ "port": N }` (listening
+- `ready`: `{exit: true}` (the default with `run`: exit code 0; without
+  `run`, the check passing), `{output: <regex>}` (the command's output,
+  ANSI codes stripped, across chunks and lines), `{port: N}` (listening
   where the step runs: the agent's listening sockets for WSL/containers, a
-  TCP connect to localhost otherwise), `{ "manual": "<prompt>" }` (a
-  Continue button), `{ "delay_ms": N }`. A command that exits before it is
-  ready fails the step. `timeout_s` (from the step's start) fails it too.
-- `openUrls`: http(s) URLs on complete output lines open in the browser
+  TCP connect to localhost otherwise), `{manual: <prompt>}` (a Continue
+  button), `{delay: <duration>}`. A command that exits before it is ready
+  fails the step. `timeout` (from the step's start) fails it too. Quote
+  text with a comma inside `{…}` (`{manual: 'Log in, then Continue'}`): a
+  comma there separates keys.
+- `open_urls`: http(s) URLs on complete output lines open in the browser
   (each once) until the step is ready plus 3 s.
 - `env`, `cwd` (relative to the project; the home folder without one) and
   the command lines expand `${workspaceFolder}` (the home folder without a
   project), `${userHome}` and `${env:NAME}` (the environment where the step
   runs; read with `env` for WSL/containers); so do artifact paths.
-- `stop_grace_s` (1–3600, default 3): every stop of the step's command
-  (Stop All, Restart, `timeout_s`, Run All replacing the run, the workflow
-  failing) sends Ctrl+C to its terminal and kills it only if it still runs
-  after that many seconds; meanwhile the step is `stopping` with a
+- `stop_grace_period` (1s–1h, default 3s): every stop of the step's
+  command (Stop All, Restart, `timeout`, Run All replacing the run, the
+  workflow failing) sends Ctrl+C to its terminal and kills it only if it
+  still runs after that long; meanwhile the step is `stopping` with a
   countdown. A second Stop All kills at once.
 - `artifacts`: files (relative to `cwd`, else the project) and http(s)
-  links the step produces: `"out/metrics.json"`, `"https://…"`,
-  `{ "label": "...", "path": "..." }`, `{ "label": "...", "url": "..." }`.
+  links the step produces: `out/metrics.json`, `https://…`,
+  `{label: ..., path: ...}`, `{label: ..., url: ...}`.
   When the step finishes they are resolved and looked up where it runs
   (through the project for WSL/containers); the details strip links them
   (a file opens in an editor tab of the step's project, a URL in the
   browser; missing files dimmed, Check again), cards show `↗ N`.
 - `${steps.<id>.status}`, `${steps.<id>.exit_code}`,
   `${steps.<id>.artifacts.<label>}` / `.<index>` in `run`, `check`, `cwd`,
-  `env`, artifact paths: what a step listed in `needs` or `after` left,
+  `env`, artifact paths: what a step listed in `depends_on` left,
   replaced when this step starts. Paths are as seen where the producing
   step runs (another machine or container may not see them).
 - `steps` (a group): a step with `steps` of its own is a group of them.
-  A group takes `id`, `title`, `needs`, `after`, `steps` and defaults its
-  steps inherit unless they set their own: `project`, `cwd`, `env`
-  (merged, the step's values winning); nothing else (no `run`, `check`,
-  `ready`, …), and at least one step. Groups nest. Ids are unique among
-  siblings and contain no `/`; `needs`/`after` inside a group name its
-  other steps only. A group's `needs`/`after` gate all its steps; steps
-  outside wait for the group like for a step, by its state: running while
-  a step in it runs, ready when all are, failed (`2 of 5 steps failed`)
-  when none can progress and some failed, waiting/blocked on its own
-  `needs`/`after`, stopped. `${steps.<id>.…}` in a step reads its
-  siblings in its `needs`/`after` and what its groups list in theirs (by
-  their id at that level); `${steps.<group>.status}` reads a group (it has
-  no exit code or artifacts). Elsewhere steps are named by qualified id:
-  `api/migrate` (events, `workflow_status`, `workflow_restart`, …).
+  A group takes `title`, `depends_on`, `steps` and defaults its steps
+  inherit unless they set their own: `project`, `cwd`, `env` (merged, the
+  step's values winning); nothing else (no `run`, `check`, `ready`, …),
+  and at least one step. Groups nest. Ids are unique among siblings and
+  contain no `/`; `depends_on` inside a group names its other steps only.
+  A group's `depends_on` gates all its steps; steps outside wait for the
+  group like for a step, by its state: running while a step in it runs,
+  ready when all are, failed (`2 of 5 steps failed`) when none can
+  progress and some failed, waiting/blocked on its own `depends_on`,
+  stopped. `${steps.<id>.…}` in a step reads its siblings in its
+  `depends_on` and what its groups list in theirs (by their id at that
+  level); `${steps.<group>.status}` reads a group (it has no exit code or
+  artifacts). Elsewhere steps are named by qualified id: `api/migrate`
+  (events, `workflow_status`, `workflow_restart`, …).
 
-  ```jsonc
-  { "id": "api", "needs": ["vpn"], "project": { "devcontainer": "C:/src/api" },
-    "env": { "PROFILE": "dev" }, "steps": [
-      { "id": "build", "run": "uv sync" },
-      { "id": "migrate", "needs": ["build"], "run": "uv run alembic upgrade head" },
-      { "id": "serve", "needs": ["migrate"], "run": "uv run uvicorn app:app", "ready": { "port": 8000 } } ] }
+  ```yaml
+  api:
+    depends_on: [vpn]
+    project: {devcontainer: C:/src/api}
+    env: {PROFILE: dev}
+    steps:
+      build: {run: uv sync}
+      migrate: {depends_on: [build], run: uv run alembic upgrade head}
+      serve: {depends_on: [migrate], run: uv run uvicorn app:app, ready: {port: 8000}}
   ```
 
-Inputs: a top-level `"inputs"` array declares parameters each run gets,
-read in steps as `${inputs.<id>}`:
+Inputs: a top-level `inputs` mapping declares parameters each run gets,
+read in steps as `${inputs.<id>}` (the shape of GitHub Actions'
+`workflow_dispatch` inputs):
 
-```jsonc
-"inputs": [
-  { "id": "env", "label": "Environment", "type": "choice",
-    "options": ["dev", "staging", { "value": "prod", "label": "Production" }],
-    "default": "dev", "description": "Where to deploy" },
-  { "id": "branch", "type": "string", "default": "main", "placeholder": "branch name", "required": true },
-  { "id": "workers", "type": "number", "default": 4, "min": 1, "max": 64, "integer": true },
-  { "id": "clean", "type": "boolean", "default": false }
-]
+```yaml
+inputs:
+  env:
+    label: Environment
+    type: choice
+    options: [dev, staging, {value: prod, label: Production}]
+    default: dev
+    description: Where to deploy
+  branch: {type: string, default: main, placeholder: branch name, required: true}
+  workers: {type: number, default: 4, min: 1, max: 64, integer: true}
+  clean: {type: boolean, default: false}
 ```
 
 | Key | Meaning |
 |---|---|
-| `id` | required, unique; no `/`, `.`, `{`, `}`, `$`, spaces |
+| (its key) | the id: unique; no `/`, `.`, `{`, `}`, `$`, spaces |
 | `type` | `string` (default; a textbox), `number` (a textbox checked as a number), `boolean` (a checkbox), `choice` (a dropdown) |
 | `label`, `description` | the form's label (default: the id) and helper text |
-| `default` | of the input's type and valid for it; without one `""`, empty, `false`, the first option |
+| `default` | of the input's type and valid for it (unquoted numbers keep their text for strings: `1.10`); without one `""`, empty, `false`, the first option |
 | `required` | `string`/`number`: must not be empty |
 | `placeholder` | `string`/`number`: shown in the empty textbox |
-| `options` | `choice`: strings or `{ "value", "label" }` |
+| `options` | `choice`: values or `{value, label}` |
 | `min`, `max`, `integer` | `number`: inclusive bounds, whole numbers only |
 
-Unknown keys, keys of another type, duplicate ids, invalid defaults and
+Unknown keys, keys of another type, invalid defaults and
 `${inputs.<id>}` naming no input are validation errors (located in the
 file). `${inputs.<id>}` works in `run`, `check`, `cwd`, `env` values,
 artifact paths and `project` strings, at any depth (groups' too); values
@@ -458,11 +504,12 @@ for numbers and booleans); the others get their defaults (not the form's
 remembered values), and invalid, unknown or missing required values fail
 it with every problem listed (``input `workers`: must be ≤ 64``).
 
-States: pending → waiting (needs/after) → starting (opening the project,
-the check) → running → ready | failed | stopped, with stopping (Ctrl+C
-sent, grace running) before stopped (or failed for a timeout). A failed
-step blocks its `needs` dependents (shown as blocked) but not its `after`
-dependents; a stopped one blocks both; others keep going. When nothing
+States: pending → waiting (its `depends_on`) → starting (opening the
+project, the check) → running → ready | failed | stopped, with stopping
+(Ctrl+C sent, grace running) before stopped (or failed for a timeout). A
+failed step blocks the steps that need it ready (shown as blocked) but
+not those that wait for it `completed`; a stopped one blocks both; others
+keep going. When nothing
 can progress and not every step is ready, the run is Failed (finished
 with failures; the failed steps keep their reason). Restart reruns one
 step (its old command is stopped with its grace first, then it starts in
@@ -479,24 +526,25 @@ projects' workflows); Run > New Workflow… writes a commented template to
 the user folder and opens its tab; the command palette's "Run Workflow:
 <name>" opens the tab and runs it. The tab has the file in an editor on
 the left (Ctrl+S saves; drag the divider to resize) and a graph on the
-right: one column per dependency depth (longest chain of `needs` and
-`after`), cards ordered for the fewest edge crossings found (median and
+right: one column per dependency depth (longest chain of `depends_on`),
+cards ordered for the fewest edge crossings found (median and
 barycenter sweeps with swapping and sifting, then an exhaustive search
 while small), chains kept on one row (Brandes–Köpf placement, compacted),
 edges spanning several columns routed between the cards they pass, never
 through them. Each card shows title, id and what it does (`after` when
-it has some), where it runs, status icon/color and elapsed time. Edges
+it waits for a step `completed`), where it runs, status icon/color and elapsed time. Edges
 leave and enter cards horizontally (several on one side get a port each)
-and end in an arrowhead they meet square on; `needs` edges turn green
-when their upstream is ready, dashed `after` edges light up when their
-upstream finished (ready or failed). The graph opens fitted to its pane
+and end in an arrowhead they meet square on; edges of `ready`
+dependencies turn green when their upstream is ready, dashed edges of
+`completed` ones light up when their upstream finished (ready or
+failed). The graph opens fitted to its pane
 (at most 100 %, at least 40 %, centered) and re-fits on resize and after
 edits until you zoom or pan: Ctrl+scroll zooms around the pointer, the
 corner overlay has −, the zoom, + and Fit (back to fitting); scroll
 (Shift+scroll sideways) or drag pans. The
 graph follows the buffer 200 ms after an edit; a file with problems shows
 them in a banner with line and column (click: go there) over the last
-good graph, dimmed. Clicking a card puts the cursor on its `"id"`; the
+good graph, dimmed. Clicking a card puts the cursor on its key; the
 card holding the cursor is highlighted. A selected card shows details
 below the graph: state, wait/failure reason or manual prompt, last output
 lines, artifacts (links), Terminal (the project's terminal tab, or this
@@ -507,7 +555,7 @@ pane 240 px), double-click it to maximize the pane and back; the size is
 kept per tab while it is open (not saved with the window). A group is a
 card of the same size: its state, title, `▸ N steps` and elapsed time
 over a miniature of its graph (its steps as small boxes in their state's
-colors, nested groups outlined, thin edges, dashed for `after`).
+colors, nested groups outlined, thin edges, dashed for `completed`).
 Clicking it selects it and expands it in place into a box around its
 graph of real cards (selectable, with their details, terminals and
 actions); clicking the box's header (`▾`) collapses it. Several groups
@@ -525,7 +573,8 @@ through the project (its tab opens first when a restored workflow tab
 needs it). Workflows run in the window that started them.
 
 Headless: `workflows_list` (groups with their `steps` nested, each entry
-with `kind` and qualified `path`; each workflow's `inputs`), `workflow_run`
+with `kind` and qualified `path`; each workflow's `inputs`),
+`workflow_convert` (an old JSON file to YAML), `workflow_run`
 (`inputs`), `workflow_status` (the run's `inputs`; a
 row per step and group: qualified `id`, `kind`, `parent`), `workflow_stop`,
 `workflow_continue`, `workflow_restart` (a group: all its steps),

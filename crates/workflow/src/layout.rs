@@ -35,7 +35,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{Step, Workflow};
+use crate::{Step, Workflow, file::Condition};
 
 /// Card size and spacing.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1182,13 +1182,21 @@ fn layout_level(
             }));
         }
     }
+    let lists: Vec<(Vec<String>, Vec<String>)> = steps
+        .iter()
+        .map(|step| {
+            let ids = |condition| step.depending(condition).map(str::to_owned).collect();
+            (ids(Condition::Ready), ids(Condition::Completed))
+        })
+        .collect();
     let specs: Vec<NodeSpec> = steps
         .iter()
         .zip(&sizes)
-        .map(|(step, &size)| NodeSpec {
+        .zip(&lists)
+        .map(|((step, &size), (needs, after))| NodeSpec {
             id: &step.id,
-            needs: &step.needs,
-            after: &step.after,
+            needs,
+            after,
             size,
         })
         .collect();
@@ -1981,19 +1989,29 @@ mod tests {
         assert_eq!(graph_sized(&steps, &[(1, (300., 200.))]), layout);
     }
 
-    const GROUPS: &str = r#"{"steps": [
-      {"id": "db", "run": "d"},
-      {"id": "svc", "needs": "db", "steps": [
-        {"id": "build", "run": "b"},
-        {"id": "inner", "needs": "build", "steps": [
-          {"id": "x", "run": "x"},
-          {"id": "y", "after": "x", "run": "y"}
-        ]},
-        {"id": "lint", "run": "l"}
-      ]},
-      {"id": "web", "after": "svc", "run": "w"},
-      {"id": "other", "steps": [{"id": "o", "run": "o"}]}
-    ]}"#;
+    const GROUPS: &str = r#"
+steps:
+  db: {run: d}
+
+  svc:
+    depends_on: [db]
+    steps:
+      build: {run: b}
+
+      inner:
+        depends_on: [build]
+        steps:
+          x: {run: x}
+          y: {depends_on: {x: completed}, run: y}
+
+      lint: {run: l}
+
+  web: {depends_on: {svc: completed}, run: w}
+
+  other:
+    steps:
+      o: {run: o}
+"#;
 
     fn expanded(paths: &[&str]) -> HashSet<String> {
         paths.iter().map(|path| (*path).to_owned()).collect()

@@ -792,15 +792,14 @@ mod tests {
     fn workflow() -> Arc<Workflow> {
         Arc::new(
             workflow::parse(
-                r#"{
-                  "inputs": [
-                    { "id": "env", "type": "choice", "options": ["dev", "staging", "prod"], "default": "dev" },
-                    { "id": "branch", "required": true, "placeholder": "branch name" },
-                    { "id": "workers", "type": "number", "default": 4, "min": 1, "max": 64, "integer": true },
-                    { "id": "clean", "type": "boolean" }
-                  ],
-                  "steps": [{ "id": "a", "run": "echo ${inputs.env}" }]
-                }"#,
+                "inputs:
+  env: {type: choice, options: [dev, staging, prod], default: dev}
+  branch: {required: true, placeholder: branch name}
+  workers: {type: number, default: 4, min: 1, max: 64, integer: true}
+  clean: {type: boolean}
+steps:
+  a: {run: 'echo ${inputs.env}'}
+",
                 "f",
             )
             .unwrap(),

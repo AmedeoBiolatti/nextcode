@@ -9,7 +9,7 @@
 //! The graph follows the buffer, 200 ms after the last edit: a file that
 //! does not parse shows its problems in a banner (with line and column;
 //! a click goes there) over the last good graph, dimmed. Clicking a card
-//! selects it, puts the editor's cursor on its `"id"` and shows its
+//! selects it, puts the editor's cursor on its key and shows its
 //! details below the graph (state, wait or failure reason, last output
 //! lines, artifact links, Terminal / Continue / Restart or Retry); with a
 //! terminal of this machine under them they become a pane of their own,
@@ -22,6 +22,10 @@
 //! in place into a box around its graph of real cards; clicking the box's
 //! header collapses it. Groups stay expanded (by qualified id) while the
 //! tab is open, across edits; the graph re-fits unless the user zoomed.
+//!
+//! A file of the old JSON format shows no graph but a banner with Convert
+//! to YAML: the YAML file is written beside it, the old one renamed to
+//! `.bak`, and the tab shows the new file ([`WorkflowViewEvent`]).
 
 use std::{
     cell::Cell,
@@ -40,14 +44,16 @@ use gpui::{
 };
 use text::Buffer;
 use workflow::{
-    ArtifactTarget, GraphLayout, InputValues, Metrics, Outcome, Ready, Status, Step, StepNode,
-    StepSpan, StepState, View as Placement, Workflow, layout::Node as Place,
+    ArtifactTarget, Condition, GraphLayout, InputValues, Metrics, Outcome, Ready, Status, Step,
+    StepNode, StepSpan, StepState, View as Placement, Workflow, format_duration,
+    layout::Node as Place,
 };
 
 use super::{
-    ActiveRun, RetryFailed, RunAll, Source, StopAll, Workflows, file_stem,
+    ActiveRun, Converted, LEGACY_FORMAT, RetryFailed, RunAll, Source, StopAll, Workflows,
+    convert_file, file_stem,
     form::{self, InputForm, InputFormEvent},
-    location_of, outcome_color, outcome_text, workflow_id,
+    is_legacy, location_of, outcome_color, outcome_text, parse_file, workflow_id,
 };
 use crate::{
     debugger::panel::Tooltip,
@@ -131,11 +137,21 @@ struct Strokes {
     edges: Vec<(Course<Point<Pixels>>, bool, bool)>,
 }
 
+/// What a workflow tab tells its window.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowViewEvent {
+    /// The old-format file `from` was converted: the tab should show the
+    /// new file.
+    Converted { from: PathBuf, to: PathBuf },
+}
+
 pub struct WorkflowView {
     workflows: Entity<Workflows>,
     /// Runs are keyed by it (see [`workflow_id`]).
     id: String,
     path: PathBuf,
+    /// The project the file is read and written through.
+    project: Project,
     editor: Entity<Editor>,
     graph: Graph,
     /// The selected step (or group), by qualified id.
@@ -262,9 +278,9 @@ fn kind_hint(step: &Step) -> String {
         Ready::Output(_) => parts.push("output".into()),
         Ready::Port(port) => parts.push(format!("port {port}")),
         Ready::Manual(_) => parts.push("manual".into()),
-        Ready::Delay(ms) => parts.push(format!("delay {ms} ms")),
+        Ready::Delay(delay) => parts.push(format!("delay {}", format_duration(*delay))),
     }
-    if !step.after.is_empty() {
+    if step.depending(Condition::Completed).next().is_some() {
         parts.push("after".into());
     }
     parts.join(" · ")
@@ -499,8 +515,9 @@ impl WorkflowView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let editor =
-            cx.new(|cx| Editor::for_file(Buffer::with_path(text, path.clone()), project, cx));
+        let editor = cx.new(|cx| {
+            Editor::for_file(Buffer::with_path(text, path.clone()), project.clone(), cx)
+        });
         let subscriptions = vec![
             cx.subscribe(&editor, |this, _, event, cx| match event {
                 EditorEvent::Edited => this.schedule_reparse(cx),
@@ -521,6 +538,7 @@ impl WorkflowView {
             workflows,
             id: workflow_id(&source, &path),
             path,
+            project,
             editor,
             graph: Graph::default(),
             selected: None,
@@ -585,6 +603,14 @@ impl WorkflowView {
     fn reparse(&mut self, cx: &mut Context<Self>) {
         self._reparse = None;
         let text = self.editor.read(cx).text();
+        if self.is_legacy() {
+            self.graph.problems = vec![ShownProblem {
+                message: LEGACY_FORMAT.into(),
+                offset: None,
+                place: None,
+            }];
+            return cx.notify();
+        }
         self.graph.spans = workflow::step_spans(&text);
         match workflow::check(&text, &file_stem(&self.path)) {
             Ok(parsed) => {
@@ -686,6 +712,32 @@ impl WorkflowView {
         }
     }
 
+    /// A file of the old JSON format: it converts, it does not run.
+    fn is_legacy(&self) -> bool {
+        is_legacy(&self.path)
+    }
+
+    /// Convert to YAML: writes the converted file (from the editor's
+    /// text) beside this one, renames this one to `.bak` and asks the
+    /// window to show the new file.
+    pub(crate) fn convert(&mut self, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text();
+        match convert_file(&self.project, &self.path, &text) {
+            Ok(Converted { path, .. }) => {
+                self.workflows
+                    .update(cx, |workflows, cx| workflows.refresh(cx).detach());
+                cx.emit(WorkflowViewEvent::Converted {
+                    from: self.path.clone(),
+                    to: path,
+                });
+            }
+            Err(error) => {
+                self.notice = Some(format!("Cannot convert: {error}").into());
+                cx.notify();
+            }
+        }
+    }
+
     /// Run All: saves the file if it has edits, then runs it afresh; a
     /// workflow with inputs asks for them first (with the form open, Run
     /// All is its Run).
@@ -700,7 +752,7 @@ impl WorkflowView {
             return cx.notify();
         }
         let text = editor.read(cx).text();
-        match workflow::parse(&text, &file_stem(&self.path)) {
+        match parse_file(&self.path, &text) {
             Ok(parsed) if parsed.inputs.is_empty() => {
                 let id = self.id.clone();
                 self.workflows.update(cx, |workflows, cx| {
@@ -1029,10 +1081,23 @@ impl WorkflowView {
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, window, cx| this.go_to_problem(window, cx)))
-                .child(selectable(
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().flex_1().min_w_0().child(selectable(
                     "text",
                     format!("{place}{}{more}", first.message),
-                ))
+                )))
+                .when(self.is_legacy(), |banner| {
+                    banner.child(
+                        button("workflow-convert", "Convert to YAML")
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.convert(cx);
+                            })),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -2359,6 +2424,8 @@ impl WorkflowView {
     }
 }
 
+impl gpui::EventEmitter<WorkflowViewEvent> for WorkflowView {}
+
 impl Focusable for WorkflowView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)
@@ -2590,15 +2657,18 @@ mod tests {
 
     #[test]
     fn cards_say_what_a_step_does() {
-        let step = workflow::parse(
-            r#"{"steps": [{"id": "api", "check": "x", "run": "y", "ready": {"port": 8000}}]}"#,
+        let mut steps = workflow::parse(
+            "steps:
+  api: {check: x, run: y, ready: {port: 8000}}
+  wait: {depends_on: {api: completed}, run: z, ready: {delay: 1500ms}}
+",
             "f",
         )
         .unwrap()
-        .steps
-        .remove(0);
-        assert_eq!(kind_hint(&step), "check · run · port 8000");
-        assert_eq!(place_text(&step, None, None), "this machine");
+        .steps;
+        assert_eq!(kind_hint(&steps[0]), "check · run · port 8000");
+        assert_eq!(place_text(&steps[0], None, None), "this machine");
+        assert_eq!(kind_hint(&steps.remove(1)), "run · delay 1.5s · after");
     }
 
     #[test]

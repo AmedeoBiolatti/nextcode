@@ -34,7 +34,7 @@ use crate::{
     theme_picker::{ThemePicker, ThemePickerEvent},
     workflows::{
         self, NewWorkflow, OpenWorkflow, RunWorkflow, Source, WorkflowPicker, WorkflowPickerEvent,
-        WorkflowView, Workflows,
+        WorkflowView, WorkflowViewEvent, Workflows,
     },
     workspace::{Preload, Workspace, WorkspaceEvent},
 };
@@ -603,6 +603,29 @@ impl Shell {
         tab._subscription = subscription;
     }
 
+    /// The workflow tab showing `view` shows file `to` instead (its old
+    /// file was converted to it).
+    fn workflow_converted(
+        &mut self,
+        view: gpui::EntityId,
+        to: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.content.id() == Some(view))
+        else {
+            return;
+        };
+        if let TabTarget::Workflow { workflow, .. } = &mut self.tabs[index].target {
+            *workflow = to.to_path_buf();
+        }
+        self.load(index, None, window, cx);
+        self.activate(index, window, cx);
+    }
+
     /// The view of a workflow file: a user one (`project: None`) read from
     /// disk, a project one through its project (`Ok(None)` while a remote
     /// project still opens, in a background tab).
@@ -660,8 +683,20 @@ impl Shell {
         }
         Some(match content {
             Content::Unloaded => return None,
-            // The tab bar shows its name and state.
-            Content::Workflow(view) => cx.observe(view, |_, _, cx| cx.notify()),
+            // The tab bar shows its name and state; a converted file's
+            // tab shows the new file.
+            Content::Workflow(view) => Subscription::join(
+                cx.observe(view, |_, _, cx| cx.notify()),
+                cx.subscribe_in(
+                    view,
+                    window,
+                    |this, view, event: &WorkflowViewEvent, window, cx| match event {
+                        WorkflowViewEvent::Converted { to, .. } => {
+                            this.workflow_converted(view.entity_id(), to, window, cx);
+                        }
+                    },
+                ),
+            ),
             Content::Connecting(connecting) => cx.subscribe_in(
                 connecting,
                 window,

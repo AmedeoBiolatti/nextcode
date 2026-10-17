@@ -6,15 +6,15 @@
 //! generation from the effect, so results of a step that was restarted or
 //! stopped since are ignored.
 //!
-//! Per step: Pending → Waiting (for `needs` and `after`) → Starting
+//! Per step: Pending → Waiting (for its `depends_on`) → Starting
 //! (opening the project, running the check) → Running (the command runs;
 //! not ready yet) → Ready | Failed | Stopped. Stopping a live command
-//! (Stop All, Restart, Run All, `timeout_s`, the workflow failing) goes
+//! (Stop All, Restart, Run All, `timeout`, the workflow failing) goes
 //! through Stopping: Ctrl+C, then a kill if it has not exited after the
-//! step's `stop_grace_s`.
+//! step's `stop_grace_period`.
 //!
 //! Steps are indexed as [`tree::flatten`] lists them, groups included. A
-//! group's `needs` and `after` gate each of its steps; its state follows
+//! group's `depends_on` gates each of its steps; its state follows
 //! from its steps' (see [`Run::steps`]), and steps outside wait for it by
 //! that state like for any step's. The outcome counts the steps that do
 //! something.
@@ -22,7 +22,7 @@
 use std::time::{Duration, Instant};
 
 use crate::{
-    file::{Ready, Step, Workflow},
+    file::{Ready, Step, Workflow, format_duration},
     output::OutputWatcher,
     tree::{self, StepNode},
     vars::{self, StepField, StepRef},
@@ -93,7 +93,7 @@ pub enum Effect {
         step: usize,
         generation: u64,
     },
-    /// Ctrl+C to the step's command. It has the step's `stop_grace_s` to
+    /// Ctrl+C to the step's command. It has the step's `stop_grace_period` to
     /// exit (report [`Run::exited`] as usual) before a [`Effect::KillCommand`].
     InterruptCommand {
         step: usize,
@@ -131,7 +131,7 @@ pub enum Outcome {
     Ready,
     /// Finished with failures: nothing can progress and some step is not
     /// ready (failed, blocked or waiting for Retry); or a check without
-    /// `onFail` failed and everything was stopped.
+    /// `on_fail` failed and everything was stopped.
     Failed,
     /// Stop All.
     Stopped,
@@ -214,7 +214,7 @@ pub struct StepState {
     blocked: bool,
     /// Waiting for a previous run's command in its terminal to end.
     held: bool,
-    /// Its check failed with `onFail`: it waits for Retry.
+    /// Its check failed with `on_fail`: it waits for Retry.
     awaiting_retry: bool,
     /// It got to where it runs (its project is open): artifacts can be
     /// located.
@@ -1007,10 +1007,10 @@ impl Run {
             Ready::Output(pattern) => format!("waiting for output /{pattern}/"),
             Ready::Port(port) => format!("waiting for port {port}"),
             Ready::Manual(prompt) => prompt.clone(),
-            Ready::Delay(ms) => format!("waiting {ms} ms"),
+            Ready::Delay(delay) => format!("waiting {}", format_duration(*delay)),
         };
-        if let Ready::Delay(ms) = step.ready {
-            state.ready_at = Some(now + Duration::from_millis(ms));
+        if let Ready::Delay(delay) = step.ready {
+            state.ready_at = Some(now + delay);
         }
         if has_command {
             state.command = Some(generation);
@@ -1068,7 +1068,7 @@ impl Run {
         }
     }
 
-    /// A check finished. A failure with `onFail` waits for Retry; without
+    /// A check finished. A failure with `on_fail` waits for Retry; without
     /// it the whole workflow fails and stops.
     pub fn check_finished(
         &mut self,
@@ -1285,13 +1285,13 @@ impl Run {
                 changed = true;
                 continue;
             }
-            let timeout = self.nodes[index].step.timeout_s.map(Duration::from_secs);
+            let timeout = self.nodes[index].step.timeout;
             if let (Some(timeout), Some(started)) = (timeout, state.started)
                 && now.saturating_duration_since(started) >= timeout
             {
                 self.fail(
                     index,
-                    format!("timed out after {} s", timeout.as_secs()),
+                    format!("timed out after {}", format_duration(timeout)),
                     now,
                 );
                 changed = true;
@@ -1314,9 +1314,9 @@ impl Run {
                 }
                 let timeout = self.nodes[index]
                     .step
-                    .timeout_s
+                    .timeout
                     .zip(state.started)
-                    .map(|(seconds, started)| started + Duration::from_secs(seconds));
+                    .map(|(timeout, started)| started + timeout);
                 [stop, state.ready_at, timeout]
             })
             .flatten()

@@ -2576,6 +2576,47 @@ fn headless_mode_forwards_dev_container_ports() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// A workflow file's text from `json!` written the old way, with `steps`
+/// and `inputs` as lists of `{"id": …}` objects: they become mappings
+/// keyed by id in list order (`json!` objects sort their keys), nested
+/// groups too. JSON is YAML.
+fn workflow_file(workflow: &Value) -> String {
+    fn keyed(list: &Value) -> String {
+        let entries: Vec<String> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                let mut settings = item.as_object().unwrap().clone();
+                let id = settings.remove("id").unwrap();
+                let steps = settings.remove("steps");
+                format!("{id}: {}", with_steps(settings, steps))
+            })
+            .collect();
+        format!("{{{}}}", entries.join(", "))
+    }
+    fn with_steps(map: serde_json::Map<String, Value>, steps: Option<Value>) -> String {
+        let mut text = Value::Object(map).to_string();
+        if let Some(steps) = steps {
+            text.pop();
+            if !text.ends_with('{') {
+                text.push_str(", ");
+            }
+            text.push_str(&format!("\"steps\": {}}}", keyed(&steps)));
+        }
+        text
+    }
+    let mut top = workflow.as_object().unwrap().clone();
+    let steps = top.remove("steps");
+    let inputs = top.remove("inputs").map(|inputs| keyed(&inputs));
+    let mut text = with_steps(top, steps);
+    if let Some(inputs) = inputs {
+        text.pop();
+        text.push_str(&format!(", \"inputs\": {inputs}}}"));
+    }
+    text
+}
+
 /// The next `workflow_event` about step `step` reaching `status`.
 fn step_event(headless: &mut Headless, step: &str, status: &str) -> Value {
     headless.next(|line| {
@@ -2615,18 +2656,18 @@ fn headless_mode_runs_a_workflow_across_projects() {
         "name": "Dev environment",
         "steps": [
             { "id": "check", "check": "exit 0" },
-            { "id": "vpn", "check": vpn_check, "onFail": "Connect the VPN" },
+            { "id": "vpn", "check": vpn_check, "on_fail": "Connect the VPN" },
             {
-                "id": "server", "title": "Server", "needs": ["check"],
+                "id": "server", "title": "Server", "depends_on": ["check"],
                 "project": { "local": root.join("other") },
                 "run": "echo http://localhost:1234/login; echo serv''ing; sleep 60",
                 "ready": { "output": "serving" },
-                "openUrls": true
+                "open_urls": true
             },
-            { "id": "gate", "needs": ["server"], "ready": { "manual": "Log in" } },
-            { "id": "port", "needs": ["gate"], "ready": { "port": port } },
+            { "id": "gate", "depends_on": ["server"], "ready": { "manual": "Log in" } },
+            { "id": "port", "depends_on": ["gate"], "ready": { "port": port } },
             {
-                "id": "last", "needs": ["port", "vpn"],
+                "id": "last", "depends_on": ["port", "vpn"],
                 "project": { "local": root.join("main") },
                 "run": "echo ${env:WORKFLOW_WORD}-done", "cwd": ".next_code",
                 "env": { "UNUSED": "1" }
@@ -2634,13 +2675,19 @@ fn headless_mode_runs_a_workflow_across_projects() {
         ]
     });
     fs::write(
-        root.join("main/.next_code/workflows/dev.jsonc"),
-        format!("// Started by the test.\n{workflow:#}\n"),
+        root.join("main/.next_code/workflows/dev.yaml"),
+        format!("# Started by the test.\n{}\n", workflow_file(&workflow)),
     )
     .unwrap();
     fs::write(
-        root.join("main/.next_code/workflows/broken.json"),
-        r#"{"steps": [{"id": "a", "needs": ["a"], "run": "x"}]}"#,
+        root.join("main/.next_code/workflows/broken.yaml"),
+        "steps: {a: {depends_on: [a], run: x}}",
+    )
+    .unwrap();
+    // A file of the old JSON format, converted below.
+    fs::write(
+        root.join("main/.next_code/workflows/old.jsonc"),
+        "// Old.\n{\"name\": \"Old\", \"steps\": [{\"id\": \"a\", \"check\": \"exit 0\", \"timeout_s\": 60}]}",
     )
     .unwrap();
 
@@ -2670,8 +2717,36 @@ fn headless_mode_runs_a_workflow_across_projects() {
         refused["error"].as_str().unwrap().contains("cannot run"),
         "{refused}"
     );
+    // The old file: listed with a problem until converted.
+    let old = list.iter().find(|w| w["name"] == "old").unwrap();
+    assert!(
+        old["error"].as_str().unwrap().contains("old JSON workflow format"),
+        "{old}"
+    );
+    let converted = headless.call(json!({ "cmd": "workflow_convert", "path": "old.jsonc" }));
+    let result = &converted["result"];
+    assert!(result["path"].as_str().unwrap().ends_with("old.yaml"), "{converted}");
+    assert!(result["backup"].as_str().unwrap().ends_with("old.jsonc.bak"), "{converted}");
+    assert_eq!(result["problems"], json!([]));
+    let text = fs::read_to_string(root.join("main/.next_code/workflows/old.yaml")).unwrap();
+    assert_eq!(text, "# Old.\nname: Old\n\nsteps:\n  a: {check: exit 0, timeout: 1m}\n");
+    let list = headless.call(json!({ "cmd": "workflows_list" }));
+    let old = list["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "Old")
+        .unwrap()
+        .clone();
+    assert_eq!(old["error"], Value::Null, "{old}");
+    assert_eq!(old["steps"][0]["timeout"], "1m");
+    let again = headless.call(json!({ "cmd": "workflow_convert", "name": "Old" }));
+    assert!(
+        again["error"].as_str().unwrap().contains("not in the old JSON format"),
+        "{again}"
+    );
 
-    let run = headless.call(json!({ "cmd": "workflow_run", "path": "dev.jsonc" }));
+    let run = headless.call(json!({ "cmd": "workflow_run", "path": "dev.yaml" }));
     assert_eq!(run["ok"], true, "{run}");
     let vpn = step_event(&mut headless, "vpn", "failed");
     assert_eq!(vpn["reason"], "Connect the VPN", "{vpn}");
@@ -2748,7 +2823,7 @@ fn status_until(headless: &mut Headless, path: &str, done: impl Fn(&Value) -> bo
 /// report that runs `after` it with `${steps.eval.exit_code}` and the
 /// artifact's path: the run finishes with failures, the report ready.
 /// Then Stop during an evaluation that checkpoints on Ctrl+C: it gets its
-/// `stop_grace_s` (longer than the old 3 s kill) and writes its checkpoint
+/// `stop_grace_period` (longer than the default 3s) and writes its checkpoint
 /// before it exits; a report after it is blocked.
 #[test]
 fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
@@ -2793,7 +2868,8 @@ fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
         "name": "Evaluate",
         "steps": [
             {
-                "id": "eval", "project": { "local": main }, "run": eval, "stop_grace_s": 20,
+                "id": "eval", "project": { "local": main }, "run": eval,
+                "stop_grace_period": "20s",
                 "artifacts": [
                     { "label": "metrics", "path": "out/metrics.json" },
                     { "label": "missing", "path": "out/none.txt" },
@@ -2801,27 +2877,28 @@ fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
                 ]
             },
             {
-                "id": "report", "after": "eval", "project": { "local": main }, "run": report,
+                "id": "report", "depends_on": { "eval": "completed" }, "project": { "local": main },
+                "run": report,
                 "artifacts": ["report.txt"]
             }
         ]
     });
-    fs::write(workflows.join("evaluate.jsonc"), format!("{evaluate:#}")).unwrap();
+    fs::write(workflows.join("evaluate.yaml"), workflow_file(&evaluate)).unwrap();
     let grace = json!({
         "name": "Grace",
         "steps": [
             {
                 "id": "eval", "project": { "local": main }, "run": checkpointing,
-                "stop_grace_s": 20,
+                "stop_grace_period": "20s",
                 "artifacts": [{ "label": "checkpoint", "path": "out/checkpoint.txt" }]
             },
             {
-                "id": "report", "after": ["eval"], "project": { "local": main },
+                "id": "report", "depends_on": { "eval": "completed" }, "project": { "local": main },
                 "run": "echo ${steps.eval.artifacts.checkpoint}"
             }
         ]
     });
-    fs::write(workflows.join("grace.jsonc"), grace.to_string()).unwrap();
+    fs::write(workflows.join("grace.yaml"), workflow_file(&grace)).unwrap();
 
     let mut headless = Headless::launch(
         &[main.as_os_str()],
@@ -2834,12 +2911,15 @@ fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|found| found["path"].as_str().unwrap().ends_with("evaluate.jsonc"))
+        .find(|found| found["path"].as_str().unwrap().ends_with("evaluate.yaml"))
         .unwrap()
         .clone();
     assert_eq!(listed["error"], Value::Null, "{listed}");
-    assert_eq!(listed["steps"][1]["after"], json!(["eval"]));
-    assert_eq!(listed["steps"][0]["stop_grace_s"], 20);
+    assert_eq!(
+        listed["steps"][1]["depends_on"],
+        json!({ "eval": "completed" })
+    );
+    assert_eq!(listed["steps"][0]["stop_grace_period"], "20s");
     assert_eq!(
         listed["steps"][0]["artifacts"][0],
         json!({ "label": "metrics", "path": "out/metrics.json" })
@@ -2850,7 +2930,7 @@ fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
     );
 
     // The evaluation fails; the report runs after it anyway.
-    let run = headless.call(json!({ "cmd": "workflow_run", "path": "evaluate.jsonc" }));
+    let run = headless.call(json!({ "cmd": "workflow_run", "path": "evaluate.yaml" }));
     assert_eq!(run["ok"], true, "{run}");
     let failed = step_event(&mut headless, "eval", "failed");
     assert_eq!(failed["reason"], "failed (exit code 1)", "{failed}");
@@ -2863,7 +2943,7 @@ fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
         outcome["outcome"], "failed",
         "finished with failures: {outcome}"
     );
-    let status = status_until(&mut headless, "evaluate.jsonc", |status| {
+    let status = status_until(&mut headless, "evaluate.yaml", |status| {
         status["steps"][1]["artifacts"][0]["exists"] == true
     });
     assert_eq!(status["outcome"], "failed", "{status}");
@@ -2898,14 +2978,14 @@ fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
     );
 
     // Stop while evaluating: Ctrl+C, then the step's grace to checkpoint.
-    let run = headless.call(json!({ "cmd": "workflow_run", "path": "grace.jsonc" }));
+    let run = headless.call(json!({ "cmd": "workflow_run", "path": "grace.yaml" }));
     assert_eq!(run["ok"], true, "{run}");
     let run_id = run["result"]["run"].clone();
-    status_until(&mut headless, "grace.jsonc", |status| {
+    status_until(&mut headless, "grace.yaml", |status| {
         status["steps"][0]["last_line"] == "evaluating"
     });
     let stopped_at = Instant::now();
-    let stop = headless.call(json!({ "cmd": "workflow_stop", "path": "grace.jsonc" }));
+    let stop = headless.call(json!({ "cmd": "workflow_stop", "path": "grace.yaml" }));
     assert_eq!(stop["result"], true, "{stop}");
     let stopping = headless.next(|line| {
         line["type"] == "step"
@@ -2938,7 +3018,7 @@ fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
             .trim(),
         "saved"
     );
-    let status = status_until(&mut headless, "grace.jsonc", |status| {
+    let status = status_until(&mut headless, "grace.yaml", |status| {
         status["steps"][0]["artifacts"][0]["exists"] == true
     });
     assert_eq!(status["outcome"], "stopped", "{status}");
@@ -2951,9 +3031,9 @@ fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
     assert_eq!(status["steps"][1]["status"], "stopped");
     // A report after a stopped evaluation can never run.
     let restart = headless
-        .call(json!({ "cmd": "workflow_restart", "path": "grace.jsonc", "step": "report" }));
+        .call(json!({ "cmd": "workflow_restart", "path": "grace.yaml", "step": "report" }));
     assert_eq!(restart["result"], true, "{restart}");
-    let status = status_until(&mut headless, "grace.jsonc", |status| {
+    let status = status_until(&mut headless, "grace.yaml", |status| {
         status["steps"][1]["status"] == "waiting"
     });
     assert_eq!(
@@ -2997,14 +3077,14 @@ fn headless_mode_runs_a_workflow_with_a_group() {
                 ]
             },
             {
-                "id": "report", "after": "svc", "project": { "local": main },
+                "id": "report", "depends_on": { "svc": "completed" }, "project": { "local": main },
                 "run": "echo report-${steps.svc.status}"
             }
         ]
     });
     fs::write(
-        main.join(".next_code/workflows/grouped.jsonc"),
-        format!("{grouped:#}"),
+        main.join(".next_code/workflows/grouped.yaml"),
+        workflow_file(&grouped),
     )
     .unwrap();
     let mut headless = Headless::launch(
@@ -3034,7 +3114,10 @@ fn headless_mode_runs_a_workflow_with_a_group() {
             .ends_with("main"),
         "inherited: {listed}"
     );
-    assert_eq!(listed["steps"][1]["after"], json!(["svc"]));
+    assert_eq!(
+        listed["steps"][1]["depends_on"],
+        json!({ "svc": "completed" })
+    );
 
     let run = headless.call(json!({ "cmd": "workflow_run", "name": "Grouped" }));
     assert_eq!(run["ok"], true, "{run}");
@@ -3049,7 +3132,7 @@ fn headless_mode_runs_a_workflow_with_a_group() {
     });
     assert_eq!(outcome["outcome"], "failed", "{outcome}");
 
-    let status = status_until(&mut headless, "grouped.jsonc", |status| {
+    let status = status_until(&mut headless, "grouped.yaml", |status| {
         status["steps"][3]["last_line"] == "report-failed"
     });
     let rows = status["steps"].as_array().unwrap();
@@ -3125,8 +3208,8 @@ fn headless_mode_runs_a_workflow_with_inputs() {
         }]
     });
     fs::write(
-        main.join(".next_code/workflows/deploy.jsonc"),
-        format!("{deploy:#}"),
+        main.join(".next_code/workflows/deploy.yaml"),
+        workflow_file(&deploy),
     )
     .unwrap();
     let mut headless = Headless::launch(
@@ -3188,7 +3271,7 @@ fn headless_mode_runs_a_workflow_with_inputs() {
     assert_eq!(run["ok"], true, "{run}");
     let show = step_event(&mut headless, "svc/show", "ready");
     assert_eq!(show["status"], "ready", "{show}");
-    let status = status_until(&mut headless, "deploy.jsonc", |status| {
+    let status = status_until(&mut headless, "deploy.yaml", |status| {
         status["steps"][1]["last_line"] == "dev-8-true"
     });
     assert_eq!(
@@ -3227,17 +3310,17 @@ fn headless_mode_runs_a_workflow_step_in_a_dev_container() {
             {
                 "id": "web", "project": { "devcontainer": root.join("web") },
                 "run": "python3 -m http.server 8765", "ready": { "port": 8765 },
-                "timeout_s": 300
+                "timeout": "5m"
             },
             {
-                "id": "home", "needs": ["web"], "project": { "devcontainer": root.join("web") },
+                "id": "home", "depends_on": ["web"], "project": { "devcontainer": root.join("web") },
                 "check": "test \"${userHome}\" = \"$HOME\" && test -f index.html"
             }
         ]
     });
     fs::write(
-        root.join("main/.next_code/workflows/container.json"),
-        workflow.to_string(),
+        root.join("main/.next_code/workflows/container.yaml"),
+        workflow_file(&workflow),
     )
     .unwrap();
     let state = root.join("state");

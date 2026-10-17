@@ -396,7 +396,7 @@ mod tests {
                             config: None,
                         }),
                         TabTarget::Workflow {
-                            workflow: PathBuf::from("/cfg/workflows/dev.jsonc"),
+                            workflow: PathBuf::from("/cfg/workflows/dev.yaml"),
                             project: None,
                         },
                         TabTarget::Workflow {
@@ -435,7 +435,7 @@ mod tests {
             [TabTarget::Project(Location::Local(PathBuf::from("/src/a")))]
         );
         assert!(
-            json.contains(r#""workflow": "/cfg/workflows/dev.jsonc""#),
+            json.contains(r#""workflow": "/cfg/workflows/dev.yaml""#),
             "{json}"
         );
         assert_eq!(minimal.focused, 0);
@@ -447,7 +447,7 @@ mod tests {
     fn folders_and_workflow_files_that_are_gone_are_not_reopened() {
         let root = std::env::temp_dir().join(format!("nc-app-state-{}", std::process::id()));
         std::fs::create_dir_all(root.join("kept")).unwrap();
-        std::fs::write(root.join("dev.jsonc"), "{}").unwrap();
+        std::fs::write(root.join("dev.yaml"), "{}").unwrap();
         let kept = local(&root.join("kept"));
         let gone = local(&root.join("gone"));
         let wsl = Location::Wsl {
@@ -475,7 +475,7 @@ mod tests {
                     vec![
                         project(&gone),
                         project(&wsl),
-                        workflow("dev.jsonc", None),
+                        workflow("dev.yaml", None),
                         project(&kept),
                         remote_workflow.clone(),
                     ],
@@ -493,7 +493,7 @@ mod tests {
                     window(
                         vec![
                             project(&wsl),
-                            workflow("dev.jsonc", None),
+                            workflow("dev.yaml", None),
                             project(&kept),
                             remote_workflow,
                         ],

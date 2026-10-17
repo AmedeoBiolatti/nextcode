@@ -170,8 +170,23 @@ fn ready_json(ready: &Ready) -> Value {
         Ready::Output(pattern) => json!({ "output": pattern }),
         Ready::Port(port) => json!({ "port": port }),
         Ready::Manual(prompt) => json!({ "manual": prompt }),
-        Ready::Delay(ms) => json!({ "delay_ms": ms }),
+        Ready::Delay(delay) => json!({ "delay": workflow::format_duration(*delay) }),
     }
+}
+
+/// `{"<id>": "ready" | "completed"}`, in the order written.
+fn depends_json(step: &workflow::Step) -> Value {
+    Value::Object(
+        step.depends_on
+            .iter()
+            .map(|dependency| {
+                (
+                    dependency.step.clone(),
+                    json!(dependency.condition.name()),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// `{label, path}` or `{label, url}` as declared (`label` null without one).
@@ -227,8 +242,7 @@ fn node_json(nodes: &[StepNode], at: usize) -> Value {
             "path": node.path,
             "kind": "group",
             "title": step.title,
-            "needs": step.needs,
-            "after": step.after,
+            "depends_on": depends_json(step),
             "project": project,
             "steps": node.children.iter().map(|&child| node_json(nodes, child)).collect::<Vec<_>>(),
         });
@@ -238,13 +252,13 @@ fn node_json(nodes: &[StepNode], at: usize) -> Value {
         "path": node.path,
         "kind": "step",
         "title": step.title,
-        "needs": step.needs,
-        "after": step.after,
+        "depends_on": depends_json(step),
         "project": project,
         "run": step.run,
         "check": step.check,
         "ready": ready_json(&step.ready),
-        "stop_grace_s": step.stop_grace_s,
+        "timeout": step.timeout.map(workflow::format_duration),
+        "stop_grace_period": workflow::format_duration(step.stop_grace()),
         "artifacts": step.artifacts.iter().map(artifact_json).collect::<Vec<_>>(),
     })
 }
@@ -393,6 +407,20 @@ impl Session {
             let result = workflows.update(cx, |workflows, cx| -> Result<Value, String> {
                 if command == "workflows_list" {
                     return Ok(list_json(workflows));
+                }
+                if command == "workflow_convert" {
+                    let name = query(&request)?;
+                    let found = workflows
+                        .lookup(&name)
+                        .ok_or_else(|| format!("no workflow `{name}`"))?
+                        .id
+                        .clone();
+                    let converted = workflows.convert(&found, cx)?;
+                    return Ok(json!({
+                        "path": converted.path,
+                        "backup": converted.backup,
+                        "problems": converted.problems,
+                    }));
                 }
                 let name = query(&request)?;
                 let found = workflows

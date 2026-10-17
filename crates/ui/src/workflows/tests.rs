@@ -3,7 +3,8 @@
 //! Terminal panel, a manual gate, a command without a project, Restart
 //! and Stop All; and the workflow tab: its graph following the editor,
 //! problems over the last good graph, cards and the cursor, Run All saving
-//! first, restore with the window.
+//! first, restore with the window; a file of the old JSON format
+//! converted from its tab.
 
 use std::{
     path::PathBuf,
@@ -83,24 +84,22 @@ fn a_workflow_opens_projects_runs_steps_in_order_and_restart_reuses_the_terminal
     let beta = root.join("beta");
     // `echo`, `sleep` and `exit` mean the same in sh and PowerShell.
     let file = format!(
-        r#"{{
-          // Comments are fine.
-          "name": "Dev",
-          "steps": [
-            {{ "id": "check", "check": "exit 0" }},
-            {{
-              "id": "server", "title": "Server", "needs": ["check"],
-              "project": {{ "local": {beta} }},
-              "run": "echo serv''ing; sleep 30",
-              "ready": {{ "output": "serving" }}
-            }},
-            {{ "id": "gate", "needs": ["server"], "ready": {{ "manual": "Go on" }} }},
-            {{ "id": "done", "needs": ["gate"], "run": "echo finished" }},
-          ],
-        }}"#,
+        r#"# Comments are fine.
+name: Dev
+steps:
+  check: {{check: exit 0}}
+  server:
+    title: Server
+    depends_on: [check]
+    project: {{local: {beta}}}
+    run: echo serv''ing; sleep 30
+    ready: {{output: serving}}
+  gate: {{depends_on: [server], ready: {{manual: Go on}}}}
+  done: {{depends_on: [gate], run: echo finished}}
+"#,
         beta = serde_json::to_string(&beta).unwrap(),
     );
-    std::fs::write(root.join("user").join("dev.jsonc"), file).unwrap();
+    std::fs::write(root.join("user").join("dev.yaml"), file).unwrap();
 
     cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
     cx.run_until_parked();
@@ -213,16 +212,17 @@ fn a_workflow_opens_projects_runs_steps_in_order_and_restart_reuses_the_terminal
 fn a_failing_check_without_on_fail_fails_the_workflow(cx: &mut TestAppContext) {
     let root = root("fail");
     std::fs::write(
-        root.join("user").join("broken.json"),
-        r#"{"name": "Broken", "steps": [
-            {"id": "vpn", "check": "echo 'no route'; exit 3"},
-            {"id": "after", "needs": ["vpn"], "run": "echo never"}
-        ]}"#,
+        root.join("user").join("broken.yaml"),
+        r#"name: Broken
+steps:
+  vpn: {check: "echo 'no route'; exit 3"}
+  after: {depends_on: [vpn], run: echo never}
+"#,
     )
     .unwrap();
     std::fs::write(
-        root.join("user").join("invalid.json"),
-        r#"{"steps": [{"id": "a", "needs": ["b"], "run": "x"}]}"#,
+        root.join("user").join("invalid.yml"),
+        "steps: {a: {depends_on: [b], run: x}}",
     )
     .unwrap();
     cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
@@ -248,7 +248,7 @@ fn a_failing_check_without_on_fail_fails_the_workflow(cx: &mut TestAppContext) {
         let invalid = &workflows.discovered()[1];
         assert_eq!(
             invalid.parsed.as_ref().unwrap_err(),
-            "`a` needs unknown step `b`"
+            "`a` depends on unknown step `b`"
         );
         (workflows.discovered()[0].id.clone(), invalid.id.clone())
     });
@@ -277,16 +277,13 @@ fn a_failing_check_without_on_fail_fails_the_workflow(cx: &mut TestAppContext) {
     cleanup(root);
 }
 
-const DIAMOND: &str = r#"{
-  "name": "Diamond",
-  "steps": [
-    { "id": "check", "check": "exit 0" },
-    { "id": "api", "needs": ["check"], "check": "exit 0" },
-    { "id": "web", "needs": ["check"], "check": "exit 0" },
-    { "id": "join", "needs": ["api", "web"], "check": "exit 0" }
-  ]
-}
-"#;
+const DIAMOND: &str = "name: Diamond
+steps:
+  check: {check: exit 0}
+  api: {depends_on: [check], check: exit 0}
+  web: {depends_on: [check], check: exit 0}
+  join: {depends_on: [api, web], check: exit 0}
+";
 
 fn columns(view: &Entity<WorkflowView>, cx: &mut TestAppContext) -> Vec<Vec<String>> {
     view.read_with(cx, |view, _| view.columns())
@@ -305,7 +302,7 @@ fn settle(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestAppContext) {
     let root = root("tab");
-    let path = root.join("user").join("diamond.jsonc");
+    let path = root.join("user").join("diamond.yaml");
     std::fs::write(&path, DIAMOND).unwrap();
     cx.update(crate::app_state::init);
     cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
@@ -353,8 +350,9 @@ fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestApp
         .unwrap();
     assert!(focused, "the tab's editor has focus");
 
-    // An unknown `needs` id: the problem, where it is; the last graph stays.
-    let broken = DIAMOND.replace(r#"["api", "web"]"#, r#"["api", "nope"]"#);
+    // An unknown dependency: the problem, where it is; the last graph
+    // stays.
+    let broken = DIAMOND.replace("[api, web]", "[api, nope]");
     editor.update(cx, |editor, cx| editor.set_text(&broken, cx));
     cx.run_until_parked();
     assert!(
@@ -364,7 +362,7 @@ fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestApp
     settle(cx);
     assert_eq!(
         view.read_with(cx, |view, _| view.problems()),
-        [("`join` needs unknown step `nope`".to_owned(), Some((7, 38)))]
+        [("`join` depends on unknown step `nope`".to_owned(), Some((6, 28)))]
     );
     assert_eq!(
         columns(&view, cx),
@@ -372,7 +370,7 @@ fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestApp
     );
 
     // Fixed differently: the graph follows (`join` needs only `api`).
-    let fixed = DIAMOND.replace(r#"["api", "web"]"#, r#"["api"]"#);
+    let fixed = DIAMOND.replace("[api, web]", "[api]");
     editor.update(cx, |editor, cx| editor.set_text(&fixed, cx));
     settle(cx);
     assert!(view.read_with(cx, |view, _| view.problems()).is_empty());
@@ -385,7 +383,7 @@ fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestApp
         ]
     );
 
-    // A card click puts the cursor on its `"id"`; the cursor in a step
+    // A card click puts the cursor on its key; the cursor in a step
     // highlights its card.
     window
         .update(cx, |_, window, cx| {
@@ -396,9 +394,9 @@ fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestApp
     let cursor_place = editor.read_with(cx, |editor, _| {
         workflow::source::line_column(&editor.text(), editor.cursor())
     });
-    assert_eq!(cursor_place, (6, 7));
+    assert_eq!(cursor_place, (5, 3));
     assert_eq!(cursor_step(&view, cx).as_deref(), Some("web"));
-    let inside_api = fixed.find("\"api\", \"needs\"").unwrap();
+    let inside_api = fixed.find("api: {depends_on").unwrap() + 8;
     editor.update(cx, |editor, cx| editor.set_cursor(inside_api, cx));
     cx.run_until_parked();
     assert_eq!(cursor_step(&view, cx).as_deref(), Some("api"));
@@ -452,25 +450,24 @@ fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestApp
     cleanup(root);
 }
 
-const GROUPED: &str = r#"{
-  "name": "Grouped",
-  "steps": [
-    { "id": "check", "check": "exit 0" },
-    { "id": "svc", "needs": ["check"], "steps": [
-      { "id": "build", "check": "exit 0" },
-      { "id": "inner", "needs": ["build"], "steps": [
-        { "id": "x", "check": "exit 0" }
-      ] }
-    ] },
-    { "id": "report", "after": ["svc"], "check": "exit 0" }
-  ]
-}
-"#;
+const GROUPED: &str = "name: Grouped
+steps:
+  check: {check: exit 0}
+  svc:
+    depends_on: [check]
+    steps:
+      build: {check: exit 0}
+      inner:
+        depends_on: [build]
+        steps:
+          x: {check: exit 0}
+  report: {depends_on: {svc: completed}, check: exit 0}
+";
 
 #[gpui::test]
 fn groups_expand_in_place_and_stay_expanded_across_edits(cx: &mut TestAppContext) {
     let root = root("groups");
-    let path = root.join("user").join("grouped.jsonc");
+    let path = root.join("user").join("grouped.yaml");
     std::fs::write(&path, GROUPED).unwrap();
     cx.update(crate::app_state::init);
     cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
@@ -524,19 +521,16 @@ fn groups_expand_in_place_and_stay_expanded_across_edits(cx: &mut TestAppContext
             "report"
         ]
     );
-    // The click selected the group and put the cursor on its `"id"`.
+    // The click selected the group and put the cursor on its key.
     assert_eq!(cursor_step(&view, cx).as_deref(), Some("svc/inner"));
     let editor = view.read_with(cx, |view, _| view.editor());
-    let inside_x = GROUPED.find("\"x\", \"check\"").unwrap();
+    let inside_x = GROUPED.find("x: {check").unwrap() + 4;
     editor.update(cx, |editor, cx| editor.set_cursor(inside_x, cx));
     cx.run_until_parked();
     assert_eq!(cursor_step(&view, cx).as_deref(), Some("svc/inner/x"));
 
     // Edits keep the groups expanded.
-    let edited = GROUPED.replace(
-        r#""report", "after": ["svc"], "check": "exit 0""#,
-        r#""report", "after": ["svc"], "check": "exit 0 ""#,
-    );
+    let edited = GROUPED.replace("completed}, check: exit 0}", "completed}, check: 'exit 0 '}");
     editor.update(cx, |editor, cx| editor.set_text(&edited, cx));
     settle(cx);
     assert_eq!(ids(&boxes(cx)).len(), 6);
@@ -572,18 +566,17 @@ fn groups_expand_in_place_and_stay_expanded_across_edits(cx: &mut TestAppContext
 #[gpui::test]
 fn run_all_asks_for_the_inputs_and_the_run_keeps_them(cx: &mut TestAppContext) {
     let root = root("inputs");
-    let path = root.join("user").join("deploy.jsonc");
+    let path = root.join("user").join("deploy.yaml");
     std::fs::write(
         &path,
-        r#"{
-          "name": "Deploy",
-          "inputs": [
-            { "id": "env", "type": "choice", "options": ["dev", "staging", "prod"] },
-            { "id": "branch", "required": true },
-            { "id": "workers", "type": "number", "default": 4, "max": 64 }
-          ],
-          "steps": [{ "id": "show", "run": "echo deploying-${inputs.env}-${inputs.workers}" }]
-        }"#,
+        "name: Deploy
+inputs:
+  env: {type: choice, options: [dev, staging, prod]}
+  branch: {required: true}
+  workers: {type: number, default: 4, max: 64}
+steps:
+  show: {run: 'echo deploying-${inputs.env}-${inputs.workers}'}
+",
     )
     .unwrap();
     cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
@@ -665,6 +658,116 @@ fn run_all_asks_for_the_inputs_and_the_run_keeps_them(cx: &mut TestAppContext) {
     assert!(view.read_with(cx, |view, _| view.form().is_none()));
     assert_eq!(summary(cx), "env=prod · branch=feature · workers=8");
 
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cleanup(root);
+}
+
+#[gpui::test]
+fn an_old_json_file_is_listed_with_a_problem_and_converts_from_its_tab(cx: &mut TestAppContext) {
+    let root = root("legacy");
+    let old = root.join("user").join("old.jsonc");
+    std::fs::write(
+        &old,
+        r#"// Kept.
+{
+  "name": "Old",
+  "steps": [
+    { "id": "a", "check": "exit 0" },
+    { "id": "b", "needs": "a", "check": "exit 0", "timeout_s": 90 }
+  ]
+}
+"#,
+    )
+    .unwrap();
+    cx.update(crate::app_state::init);
+    cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
+    cx.run_until_parked();
+    let window = cx.windows()[0].downcast::<Shell>().unwrap();
+    let workflows = window
+        .update(cx, |_, window, cx| for_window(window, cx))
+        .unwrap();
+    workflows.update(cx, |workflows, _| {
+        workflows.user_dir = Some(root.join("user"))
+    });
+    workflows
+        .update(cx, |workflows, cx| workflows.refresh(cx))
+        .detach();
+    cx.run_until_parked();
+    workflows.read_with(cx, |workflows, _| {
+        let found = &workflows.discovered()[0];
+        assert_eq!(found.name, "old");
+        assert_eq!(found.parsed.as_ref().unwrap_err(), LEGACY_FORMAT);
+    });
+
+    // Its tab says so instead of showing a graph.
+    let view = window
+        .update(cx, |shell, window, cx| {
+            shell.open_workflow(&Source::User, &old, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.problems()),
+        [(LEGACY_FORMAT.to_owned(), None)]
+    );
+    assert!(view.read_with(cx, |view, _| view.columns()).is_empty());
+
+    // Convert to YAML: the new file beside it, the old one kept as
+    // `.bak`, and the same tab shows the new file.
+    view.update(cx, |view, cx| view.convert(cx));
+    cx.run_until_parked();
+    let yaml = root.join("user").join("old.yaml");
+    let converted = std::fs::read_to_string(&yaml).unwrap();
+    assert!(converted.starts_with("# Kept.\nname: Old\n"), "{converted}");
+    assert!(converted.contains("b: {depends_on: [a], check: exit 0, timeout: 1m30s}"), "{converted}");
+    assert!(!old.exists());
+    assert!(root.join("user").join("old.jsonc.bak").exists());
+    let tabs = window
+        .read_with(cx, |shell, cx| shell.tab_summary(cx))
+        .unwrap();
+    assert_eq!(tabs, (vec!["alpha".into(), "◈ Old".into()], 1));
+    let new_view = window
+        .update(cx, |shell, window, cx| {
+            shell.open_workflow(&Source::User, &yaml, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    assert_ne!(new_view, view);
+    assert_eq!(
+        window
+            .read_with(cx, |shell, cx| shell.tab_summary(cx).0.len())
+            .unwrap(),
+        2,
+        "the converted file's tab is the old one's"
+    );
+    assert!(new_view.read_with(cx, |view, _| view.problems()).is_empty());
+    assert_eq!(
+        new_view.read_with(cx, |view, _| view.columns()),
+        [vec!["a"], vec!["b"]]
+    );
+    workflows.read_with(cx, |workflows, _| {
+        let names: Vec<&str> = workflows
+            .discovered()
+            .iter()
+            .map(|found| found.name.as_str())
+            .collect();
+        assert_eq!(names, ["Old"], "the `.bak` file is not listed");
+    });
+    // Another old file of that name is refused: `old.yaml` exists.
+    let again = root.join("user").join("old.json");
+    std::fs::write(&again, r#"{"steps": []}"#).unwrap();
+    let error = convert_file(
+        &Project::local(root.join("user")),
+        &again,
+        r#"{"steps": []}"#,
+    )
+    .unwrap_err();
+    assert!(error.contains("already exists"), "{error}");
+    assert!(again.exists(), "left as it was");
     window
         .update(cx, |_, window, _| window.remove_window())
         .unwrap();

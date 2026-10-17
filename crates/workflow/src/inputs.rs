@@ -9,9 +9,8 @@
 
 use serde_json::{Map, Value, json};
 
-/// The keys an input may have.
+/// The keys an input may have (its id is its key in `inputs`).
 pub const INPUT_KEYS: &[&str] = &[
-    "id",
     "label",
     "type",
     "description",
@@ -410,28 +409,23 @@ pub fn substitute(text: &str, values: &InputValues) -> String {
 /// about (`None`: the whole input).
 pub(crate) type InputProblem = (String, Option<&'static str>);
 
-/// The top-level `inputs` array: the inputs that parse, every id (also of
-/// those that do not, so steps' references to them are not reported too),
-/// and each problem with the input's index.
-pub(crate) fn parse(values: Vec<Value>) -> (Vec<Input>, Vec<String>, Vec<(usize, InputProblem)>) {
+/// The top-level `inputs` mapping, as `(id, declaration)` in file order:
+/// the inputs that parse, every id (also of those that do not, so steps'
+/// references to them are not reported too), and each problem with the
+/// input's index. `id` problems are about the input's key.
+pub(crate) fn parse(
+    declared: Vec<(String, Value)>,
+) -> (Vec<Input>, Vec<String>, Vec<(usize, InputProblem)>) {
     let mut inputs: Vec<Input> = Vec::new();
     let mut ids = Vec::new();
     let mut problems = Vec::new();
-    for (index, value) in values.into_iter().enumerate() {
-        let id = value.get("id").and_then(Value::as_str).map(str::to_owned);
-        let name = match &id {
-            Some(id) => format!("input `{id}`"),
-            None => format!("input {}", index + 1),
-        };
-        if let Some(id) = &id {
-            if ids.contains(id) {
-                problems.push((index, (format!("duplicate input id `{id}`"), Some("id"))));
-            }
-            ids.push(id.clone());
-        }
-        match parse_input(value) {
+    for (index, (id, value)) in declared.into_iter().enumerate() {
+        ids.push(id.clone());
+        match parse_input(id.clone(), value) {
             Ok(input) => inputs.push(input),
-            Err((message, key)) => problems.push((index, (format!("{name}: {message}"), key))),
+            Err((message, key)) => {
+                problems.push((index, (format!("input `{id}`: {message}"), key)));
+            }
         }
     }
     (inputs, ids, problems)
@@ -463,7 +457,7 @@ fn flag(map: &mut Map<String, Value>, key: &'static str) -> Result<Option<bool>,
 
 fn choices(value: Value) -> Result<Vec<Choice>, String> {
     const SHAPES: &str =
-        "`options` is an array of strings or {\"value\": \"...\", \"label\": \"...\"}";
+        "`options` is a list of values or `{value: ..., label: ...}`";
     let Value::Array(entries) = value else {
         return Err(SHAPES.into());
     };
@@ -502,9 +496,12 @@ fn choices(value: Value) -> Result<Vec<Choice>, String> {
     Ok(options)
 }
 
-fn parse_input(value: Value) -> Result<Input, InputProblem> {
-    let Value::Object(mut map) = value else {
-        return Err(("an input is an object".into(), None));
+fn parse_input(id: String, value: Value) -> Result<Input, InputProblem> {
+    let mut map = match value {
+        Value::Object(map) => map,
+        // `branch:` alone: a string input with no settings.
+        Value::Null => Map::new(),
+        _ => return Err(("an input is a mapping of its settings".into(), None)),
     };
     // Located at the input, like a step's unknown keys.
     if let Some(unknown) = map.keys().find(|key| !INPUT_KEYS.contains(&key.as_str())) {
@@ -513,7 +510,6 @@ fn parse_input(value: Value) -> Result<Input, InputProblem> {
             None,
         ));
     }
-    let id = string(&mut map, "id")?.ok_or(("missing `id`".to_owned(), None))?;
     if id.trim().is_empty() {
         return Err(("`id` must not be empty".into(), Some("id")));
     }
@@ -630,17 +626,29 @@ fn parse_input(value: Value) -> Result<Input, InputProblem> {
 mod tests {
     use super::*;
 
+    /// A declaration written with its `id` (the key in a file), as
+    /// `(id, settings)`.
+    fn declared(json: Value) -> (String, Value) {
+        match json {
+            Value::Object(mut map) => match map.remove("id") {
+                Some(Value::String(id)) => (id, Value::Object(map)),
+                _ => ("x".into(), Value::Object(map)),
+            },
+            other => ("x".into(), other),
+        }
+    }
+
     fn inputs(json: Value) -> Vec<Input> {
         let Value::Array(values) = json else {
             unreachable!()
         };
-        let (inputs, _, problems) = parse(values);
+        let (inputs, _, problems) = parse(values.into_iter().map(declared).collect());
         assert!(problems.is_empty(), "{problems:?}");
         inputs
     }
 
     fn problem(json: Value) -> String {
-        let (_, _, problems) = parse(vec![json]);
+        let (_, _, problems) = parse(vec![declared(json)]);
         problems
             .into_iter()
             .map(|(_, (message, _))| message)
@@ -698,8 +706,7 @@ mod tests {
     #[test]
     fn declarations_with_problems_say_what_is_wrong() {
         for (json, expected) in [
-            (json!("x"), "input 1: an input is an object"),
-            (json!({ "type": "string" }), "input 1: missing `id`"),
+            (json!("x"), "input `x`: an input is a mapping of its settings"),
             (
                 json!({ "id": "a.b" }),
                 "input `a.b`: an input id must not contain `/`, `.`, `{`, `}`, `$` or spaces",
@@ -707,7 +714,7 @@ mod tests {
             (json!({ "id": "a/b" }), "input `a/b`: an input id must not"),
             (
                 json!({ "id": "x", "colour": 1 }),
-                "input `x`: unknown key `colour` (known: id,",
+                "input `x`: unknown key `colour` (known: label,",
             ),
             (
                 json!({ "id": "x", "type": "date" }),
@@ -727,7 +734,7 @@ mod tests {
             ),
             (
                 json!({ "id": "x", "type": "choice", "options": [1] }),
-                "`options` is an array of strings",
+                "`options` is a list of values",
             ),
             (
                 json!({ "id": "env", "type": "choice", "options": ["dev", "prod"], "default": "qa" }),
@@ -789,18 +796,16 @@ mod tests {
             let found = problem(json.clone());
             assert!(found.contains(expected), "{json}: {found}");
         }
-        let (_, ids, problems) = parse(vec![
-            json!({ "id": "a" }),
-            json!({ "id": "a" }),
-            json!({ "id": "b", "type": 1 }),
+        let (parsed, ids, problems) = parse(vec![
+            declared(json!({ "id": "a" })),
+            declared(json!({ "id": "b", "type": 1 })),
+            ("c".into(), Value::Null),
         ]);
-        assert_eq!(ids, ["a", "a", "b"]);
-        assert_eq!(
-            problems[0],
-            (1, ("duplicate input id `a`".into(), Some("id")))
-        );
-        assert_eq!(problems[1].0, 2);
-        assert_eq!(problems[1].1.1, Some("type"));
+        assert_eq!(ids, ["a", "b", "c"], "every id, also of inputs with problems");
+        assert_eq!(parsed.len(), 2, "`c:` alone is a string input");
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].0, 1);
+        assert_eq!(problems[0].1.1, Some("type"));
     }
 
     #[test]

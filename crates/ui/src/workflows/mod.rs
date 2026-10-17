@@ -1,7 +1,8 @@
-//! Workflows: JSONC files that start a multi-project development
+//! Workflows: YAML files that start a multi-project development
 //! environment (format and scheduling in the `workflow` crate). They are
 //! found in the user's config dir (`<config>/next_code/workflows/`) and in
-//! each open project's `.next_code/workflows/`. A [`Workflows`] model per
+//! each open project's `.next_code/workflows/`; files of the old JSON
+//! format are listed with a problem until converted ([`convert_file`]). A [`Workflows`] model per
 //! window (and one in headless mode) runs them: it performs what a
 //! `workflow::Run` asks for through a [`Host`] (open project tabs, start
 //! commands in their Terminal panels, Ctrl+C and kill them when the run
@@ -50,7 +51,7 @@ mod picker;
 mod view;
 
 pub use picker::{WorkflowPicker, WorkflowPickerEvent};
-pub use view::WorkflowView;
+pub use view::{WorkflowView, WorkflowViewEvent};
 
 actions!(
     workflows,
@@ -117,15 +118,99 @@ pub fn workflow_id(source: &Source, path: &Path) -> String {
     }
 }
 
-/// A workflow file's name without `.json`/`.jsonc` (a workflow without
+/// The extensions of workflow files: YAML, and the old JSON format's.
+const EXTENSIONS: &[&str] = &[".yaml", ".yml", ".jsonc", ".json"];
+
+/// Whether a file named `name` is a workflow file (of either format).
+pub fn is_workflow_file(name: &str) -> bool {
+    EXTENSIONS.iter().any(|extension| name.ends_with(extension))
+}
+
+/// A workflow file's name without its extension (a workflow without
 /// `name` is called that).
 pub fn file_stem(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_default()
-        .trim_end_matches(".jsonc")
-        .trim_end_matches(".json")
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    EXTENSIONS
+        .iter()
+        .find_map(|extension| name.strip_suffix(extension))
+        .unwrap_or(&name)
         .to_owned()
+}
+
+/// What a file of the old JSON format shows instead of its steps.
+pub const LEGACY_FORMAT: &str = "This file uses the old JSON workflow format. Convert it to \
+                                 YAML: Convert to YAML in its tab (headless: \
+                                 `workflow_convert`).";
+
+/// Whether `path` is a file of the old JSON format.
+pub fn is_legacy(path: &Path) -> bool {
+    workflow::legacy::is_legacy(&path.to_string_lossy())
+}
+
+/// The workflow in file `path` with contents `text` ([`LEGACY_FORMAT`]
+/// for an old-format file).
+pub fn parse_file(path: &Path, text: &str) -> Result<Workflow, String> {
+    if is_legacy(path) {
+        return Err(LEGACY_FORMAT.into());
+    }
+    workflow::parse(text, &file_stem(path))
+}
+
+/// What [`convert_file`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Converted {
+    /// The new YAML file.
+    pub path: PathBuf,
+    /// Where the old file went.
+    pub backup: PathBuf,
+    /// The problems the converted file has (as the old one had them).
+    pub problems: Vec<String>,
+}
+
+/// Converts the old-format workflow file `path`, whose text is `text`,
+/// through `project`: writes `<stem>.yaml` beside it (an error if that
+/// exists) and renames the old file to `<name>.bak` (or `.bak2`, …).
+/// Blocks.
+pub fn convert_file(project: &Project, path: &Path, text: &str) -> Result<Converted, String> {
+    let yaml = workflow::legacy::convert(text)?;
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let target = project.join(dir, &format!("{}.yaml", file_stem(path)));
+    let exists = |path: &Path| project.kind(path).ok().flatten().is_some();
+    if exists(&target) {
+        return Err(format!(
+            "{} already exists: rename or remove it first",
+            target.display()
+        ));
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let backup = (1..)
+        .map(|n| match n {
+            1 => project.join(dir, &format!("{name}.bak")),
+            n => project.join(dir, &format!("{name}.bak{n}")),
+        })
+        .find(|backup| !exists(backup))
+        .expect("a free name");
+    let problems = match workflow::parse(&yaml, &file_stem(path)) {
+        Ok(_) => Vec::new(),
+        Err(problems) => problems.lines().map(str::to_owned).collect(),
+    };
+    project
+        .write(&target, yaml.into_bytes())
+        .map_err(|err| format!("cannot write {}: {err}", target.display()))?;
+    project
+        .rename(path, &backup)
+        .map_err(|err| format!("cannot rename {} to .bak: {err}", path.display()))?;
+    Ok(Converted {
+        path: target,
+        backup,
+        problems,
+    })
 }
 
 /// What a workflow's state is called in its tab.
@@ -164,12 +249,11 @@ pub struct Discovered {
 /// Reads every workflow file: the user's, then each project's. Blocks.
 fn discover(user_dir: Option<&Path>, projects: &[(Location, Project)]) -> Vec<Discovered> {
     let mut found = Vec::new();
-    let is_workflow = |name: &str| name.ends_with(".json") || name.ends_with(".jsonc");
     let mut add = |path: PathBuf, source: Source, text: std::io::Result<String>| {
         let stem = file_stem(&path);
         let parsed = text
             .map_err(|err| format!("cannot read the file: {err}"))
-            .and_then(|text| workflow::parse(&text, &stem))
+            .and_then(|text| parse_file(&path, &text))
             .map(Arc::new);
         let name = parsed
             .as_ref()
@@ -188,7 +272,7 @@ fn discover(user_dir: Option<&Path>, projects: &[(Location, Project)]) -> Vec<Di
         let mut paths: Vec<PathBuf> = entries
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| path.is_file() && is_workflow(&path.to_string_lossy()))
+            .filter(|path| path.is_file() && is_workflow_file(&path.to_string_lossy()))
             .collect();
         paths.sort();
         for path in paths {
@@ -222,7 +306,7 @@ fn discover(user_dir: Option<&Path>, projects: &[(Location, Project)]) -> Vec<Di
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
                 .collect()
         };
-        names.retain(|name| is_workflow(name));
+        names.retain(|name| is_workflow_file(name));
         names.sort();
         for name in names {
             let dir = project.join(&project.join(project.root(), ".next_code"), "workflows");
@@ -482,6 +566,38 @@ impl Workflows {
 
     pub(crate) fn user_dir(&self) -> Option<&Path> {
         self.user_dir.as_deref()
+    }
+
+    /// Converts workflow `id`, a file of the old JSON format (see
+    /// [`convert_file`]), and reads the files again. Blocks.
+    pub fn convert(&mut self, id: &str, cx: &mut Context<Self>) -> Result<Converted, String> {
+        let found = self
+            .find(id)
+            .cloned()
+            .ok_or_else(|| format!("no workflow `{id}`"))?;
+        if !is_legacy(&found.path) {
+            return Err(format!(
+                "{} is not in the old JSON format",
+                found.path.display()
+            ));
+        }
+        let path = found.path;
+        let project = match &found.source {
+            Source::User => Project::local(path.parent().map(Path::to_path_buf).unwrap_or_default()),
+            Source::Project(location) => self
+                .host
+                .projects(cx)
+                .into_iter()
+                .find(|(open, _)| open == location)
+                .map(|(_, project)| project)
+                .ok_or_else(|| format!("the project {location} is not open"))?,
+        };
+        let text = project
+            .read_text(&path)
+            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+        let converted = convert_file(&project, &path, &text)?;
+        self.refresh(cx).detach();
+        Ok(converted)
     }
 
     /// Reads the workflow files again; the task ends once the list is
@@ -1244,14 +1360,14 @@ impl Host for WindowHost {
     }
 }
 
-/// Writes a new commented workflow file in `dir` (`workflow.jsonc`, else
-/// `workflow-2.jsonc`, …) and returns its path.
+/// Writes a new commented workflow file in `dir` (`workflow.yaml`, else
+/// `workflow-2.yaml`, …) and returns its path.
 pub fn create_template(dir: &Path) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = (1..)
         .map(|n| match n {
-            1 => dir.join("workflow.jsonc"),
-            n => dir.join(format!("workflow-{n}.jsonc")),
+            1 => dir.join("workflow.yaml"),
+            n => dir.join(format!("workflow-{n}.yaml")),
         })
         .find(|path| !path.exists())
         .expect("a free name");

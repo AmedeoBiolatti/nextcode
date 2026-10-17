@@ -124,10 +124,11 @@
 //! | `ports_list` | | `{available, listening: [{port, addresses, pid, command}], forwarded: [{port, host, local_port, address, url, origin, label, connections, process}], error}` after a fresh scan (`origin`: `auto` \| `user` \| `dev_container`; `available` false for local projects) |
 //! | `ports_forward` | `port` (number or `"host:port"`), `host`?, `local_port`? (required when given; default: the same port, else the next free one) | `{local_port, url}`; a user port, saved for the project |
 //! | `ports_stop` | `port`, `host`? | `null`; an automatically forwarded port stays unforwarded while it keeps listening |
-//! | `workflows_list` | | `[{id, name, path, source, error, inputs: [{id, label, type, description, default, required, placeholder, options?: [{value, label}], min?, max?, integer?}], steps: [{id, path, kind: "step", title, needs, after, project, run, check, ready, stop_grace_s, artifacts: [{label, path or url}]} or {id, path, kind: "group", title, needs, after, project, steps: [...]}], outcome}]`: the user's workflows (`<config>/next_code/workflows/`) and the project's (`.next_code/workflows/`), read again for every workflow command; `path` is the qualified id (`group/step`); `run`/`project` show `${inputs.…}` unexpanded |
+//! | `workflows_list` | | `[{id, name, path, source, error, inputs: [{id, label, type, description, default, required, placeholder, options?: [{value, label}], min?, max?, integer?}], steps: [{id, path, kind: "step", title, depends_on: {"<id>": "ready" \| "completed"}, project, run, check, ready, timeout, stop_grace_period, artifacts: [{label, path or url}]} or {id, path, kind: "group", title, depends_on, project, steps: [...]}], outcome}]`: the user's workflows (`<config>/next_code/workflows/*.yaml`) and the project's (`.next_code/workflows/`), read again for every workflow command; `path` is the qualified id (`group/step`); `run`/`project` show `${inputs.…}` unexpanded; durations as written in files (`10m`, `3s`); files of the old JSON format are listed with an `error` saying to convert them |
+//! | `workflow_convert` | `name`/`path`/`id` of an old-format file (`.json`/`.jsonc`) | `{path, backup, problems}`: writes the YAML file beside it (comments kept; an error if it exists) and renames the old one to `.bak`; `problems` are the converted file's (as the old one had them) |
 //! | `workflow_run` | `name`, `path` (or its end) or `id`, `inputs`? (`{"<id>": value}`: JSON types, or strings that parse for numbers and booleans) | `{run, id}`; starts it afresh (a run of it going is stopped first, each command with its step's grace; a step starts once its old command is gone); inputs not given get their defaults (not the GUI form's remembered values); invalid or missing required ones are an error listing each (``input `workers`: must be ≤ 64``); progress comes as `workflow_event`s |
 //! | `workflow_status` | `name`/`path`/`id` | `{run, workflow, outcome, inputs, steps: [...]}`, `inputs` the run's values by id; a row per step and group (qualified `id`, `kind`, `parent`): steps `{id, kind, parent, title, status, reason, detail, blocked, last_line, check_output, exit_code, exited, elapsed_ms, location, terminal, artifacts: [{label, name, path or url, resolved, exists}], artifacts_error}`, groups `{id, kind, parent, title, status, reason, detail, blocked, elapsed_ms, steps}` |
-//! | `workflow_stop` | `name`/`path`/`id` | `true` if it had run: Stop All (Ctrl+C, then kill after the step's `stop_grace_s`, default 3 s; a second stop kills at once) |
+//! | `workflow_stop` | `name`/`path`/`id` | `true` if it had run: Stop All (Ctrl+C, then kill after the step's `stop_grace_period`, default 3s; a second stop kills at once) |
 //! | `workflow_continue` | `name`/`path`/`id`, `step` (qualified id) | `null`; an error if the step does not wait for Continue |
 //! | `workflow_restart` | `name`/`path`/`id`, `step` | `true`: the step (a group: each of its steps) starts again once its old command is gone (same terminal) |
 //! | `workflow_retry` | `name`/`path`/`id`, `step`? | without `step`: `true` if it had run, failed steps start again; with it: whether that step (a group: any of its steps) had failed and starts again |
@@ -149,8 +150,8 @@
 //! `status` (`pending`, `waiting`, `starting`, `running`, `stopping`,
 //! `ready`, `failed`, `stopped`), `reason`, `detail`; `outcome` with
 //! `outcome` (`running`, `ready`, `failed`: finished with failures or a
-//! check without `onFail` failed, `stopped`); `url` with `step`, `url`:
-//! an `openUrls` URL, which headless mode does not open). Workflow steps
+//! check without `on_fail` failed, `stopped`); `url` with `step`, `url`:
+//! an `open_urls` URL, which headless mode does not open). Workflow steps
 //! for other projects open them without a window; commands run in
 //! terminals nobody sees.
 use std::{

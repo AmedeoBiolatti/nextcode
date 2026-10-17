@@ -1,30 +1,32 @@
-//! The workflow file: JSON with comments and trailing commas,
-//! `{ "name": "...", "inputs"?: [ ... ], "steps": [ ... ] }`, parsed into
-//! [`Workflow`] and validated (inputs, ids, `needs` and `after`, what each
-//! step does and when it is ready, its artifacts, `${steps.…}` and
-//! `${inputs.…}` variables). A step with `steps` of its own is a group:
-//! its `needs` and `after` gate all its steps, which inherit its
-//! `project`, `cwd` and `env`; ids are unique among siblings, `needs` and
-//! `after` name siblings.
+//! The workflow file: YAML (JSON works too: it is YAML),
+//! `name`, `inputs`, `env` and `steps`, with steps and inputs as mappings
+//! keyed by id like Compose services or GitHub Actions jobs; parsed into
+//! [`Workflow`] and validated (inputs, `depends_on`, what each step does
+//! and when it is ready, its artifacts, `${steps.…}` and `${inputs.…}`
+//! variables). A step with `steps` of its own is a group: its
+//! `depends_on` gates all its steps, which inherit its `project`, `cwd`
+//! and `env`; `depends_on` names siblings. Every problem is located at
+//! the key or value it is about.
 
 use std::{
     collections::{BTreeMap, HashMap},
     time::Duration,
 };
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::{
     inputs::{self, Input, InputValues},
-    source::{self, Problem},
+    source::{self, Problem, StepSpan},
     tree,
     vars::{self, ArtifactRef, StepField},
+    yaml::{self, Data, Entry, Node},
 };
 
-/// Seconds a stopped command gets after Ctrl+C by default.
-pub const DEFAULT_STOP_GRACE_S: u64 = 3;
-/// The longest `stop_grace_s`.
-pub const MAX_STOP_GRACE_S: u64 = 3600;
+/// How long a stopped command gets after Ctrl+C by default.
+pub const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(3);
+/// The longest `stop_grace_period`.
+pub const MAX_STOP_GRACE: Duration = Duration::from_secs(3600);
 
 /// A parsed, valid workflow.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,13 +34,15 @@ pub struct Workflow {
     pub name: String,
     /// What a run asks for, in order (see [`crate::inputs`]).
     pub inputs: Vec<Input>,
+    /// Environment every step gets (its groups' and its own win).
+    pub env: BTreeMap<String, String>,
     pub steps: Vec<Step>,
 }
 
 impl Workflow {
     /// A copy with every `${inputs.<id>}` in its steps (at any depth:
-    /// `run`, `check`, `cwd`, `env` values, artifact paths, `project`)
-    /// replaced by its value; what a run of it does.
+    /// `run`, `check`, `cwd`, `env` values, artifact paths, `project`) and
+    /// its `env` replaced by its value; what a run of it does.
     pub fn with_inputs(&self, values: &InputValues) -> Workflow {
         let mut resolved = self.clone();
         if !values.is_empty() {
@@ -47,6 +51,7 @@ impl Workflow {
                     *text = inputs::substitute(text, values);
                 }
             };
+            resolved.env.values_mut().for_each(replace);
             for step in &mut resolved.steps {
                 step.map_texts(&replace);
             }
@@ -57,14 +62,11 @@ impl Workflow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
-    /// Unique among its siblings (no `/`); `needs` refers to it.
+    /// Its key in `steps`: unique among its siblings, no `/`.
     pub id: String,
     pub title: Option<String>,
-    /// Steps that must be ready before this one starts.
-    pub needs: Vec<String>,
-    /// Steps that must have finished (ready or failed) before this one
-    /// starts.
-    pub after: Vec<String>,
+    /// The siblings it waits for, in the order written.
+    pub depends_on: Vec<Dependency>,
     /// Where it runs; `None` is the machine the editor runs on.
     pub project: Option<ProjectSpec>,
     /// Command line run in a terminal tab.
@@ -77,18 +79,44 @@ pub struct Step {
     /// of failing the workflow.
     pub on_fail: Option<String>,
     pub ready: Ready,
-    pub timeout_s: Option<u64>,
+    pub timeout: Option<Duration>,
     /// URLs the command prints (until ready) open in the browser.
     pub open_urls: bool,
     pub env: BTreeMap<String, String>,
     /// Relative to the project (or the home folder without a project).
     pub cwd: Option<String>,
-    /// Seconds its command gets after Ctrl+C before it is killed.
-    pub stop_grace_s: u64,
+    /// How long its command gets after Ctrl+C before it is killed.
+    pub stop_grace: Duration,
     /// Files and links it produces.
     pub artifacts: Vec<Artifact>,
     /// A group's steps (empty for a step that does something).
     pub steps: Vec<Step>,
+}
+
+/// One entry of a step's `depends_on`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    /// A sibling's id.
+    pub step: String,
+    pub condition: Condition,
+}
+
+/// What a dependency must have done before the step starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Condition {
+    /// Ready (the default).
+    Ready,
+    /// Finished: ready or failed (a report after an evaluation).
+    Completed,
+}
+
+impl Condition {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Completed => "completed",
+        }
+    }
 }
 
 impl Step {
@@ -107,19 +135,18 @@ impl Step {
         Step {
             id: self.id.clone(),
             title: self.title.clone(),
-            needs: self.needs.clone(),
-            after: self.after.clone(),
+            depends_on: self.depends_on.clone(),
             project: self.project.clone(),
             run: self.run.clone(),
             terminal: self.terminal.clone(),
             check: self.check.clone(),
             on_fail: self.on_fail.clone(),
             ready: self.ready.clone(),
-            timeout_s: self.timeout_s,
+            timeout: self.timeout,
             open_urls: self.open_urls,
             env: self.env.clone(),
             cwd: self.cwd.clone(),
-            stop_grace_s: self.stop_grace_s,
+            stop_grace: self.stop_grace,
             artifacts: self.artifacts.clone(),
             steps: Vec::new(),
         }
@@ -131,12 +158,22 @@ impl Step {
     }
 
     pub fn stop_grace(&self) -> Duration {
-        Duration::from_secs(self.stop_grace_s)
+        self.stop_grace
     }
 
-    /// The steps it waits for: `needs`, then `after`.
+    /// The ids of its dependencies with this condition.
+    pub fn depending(&self, condition: Condition) -> impl Iterator<Item = &str> {
+        self.depends_on
+            .iter()
+            .filter(move |dependency| dependency.condition == condition)
+            .map(|dependency| dependency.step.as_str())
+    }
+
+    /// The ids it waits for, in the order written.
     pub fn upstream(&self) -> impl Iterator<Item = &str> {
-        self.needs.iter().chain(&self.after).map(String::as_str)
+        self.depends_on
+            .iter()
+            .map(|dependency| dependency.step.as_str())
     }
 
     /// The texts `${…}` variables are expanded in: `run`, `check`, `cwd`,
@@ -245,8 +282,8 @@ pub enum Ready {
     Port(u16),
     /// The user pressed Continue; the text is the prompt.
     Manual(String),
-    /// Milliseconds after the command started (or the check passed).
-    Delay(u64),
+    /// This long after the command started (or the check passed).
+    Delay(Duration),
 }
 
 /// Where a step runs. The editor maps it to a project location; the
@@ -298,30 +335,45 @@ impl ProjectSpec {
     }
 }
 
+/// The keys at the top of the file (and `x-…` ones, which hold shared
+/// parts for YAML anchors, as in Compose files).
+const TOP_KEYS: &[&str] = &["name", "description", "inputs", "env", "steps", "$schema"];
+
 /// The keys a step may have.
 const STEP_KEYS: &[&str] = &[
-    "id",
     "title",
-    "needs",
-    "after",
+    "depends_on",
     "project",
     "run",
     "terminal",
     "check",
-    "onFail",
+    "on_fail",
     "ready",
-    "timeout_s",
-    "openUrls",
+    "timeout",
+    "stop_grace_period",
+    "open_urls",
     "env",
     "cwd",
-    "stop_grace_s",
     "artifacts",
     "steps",
 ];
 
 /// The keys a group (a step with `steps`) may have.
-const GROUP_KEYS: &[&str] = &[
-    "id", "title", "needs", "after", "steps", "project", "env", "cwd",
+const GROUP_KEYS: &[&str] = &["title", "depends_on", "steps", "project", "env", "cwd"];
+
+/// Keys of the format that are designed but not supported yet (see the
+/// workflows manual): an error says so instead of "unknown key".
+const PLANNED_KEYS: &[&str] = &["restart", "healthcheck", "if", "env_file"];
+
+/// The old JSON format's step keys, and what they became.
+const RENAMED_KEYS: &[(&str, &str)] = &[
+    ("id", "the step's key in `steps`"),
+    ("needs", "`depends_on`"),
+    ("after", "`depends_on` with `condition: completed`"),
+    ("onFail", "`on_fail`"),
+    ("openUrls", "`open_urls`"),
+    ("timeout_s", "`timeout` (a duration: `10m`, `90s`)"),
+    ("stop_grace_s", "`stop_grace_period` (a duration: `30s`)"),
 ];
 
 /// Parses and validates a workflow file; `fallback_name` names it when it
@@ -341,154 +393,235 @@ pub fn parse(text: &str, fallback_name: &str) -> Result<Workflow, String> {
 /// each group's.
 type StepPath = Vec<usize>;
 
-/// What a problem found while parsing is about.
+/// What a problem found by the graph checks is about; located through the
+/// steps' spans.
 enum At {
-    File,
-    /// The step at this path.
-    Step(StepPath),
-    /// That step's `"id"`.
+    /// That step's key.
     StepId(StepPath),
-    /// One of that step's `needs`.
-    Need(StepPath, String),
-    /// One of that step's `after`.
-    After(StepPath, String),
+    /// One of that step's `depends_on` ids.
+    Dependency(StepPath, String),
     /// Where this text first occurs in that step (else in its groups,
-    /// innermost first: it may inherit it).
+    /// innermost first: it may inherit it; else anywhere: the workflow's
+    /// `env`).
     Text(StepPath, String),
-    /// The input at this index in `inputs`: at this key, else the input.
-    Input(usize, Option<&'static str>),
 }
 
-/// [`parse`], with each problem located in `text` where possible: JSON
-/// syntax errors where the parser stopped, step problems at the step,
-/// unknown `needs`/`after` at the id, `${steps.…}` and `${inputs.…}`
-/// problems at the variable, duplicates and cycles at the step's `"id"`
-/// (nested steps included), input problems at the key they are about.
+fn problem(message: impl Into<String>, offset: usize) -> Problem {
+    Problem {
+        message: message.into(),
+        offset: Some(offset),
+    }
+}
+
+/// [`parse`], with each problem located in `text`: YAML syntax errors
+/// where the parser stopped, step and input problems at the key or value
+/// they are about, unknown dependencies at the id, `${steps.…}` and
+/// `${inputs.…}` problems at the variable, cycles at the step's key.
 pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> {
-    let value: Value = match serde_json::from_str(&devcontainer::jsonc::to_json(text)) {
-        Ok(value) => value,
-        Err(err) => {
-            return Err(vec![Problem {
-                message: format!("invalid JSON: {err}"),
-                offset: (err.line() > 0).then(|| source::offset_of(text, err.line(), err.column())),
-            }]);
-        }
-    };
+    let document = yaml::load(text);
+    if !document.errors.is_empty() {
+        return Err(document
+            .errors
+            .into_iter()
+            .map(|error| problem(error.message, error.offset))
+            .collect());
+    }
     let file_problem = |message: &str| {
         vec![Problem {
             message: message.to_owned(),
             offset: None,
         }]
     };
-    let Value::Object(mut root) = value else {
-        return Err(file_problem(
-            "a workflow is a JSON object with `name` and `steps`",
-        ));
+    let Some(root) = document.root else {
+        return Err(file_problem("missing `steps`"));
     };
-    let mut errors: Vec<(String, At)> = Vec::new();
-    let name = match root.remove("name") {
-        None => fallback_name.to_owned(),
-        Some(Value::String(name)) if !name.trim().is_empty() => name,
-        Some(_) => {
-            errors.push(("`name` must be a non-empty string".to_owned(), At::File));
-            fallback_name.to_owned()
+    let Some(entries) = root.as_map() else {
+        return Err(vec![problem(
+            "a workflow is a mapping with `name` and `steps`",
+            root.start,
+        )]);
+    };
+    let mut problems: Vec<Problem> = Vec::new();
+    for entry in entries {
+        if !TOP_KEYS.contains(&entry.key.as_str()) && !entry.key.starts_with("x-") {
+            problems.push(problem(
+                format!(
+                    "unknown key `{}` (known: {}, and `x-…` keys for shared parts)",
+                    entry.key,
+                    TOP_KEYS[..5].join(", ")
+                ),
+                entry.key_start,
+            ));
         }
-    };
-    let (inputs, input_ids) = match root.remove("inputs") {
-        None => (Vec::new(), Vec::new()),
-        Some(Value::Array(values)) => {
-            let (inputs, ids, problems) = inputs::parse(values);
-            errors.extend(
-                problems
-                    .into_iter()
-                    .map(|(index, (message, key))| (message, At::Input(index, key))),
-            );
-            (inputs, ids)
-        }
-        Some(_) => {
-            errors.push(("`inputs` must be an array of inputs".to_owned(), At::File));
-            (Vec::new(), Vec::new())
-        }
-    };
-    let steps = match root.remove("steps") {
-        Some(Value::Array(steps)) => steps,
-        Some(_) => return Err(file_problem("`steps` must be an array")),
-        None => return Err(file_problem("missing `steps`")),
-    };
-    // `$schema`, `description` and other documentation keys are allowed.
-    let steps = parse_steps(steps, &[], &mut errors);
-    if errors.iter().all(|(_, at)| matches!(at, At::Input(..))) {
-        errors.extend(validate(&steps));
-        errors.extend(validate_input_refs(&steps, &input_ids));
     }
-    if errors.is_empty() {
-        return Ok(Workflow {
+    let name = match root.get("name") {
+        None => fallback_name.to_owned(),
+        Some(node) => match node.text() {
+            Some(name) if !name.trim().is_empty() => name.to_owned(),
+            _ => {
+                problems.push(problem("`name` must be a non-empty string", node.start));
+                fallback_name.to_owned()
+            }
+        },
+    };
+    let (inputs, input_ids) = match root.get("inputs") {
+        None => (Vec::new(), Vec::new()),
+        Some(node) => parse_inputs(node, &mut problems),
+    };
+    let env = match root.get("env") {
+        None => BTreeMap::new(),
+        Some(node) => env(node, "`env`").unwrap_or_else(|err| {
+            problems.push(err);
+            BTreeMap::new()
+        }),
+    };
+    let Some(steps_node) = root.get("steps") else {
+        problems.push(Problem {
+            message: "missing `steps`".into(),
+            offset: None,
+        });
+        return Err(problems);
+    };
+    let steps = match &steps_node.data {
+        Data::Map(entries) => parse_steps(entries, "", &mut problems),
+        Data::Null => Vec::new(),
+        Data::List(_) => {
+            problems.push(problem(
+                "`steps` is a mapping of step ids to steps (`api: {run: ...}`), not a list",
+                steps_node.start,
+            ));
+            return Err(problems);
+        }
+        _ => {
+            problems.push(problem(
+                "`steps` must be a mapping of step ids to steps",
+                steps_node.start,
+            ));
+            return Err(problems);
+        }
+    };
+    if problems.is_empty() {
+        let spans = source::spans_of(&root).0;
+        let mut errors = validate(&steps, &env);
+        errors.extend(validate_input_refs(&steps, &input_ids));
+        problems.extend(errors.into_iter().map(|(message, at)| Problem {
+            offset: locate(text, &spans, at),
+            message,
+        }));
+        if let Some(found) = env_input_problems(&env, &input_ids) {
+            problems.extend(found.into_iter().map(|message| {
+                let offset = root.get("env").map(|node| node.start);
+                Problem { message, offset }
+            }));
+        }
+    }
+    if problems.is_empty() {
+        Ok(Workflow {
             name,
             inputs,
+            env,
             steps,
-        });
-    }
-    let (spans, input_spans) = source::scan(text);
-    Err(errors
-        .into_iter()
-        .map(|(message, at)| {
-            let offset = match at {
-                At::File => None,
-                At::Step(path) => source::span_at(&spans, &path).map(|span| span.start),
-                At::StepId(path) => source::span_at(&spans, &path).map(|span| span.id_or_start()),
-                At::Need(path, id) => {
-                    source::span_at(&spans, &path).map(|span| listed_at(span, &span.needs, &id))
-                }
-                At::After(path, id) => {
-                    source::span_at(&spans, &path).map(|span| listed_at(span, &span.after, &id))
-                }
-                At::Text(path, needle) => (1..=path.len())
-                    .rev()
-                    .filter_map(|depth| source::span_at(&spans, &path[..depth]))
-                    .find_map(|span| {
-                        text.get(span.start..span.end)
-                            .and_then(|inside| inside.find(&needle))
-                            .map(|at| span.start + at)
-                    })
-                    .or_else(|| source::span_at(&spans, &path).map(|span| span.id_or_start())),
-                At::Input(index, key) => input_spans
-                    .get(index)
-                    .map(|span| key.map_or(span.start, |key| span.key_or_start(key))),
-            };
-            Problem { message, offset }
         })
-        .collect())
+    } else {
+        Err(problems)
+    }
 }
 
-/// Where `id` is listed in `listed` (a step's `needs` or `after`), else the
-/// step's `"id"`.
-fn listed_at(span: &source::StepSpan, listed: &[(String, usize)], id: &str) -> usize {
-    listed
+/// Where a graph problem is in `text`.
+fn locate(text: &str, spans: &[StepSpan], at: At) -> Option<usize> {
+    match at {
+        At::StepId(path) => source::span_at(spans, &path).map(|span| span.start),
+        At::Dependency(path, id) => source::span_at(spans, &path).map(|span| {
+            span.depends_on
+                .iter()
+                .find(|(listed, _)| *listed == id)
+                .map_or(span.start, |(_, at)| *at)
+        }),
+        At::Text(path, needle) => (1..=path.len())
+            .rev()
+            .filter_map(|depth| source::span_at(spans, &path[..depth]))
+            .find_map(|span| {
+                text.get(span.start..span.end)
+                    .and_then(|inside| inside.find(&needle))
+                    .map(|at| span.start + at)
+            })
+            .or_else(|| text.find(&needle))
+            .or_else(|| source::span_at(spans, &path).map(|span| span.start)),
+    }
+}
+
+/// The `inputs` mapping: the inputs that parse and every declared id;
+/// problems located at the key they are about.
+fn parse_inputs(node: &Node, problems: &mut Vec<Problem>) -> (Vec<Input>, Vec<String>) {
+    let entries = match &node.data {
+        Data::Map(entries) => entries,
+        Data::Null => return (Vec::new(), Vec::new()),
+        _ => {
+            problems.push(problem(
+                "`inputs` is a mapping of input ids to their settings (`env: {type: choice, ...}`)",
+                node.start,
+            ));
+            return (Vec::new(), Vec::new());
+        }
+    };
+    let declared: Vec<(String, Value)> = entries
         .iter()
-        .find(|(listed, _)| listed == id)
-        .map(|(_, at)| *at)
-        .unwrap_or_else(|| span.id_or_start())
+        .map(|entry| (entry.key.clone(), input_json(&entry.value)))
+        .collect();
+    let (inputs, ids, found) = inputs::parse(declared);
+    for (index, (message, key)) in found {
+        let entry = &entries[index];
+        let offset = key
+            .and_then(|key| entry.value.entry(key))
+            .map_or(entry.key_start, |found| found.key_start);
+        problems.push(problem(message, offset));
+    }
+    (inputs, ids)
 }
 
-/// `step 3`, or `step 2.1` for the first step of the second one's group.
-fn step_number(path: &[usize]) -> String {
-    let numbers: Vec<String> = path.iter().map(|index| (index + 1).to_string()).collect();
-    format!("step {}", numbers.join("."))
+/// An input's settings as JSON; `default` and the options as written
+/// (`default: 1.10` is `1.10` for a string input; numbers and booleans
+/// read their text).
+fn input_json(node: &Node) -> Value {
+    let as_text = |node: &Node| match (&node.data, node.text()) {
+        (Data::Number(_) | Data::Bool(_), Some(text)) => Value::String(text.to_owned()),
+        _ => node.to_json(),
+    };
+    let Some(entries) = node.as_map() else {
+        return node.to_json();
+    };
+    Value::Object(
+        entries
+            .iter()
+            .map(|entry| {
+                let value = match (entry.key.as_str(), &entry.value.data) {
+                    ("default", _) => as_text(&entry.value),
+                    ("options", Data::List(items)) => {
+                        Value::Array(items.iter().map(as_text).collect())
+                    }
+                    _ => entry.value.to_json(),
+                };
+                (entry.key.clone(), value)
+            })
+            .collect(),
+    )
 }
 
-/// The elements of a `steps` array at `path` (empty: the top level); the
-/// ones with problems are left out (and the problems noted).
-fn parse_steps(values: Vec<Value>, path: &[usize], errors: &mut Vec<(String, At)>) -> Vec<Step> {
-    values
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, value)| {
-            let mut at = path.to_vec();
-            at.push(index);
-            match parse_step(value, &at, errors) {
+/// The steps of a `steps` mapping (of the group `group`, qualified; empty:
+/// the top level); the ones with problems are left out (and the problems
+/// noted).
+fn parse_steps(entries: &[Entry], group: &str, problems: &mut Vec<Problem>) -> Vec<Step> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let path = match group {
+                "" => entry.key.clone(),
+                group => format!("{group}/{}", entry.key),
+            };
+            match parse_step(entry, &path, problems) {
                 Ok(step) => Some(step),
                 Err(err) => {
-                    errors.push((format!("{}: {err}", step_number(&at)), At::Step(at)));
+                    problems.push(err);
                     None
                 }
             }
@@ -496,214 +629,452 @@ fn parse_steps(values: Vec<Value>, path: &[usize], errors: &mut Vec<(String, At)
         .collect()
 }
 
-/// The step at `path`; problems in a group's steps are noted in `errors`.
-fn parse_step(
-    value: Value,
-    path: &[usize],
-    errors: &mut Vec<(String, At)>,
-) -> Result<Step, String> {
-    let Value::Object(mut map) = value else {
-        return Err("a step is an object".into());
-    };
-    if let Some(unknown) = map.keys().find(|key| !STEP_KEYS.contains(&key.as_str())) {
-        return Err(format!(
-            "unknown key `{unknown}` (known: {})",
-            STEP_KEYS.join(", ")
-        ));
-    }
-    let id = string(&mut map, "id")?.ok_or("missing `id`")?;
+/// The step `entry` (qualified id `path`); problems in a group's steps
+/// are noted in `problems`.
+fn parse_step(entry: &Entry, path: &str, problems: &mut Vec<Problem>) -> Result<Step, Problem> {
+    let id = entry.key.clone();
+    let at = |message: String, offset: usize| problem(format!("`{path}`: {message}"), offset);
     if id.trim().is_empty() {
-        return Err("`id` must not be empty".into());
+        return Err(at("a step id must not be empty".into(), entry.key_start));
     }
-    let at = |err: String| format!("`{id}`: {err}");
     if id.contains('/') {
         return Err(at(
-            "an id must not contain `/` (it joins a group's id and its steps')".into(),
+            "a step id must not contain `/` (it joins a group's id and its steps')".into(),
+            entry.key_start,
         ));
     }
-    let group = match map.remove("steps") {
-        None => None,
-        Some(Value::Array(steps)) if steps.is_empty() => {
-            return Err(at("a group needs at least one step in `steps`".into()));
+    let node = &entry.value;
+    let empty = Vec::new();
+    let fields: &[Entry] = match &node.data {
+        Data::Map(entries) => entries,
+        Data::Null => &empty,
+        _ => {
+            return Err(at(
+                format!("a step is a mapping (`run`, `ready`, …), not {}", node.kind()),
+                node.start,
+            ));
         }
-        Some(Value::Array(steps)) => Some(steps),
-        Some(_) => return Err(at("`steps` must be an array of steps".into())),
     };
-    if group.is_some()
-        && let Some(key) = map.keys().find(|key| !GROUP_KEYS.contains(&key.as_str()))
-    {
-        return Err(at(format!(
-            "a group cannot have `{key}` (a group has {}; its steps do the work)",
-            GROUP_KEYS.join(", ")
-        )));
-    }
-    let needs = id_list(&mut map, "needs").map_err(at)?;
-    let after = id_list(&mut map, "after").map_err(at)?;
-    for (i, id) in after.iter().enumerate() {
-        if after[..i].contains(id) {
-            return Err(at(format!("`after` lists `{id}` twice")));
+    for field in fields {
+        let key = field.key.as_str();
+        if STEP_KEYS.contains(&key) || key.starts_with("x-") {
+            continue;
         }
-        if needs.contains(id) {
-            return Err(at(format!(
-                "`{id}` is in both `needs` and `after` (keep one)"
-            )));
-        }
+        let message = if PLANNED_KEYS.contains(&key) {
+            format!("`{key}` is planned but not supported yet")
+        } else if let Some((_, now)) = RENAMED_KEYS.iter().find(|(old, _)| *old == key) {
+            format!("`{key}` is from the old JSON format; it is now {now}")
+        } else {
+            format!("unknown key `{key}` (known: {})", STEP_KEYS.join(", "))
+        };
+        return Err(at(message, field.key_start));
     }
-    let project = map
-        .remove("project")
-        .map(|value| project_spec(value).map_err(|err| at(format!("`project`: {err}"))))
-        .transpose()?;
-    let title = string(&mut map, "title").map_err(at)?;
-    let run = string(&mut map, "run").map_err(at)?;
-    let terminal = string(&mut map, "terminal").map_err(at)?;
-    let check = string(&mut map, "check").map_err(at)?;
-    let on_fail = string(&mut map, "onFail").map_err(at)?;
-    let cwd = string(&mut map, "cwd").map_err(at)?;
-    let ready = map
-        .remove("ready")
-        .map(|value| ready(value).map_err(|err| at(format!("`ready`: {err}"))))
-        .transpose()?;
-    let timeout_s = match map.remove("timeout_s") {
+    let get = |key: &str| fields.iter().find(|field| field.key == key);
+    let group = match get("steps") {
         None => None,
-        Some(Value::Number(number)) => match number.as_u64() {
-            Some(seconds @ 1..) => Some(seconds),
-            _ => return Err(at("`timeout_s` must be a positive whole number".into())),
-        },
-        Some(_) => return Err(at("`timeout_s` must be a number of seconds".into())),
-    };
-    let stop_grace_s = match map.remove("stop_grace_s") {
-        None => None,
-        Some(Value::Number(number)) => match number.as_u64() {
-            Some(seconds @ 1..=MAX_STOP_GRACE_S) => Some(seconds),
+        Some(field) => match &field.value.data {
+            Data::Map(steps) if !steps.is_empty() => Some(steps),
+            Data::Map(_) | Data::Null => {
+                return Err(at(
+                    "a group needs at least one step in `steps`".into(),
+                    field.key_start,
+                ));
+            }
             _ => {
-                return Err(at(format!(
-                    "`stop_grace_s` must be a whole number of seconds from 1 to {MAX_STOP_GRACE_S}"
-                )));
+                return Err(at(
+                    "`steps` must be a mapping of step ids to steps".into(),
+                    field.value.start,
+                ));
             }
         },
-        Some(_) => return Err(at("`stop_grace_s` must be a number of seconds".into())),
     };
-    let artifacts = match map.remove("artifacts") {
-        None => Vec::new(),
-        Some(Value::Array(entries)) => entries
-            .into_iter()
-            .map(artifact)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| at(format!("`artifacts`: {err}")))?,
-        Some(_) => return Err(at("`artifacts` must be an array".into())),
-    };
-    for (i, artifact) in artifacts.iter().enumerate() {
-        if let Some(label) = &artifact.label
-            && artifacts[..i]
-                .iter()
-                .any(|other| other.label.as_ref() == Some(label))
-        {
-            return Err(at(format!("`artifacts`: two are labelled `{label}`")));
-        }
+    if group.is_some()
+        && let Some(field) = fields
+            .iter()
+            .find(|field| !GROUP_KEYS.contains(&field.key.as_str()) && !field.key.starts_with("x-"))
+    {
+        return Err(at(
+            format!(
+                "a group cannot have `{}` (a group has {}; its steps do the work)",
+                field.key,
+                GROUP_KEYS.join(", ")
+            ),
+            field.key_start,
+        ));
     }
-    let open_urls = match map.remove("openUrls") {
-        None => false,
-        Some(Value::Bool(open)) => open,
-        Some(_) => return Err(at("`openUrls` must be true or false".into())),
+    let string = |key: &str| -> Result<Option<String>, Problem> {
+        match get(key) {
+            None => Ok(None),
+            Some(field) if field.value.is_null() => Ok(None),
+            Some(field) => match field.value.text() {
+                Some(text) => Ok(Some(text.to_owned())),
+                None => Err(at(
+                    format!("`{key}` must be a string, not {}", field.value.kind()),
+                    field.value.start,
+                )),
+            },
+        }
     };
-    let env = match map.remove("env") {
+    let depends_on = match get("depends_on") {
+        None => Vec::new(),
+        Some(field) => dependencies(&field.value).map_err(|(message, offset)| at(message, offset))?,
+    };
+    let project = match get("project") {
+        None => None,
+        Some(field) => Some(
+            project_spec(&field.value)
+                .map_err(|err| at(format!("`project`: {err}"), field.value.start))?,
+        ),
+    };
+    let title = string("title")?;
+    let run = string("run")?;
+    let terminal = string("terminal")?;
+    let check = string("check")?;
+    let on_fail = string("on_fail")?;
+    let cwd = string("cwd")?;
+    let ready = match get("ready") {
+        None => None,
+        Some(field) => {
+            Some(ready(&field.value).map_err(|(message, offset)| at(format!("`ready`: {message}"), offset))?)
+        }
+    };
+    let duration_field = |key: &str| -> Result<Option<(Duration, usize)>, Problem> {
+        match get(key) {
+            None => Ok(None),
+            Some(field) => duration(&field.value)
+                .map(|duration| Some((duration, field.value.start)))
+                .map_err(|err| at(format!("`{key}`: {err}"), field.value.start)),
+        }
+    };
+    let timeout = match duration_field("timeout")? {
+        Some((timeout, offset)) if timeout.is_zero() => {
+            return Err(at("`timeout` must be longer than 0".into(), offset));
+        }
+        other => other.map(|(timeout, _)| timeout),
+    };
+    let stop_grace = match duration_field("stop_grace_period")? {
+        Some((grace, offset)) if grace < Duration::from_secs(1) || grace > MAX_STOP_GRACE => {
+            return Err(at(
+                "`stop_grace_period` must be from 1s to 1h".into(),
+                offset,
+            ));
+        }
+        other => other.map(|(grace, _)| grace),
+    };
+    let artifacts = match get("artifacts") {
+        None => Vec::new(),
+        Some(field) => match &field.value.data {
+            Data::List(items) => {
+                let mut artifacts: Vec<Artifact> = Vec::with_capacity(items.len());
+                for item in items {
+                    let artifact = artifact(item)
+                        .map_err(|err| at(format!("`artifacts`: {err}"), item.start))?;
+                    if let Some(label) = &artifact.label
+                        && artifacts
+                            .iter()
+                            .any(|other| other.label.as_ref() == Some(label))
+                    {
+                        return Err(at(
+                            format!("`artifacts`: two are labelled `{label}`"),
+                            item.start,
+                        ));
+                    }
+                    artifacts.push(artifact);
+                }
+                artifacts
+            }
+            _ => {
+                return Err(at(
+                    "`artifacts` must be a list".into(),
+                    field.value.start,
+                ));
+            }
+        },
+    };
+    let open_urls = match get("open_urls") {
+        None => false,
+        Some(field) => match field.value.data {
+            Data::Bool(open) => open,
+            _ => {
+                return Err(at(
+                    "`open_urls` must be true or false".into(),
+                    field.value.start,
+                ));
+            }
+        },
+    };
+    let env = match get("env") {
         None => BTreeMap::new(),
-        Some(Value::Object(env)) => env
-            .into_iter()
-            .map(|(name, value)| match value {
-                Value::String(value) => Ok((name, value)),
-                Value::Number(number) => Ok((name, number.to_string())),
-                Value::Bool(flag) => Ok((name, flag.to_string())),
-                _ => Err(at(format!("`env.{name}` must be a string"))),
-            })
-            .collect::<Result<_, _>>()?,
-        Some(_) => return Err(at("`env` must be an object".into())),
+        Some(field) => env(&field.value, &format!("`{path}`: `env`"))?,
     };
 
-    let problem = if group.is_some() {
-        None
-    } else if run.is_none() && check.is_none() && ready.is_none() {
-        Some("needs `run`, `check` or `ready` (or `steps`: a group)")
-    } else if run.is_none() && matches!(ready, Some(Ready::Exit | Ready::Output(_))) {
-        Some("`ready.exit` and `ready.output` need `run`")
-    } else if run.is_none() && open_urls {
-        Some("`openUrls` needs `run`")
-    } else if run.is_none() && terminal.is_some() {
-        Some("`terminal` needs `run`")
-    } else if run.is_none() && stop_grace_s.is_some() {
-        Some("`stop_grace_s` needs `run`")
-    } else if check.is_none() && on_fail.is_some() {
-        Some("`onFail` needs `check`")
-    } else {
-        None
+    let needs_run = |key: &str, message: &str| -> Result<(), Problem> {
+        match get(key) {
+            Some(field) if group.is_none() && run.is_none() => {
+                Err(at(message.into(), field.key_start))
+            }
+            _ => Ok(()),
+        }
     };
-    if let Some(problem) = problem {
-        return Err(at(problem.into()));
+    if group.is_none() && run.is_none() && check.is_none() && ready.is_none() {
+        return Err(at(
+            "needs `run`, `check` or `ready` (or `steps`: a group)".into(),
+            entry.key_start,
+        ));
     }
-    let steps = group.map_or_else(Vec::new, |steps| parse_steps(steps, path, errors));
+    if run.is_none() && matches!(ready, Some(Ready::Exit | Ready::Output(_))) {
+        needs_run("ready", "`ready.exit` and `ready.output` need `run`")?;
+    }
+    needs_run("open_urls", "`open_urls` needs `run`")?;
+    needs_run("terminal", "`terminal` needs `run`")?;
+    needs_run("stop_grace_period", "`stop_grace_period` needs `run`")?;
+    if check.is_none()
+        && let Some(field) = get("on_fail")
+    {
+        return Err(at("`on_fail` needs `check`".into(), field.key_start));
+    }
+    let steps = group.map_or_else(Vec::new, |steps| parse_steps(steps, path, problems));
     Ok(Step {
         id,
         title,
-        needs,
-        after,
+        depends_on,
         project,
         run,
         terminal,
         check,
         on_fail,
         ready: ready.unwrap_or(Ready::Exit),
-        timeout_s,
+        timeout,
         open_urls,
         env,
         cwd,
-        stop_grace_s: stop_grace_s.unwrap_or(DEFAULT_STOP_GRACE_S),
+        stop_grace: stop_grace.unwrap_or(DEFAULT_STOP_GRACE),
         artifacts,
         steps,
     })
 }
 
-/// A step's `needs` or `after`: one id, or an array of them.
-fn id_list(map: &mut Map<String, Value>, key: &str) -> Result<Vec<String>, String> {
-    match map.remove(key) {
-        None => Ok(Vec::new()),
-        Some(Value::String(id)) => Ok(vec![id]),
-        Some(Value::Array(ids)) => ids
-            .into_iter()
-            .map(|id| match id {
-                Value::String(id) => Ok(id),
-                _ => Err(format!("`{key}` lists step ids (strings)")),
+/// A step's `depends_on`: `api`, `[api, db]` (each must be ready), or a
+/// mapping of ids to a condition (`api: ready`, `eval: completed`, or
+/// Compose's `eval: {condition: completed}`); with each problem's offset.
+fn dependencies(node: &Node) -> Result<Vec<Dependency>, (String, usize)> {
+    const SHAPES: &str = "`depends_on` is a step id, a list of step ids, or a mapping of step \
+                          ids to `ready` or `completed`";
+    let ready = |item: &Node| match item.text() {
+        Some(id) => Ok((
+            Dependency {
+                step: id.to_owned(),
+                condition: Condition::Ready,
+            },
+            item.start,
+        )),
+        None => Err((SHAPES.to_owned(), item.start)),
+    };
+    let found: Vec<(Dependency, usize)> = match &node.data {
+        Data::Null => Vec::new(),
+        Data::List(items) => items.iter().map(ready).collect::<Result<_, _>>()?,
+        Data::Map(entries) => entries
+            .iter()
+            .map(|entry| {
+                let condition_node = match entry.value.get("condition") {
+                    Some(condition) if entry.value.as_map().is_some_and(|map| map.len() == 1) => {
+                        condition
+                    }
+                    _ if entry.value.as_map().is_some() => {
+                        return Err((
+                            format!(
+                                "`{}`: a dependency's settings are `{{condition: ready}}` or \
+                                 `{{condition: completed}}`",
+                                entry.key
+                            ),
+                            entry.value.start,
+                        ));
+                    }
+                    _ => &entry.value,
+                };
+                let condition = match condition_node.text() {
+                    None if condition_node.is_null() => Condition::Ready,
+                    Some("ready") => Condition::Ready,
+                    Some("completed") => Condition::Completed,
+                    _ => {
+                        return Err((
+                            format!(
+                                "`{}`: unknown condition{} (`ready`: it must be ready; \
+                                 `completed`: ready or failed)",
+                                entry.key,
+                                condition_node
+                                    .text()
+                                    .map(|text| format!(" `{text}`"))
+                                    .unwrap_or_default()
+                            ),
+                            condition_node.start,
+                        ));
+                    }
+                };
+                Ok((
+                    Dependency {
+                        step: entry.key.clone(),
+                        condition,
+                    },
+                    entry.key_start,
+                ))
+            })
+            .collect::<Result<_, _>>()?,
+        _ => vec![ready(node)?],
+    };
+    let mut dependencies: Vec<Dependency> = Vec::with_capacity(found.len());
+    for (dependency, offset) in found {
+        if dependencies
+            .iter()
+            .any(|known| known.step == dependency.step)
+        {
+            return Err((
+                format!("`depends_on` lists `{}` twice", dependency.step),
+                offset,
+            ));
+        }
+        dependencies.push(dependency);
+    }
+    Ok(dependencies)
+}
+
+/// A step's, a group's or the workflow's `env`: a mapping of names to
+/// strings, numbers or booleans (as written). `what` names it in
+/// messages.
+fn env(node: &Node, what: &str) -> Result<BTreeMap<String, String>, Problem> {
+    match &node.data {
+        Data::Null => Ok(BTreeMap::new()),
+        Data::Map(entries) => entries
+            .iter()
+            .map(|entry| match entry.value.text() {
+                Some(value) if !matches!(entry.value.data, Data::List(_) | Data::Map(_)) => {
+                    Ok((entry.key.clone(), value.to_owned()))
+                }
+                _ => Err(problem(
+                    format!(
+                        "{what}: `{}` needs a value (a string, number or boolean)",
+                        entry.key
+                    ),
+                    entry.value.start.max(entry.key_start),
+                )),
             })
             .collect(),
-        Some(_) => Err(format!("`{key}` must be an array of step ids")),
+        _ => Err(problem(
+            format!("{what} must be a mapping of names to values"),
+            node.start,
+        )),
     }
 }
 
-/// `"<path or http(s) URL>"`, `{"label": "...", "path": "..."}` or
-/// `{"label": "...", "url": "..."}` (`label` optional).
-fn artifact(value: Value) -> Result<Artifact, String> {
-    const SHAPES: &str = "each is \"<path or http(s) URL>\", {\"label\": \"...\", \"path\": \
-                          \"...\"} or {\"label\": \"...\", \"url\": \"...\"}";
-    let is_url = |text: &str| text.starts_with("http://") || text.starts_with("https://");
-    let (label, target) = match value {
-        Value::String(text) if is_url(&text) => (None, ArtifactTarget::Url(text)),
-        Value::String(text) => (None, ArtifactTarget::Path(text)),
-        Value::Object(mut map) => {
-            if let Some(unknown) = map
-                .keys()
-                .find(|key| !["label", "path", "url"].contains(&key.as_str()))
-            {
-                return Err(format!("unknown key `{unknown}` ({SHAPES})"));
+/// A Compose-style duration: `90s`, `10m`, `1h30m`, `500ms`, `1.5s`; a
+/// plain number is seconds.
+pub fn duration(node: &Node) -> Result<Duration, String> {
+    match &node.data {
+        Data::Number(number) => match number.as_f64() {
+            Some(seconds) if seconds >= 0.0 && seconds.is_finite() => {
+                Ok(Duration::from_secs_f64(seconds))
             }
-            let label = string(&mut map, "label")?;
-            let target = match (string(&mut map, "path")?, string(&mut map, "url")?) {
+            _ => Err("must not be negative".into()),
+        },
+        Data::String(text) => parse_duration(text),
+        _ => Err(format!(
+            "must be a duration (`90s`, `10m`, `1h30m`, `500ms`), not {}",
+            node.kind()
+        )),
+    }
+}
+
+/// [`duration`] of a text.
+pub fn parse_duration(text: &str) -> Result<Duration, String> {
+    let bad = || format!("`{text}` is not a duration (`90s`, `10m`, `1h30m`, `500ms`)");
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return Err(bad());
+    }
+    let mut total = 0.0;
+    while !rest.is_empty() {
+        let number_end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .ok_or_else(bad)?;
+        let number: f64 = rest[..number_end].parse().map_err(|_| bad())?;
+        rest = &rest[number_end..];
+        let unit_end = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let seconds = match &rest[..unit_end] {
+            "h" => 3600.0,
+            "m" => 60.0,
+            "s" => 1.0,
+            "ms" => 0.001,
+            "us" | "µs" => 0.000_001,
+            _ => return Err(bad()),
+        };
+        total += number * seconds;
+        rest = &rest[unit_end..];
+    }
+    Ok(Duration::from_secs_f64(total))
+}
+
+/// A duration as a workflow file writes it: `1h30m`, `90s` → `1m30s`,
+/// `500ms`.
+pub fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    match millis {
+        0 => return "0s".into(),
+        1..1000 => return format!("{millis}ms"),
+        _ if !millis.is_multiple_of(1000) && millis < 60_000 => {
+            return format!("{}s", millis as f64 / 1000.0);
+        }
+        _ => {}
+    }
+    let seconds = duration.as_secs();
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    let mut text = String::new();
+    for (value, unit) in [(hours, "h"), (minutes, "m"), (seconds, "s")] {
+        if value > 0 {
+            text.push_str(&format!("{value}{unit}"));
+        }
+    }
+    text
+}
+
+/// `"<path or http(s) URL>"`, `{label: ..., path: ...}` or
+/// `{label: ..., url: ...}` (`label` optional).
+fn artifact(node: &Node) -> Result<Artifact, String> {
+    const SHAPES: &str = "each is a path or http(s) URL, `{label: ..., path: ...}` or \
+                          `{label: ..., url: ...}`";
+    let is_url = |text: &str| text.starts_with("http://") || text.starts_with("https://");
+    let (label, target) = match &node.data {
+        Data::Map(entries) => {
+            if let Some(unknown) = entries
+                .iter()
+                .find(|entry| !["label", "path", "url"].contains(&entry.key.as_str()))
+            {
+                return Err(format!("unknown key `{}` ({SHAPES})", unknown.key));
+            }
+            let text = |key: &str| -> Result<Option<String>, String> {
+                match node.get(key) {
+                    None => Ok(None),
+                    Some(value) => value
+                        .text()
+                        .map(|text| Some(text.to_owned()))
+                        .ok_or_else(|| format!("`{key}` must be a string")),
+                }
+            };
+            let label = text("label")?;
+            let target = match (text("path")?, text("url")?) {
                 (Some(path), None) => ArtifactTarget::Path(path),
                 (None, Some(url)) if is_url(&url) => ArtifactTarget::Url(url),
                 (None, Some(url)) => return Err(format!("`{url}` is not an http(s) URL")),
-                _ => return Err(format!("an object needs `path` or `url` ({SHAPES})")),
+                _ => return Err(format!("a mapping needs `path` or `url` ({SHAPES})")),
             };
             (label, target)
         }
-        _ => return Err(SHAPES.into()),
+        _ => match node.text() {
+            Some(text) if is_url(text) => (None, ArtifactTarget::Url(text.to_owned())),
+            Some(text) => (None, ArtifactTarget::Path(text.to_owned())),
+            None => return Err(SHAPES.into()),
+        },
     };
     if target.text().trim().is_empty() {
         return Err("an artifact's path must not be empty".into());
@@ -724,120 +1095,143 @@ fn artifact(value: Value) -> Result<Artifact, String> {
     Ok(Artifact { label, target })
 }
 
-fn string(map: &mut Map<String, Value>, key: &str) -> Result<Option<String>, String> {
-    match map.remove(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text)),
-        Some(_) => Err(format!("`{key}` must be a string")),
-    }
-}
-
-fn ready(value: Value) -> Result<Ready, String> {
-    const SHAPES: &str = "one of {\"exit\": true}, {\"output\": \"<regex>\"}, {\"port\": N}, \
-                          {\"manual\": \"<prompt>\"}, {\"delay_ms\": N}";
-    let Value::Object(map) = value else {
-        return Err(format!("expected {SHAPES}"));
+/// One condition: `{exit: true}`, `{output: <regex>}`, `{port: N}`,
+/// `{manual: <prompt>}` or `{delay: <duration>}`; with the problem's
+/// offset.
+fn ready(node: &Node) -> Result<Ready, (String, usize)> {
+    const SHAPES: &str = "one of `exit: true`, `output: <regex>`, `port: <number>`, \
+                          `manual: <prompt>`, `delay: <duration>`";
+    let entries = match &node.data {
+        Data::Map(entries) => entries,
+        _ => return Err((format!("expected {SHAPES}"), node.start)),
     };
-    let mut entries = map.into_iter();
-    let (Some((key, value)), None) = (entries.next(), entries.next()) else {
-        return Err(format!("expected exactly {SHAPES}"));
-    };
-    match (key.as_str(), value) {
-        ("exit", Value::Bool(true)) => Ok(Ready::Exit),
-        ("output", Value::String(pattern)) => match regex::Regex::new(&pattern) {
-            Ok(_) => Ok(Ready::Output(pattern)),
-            Err(err) => Err(format!("invalid regex: {err}")),
-        },
-        ("port", Value::Number(number)) => match number.as_u64() {
-            Some(port @ 1..=65535) => Ok(Ready::Port(port as u16)),
-            _ => Err("`port` must be 1-65535".into()),
-        },
-        ("manual", Value::String(prompt)) => Ok(Ready::Manual(prompt)),
-        ("delay_ms", Value::Number(number)) => number
-            .as_u64()
-            .map(Ready::Delay)
-            .ok_or_else(|| "`delay_ms` must be a whole number".into()),
-        _ => Err(format!("expected {SHAPES}")),
-    }
-}
-
-/// `{"local": "C:/p"}`, `{"wsl": "Ubuntu", "path": "~/p"}`,
-/// `{"devcontainer": <folder>, "config"?: "..."}` (folder: a string or one
-/// of the first two shapes), a typed location string, or the editor's own
-/// `{"Local": ...}` / `{"Wsl": {...}}` / `{"DevContainer": {...}}` shape.
-pub fn project_spec(value: Value) -> Result<ProjectSpec, String> {
-    const SHAPES: &str = "expected {\"local\": \"<path>\"}, {\"wsl\": \"<distro>\", \"path\": \
-                          \"<path>\"}, {\"devcontainer\": <folder>, \"config\"?: \"<path>\"} or a \
-                          location string";
-    let non_empty = |text: String, what: &str| {
-        if text.trim().is_empty() {
-            Err(format!("`{what}` must not be empty"))
+    let [entry] = entries.as_slice() else {
+        // `{manual: Log in, then Continue}` reads as two keys.
+        let hint = if entries.iter().skip(1).any(|entry| entry.value.is_null()) {
+            " (a comma inside `{…}` separates keys: quote text that has one)"
         } else {
-            Ok(text)
-        }
+            ""
+        };
+        return Err((
+            format!("expected exactly one condition: {SHAPES}{hint}"),
+            entries.get(1).map_or(node.start, |entry| entry.key_start),
+        ));
     };
-    let mut map = match value {
-        Value::String(text) => return Ok(ProjectSpec::Typed(non_empty(text, "project")?)),
-        Value::Object(map) => map,
-        _ => return Err(SHAPES.into()),
-    };
-    let keys: Vec<&str> = map.keys().map(String::as_str).collect();
-    let spec = match keys.as_slice() {
-        ["local"] => ProjectSpec::Local(non_empty(
-            string(&mut map, "local")?.ok_or(SHAPES)?,
-            "local",
-        )?),
-        ["path", "wsl"] | ["wsl", "path"] => ProjectSpec::Wsl {
-            distro: non_empty(string(&mut map, "wsl")?.ok_or(SHAPES)?, "wsl")?,
-            path: non_empty(string(&mut map, "path")?.ok_or(SHAPES)?, "path")?,
+    let value = &entry.value;
+    let wrong = |what: &str| Err((format!("`{}` {what}", entry.key), value.start));
+    match entry.key.as_str() {
+        "exit" => match value.data {
+            Data::Bool(true) => Ok(Ready::Exit),
+            _ => wrong("must be true (the command exits with code 0)"),
         },
-        ["devcontainer"] | ["devcontainer", "config"] | ["config", "devcontainer"] => {
-            let folder = project_spec(map.remove("devcontainer").unwrap_or_default())?;
+        "output" => match value.text() {
+            Some(pattern) => match regex::Regex::new(pattern) {
+                Ok(_) => Ok(Ready::Output(pattern.to_owned())),
+                Err(err) => Err((format!("invalid regex: {err}"), value.start)),
+            },
+            None => wrong("must be a regex"),
+        },
+        "port" => match &value.data {
+            Data::Number(number) => match number.as_u64() {
+                Some(port @ 1..=65535) => Ok(Ready::Port(port as u16)),
+                _ => wrong("must be 1-65535"),
+            },
+            _ => wrong("must be a port number"),
+        },
+        "manual" => match value.text() {
+            Some(prompt) => Ok(Ready::Manual(prompt.to_owned())),
+            None => wrong("must be the prompt to show"),
+        },
+        "delay" => match duration(value) {
+            Ok(delay) => Ok(Ready::Delay(delay)),
+            Err(err) => wrong(&err),
+        },
+        "http" => Err((
+            "`http` is planned but not supported yet".into(),
+            entry.key_start,
+        )),
+        "delay_ms" => Err((
+            "`delay_ms` is from the old JSON format; it is now `delay` (a duration: `500ms`)"
+                .into(),
+            entry.key_start,
+        )),
+        _ => Err((format!("unknown condition `{}`: {SHAPES}", entry.key), entry.key_start)),
+    }
+}
+
+/// `{local: C:/p}`, `{wsl: Ubuntu, path: ~/p}`,
+/// `{devcontainer: <folder>, config?: ...}` (folder: a string or one of
+/// the first two shapes), a typed location string, or the editor's own
+/// `{Local: ...}` / `{Wsl: {...}}` / `{DevContainer: {...}}` shape.
+pub fn project_spec(node: &Node) -> Result<ProjectSpec, String> {
+    const SHAPES: &str = "expected `{local: <path>}`, `{wsl: <distro>, path: <path>}`, \
+                          `{devcontainer: <folder>, config: <path>}` or a location string";
+    let non_empty = |text: Option<&str>, what: &str| match text {
+        Some(text) if !text.trim().is_empty() => Ok(text.to_owned()),
+        Some(_) => Err(format!("`{what}` must not be empty")),
+        None => Err(SHAPES.to_owned()),
+    };
+    let entries = match &node.data {
+        Data::Map(entries) => entries,
+        _ => return Ok(ProjectSpec::Typed(non_empty(node.text(), "project")?)),
+    };
+    fn text<'n>(node: &'n Node, key: &str) -> Option<&'n str> {
+        node.get(key).and_then(Node::text)
+    }
+    let mut keys: Vec<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
+    keys.sort_unstable();
+    let spec = match keys.as_slice() {
+        ["local"] => ProjectSpec::Local(non_empty(text(node, "local"), "local")?),
+        ["path", "wsl"] => ProjectSpec::Wsl {
+            distro: non_empty(text(node, "wsl"), "wsl")?,
+            path: non_empty(text(node, "path"), "path")?,
+        },
+        ["devcontainer"] | ["config", "devcontainer"] => {
+            let folder = project_spec(node.get("devcontainer").expect("listed"))?;
             if matches!(folder, ProjectSpec::DevContainer { .. }) {
                 return Err("a dev container's folder cannot be another dev container".into());
             }
             ProjectSpec::DevContainer {
                 folder: Box::new(folder),
-                config: string(&mut map, "config")?,
+                config: text(node, "config").map(str::to_owned),
             }
         }
         // The editor's serde shape (`recent.json`, `windows.json`).
-        ["Local"] => ProjectSpec::Local(non_empty(
-            string(&mut map, "Local")?.ok_or(SHAPES)?,
-            "Local",
-        )?),
-        ["Wsl"] => match map.remove("Wsl") {
-            Some(Value::Object(mut wsl)) => ProjectSpec::Wsl {
-                distro: string(&mut wsl, "distro")?.ok_or("`Wsl` needs `distro`")?,
-                path: string(&mut wsl, "path")?.ok_or("`Wsl` needs `path`")?,
-            },
-            _ => return Err("`Wsl` is {\"distro\": ..., \"path\": ...}".into()),
-        },
-        ["DevContainer"] => match map.remove("DevContainer") {
-            Some(Value::Object(mut container)) => ProjectSpec::DevContainer {
+        ["Local"] => ProjectSpec::Local(non_empty(text(node, "Local"), "Local")?),
+        ["Wsl"] => {
+            let wsl = node.get("Wsl").expect("listed");
+            ProjectSpec::Wsl {
+                distro: text(wsl, "distro")
+                    .ok_or("`Wsl` needs `distro`")?
+                    .to_owned(),
+                path: text(wsl, "path").ok_or("`Wsl` needs `path`")?.to_owned(),
+            }
+        }
+        ["DevContainer"] => {
+            let container = node.get("DevContainer").expect("listed");
+            ProjectSpec::DevContainer {
                 folder: Box::new(project_spec(
                     container
-                        .remove("folder")
+                        .get("folder")
                         .ok_or("`DevContainer` needs `folder`")?,
                 )?),
-                config: string(&mut container, "config")?,
-            },
-            _ => return Err("`DevContainer` is {\"folder\": ..., \"config\": ...}".into()),
-        },
+                config: text(container, "config").map(str::to_owned),
+            }
+        }
         _ => return Err(SHAPES.into()),
     };
     Ok(spec)
 }
 
-/// Ids unique among siblings, `needs` and `after` naming siblings, valid
-/// `${steps.…}` variables, no cycles (at every level).
-fn validate(steps: &[Step]) -> Vec<(String, At)> {
+/// Known dependencies, valid `${steps.…}` variables, no cycles (at every
+/// level). Ids are unique: they are keys.
+fn validate(steps: &[Step], env: &BTreeMap<String, String>) -> Vec<(String, At)> {
     let mut errors = Vec::new();
     check_ids(steps, &mut Vec::new(), None, &mut errors);
     if !errors.is_empty() {
         return errors;
     }
-    errors.extend(validate_variables(steps));
+    errors.extend(validate_variables(steps, env));
     check_cycles(steps, &mut Vec::new(), None, &mut errors);
     errors
 }
@@ -854,8 +1248,8 @@ fn child_path(path: &[usize], index: usize) -> StepPath {
     child
 }
 
-/// Unique ids and known `needs` and `after` among `steps` (at `path`, in
-/// `group`), then the same in each group.
+/// Known `depends_on` ids among `steps` (at `path`, in `group`), then the
+/// same in each group.
 fn check_ids(
     steps: &[Step],
     path: &mut Vec<usize>,
@@ -863,29 +1257,15 @@ fn check_ids(
     errors: &mut Vec<(String, At)>,
 ) {
     let in_group = in_group(group);
-    let mut index: HashMap<&str, usize> = HashMap::new();
     for (i, step) in steps.iter().enumerate() {
-        if index.insert(&step.id, i).is_some() {
-            errors.push((
-                format!("duplicate step id `{}`{in_group}", step.id),
-                At::StepId(child_path(path, i)),
-            ));
-        }
-    }
-    for (i, step) in steps.iter().enumerate() {
-        for need in &step.needs {
-            if !index.contains_key(need.as_str()) {
+        for dependency in &step.depends_on {
+            if !steps.iter().any(|other| other.id == dependency.step) {
                 errors.push((
-                    format!("`{}` needs unknown step `{need}`{in_group}", step.id),
-                    At::Need(child_path(path, i), need.clone()),
-                ));
-            }
-        }
-        for after in &step.after {
-            if !index.contains_key(after.as_str()) {
-                errors.push((
-                    format!("`{}` runs after unknown step `{after}`{in_group}", step.id),
-                    At::After(child_path(path, i), after.clone()),
+                    format!(
+                        "`{}` depends on unknown step `{}`{in_group}",
+                        step.id, dependency.step
+                    ),
+                    At::Dependency(child_path(path, i), dependency.step.clone()),
                 ));
             }
         }
@@ -977,12 +1357,12 @@ fn check_cycles(
     }
 }
 
-/// `${steps.<id>.…}` variables name a step its `needs` or `after` list
-/// (or an enclosing group's), a known field (a group only has `status`),
-/// and an artifact that step declares. Checked in each step that does
-/// something, with what it inherits from its groups.
-fn validate_variables(steps: &[Step]) -> Vec<(String, At)> {
-    let nodes = tree::flatten_steps(steps);
+/// `${steps.<id>.…}` variables name a step its `depends_on` lists (or an
+/// enclosing group's), a known field (a group only has `status`), and an
+/// artifact that step declares. Checked in each step that does something,
+/// with what it inherits from its groups and the workflow.
+fn validate_variables(steps: &[Step], env: &BTreeMap<String, String>) -> Vec<(String, At)> {
+    let nodes = tree::flatten_steps(steps, env);
     let ids: Vec<&str> = nodes.iter().map(|node| node.step.id.as_str()).collect();
     let mut errors = Vec::new();
     for (at, node) in nodes.iter().enumerate() {
@@ -1011,13 +1391,12 @@ fn validate_variables(steps: &[Step]) -> Vec<(String, At)> {
                             .map(|&(_, target)| &nodes[target]);
                         let problem = match (target, &found.field) {
                             (None, _) if node.depth == 0 => Some(format!(
-                                "`{}` refers to `{}`, which is not in this step's `needs` or \
-                                 `after`",
+                                "`{}` refers to `{}`, which is not in this step's `depends_on`",
                                 found.text, found.step
                             )),
                             (None, _) => Some(format!(
-                                "`{}` refers to `{}`, which is not in the `needs` or `after` of \
-                                 this step or of its groups",
+                                "`{}` refers to `{}`, which is not in the `depends_on` of this \
+                                 step or of its groups",
                                 found.text, found.step
                             )),
                             (Some(target), StepField::ExitCode | StepField::Artifact(_))
@@ -1079,23 +1458,9 @@ fn validate_input_refs(steps: &[Step], ids: &[String]) -> Vec<(String, At)> {
             };
             path.push(index);
             for text in step.input_texts() {
-                for found in inputs::input_refs(text) {
-                    let (problem, needle) = match found {
-                        Err(err) => (err, text.find("${inputs.").map(|at| &text[at..])),
-                        Ok(found) if ids.iter().any(|id| id == found.id) => continue,
-                        Ok(found) => {
-                            let known = match ids {
-                                [] => "the workflow has no `inputs`".to_owned(),
-                                ids => format!("inputs: {}", ids.join(", ")),
-                            };
-                            (
-                                format!("`{}` names no input `{}` ({known})", found.text, found.id),
-                                Some(found.text),
-                            )
-                        }
-                    };
+                for (problem, needle) in input_ref_problems(text, ids) {
                     let at = match needle {
-                        Some(needle) => At::Text(path.clone(), needle.to_owned()),
+                        Some(needle) => At::Text(path.clone(), needle),
                         None => At::StepId(path.clone()),
                     };
                     errors.push((format!("`{name}`: {problem}"), at));
@@ -1110,844 +1475,162 @@ fn validate_input_refs(steps: &[Step], ids: &[String]) -> Vec<(String, At)> {
     errors
 }
 
-/// A new workflow file: every field shown and explained.
-pub const TEMPLATE: &str = r#"// A workflow starts a development environment in one go: checks, commands
-// in the terminals of several projects (opened as needed, dev containers
-// included), in order, with readiness conditions, browser links and manual
-// steps. Its tab (Run > Open Workflow…) shows this file next to the steps'
-// graph, which follows your edits; Run All saves and runs it. The command
-// palette has "Run Workflow: <name>" too.
-{
-  "name": "My environment",
-  // Asked for when it runs (a small form; the last values are
-  // remembered): string, number (min, max, integer), boolean or choice;
-  // ${inputs.<id>} puts the value into run, check, cwd, env, artifacts
-  // and project.
-  "inputs": [
-    {
-      "id": "profile",
-      "label": "Profile",
-      "type": "choice",
-      "options": ["dev", "staging", { "value": "prod", "label": "Production" }],
-      "default": "dev",
-      "description": "Settings the API starts with"
-    },
-    {
-      "id": "branch",
-      "type": "string",
-      "default": "main",
-      "placeholder": "branch name",
-      "required": true
+/// The problems of the `${inputs.…}` variables in `text`, each with the
+/// text to point at.
+fn input_ref_problems(text: &str, ids: &[String]) -> Vec<(String, Option<String>)> {
+    let mut problems = Vec::new();
+    for found in inputs::input_refs(text) {
+        match found {
+            Err(err) => problems.push((err, text.find("${inputs.").map(|at| text[at..].to_owned()))),
+            Ok(found) if ids.iter().any(|id| id == found.id) => {}
+            Ok(found) => {
+                let known = match ids {
+                    [] => "the workflow has no `inputs`".to_owned(),
+                    ids => format!("inputs: {}", ids.join(", ")),
+                };
+                problems.push((
+                    format!("`{}` names no input `{}` ({known})", found.text, found.id),
+                    Some(found.text.to_owned()),
+                ));
+            }
+        }
     }
-  ],
-  "steps": [
-    {
-      // Unique id, used by `needs`, `after` and ${steps.<id>.…}.
-      "id": "vpn",
-      "title": "VPN connected",
-      // Runs as a process where the step runs (no `project`: this
-      // machine; PowerShell on Windows, sh elsewhere); exit code 0 passes.
-      "check": "ping -n 1 intranet.example.com",
-      // With `onFail` a failed check waits for Retry instead of failing
-      // the workflow.
-      "onFail": "Connect the VPN, then press Retry."
-    },
-    {
-      "id": "api",
-      "needs": ["vpn"],
-      // {"local": "C:/src/api"}, {"wsl": "Ubuntu", "path": "~/api"},
-      // {"devcontainer": "C:/src/api"} or
-      // {"devcontainer": {"wsl": "Ubuntu", "path": "~/api"}, "config": "..."}.
-      "project": { "devcontainer": "C:/src/api" },
-      // Runs in a terminal tab named `terminal` (default: the title) of
-      // the project's Terminal panel (PowerShell on Windows, the login
-      // shell elsewhere).
-      "run": "uv run uvicorn app:app --port 8000",
-      "terminal": "API",
-      // exit (default) | output (regex) | port | manual | delay_ms.
-      "ready": { "port": 8000 },
-      "timeout_s": 300,
-      "env": { "LOG_LEVEL": "debug", "PROFILE": "${inputs.profile}" },
-      // Relative to the project; ${workspaceFolder}, ${userHome} and
-      // ${env:NAME} work in run, check, cwd and env.
-      "cwd": "."
-    },
-    {
-      "id": "web",
-      "needs": ["api"],
-      "project": { "wsl": "Ubuntu", "path": "~/web" },
-      "run": "git switch ${inputs.branch} && npm run dev",
-      "ready": { "output": "ready in \\d+ ms" },
-      // http(s) URLs the command prints until it is ready open in the
-      // browser (each once).
-      "openUrls": true
-    },
-    {
-      "id": "login",
-      "needs": ["web"],
-      "ready": { "manual": "Log in in the browser, then press Continue." }
-    },
-    {
-      "id": "tests",
-      "needs": ["api"],
-      "project": { "devcontainer": "C:/src/api" },
-      "run": "uv run pytest --junitxml=reports/tests.xml",
-      // Stop sends Ctrl+C, then kills after this many seconds (default 3).
-      "stop_grace_s": 30,
-      // Files (relative to `cwd`, else the project) or http(s) links the
-      // step produces; its details link to them. Also
-      // {"label": "...", "url": "https://..."} or a plain string.
-      "artifacts": [{ "label": "junit", "path": "reports/tests.xml" }]
-    },
-    {
-      "id": "report",
-      // Starts once `tests` finished, ready or failed (`needs` wants it
-      // ready).
-      "after": ["tests"],
-      "project": { "devcontainer": "C:/src/api" },
-      // ${steps.<id>.status}, ${steps.<id>.exit_code} and
-      // ${steps.<id>.artifacts.<label or index>} read a step listed in
-      // `needs` or `after`.
-      "run": "uv run python report.py ${steps.tests.artifacts.junit} ${steps.tests.exit_code}"
-    },
-    {
-      // A group: `steps` of its own, drawn as one card with a miniature of
-      // them (click it to expand). Its `needs`/`after` gate all its steps,
-      // which inherit its `project`, `cwd` and `env`; ids inside are its
-      // own (elsewhere `services/db`), their `needs`/`after` name
-      // siblings. Steps outside wait for the whole group.
-      "id": "services",
-      "title": "Services",
-      "needs": ["vpn"],
-      "project": { "wsl": "Ubuntu", "path": "~/services" },
-      "steps": [
-        { "id": "db", "run": "docker compose up db", "ready": { "port": 5432 } },
-        { "id": "seed", "needs": ["db"], "run": "./seed.sh" }
-      ]
-    }
-  ]
+    problems
 }
+
+/// Problems of `${inputs.…}` in the workflow's `env`.
+fn env_input_problems(env: &BTreeMap<String, String>, ids: &[String]) -> Option<Vec<String>> {
+    let problems: Vec<String> = env
+        .values()
+        .flat_map(|text| input_ref_problems(text, ids))
+        .map(|(problem, _)| format!("`env`: {problem}"))
+        .collect();
+    (!problems.is_empty()).then_some(problems)
+}
+
+/// A new workflow file: every field shown and explained.
+pub const TEMPLATE: &str = r#"# A workflow starts a development environment in one go: checks, commands
+# in the terminals of several projects (opened as needed, dev containers
+# included), in order, with readiness conditions, browser links and manual
+# steps. Its tab (Run > Open Workflow…) shows this file next to the steps'
+# graph, which follows your edits; Run All saves and runs it. The command
+# palette has "Run Workflow: <name>" too. The format borrows from Docker
+# Compose (depends_on, durations, x- keys with anchors) and GitHub Actions
+# (inputs).
+name: My environment
+
+# Asked for when it runs (a small form; the last values are remembered):
+# string, number (min, max, integer), boolean or choice. ${inputs.<id>}
+# puts the value into run, check, cwd, env, artifacts and project.
+inputs:
+  profile:
+    label: Profile
+    type: choice
+    options: [dev, staging, {value: prod, label: Production}]
+    default: dev
+    description: Settings the API starts with
+  branch:
+    type: string
+    default: main
+    placeholder: branch name
+    required: true
+
+# Environment for every step (a group's and a step's own `env` win).
+env:
+  LOG_LEVEL: info
+
+# Shared parts: any `x-` key, reused with YAML anchors (&name, *name, <<).
+x-api: &api
+  project: {devcontainer: C:/src/api}
+
+steps:
+  # The key is the step's id, used by depends_on and ${steps.<id>.…}.
+  vpn:
+    title: VPN connected
+    # Runs as a process where the step runs (no `project`: this machine;
+    # PowerShell on Windows, sh elsewhere); exit code 0 passes.
+    check: ping -n 1 intranet.example.com
+    # With `on_fail` a failed check waits for Retry instead of failing the
+    # workflow.
+    on_fail: Connect the VPN, then press Retry.
+
+  api:
+    <<: *api
+    depends_on: [vpn]
+    # {local: C:/src/api}, {wsl: Ubuntu, path: ~/api},
+    # {devcontainer: C:/src/api} or
+    # {devcontainer: {wsl: Ubuntu, path: ~/api}, config: ...}.
+    # Runs in a terminal tab named `terminal` (default: the title) of the
+    # project's Terminal panel (PowerShell on Windows, the login shell
+    # elsewhere).
+    run: uv run uvicorn app:app --port 8000
+    terminal: API
+    # exit: true (default) | output: <regex> | port: N | manual: <prompt>
+    # | delay: <duration>.
+    ready: {port: 8000}
+    # Durations: 90s, 10m, 1h30m, 500ms.
+    timeout: 5m
+    env:
+      LOG_LEVEL: debug
+      PROFILE: ${inputs.profile}
+    # Relative to the project; ${workspaceFolder}, ${userHome} and
+    # ${env:NAME} work in run, check, cwd and env.
+    cwd: .
+
+  web:
+    depends_on: [api]
+    project: {wsl: Ubuntu, path: ~/web}
+    run: git switch ${inputs.branch} && npm run dev
+    ready: {output: 'ready in \d+ ms'}
+    # http(s) URLs the command prints until it is ready open in the
+    # browser (each once).
+    open_urls: true
+
+  login:
+    depends_on: [web]
+    # Quote text with commas inside {…}: a comma there separates keys.
+    ready: {manual: 'Log in in the browser, then press Continue.'}
+
+  tests:
+    <<: *api
+    depends_on: [api]
+    run: uv run pytest --junitxml=reports/tests.xml
+    # Stop sends Ctrl+C, then kills after this long (default 3s).
+    stop_grace_period: 30s
+    # Files (relative to `cwd`, else the project) or http(s) links the
+    # step produces; its details link to them. Also
+    # {label: ..., url: https://...} or a plain string.
+    artifacts:
+      - {label: junit, path: reports/tests.xml}
+
+  report:
+    <<: *api
+    # `completed`: starts once `tests` finished, ready or failed (`ready`,
+    # the default, wants it ready).
+    depends_on:
+      tests: completed
+    # ${steps.<id>.status}, ${steps.<id>.exit_code} and
+    # ${steps.<id>.artifacts.<label or index>} read a step listed in
+    # depends_on.
+    run: uv run python report.py ${steps.tests.artifacts.junit} ${steps.tests.exit_code}
+
+  # A group: `steps` of its own, drawn as one card with a miniature of them
+  # (click it to expand). Its depends_on gates all its steps, which inherit
+  # its `project`, `cwd` and `env`; ids inside are its own (elsewhere
+  # `services/db`), their depends_on name siblings. Steps outside wait for
+  # the whole group.
+  services:
+    title: Services
+    depends_on: [vpn]
+    project: {wsl: Ubuntu, path: ~/services}
+    steps:
+      db:
+        run: docker compose up db
+        ready: {port: 5432}
+      seed:
+        depends_on: [db]
+        run: ./seed.sh
 "#;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn steps(text: &str) -> Result<Vec<Step>, String> {
-        parse(text, "fallback").map(|workflow| workflow.steps)
-    }
-
-    #[test]
-    fn parses_comments_trailing_commas_and_every_field() {
-        let workflow = parse(
-            r#"
-            // Comment
-            {
-              "name": "Env", /* block */
-              "steps": [
-                {
-                  "id": "a",
-                  "title": "First",
-                  "project": { "local": "C:/src/a" },
-                  "run": "serve",
-                  "terminal": "Server",
-                  "check": "true",
-                  "onFail": "fix it",
-                  "ready": { "output": "listening on \\d+" },
-                  "timeout_s": 30,
-                  "openUrls": true,
-                  "env": { "A": "1", "N": 2, "B": true, },
-                  "cwd": "sub",
-                },
-                { "id": "b", "needs": ["a"], "ready": { "manual": "Go" } },
-                { "id": "c", "needs": "b", "ready": { "delay_ms": 500 } },
-                { "id": "d", "check": "x", "ready": { "port": 8080 } },
-                { "id": "e", "run": "make", "ready": { "exit": true } },
-              ],
-            }
-            "#,
-            "fallback",
-        )
-        .unwrap();
-        assert_eq!(workflow.name, "Env");
-        let a = &workflow.steps[0];
-        assert_eq!(a.label(), "First");
-        assert_eq!(a.terminal_name(), "Server");
-        assert_eq!(a.project, Some(ProjectSpec::Local("C:/src/a".into())));
-        assert_eq!(a.ready, Ready::Output("listening on \\d+".into()));
-        assert_eq!(a.timeout_s, Some(30));
-        assert!(a.open_urls);
-        assert_eq!(a.env["N"], "2");
-        assert_eq!(a.env["B"], "true");
-        assert_eq!(a.cwd.as_deref(), Some("sub"));
-        assert_eq!(workflow.steps[1].ready, Ready::Manual("Go".into()));
-        assert_eq!(workflow.steps[2].needs, vec!["b".to_owned()]);
-        assert_eq!(workflow.steps[2].ready, Ready::Delay(500));
-        assert_eq!(workflow.steps[3].ready, Ready::Port(8080));
-        assert_eq!(workflow.steps[4].ready, Ready::Exit);
-        assert_eq!(workflow.steps[4].terminal_name(), "e");
-        assert_eq!(parse(r#"{"steps": []}"#, "file").unwrap().name, "file");
-    }
-
-    #[test]
-    fn parses_every_project_shape() {
-        let project = |json: &str| project_spec(serde_json::from_str(json).unwrap());
-        assert_eq!(
-            project(r#"{"local": "C:/p"}"#),
-            Ok(ProjectSpec::Local("C:/p".into()))
-        );
-        let wsl = ProjectSpec::Wsl {
-            distro: "Ubuntu".into(),
-            path: "~/x".into(),
-        };
-        assert_eq!(
-            project(r#"{"wsl": "Ubuntu", "path": "~/x"}"#),
-            Ok(wsl.clone())
-        );
-        assert_eq!(
-            project(r#"{"path": "~/x", "wsl": "Ubuntu"}"#),
-            Ok(wsl.clone())
-        );
-        assert_eq!(
-            project(r#"{"devcontainer": "C:/p"}"#),
-            Ok(ProjectSpec::DevContainer {
-                folder: Box::new(ProjectSpec::Typed("C:/p".into())),
-                config: None,
-            })
-        );
-        assert_eq!(
-            project(
-                r#"{"devcontainer": {"wsl": "Ubuntu", "path": "~/x"}, "config": "/c/devcontainer.json"}"#
-            ),
-            Ok(ProjectSpec::DevContainer {
-                folder: Box::new(wsl.clone()),
-                config: Some("/c/devcontainer.json".into()),
-            })
-        );
-        assert_eq!(
-            project(r#""Ubuntu:~/x""#),
-            Ok(ProjectSpec::Typed("Ubuntu:~/x".into()))
-        );
-        // The editor's own serde shape, as in recent.json.
-        assert_eq!(
-            project(r#"{"Local": "C:\\p"}"#),
-            Ok(ProjectSpec::Local("C:\\p".into()))
-        );
-        assert_eq!(
-            project(r#"{"Wsl": {"distro": "Ubuntu", "path": "~/x"}}"#),
-            Ok(wsl.clone())
-        );
-        assert_eq!(
-            project(
-                r#"{"DevContainer": {"folder": {"Wsl": {"distro": "Ubuntu", "path": "~/x"}}, "config": null}}"#
-            ),
-            Ok(ProjectSpec::DevContainer {
-                folder: Box::new(wsl),
-                config: None,
-            })
-        );
-        assert!(project(r#"{"devcontainer": {"devcontainer": "C:/p"}}"#).is_err());
-        assert!(project(r#"{"local": ""}"#).is_err());
-        assert!(project(r#"{"local": "C:/p", "path": "x"}"#).is_err());
-        assert!(project("42").is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_steps() {
-        let error = |text: &str| steps(text).unwrap_err();
-        assert!(error(r#"{"steps": [{"run": "x"}]}"#).contains("missing `id`"));
-        assert!(error(r#"{"steps": [{"id": "a"}]}"#).contains("needs `run`, `check` or `ready`"));
-        assert!(error(r#"{"steps": [{"id": "a", "rum": "x"}]}"#).contains("unknown key `rum`"));
-        assert!(
-            error(r#"{"steps": [{"id": "a", "check": "x", "ready": {"output": "y"}}]}"#)
-                .contains("need `run`")
-        );
-        assert!(
-            error(r#"{"steps": [{"id": "a", "run": "x", "ready": {"output": "("}}]}"#)
-                .contains("invalid regex")
-        );
-        assert!(
-            error(r#"{"steps": [{"id": "a", "run": "x", "ready": {"port": 0}}]}"#)
-                .contains("1-65535")
-        );
-        assert!(
-            error(r#"{"steps": [{"id": "a", "run": "x", "ready": {"exit": true, "port": 1}}]}"#)
-                .contains("exactly")
-        );
-        assert!(error(r#"{"steps": [{"id": "a", "run": "x", "onFail": "m"}]}"#).contains("onFail"));
-        assert!(
-            error(r#"{"steps": [{"id": "a", "run": "x", "timeout_s": 0}]}"#).contains("positive")
-        );
-        assert!(error(r#"{"steps": {}}"#).contains("array"));
-        assert!(error("[1]").contains("JSON object"));
-        assert!(error("{").contains("invalid JSON"));
-    }
-
-    #[test]
-    fn reports_duplicates_unknown_needs_and_cycles() {
-        let error = |text: &str| steps(text).unwrap_err();
-        assert_eq!(
-            error(r#"{"steps": [{"id": "a", "run": "x"}, {"id": "a", "run": "y"}]}"#),
-            "duplicate step id `a`"
-        );
-        assert_eq!(
-            error(
-                r#"{"steps": [{"id": "a", "run": "x", "needs": ["b", "c"]}, {"id": "b", "run": "y"}]}"#
-            ),
-            "`a` needs unknown step `c`"
-        );
-        assert_eq!(
-            error(
-                r#"{"steps": [
-                    {"id": "a", "run": "x", "needs": ["c"]},
-                    {"id": "b", "run": "y", "needs": ["a"]},
-                    {"id": "c", "run": "z", "needs": ["b"]}
-                ]}"#
-            ),
-            "dependency cycle: a → c → b → a"
-        );
-        assert_eq!(
-            error(r#"{"steps": [{"id": "a", "run": "x", "needs": ["a"]}]}"#),
-            "dependency cycle: a → a"
-        );
-        // Several problems at once, one per line.
-        let both = error(r#"{"name": 3, "steps": [{"id": "a"}, {"id": "b", "run": 1}]}"#);
-        assert_eq!(both.lines().count(), 3, "{both}");
-    }
-
-    #[test]
-    fn the_template_is_a_valid_workflow() {
-        let workflow = parse(TEMPLATE, "template").unwrap();
-        assert_eq!(workflow.steps.len(), 7);
-        assert_eq!(workflow.steps[6].steps.len(), 2, "a group");
-        assert_eq!(workflow.steps[5].after, ["tests"]);
-        assert_eq!(workflow.steps[4].stop_grace_s, 30);
-    }
-
-    #[test]
-    fn problems_point_at_where_they_are() {
-        let at = |text: &str| -> Vec<(String, Option<(usize, usize)>)> {
-            check(text, "f")
-                .unwrap_err()
-                .into_iter()
-                .map(|problem| {
-                    let place = problem.line_column(text);
-                    (problem.message, place)
-                })
-                .collect()
-        };
-        // JSON syntax: where the parser stopped (comments keep positions).
-        let broken = "{\n  // c\n  \"steps\": [\n    { \"id\": \"a\" \"run\": \"x\" }\n  ]\n}";
-        let problems = at(broken);
-        assert!(problems[0].0.starts_with("invalid JSON"), "{problems:?}");
-        assert_eq!(problems[0].1.map(|(line, _)| line), Some(4));
-        // An unknown `needs` id: at that id.
-        let unknown = "{\"steps\": [\n  {\"id\": \"a\", \"run\": \"x\"},\n  {\"id\": \"b\", \"run\": \"y\",\n   \"needs\": [\"a\", \"zz\"]}\n]}";
-        assert_eq!(
-            at(unknown),
-            [("`b` needs unknown step `zz`".to_owned(), Some((4, 19)))]
-        );
-        // A bad step: at the step; a duplicate: at its second `"id"`.
-        let bad = "{\"steps\": [\n  {\"id\": \"a\"},\n  {\"id\": \"a\", \"run\": \"x\"}]}";
-        assert_eq!(at(bad)[0].1, Some((2, 3)));
-        let duplicate = "{\"steps\": [\n  {\"id\": \"a\", \"run\": \"x\"},\n  {\"id\": \"a\", \"run\": \"x\"}]}";
-        assert_eq!(
-            at(duplicate),
-            [("duplicate step id `a`".to_owned(), Some((3, 4)))]
-        );
-        // File-level problems have no place.
-        assert_eq!(at("{}"), [("missing `steps`".to_owned(), None)]);
-    }
-
-    #[test]
-    fn parses_after_stop_grace_and_artifacts() {
-        let steps = steps(
-            r#"{"steps": [
-                {"id": "eval", "run": "python eval.py", "stop_grace_s": 60,
-                 "cwd": "runs",
-                 "artifacts": [
-                    "out/metrics.json",
-                    "https://dash.example/run/${env:RUN}",
-                    {"label": "report", "path": "out/report.html"},
-                    {"label": "board", "url": "http://localhost:6006"}
-                 ]},
-                {"id": "report", "after": "eval", "run": "r ${steps.eval.exit_code}"},
-                {"id": "both", "needs": ["report"], "after": ["eval"],
-                 "check": "test -f ${steps.eval.artifacts.report}",
-                 "env": {"S": "${steps.eval.status}", "M": "${steps.eval.artifacts.0}"}}
-            ]}"#,
-        )
-        .unwrap();
-        let eval = &steps[0];
-        assert_eq!(eval.stop_grace_s, 60);
-        assert_eq!(eval.stop_grace(), Duration::from_secs(60));
-        assert_eq!(steps[1].stop_grace_s, DEFAULT_STOP_GRACE_S);
-        assert_eq!(
-            eval.artifacts,
-            [
-                Artifact {
-                    label: None,
-                    target: ArtifactTarget::Path("out/metrics.json".into())
-                },
-                Artifact {
-                    label: None,
-                    target: ArtifactTarget::Url("https://dash.example/run/${env:RUN}".into())
-                },
-                Artifact {
-                    label: Some("report".into()),
-                    target: ArtifactTarget::Path("out/report.html".into())
-                },
-                Artifact {
-                    label: Some("board".into()),
-                    target: ArtifactTarget::Url("http://localhost:6006".into())
-                },
-            ]
-        );
-        let names: Vec<&str> = eval.artifacts.iter().map(Artifact::name).collect();
-        assert_eq!(
-            names,
-            [
-                "metrics.json",
-                "https://dash.example/run/${env:RUN}",
-                "report",
-                "board"
-            ]
-        );
-        assert_eq!(eval.artifact(&ArtifactRef::Label("report".into())), Some(2));
-        assert_eq!(eval.artifact(&ArtifactRef::Index(3)), Some(3));
-        assert_eq!(eval.artifact(&ArtifactRef::Index(4)), None);
-        assert_eq!(steps[1].after, ["eval"]);
-        let upstream: Vec<&str> = steps[2].upstream().collect();
-        assert_eq!(upstream, ["report", "eval"]);
-    }
-
-    #[test]
-    fn rejects_bad_after_stop_grace_and_artifacts() {
-        let error = |text: &str| steps(text).unwrap_err();
-        let one = |extra: &str| {
-            error(&format!(
-                r#"{{"steps": [{{"id": "a", "run": "x"}}, {{"id": "b", "run": "y", {extra}}}]}}"#
-            ))
-        };
-        assert_eq!(
-            one(r#""after": ["a", "a"]"#),
-            "step 2: `b`: `after` lists `a` twice"
-        );
-        assert_eq!(
-            one(r#""needs": "a", "after": ["a"]"#),
-            "step 2: `b`: `a` is in both `needs` and `after` (keep one)"
-        );
-        assert_eq!(
-            one(r#""after": ["zz"]"#),
-            "`b` runs after unknown step `zz`"
-        );
-        assert!(one(r#""after": 3"#).contains("`after` must be an array of step ids"));
-        for bad in ["0", "3601", "1.5", "-1"] {
-            assert!(
-                one(&format!(r#""stop_grace_s": {bad}"#)).contains("from 1 to 3600"),
-                "{bad}"
-            );
-        }
-        assert!(one(r#""stop_grace_s": "3""#).contains("number of seconds"));
-        assert!(
-            error(r#"{"steps": [{"id": "a", "check": "x", "stop_grace_s": 5}]}"#)
-                .contains("`stop_grace_s` needs `run`")
-        );
-        assert!(one(r#""artifacts": "x""#).contains("`artifacts` must be an array"));
-        assert!(one(r#""artifacts": [3]"#).contains("each is"));
-        assert!(one(r#""artifacts": [""]"#).contains("must not be empty"));
-        assert!(one(r#""artifacts": [{"label": "l"}]"#).contains("needs `path` or `url`"));
-        assert!(
-            one(r#""artifacts": [{"path": "p", "url": "http://u"}]"#)
-                .contains("needs `path` or `url`")
-        );
-        assert!(one(r#""artifacts": [{"url": "ftp://u"}]"#).contains("not an http(s) URL"));
-        assert!(one(r#""artifacts": [{"path": "p", "name": "n"}]"#).contains("unknown key `name`"));
-        assert!(one(r#""artifacts": [{"label": "7", "path": "p"}]"#).contains("is a number"));
-        assert!(
-            one(r#""artifacts": [{"label": "l", "path": "p"}, {"label": "l", "path": "q"}]"#)
-                .contains("two are labelled `l`")
-        );
-    }
-
-    #[test]
-    fn step_variables_must_name_needs_or_after_and_known_artifacts() {
-        let error = |text: &str| steps(text).unwrap_err();
-        let with = |extra: &str| {
-            error(&format!(
-                r#"{{"steps": [
-                    {{"id": "eval", "run": "x", "artifacts": [{{"label": "log", "path": "l"}}]}},
-                    {{"id": "other", "run": "y"}},
-                    {{"id": "report", "after": ["eval"], {extra}}}
-                ]}}"#
-            ))
-        };
-        assert_eq!(
-            with(r#""run": "r ${steps.other.status}""#),
-            "`report`: `${steps.other.status}` refers to `other`, which is not in this step's \
-             `needs` or `after`"
-        );
-        assert_eq!(
-            with(r#""run": "r", "env": {"X": "${steps.nope.exit_code}"}"#),
-            "`report`: `${steps.nope.exit_code}` refers to `nope`, which is not in this step's \
-             `needs` or `after`"
-        );
-        assert_eq!(
-            with(r#""run": "r", "cwd": "${steps.eval.artifacts.html}""#),
-            "`report`: `${steps.eval.artifacts.html}`: `eval` has no artifact labelled `html`"
-        );
-        assert_eq!(
-            with(r#""check": "${steps.eval.artifacts.1}""#),
-            "`report`: `${steps.eval.artifacts.1}`: `eval` has 1 artifact(s), numbered from 0"
-        );
-        assert!(with(r#""run": "${steps.eval.code}""#).contains("unknown field `code`"));
-        assert!(
-            with(r#""run": "r", "artifacts": ["${steps.other.artifacts.0}/x"]"#)
-                .contains("refers to `other`")
-        );
-        // At the variable in the text.
-        let text = "{\"steps\": [\n  {\"id\": \"a\", \"run\": \"x\"},\n  {\"id\": \"b\",\n   \"run\": \"echo ${steps.a.status}\"}\n]}";
-        let problems = check(text, "f").unwrap_err();
-        assert_eq!(problems[0].line_column(text), Some((4, 17)));
-        // After-cycles, and cycles mixing needs and after, show the path.
-        assert_eq!(
-            error(
-                r#"{"steps": [
-                    {"id": "a", "run": "x", "after": ["b"]},
-                    {"id": "b", "run": "y", "needs": ["a"]}
-                ]}"#
-            ),
-            "dependency cycle: a → b → a"
-        );
-        assert_eq!(
-            error(r#"{"steps": [{"id": "a", "run": "x", "after": "a"}]}"#),
-            "dependency cycle: a → a"
-        );
-        // An unknown `after` id points at that id.
-        let unknown =
-            "{\"steps\": [\n  {\"id\": \"b\", \"run\": \"y\",\n   \"after\": [\"zz\"]}\n]}";
-        let problems = check(unknown, "f").unwrap_err();
-        assert_eq!(problems[0].line_column(unknown), Some((3, 14)));
-    }
-
-    #[test]
-    fn groups_hold_steps_and_pass_on_their_defaults() {
-        let workflow = parse(
-            r#"{"steps": [
-              {"id": "db", "run": "d"},
-              {"id": "api", "title": "API", "needs": "db", "project": "C:/api",
-               "env": {"A": "1"}, "cwd": "srv", "steps": [
-                {"id": "build", "run": "b"},
-                {"id": "db", "needs": "build", "run": "migrate"},
-                {"id": "inner", "after": "db", "steps": [{"id": "x", "check": "x"}]}
-              ]}
-            ]}"#,
-            "f",
-        )
-        .unwrap();
-        let api = &workflow.steps[1];
-        assert!(api.is_group() && !workflow.steps[0].is_group());
-        assert_eq!(api.label(), "API");
-        assert_eq!(api.steps.len(), 3);
-        assert_eq!(api.steps[1].id, "db", "ids are unique among siblings");
-        assert_eq!(api.steps[2].steps[0].id, "x");
-        assert_eq!(api.cwd.as_deref(), Some("srv"));
-        assert!(
-            api.steps[0].env.is_empty(),
-            "as written; flattening inherits"
-        );
-    }
-
-    #[test]
-    fn rejects_bad_groups() {
-        let error = |text: &str| steps(text).unwrap_err();
-        let group = |extra: &str| {
-            error(&format!(
-                r#"{{"steps": [{{"id": "g", {extra} "steps": [{{"id": "a", "run": "x"}}]}}]}}"#
-            ))
-        };
-        for key in [
-            r#""run": "x","#,
-            r#""check": "x","#,
-            r#""ready": {"exit": true},"#,
-            r#""timeout_s": 5,"#,
-            r#""openUrls": true,"#,
-            r#""terminal": "t","#,
-            r#""stop_grace_s": 5,"#,
-            r#""artifacts": [],"#,
-        ] {
-            let message = group(key);
-            assert!(message.contains("a group cannot have"), "{key}: {message}");
-        }
-        let message = group(r#""onFail": "x","#);
-        assert!(
-            message.contains("a group cannot have `onFail`"),
-            "{message}"
-        );
-        assert!(
-            error(r#"{"steps": [{"id": "g", "steps": []}]}"#)
-                .contains("a group needs at least one step")
-        );
-        assert!(
-            error(r#"{"steps": [{"id": "g", "steps": {}}]}"#).contains("`steps` must be an array")
-        );
-        assert_eq!(
-            error(r#"{"steps": [{"id": "a/b", "run": "x"}]}"#),
-            "step 1: `a/b`: an id must not contain `/` (it joins a group's id and its steps')"
-        );
-        // Problems inside a group are numbered by their place.
-        assert_eq!(
-            error(r#"{"steps": [{"id": "g", "steps": [{"id": "a", "run": "x"}, {"id": "b"}]}]}"#),
-            "step 1.2: `b`: needs `run`, `check` or `ready` (or `steps`: a group)"
-        );
-        // Siblings only: `needs` cannot reach out of (or into) a group.
-        assert_eq!(
-            error(
-                r#"{"steps": [{"id": "top", "run": "t"},
-                  {"id": "g", "steps": [{"id": "a", "needs": "top", "run": "x"}]},
-                  {"id": "after", "needs": "a", "run": "y"}]}"#
-            ),
-            "`after` needs unknown step `a`\n`a` needs unknown step `top` in group `g`"
-        );
-        assert_eq!(
-            error(
-                r#"{"steps": [{"id": "g", "steps": [
-                  {"id": "a", "run": "x"}, {"id": "a", "run": "y"},
-                  {"id": "h", "steps": [{"id": "z", "after": "q", "run": "z"}]}]}]}"#
-            ),
-            "duplicate step id `a` in group `g`\n`z` runs after unknown step `q` in group `g/h`"
-        );
-        assert_eq!(
-            error(
-                r#"{"steps": [{"id": "g", "steps": [
-                  {"id": "a", "needs": "b", "run": "x"}, {"id": "b", "after": "a", "run": "y"}]}]}"#
-            ),
-            "dependency cycle: a → b → a in group `g`"
-        );
-    }
-
-    #[test]
-    fn nested_problems_point_at_where_they_are() {
-        let text = "{\"steps\": [\n  {\"id\": \"top\", \"run\": \"t\"},\n  {\"id\": \"g\", \"steps\": [\n    {\"id\": \"a\", \"run\": \"x\"},\n    {\"id\": \"b\", \"needs\": [\"nope\"], \"run\": \"y\"}\n  ]}\n]}";
-        let problems = check(text, "f").unwrap_err();
-        assert_eq!(problems.len(), 1);
-        assert_eq!(problems[0].line_column(text), Some((5, 27)), "at `nope`");
-        let text = "{\"steps\": [{\"id\": \"g\", \"steps\": [\n  {\"id\": \"a\", \"run\": \"x\"},\n  {\"id\": \"a\", \"run\": \"y\"}]}]}";
-        let problems = check(text, "f").unwrap_err();
-        assert_eq!(
-            problems[0].line_column(text),
-            Some((3, 4)),
-            "the second `\"id\"`"
-        );
-        let text = "{\"steps\": [{\"id\": \"g\", \"steps\": [\n  {\"id\": \"a\", \"timeout_s\": 0, \"run\": \"x\"}]}]}";
-        let problems = check(text, "f").unwrap_err();
-        assert_eq!(
-            problems[0].line_column(text),
-            Some((2, 3)),
-            "the nested step"
-        );
-        // An inherited variable is found in the group that holds it.
-        let text = "{\"steps\": [{\"id\": \"g\",\n \"env\": {\"V\": \"${steps.zz.status}\"},\n \"steps\": [{\"id\": \"a\", \"run\": \"x\"}]}]}";
-        let problems = check(text, "f").unwrap_err();
-        assert!(
-            problems[0]
-                .message
-                .starts_with("`g/a`: `${steps.zz.status}` refers to `zz`")
-        );
-        assert_eq!(problems[0].line_column(text), Some((2, 16)));
-    }
-
-    #[test]
-    fn variables_reach_siblings_and_what_enclosing_groups_wait_for() {
-        let ok = steps(
-            r#"{"steps": [
-              {"id": "eval", "run": "e", "artifacts": [{"label": "m", "path": "m.json"}]},
-              {"id": "g", "after": "eval", "steps": [
-                {"id": "build", "run": "b"},
-                {"id": "use", "needs": "build", "run":
-                  "x ${steps.eval.artifacts.m} ${steps.eval.exit_code} ${steps.build.status}"}
-              ]},
-              {"id": "report", "after": "g", "run": "r ${steps.g.status}"}
-            ]}"#,
-        );
-        assert!(ok.is_ok(), "{ok:?}");
-        let error = |text: &str| steps(text).unwrap_err();
-        assert_eq!(
-            error(
-                r#"{"steps": [{"id": "g", "steps": [{"id": "a", "run": "x"}]},
-                  {"id": "r", "after": "g", "run": "${steps.g.exit_code}"}]}"#
-            ),
-            "`r`: `${steps.g.exit_code}`: `g` is a group (a group only has `status`)"
-        );
-        assert_eq!(
-            error(
-                r#"{"steps": [{"id": "g", "steps": [{"id": "a", "run": "x"}]},
-                  {"id": "r", "needs": "g", "run": "${steps.g.artifacts.0}"}]}"#
-            ),
-            "`r`: `${steps.g.artifacts.0}`: `g` is a group (a group only has `status`)"
-        );
-        // A sibling not listed, or a step outside the group.
-        assert_eq!(
-            error(
-                r#"{"steps": [{"id": "top", "run": "t"}, {"id": "g", "steps": [
-                  {"id": "a", "run": "x"}, {"id": "b", "run": "${steps.a.status} ${steps.top.status}"}]}]}"#
-            ),
-            "`g/b`: `${steps.a.status}` refers to `a`, which is not in the `needs` or `after` of \
-             this step or of its groups\n`g/b`: `${steps.top.status}` refers to `top`, which is \
-             not in the `needs` or `after` of this step or of its groups"
-        );
-    }
-
-    #[test]
-    fn inputs_are_declared_referenced_and_substituted_at_any_depth() {
-        let workflow = parse(
-            r#"{
-              "inputs": [
-                { "id": "env", "type": "choice", "options": ["dev", "prod"], "default": "dev" },
-                { "id": "workers", "type": "number", "default": 4 },
-                { "id": "clean", "type": "boolean" },
-              ],
-              "steps": [
-                { "id": "a", "run": "deploy ${inputs.env} -j ${inputs.workers}",
-                  "check": "test ${inputs.clean}", "cwd": "out/${inputs.env}",
-                  "env": { "ENV": "${inputs.env}" },
-                  "artifacts": ["logs/${inputs.env}.log"],
-                  "project": { "wsl": "Ubuntu", "path": "~/${inputs.env}" } },
-                { "id": "g", "project": { "devcontainer": { "local": "C:/${inputs.env}" },
-                  "config": "${inputs.env}.json" },
-                  "steps": [{ "id": "inner", "steps": [
-                    { "id": "deep", "run": "echo ${inputs.env}-${inputs.workers} ${env:HOME}" }] }] }
-              ]
-            }"#,
-            "f",
-        )
-        .unwrap();
-        assert_eq!(workflow.inputs.len(), 3);
-        let mut values = inputs::defaults(&workflow.inputs);
-        assert_eq!(values.summary(), "env=dev · workers=4 · clean=false");
-        values = inputs::resolve(
-            &workflow.inputs,
-            serde_json::json!({ "env": "prod", "workers": 8 })
-                .as_object()
-                .unwrap(),
-        )
-        .unwrap();
-        let resolved = workflow.with_inputs(&values);
-        let a = &resolved.steps[0];
-        assert_eq!(a.run.as_deref(), Some("deploy prod -j 8"));
-        assert_eq!(a.check.as_deref(), Some("test false"));
-        assert_eq!(a.cwd.as_deref(), Some("out/prod"));
-        assert_eq!(a.env["ENV"], "prod");
-        assert_eq!(a.artifacts[0].target.text(), "logs/prod.log");
-        assert_eq!(
-            a.project,
-            Some(ProjectSpec::Wsl {
-                distro: "Ubuntu".into(),
-                path: "~/prod".into()
-            })
-        );
-        let g = &resolved.steps[1];
-        assert_eq!(
-            g.project,
-            Some(ProjectSpec::DevContainer {
-                folder: Box::new(ProjectSpec::Local("C:/prod".into())),
-                config: Some("prod.json".into())
-            })
-        );
-        assert_eq!(
-            g.steps[0].steps[0].run.as_deref(),
-            Some("echo prod-8 ${env:HOME}"),
-            "other variables stay"
-        );
-        // The file's own steps are unchanged.
-        assert_eq!(
-            workflow.steps[0].run.as_deref(),
-            Some("deploy ${inputs.env} -j ${inputs.workers}")
-        );
-        assert!(parse(r#"{"steps": []}"#, "f").unwrap().inputs.is_empty());
-    }
-
-    #[test]
-    fn input_problems_point_at_where_they_are() {
-        let located = |text: &str| -> Vec<(String, Option<(usize, usize)>)> {
-            check(text, "f")
-                .unwrap_err()
-                .into_iter()
-                .map(|problem| {
-                    let place = problem.line_column(text);
-                    (problem.message, place)
-                })
-                .collect()
-        };
-        let text = r#"{
-  "inputs": [
-    { "id": "env", "type": "choice", "options": ["dev"], "default": "qa" },
-    { "id": "n", "type": "number", "max": 64, "default": 100 },
-    { "id": "env" },
-    { "id": "x", "colour": 1 }
-  ],
-  "steps": [{ "id": "a", "run": "x" }]
-}"#;
-        assert_eq!(
-            located(text),
-            [
-                (
-                    "input `env`: `default` `qa` is not one of dev".to_owned(),
-                    Some((3, 58))
-                ),
-                (
-                    "input `n`: `default` must be ≤ 64".to_owned(),
-                    Some((4, 47))
-                ),
-                ("duplicate input id `env`".to_owned(), Some((5, 7))),
-                (
-                    format!(
-                        "input `x`: unknown key `colour` (known: {})",
-                        inputs::INPUT_KEYS.join(", ")
-                    ),
-                    Some((6, 5))
-                ),
-            ]
-        );
-        // Unknown inputs in steps, at the variable (in a group's project
-        // and a nested step too).
-        let text = r#"{
-  "inputs": [{ "id": "env" }],
-  "steps": [
-    { "id": "a", "run": "echo ${inputs.env} ${inputs.nope}" },
-    { "id": "g", "project": { "local": "C:/${inputs.where}" }, "steps": [
-      { "id": "b", "run": "y", "env": { "X": "${inputs.}" } }] }
-  ]
-}"#;
-        assert_eq!(
-            located(text),
-            [
-                (
-                    "`a`: `${inputs.nope}` names no input `nope` (inputs: env)".to_owned(),
-                    Some((4, 45))
-                ),
-                (
-                    "`g`: `${inputs.where}` names no input `where` (inputs: env)".to_owned(),
-                    Some((5, 44))
-                ),
-                (
-                    "`g/b`: `${inputs.}` names no input".to_owned(),
-                    Some((6, 47))
-                ),
-            ]
-        );
-        assert_eq!(
-            steps(r#"{"steps": [{"id": "a", "run": "${inputs.env}"}]}"#).unwrap_err(),
-            "`a`: `${inputs.env}` names no input `env` (the workflow has no `inputs`)"
-        );
-        assert_eq!(
-            steps(r#"{"inputs": {}, "steps": []}"#).unwrap_err(),
-            "`inputs` must be an array of inputs"
-        );
-        // Step problems are reported with input problems.
-        let both =
-            steps(r#"{"inputs": [{"id": "a", "type": "x"}], "steps": [{"id": "s"}]}"#).unwrap_err();
-        assert!(both.contains("unknown type `x`"), "{both}");
-        assert!(both.contains("needs `run`, `check` or `ready`"), "{both}");
-    }
-}
+mod tests;
