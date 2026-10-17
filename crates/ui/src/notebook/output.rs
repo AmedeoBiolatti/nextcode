@@ -1,6 +1,7 @@
 //! A code cell's outputs as elements: streams and tracebacks with their
-//! ANSI colours, images, Markdown, JSON, and text fallbacks for what the
-//! editor does not render (HTML opens in the browser, widgets).
+//! ANSI colours, images, Markdown, HTML (the safe subset natively, see
+//! `html.rs`; anything else as text with "Open in browser"), JSON,
+//! ipywidgets (`widgets.rs`) and text fallbacks.
 //!
 //! Rendering runs every frame for every visible output, so the expensive
 //! parts (base64 decoding, ANSI parsing) are done once per content and
@@ -29,13 +30,25 @@ use notebook::{
 };
 use terminal::Palette;
 
-use super::markdown::{MarkdownImages, markdown};
+use super::{
+    html::{parsed, render_html},
+    marimo_ui,
+    markdown::{MarkdownImages, markdown},
+    widgets::{WidgetEvent, WidgetInputs, WidgetRender, widget_output},
+};
 use crate::{git_dialogs::button, selectable::selectable, terminal_panel::to_hsla, theme};
 
-pub struct OutputOptions {
+#[derive(Clone, Copy)]
+pub struct OutputOptions<'a> {
     /// Text outputs show this many lines until expanded (0: all).
     pub max_lines: usize,
     pub expanded: bool,
+    /// The notebook's widget models (`None`: widget views show their
+    /// text).
+    pub widgets: Option<WidgetRender<'a>>,
+    /// The text fields of marimo UI elements, by element id (`None`: those
+    /// elements show their value as text).
+    pub marimo_inputs: Option<&'a WidgetInputs>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +57,16 @@ pub enum OutputAction {
     ShowMore,
     /// "Open in browser" on an HTML (or unrenderable SVG) output.
     OpenHtml(String),
+    /// A widget control was used.
+    Widget(WidgetEvent),
+    /// A marimo UI element was used: `value` is its new value in marimo's
+    /// front-end form, `send` false while a slider is dragged (only
+    /// shown); `value: None` sends the value shown (a drag's end).
+    MarimoUi {
+        object_id: String,
+        value: Option<serde_json::Value>,
+        send: bool,
+    },
 }
 
 /// Images decoded at once (the visible ones must fit).
@@ -420,7 +443,7 @@ fn metadata_size(
     }
 }
 
-type OnAction = Rc<dyn Fn(OutputAction, &mut Window, &mut App)>;
+pub(super) type OnAction = Rc<dyn Fn(OutputAction, &mut Window, &mut App)>;
 
 /// One output as an element.
 pub fn render_output(
@@ -432,10 +455,22 @@ pub fn render_output(
     cx: &App,
 ) -> AnyElement {
     let on_action: OnAction = Rc::new(on_action);
+    render_output_inner(id, output, cache, &options, &on_action, cx)
+}
+
+/// [`render_output`] for outputs inside outputs (Output widgets).
+pub(super) fn render_output_inner(
+    id: impl Into<ElementId>,
+    output: &notebook::Output,
+    cache: &mut OutputCache,
+    options: &OutputOptions,
+    on_action: &OnAction,
+    cx: &App,
+) -> AnyElement {
     let body = match view(output) {
         View::Stream { text, stderr } => {
             let text = cache.text(&[text]);
-            text_block(&text, &options, &on_action).when(stderr, |block| {
+            text_block(&text, options, on_action).when(stderr, |block| {
                 block.bg(theme::error().opacity(0.08)).px_1().rounded_sm()
             })
         }
@@ -455,19 +490,60 @@ pub fn render_output(
                 parts.push(line.as_str());
             }
             let text = cache.text(&parts);
-            text_block(&text, &options, &on_action)
+            text_block(&text, options, on_action)
         }
         View::Data(rich, metadata) => {
-            return div()
-                .id(id)
-                .w_full()
-                .child(data_element(
-                    rich, metadata, cache, &options, &on_action, cx,
-                ))
-                .into_any_element();
+            let element = match (plotly_figure(output), &rich) {
+                (Some(figure), Rich::Unsupported(_) | Rich::Plain(_)) => {
+                    let plain = match rich {
+                        Rich::Plain(text) => Some(text),
+                        _ => None,
+                    };
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(plain.map(|plain| plain_block(plain, cache, options, on_action)))
+                        .child(note(
+                            "A Plotly figure: it draws with JavaScript, so it opens in the browser.",
+                        ))
+                        .child(div().flex().child(open_button(plotly_page(figure), on_action.clone())))
+                        .into_any_element()
+                }
+                _ => data_element(rich, metadata, cache, options, on_action, cx),
+            };
+            return div().id(id).w_full().child(element).into_any_element();
         }
     };
     div().id(id).w_full().child(body).into_any_element()
+}
+
+const PLOTLY_MIME: &str = "application/vnd.plotly.v1+json";
+
+/// A display's Plotly figure (`{data, layout, config}`), if it has one.
+fn plotly_figure(output: &Output) -> Option<&serde_json::Value> {
+    match output {
+        Output::DisplayData { data, .. } | Output::ExecuteResult { data, .. } => {
+            data.get(PLOTLY_MIME)
+        }
+        _ => None,
+    }
+}
+
+/// A page drawing `figure` with plotly.js (from its CDN, as Plotly's own
+/// `notebook_connected` renderer does).
+fn plotly_page(figure: &serde_json::Value) -> String {
+    let json = serde_json::to_string(figure)
+        .unwrap_or_else(|_| "{}".into())
+        .replace("</", "<\\/");
+    format!(
+        "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\
+         <script src=\"https://cdn.plot.ly/plotly-2.35.2.min.js\"></script></head>\
+         <body><div id=\"plot\" style=\"width:100%;height:90vh\"></div><script>\
+         const figure = {json};\
+         Plotly.newPlot('plot', figure.data || [], figure.layout || {{}}, figure.config || {{}});\
+         </script></body></html>\n"
+    )
 }
 
 fn data_element(
@@ -528,20 +604,31 @@ fn data_element(
             }
         }
         Rich::Markdown(text) => markdown("markdown", text, MarkdownImages::default(), cx),
-        Rich::Html { html, plain } => div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(match plain {
-                Some(plain) => text_block(&cache.text(&[plain]), options, on_action),
-                None => div().child(note("HTML output")),
-            })
-            .child(
-                div()
+        Rich::Html { html, plain } => {
+            let open = div()
+                .flex()
+                .child(open_button(html.to_owned(), on_action.clone()));
+            match parsed(html, cx).as_ref() {
+                Ok(blocks) => div()
                     .flex()
-                    .child(open_button(html.to_owned(), on_action.clone())),
-            )
-            .into_any_element(),
+                    .flex_col()
+                    .gap_1()
+                    .child(render_html("html", blocks))
+                    .child(open)
+                    .into_any_element(),
+                Err(unsupported) => div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(plain.map(|plain| plain_block(plain, cache, options, on_action)))
+                    .child(note(format!(
+                        "Shown as text: this HTML needs a browser ({}).",
+                        unsupported.reason
+                    )))
+                    .child(open)
+                    .into_any_element(),
+            }
+        }
         Rich::Latex(text) => {
             text_block(&cache.text(&[text]), options, on_action).into_any_element()
         }
@@ -549,15 +636,10 @@ fn data_element(
             let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
             text_block(&cache.text(&[&pretty]), options, on_action).into_any_element()
         }
-        Rich::Widget { plain } => div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .children(plain.map(|plain| text_block(&cache.text(&[plain]), options, on_action)))
-            .child(note(
-                "Interactive widgets are not supported; showing the text fallback.",
-            ))
-            .into_any_element(),
+        Rich::Widget { model_id, plain } => {
+            widget_output(model_id, plain, cache, options, on_action, cx)
+        }
+        Rich::MarimoUi { parts, .. } => marimo_ui::render(parts, options, on_action, cx),
         Rich::Plain(text) => {
             text_block(&cache.text(&[text]), options, on_action).into_any_element()
         }
@@ -577,7 +659,7 @@ fn mono() -> gpui::Div {
 }
 
 /// A muted remark in the UI font.
-fn note(text: impl Into<SharedString>) -> gpui::Div {
+pub(super) fn note(text: impl Into<SharedString>) -> gpui::Div {
     div()
         .text_sm()
         .italic()
@@ -589,6 +671,16 @@ fn open_button(html: String, on_action: OnAction) -> impl IntoElement {
     button("open-html", "Open in browser".into(), false)
         .text_sm()
         .on_click(move |_, window, cx| on_action(OutputAction::OpenHtml(html.clone()), window, cx))
+}
+
+/// `text` as a plain text output.
+pub(super) fn plain_block(
+    text: &str,
+    cache: &mut OutputCache,
+    options: &OutputOptions,
+    on_action: &OnAction,
+) -> gpui::Div {
+    text_block(&cache.text(&[text]), options, on_action)
 }
 
 /// Coloured, selectable text, cut to `options.max_lines` lines with a
@@ -687,10 +779,12 @@ mod tests {
         }
     }
 
-    fn options(max_lines: usize, expanded: bool) -> OutputOptions {
+    fn options(max_lines: usize, expanded: bool) -> OutputOptions<'static> {
         OutputOptions {
             max_lines,
             expanded,
+            widgets: None,
+            marimo_inputs: None,
         }
     }
 
@@ -911,6 +1005,15 @@ mod tests {
                 json!({}),
             ),
             bundle("text/html", json!("<b>x</b>")),
+            // Needs a browser: its text instead.
+            display(
+                json!({"text/html": "<div id='p'></div><script>draw('p')</script>", "text/plain": "<Figure>"}),
+                json!({}),
+            ),
+            bundle(
+                PLOTLY_MIME,
+                json!({"data": [{"x": [1], "y": [2]}], "layout": {}}),
+            ),
             bundle("text/latex", json!("$x^2$")),
             bundle("application/json", json!({"a": [1, 2]})),
             display(
@@ -931,7 +1034,10 @@ mod tests {
         cx.run_until_parked();
         window
             .update(cx, |view, _, cx| {
-                assert!(view.cache.texts.len() >= 8);
+                // Streams, traceback, the script HTML's text, LaTeX, JSON,
+                // the widget's text and the result (rendered HTML is not
+                // text).
+                assert_eq!(view.cache.texts.len(), 8);
                 cx.notify();
             })
             .unwrap();

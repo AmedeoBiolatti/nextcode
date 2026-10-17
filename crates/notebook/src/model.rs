@@ -102,6 +102,71 @@ impl Cell {
             marimo: None,
         }
     }
+
+    /// Outputs collapsed: nbformat's `metadata.jupyter.outputs_hidden`, or
+    /// the older `metadata.collapsed` (classic Notebook, JupyterLab).
+    pub fn outputs_hidden(&self) -> bool {
+        self.metadata.get("collapsed").and_then(Value::as_bool) == Some(true)
+            || self.jupyter_flag("outputs_hidden")
+    }
+
+    /// Source collapsed: nbformat's `metadata.jupyter.source_hidden`.
+    pub fn source_hidden(&self) -> bool {
+        self.jupyter_flag("source_hidden")
+    }
+
+    /// Writes the outputs' collapsed state where every Jupyter front end
+    /// reads it: hidden sets `jupyter.outputs_hidden` and `collapsed`;
+    /// shown removes `jupyter.outputs_hidden` and turns a `collapsed` the
+    /// cell has into `false` (cells that never had one get none).
+    pub fn set_outputs_hidden(&mut self, hidden: bool) {
+        if hidden == self.outputs_hidden() {
+            return;
+        }
+        self.set_jupyter_flag("outputs_hidden", hidden);
+        if hidden {
+            self.metadata.insert("collapsed".into(), Value::Bool(true));
+        } else if let Some(collapsed) = self.metadata.get_mut("collapsed") {
+            *collapsed = Value::Bool(false);
+        }
+    }
+
+    /// Sets (or removes) `metadata.jupyter.source_hidden`.
+    pub fn set_source_hidden(&mut self, hidden: bool) {
+        if hidden != self.source_hidden() {
+            self.set_jupyter_flag("source_hidden", hidden);
+        }
+    }
+
+    fn jupyter_flag(&self, key: &str) -> bool {
+        self.metadata
+            .get("jupyter")
+            .and_then(|jupyter| jupyter.get(key))
+            .and_then(Value::as_bool)
+            == Some(true)
+    }
+
+    /// `true` sets `jupyter.<key>`; `false` removes it (and an emptied
+    /// `jupyter` object).
+    fn set_jupyter_flag(&mut self, key: &str, value: bool) {
+        if value {
+            let jupyter = self
+                .metadata
+                .entry("jupyter")
+                .or_insert_with(|| Value::Object(Metadata::new()));
+            if !jupyter.is_object() {
+                *jupyter = Value::Object(Metadata::new());
+            }
+            if let Some(jupyter) = jupyter.as_object_mut() {
+                jupyter.insert(key.into(), Value::Bool(true));
+            }
+        } else if let Some(Value::Object(jupyter)) = self.metadata.get_mut("jupyter") {
+            jupyter.remove(key);
+            if jupyter.is_empty() {
+                self.metadata.remove("jupyter");
+            }
+        }
+    }
 }
 
 /// How a marimo cell is written.

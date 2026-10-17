@@ -1,13 +1,15 @@
 //! Notebook tabs (`.ipynb`, marimo `.py`): opening files as notebooks
-//! (views in several panes share one `NotebookDocument`), Open as Text /
+//! (views in several panes share one `NotebookDocument` and its
+//! language-server document), Open as Text /
 //! Open as Notebook for marimo files, reloading after external changes,
-//! Open in marimo and Install ipykernel in the Terminal panel, and
+//! Open in marimo and Install ipykernel in the Terminal panel, going to
+//! language-server locations inside notebooks, and
 //! stopping kernels with their last tab or the app.
 
 use gpui::EntityId;
 
 use super::*;
-use crate::notebook::{NotebookDocument, launch};
+use crate::notebook::{NotebookDocument, launch, lsp::NotebookLsp};
 
 impl Workspace {
     #[cfg(test)]
@@ -54,7 +56,11 @@ impl Workspace {
             .all_tabs()
             .filter(|tab| tab.path == path)
             .find_map(Tab::notebook)
-            .map(|view| view.read(cx).document().clone());
+            .map(|view| {
+                let view = view.read(cx);
+                (view.document().clone(), view.language_server().cloned())
+            });
+        let (existing, language_server) = existing.unzip();
         let document = match existing {
             Some(document) => document,
             None => {
@@ -73,7 +79,16 @@ impl Workspace {
                     .map_err(|err| format!("Cannot open {} as a notebook: {err}", path.display()))?
             }
         };
-        let view = cx.new(|cx| NotebookView::new(document, window, cx));
+        let language_server = language_server.flatten().unwrap_or_else(|| {
+            let store = self.lsp_store.clone();
+            let document = document.clone();
+            cx.new(|cx| NotebookLsp::new(document, store, cx))
+        });
+        let view = cx.new(|cx| {
+            let mut view = NotebookView::new(document, window, cx);
+            view.set_language_server(language_server, cx);
+            view
+        });
         let subscription = cx.subscribe_in(&view, window, Self::on_notebook_event);
         let title = path
             .file_name()
@@ -119,7 +134,57 @@ impl Workspace {
                     }
                 }
             }
+            NotebookViewEvent::Navigate { locations, title } => {
+                self.navigate(locations.clone(), title.clone(), window, cx)
+            }
+            NotebookViewEvent::ApplyEdit {
+                edit,
+                server,
+                command,
+                label,
+            } => self.apply_editor_edit(
+                None,
+                edit.clone(),
+                server.clone(),
+                command.clone(),
+                label,
+                cx,
+            ),
         }
+    }
+
+    /// A language-server location in a notebook's virtual document: opens
+    /// the notebook at that cell. False when `location` is elsewhere.
+    pub(super) fn jump_to_notebook(
+        &mut self,
+        location: &Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(document) = self.lsp_store.read(cx).notebook(&location.path) else {
+            return false;
+        };
+        let (path, target) = {
+            let document = document.borrow();
+            (
+                document.notebook_path().to_path_buf(),
+                document.cell_position(location.range.start),
+            )
+        };
+        match self.open_notebook(&path, None, window, cx) {
+            Ok(view) => {
+                if let Some(target) = target {
+                    view.update(cx, |view, cx| {
+                        view.go_to_cell(target.cell, target.position, window, cx)
+                    });
+                }
+            }
+            Err(err) => {
+                self.notice = Some(err.into());
+                cx.notify();
+            }
+        }
+        true
     }
 
     /// Open as Text (marimo): a text editor replaces the file's notebook

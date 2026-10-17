@@ -1,10 +1,12 @@
 //! Starts, supervises and answers language servers for one project.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs::File,
     io::{LineWriter, Write},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -28,6 +30,7 @@ use text::Encoding;
 
 use crate::{
     editor::semantic,
+    notebook::lsp::{Registered, VirtualDocument},
     project::{Project, Root},
     settings::{self, ServerConfig, Settings},
 };
@@ -171,6 +174,8 @@ pub struct LspStore {
     settings: Arc<Settings>,
     slots: HashMap<SlotKey, Slot>,
     diagnostics: HashMap<PathBuf, Vec<lsp::types::Diagnostic>>,
+    /// Open notebooks' virtual documents by their (virtual) path.
+    notebooks: HashMap<PathBuf, Registered>,
 }
 
 impl EventEmitter<LspStoreEvent> for LspStore {}
@@ -182,6 +187,7 @@ impl LspStore {
             settings,
             slots: HashMap::new(),
             diagnostics: HashMap::new(),
+            notebooks: HashMap::new(),
         }
     }
 
@@ -244,6 +250,21 @@ impl LspStore {
 
     pub fn diagnostics(&self, path: &Path) -> &[lsp::types::Diagnostic] {
         self.diagnostics.get(path).map_or(&[], Vec::as_slice)
+    }
+
+    /// Registers a notebook's virtual document: its diagnostics are
+    /// filtered (see `VirtualDocument::filter_diagnostics`), and workspace
+    /// edits, navigation and Problems map its positions to cells.
+    pub fn register_notebook(&mut self, document: &Rc<RefCell<VirtualDocument>>) {
+        self.notebooks.retain(|_, entry| entry.strong_count() > 0);
+        let path = document.borrow().path().to_path_buf();
+        self.diagnostics.remove(&path);
+        self.notebooks.insert(path, Rc::downgrade(document));
+    }
+
+    /// The open notebook whose virtual document is `path`.
+    pub fn notebook(&self, path: &Path) -> Option<Rc<RefCell<VirtualDocument>>> {
+        self.notebooks.get(path)?.upgrade()
     }
 
     /// Tells every running server about files changed outside the editor.
@@ -339,10 +360,16 @@ impl LspStore {
         .detach();
     }
 
-    /// Every file's diagnostics, in no particular order.
+    /// Every file's diagnostics, in no particular order (closed notebooks'
+    /// left out).
     pub fn all_diagnostics(&self) -> impl Iterator<Item = (&Path, &[lsp::types::Diagnostic])> {
         self.diagnostics
             .iter()
+            .filter(|(path, _)| {
+                self.notebooks
+                    .get(*path)
+                    .is_none_or(|entry| entry.strong_count() > 0)
+            })
             .map(|(path, diagnostics)| (path.as_path(), diagnostics.as_slice()))
     }
 
@@ -684,7 +711,22 @@ impl LspStore {
                         return;
                     };
                     if let Some(path) = uri_to_path(&published.uri) {
-                        self.diagnostics.insert(path.clone(), published.diagnostics);
+                        let diagnostics = match self.notebook(&path) {
+                            Some(notebook) => {
+                                let notebook = notebook.borrow();
+                                // Positions of an older text may now be
+                                // in another cell; the latest text's come.
+                                if published
+                                    .version
+                                    .is_some_and(|version| version != notebook.version())
+                                {
+                                    return;
+                                }
+                                notebook.filter_diagnostics(published.diagnostics)
+                            }
+                            None => published.diagnostics,
+                        };
+                        self.diagnostics.insert(path.clone(), diagnostics);
                         cx.emit(LspStoreEvent::DiagnosticsUpdated(path));
                     }
                 }

@@ -106,8 +106,10 @@ pub fn group_listeners(ports: &[ListeningPort]) -> Vec<Listener> {
     grouped
 }
 
-/// Debug adapters started by the editor listen for their debuggees; those
-/// ports are not the user's applications.
+/// Debug adapters started by the editor listen for their debuggees, and
+/// notebook kernels (their connection file `next_code-kernel-*.json` is on
+/// their command line) for the editor's kernel bridge: those ports are not
+/// the user's applications.
 fn editor_owned(command: Option<&str>) -> bool {
     command.is_some_and(|command| {
         [
@@ -115,6 +117,7 @@ fn editor_owned(command: Option<&str>) -> bool {
             "debugpy/adapter",
             "codelldb",
             "next_code_agent",
+            "next_code-kernel-",
         ]
         .iter()
         .any(|marker| command.contains(marker))
@@ -705,6 +708,13 @@ mod tests {
             socket(ANY4, 9229, Some("node --inspect")),
             socket(ANY4, 6379, Some("redis-server *:6379")),
             socket(ANY4, 5678, Some("python -m debugpy.adapter")),
+            socket(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                41234,
+                Some(
+                    "/p/.venv/bin/python -m ipykernel_launcher -f /tmp/next_code-kernel-ab12.json",
+                ),
+            ),
             socket(ANY4, 3000, Some("node")),
             socket(ANY4, 4000, None),
             socket(ANY4, 5432, None),

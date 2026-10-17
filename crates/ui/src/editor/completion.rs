@@ -6,7 +6,7 @@ use gpui::{
 use language::completion::{self as complete, Candidate};
 use lsp::types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
-    CompletionTriggerKind, Documentation, InsertTextFormat, SymbolKind,
+    CompletionTextEdit, CompletionTriggerKind, Documentation, InsertTextFormat, SymbolKind,
     request::{Completion, ResolveCompletionItem},
 };
 
@@ -15,6 +15,15 @@ use super::*;
 /// Rows visible at once.
 const MAX_ROWS: usize = 10;
 const ROW_HEIGHT: f32 = 22.;
+/// Key in `data` of items from the `CompletionProvider` merged into a
+/// server's list (never resolved by the server; edits already local).
+const KERNEL_ITEM: &str = "nextCodeKernel";
+
+fn is_kernel_item(item: &CompletionItem) -> bool {
+    item.data
+        .as_ref()
+        .is_some_and(|data| data.get(KERNEL_ITEM).is_some())
+}
 
 pub(crate) struct CompletionMenu {
     /// Start of the word being completed; the query runs from here to the cursor.
@@ -88,7 +97,7 @@ impl Editor {
         self.request_completions(None, cx);
     }
 
-    fn request_completions(&mut self, trigger: Option<String>, cx: &mut Context<Self>) {
+    pub(super) fn request_completions(&mut self, trigger: Option<String>, cx: &mut Context<Self>) {
         let Some(server) = self.server() else {
             return self.request_provider_completions(cx);
         };
@@ -115,36 +124,121 @@ impl Editor {
         let generation = self.completion_generation;
         let requested_at = self.primary().head;
         let request = server.connection.request::<Completion>(params);
+        // A notebook kernel's names (runtime attributes) come after the
+        // server's; whichever answers first shows at once.
+        let kernel = self
+            .completion_provider
+            .clone()
+            .map(|provider| provider(self.text(), requested_at, cx));
         self._completion_task = Some(cx.spawn(async move |this, cx| {
-            let response = request.await;
-            this.update(cx, |this, cx| {
-                if this.completion_generation != generation {
-                    return;
+            let kernel = async move {
+                match kernel {
+                    Some(task) => task.await,
+                    None => None,
                 }
-                let (items, incomplete) = match response {
-                    Ok(Some(CompletionResponse::Array(items))) => (items, false),
-                    Ok(Some(CompletionResponse::List(list))) => (list.items, list.is_incomplete),
-                    Ok(None) | Err(_) => return,
-                };
-                let head = this.primary().head;
-                let word_start = complete::word_start(&this.buffer, head);
-                let same_line = this.buffer.line_of(head) == this.buffer.line_of(requested_at);
-                if items.is_empty() || !same_line || head < word_start.min(requested_at) {
-                    return;
+            };
+            let show = |response: Option<&_>, found: Option<&_>, cx: &mut gpui::AsyncApp| {
+                this.update(cx, |this, cx| {
+                    this.show_server_completions(
+                        generation,
+                        requested_at,
+                        &server,
+                        response,
+                        found,
+                        cx,
+                    )
+                })
+                .ok();
+            };
+            match futures::future::select(Box::pin(request), Box::pin(kernel)).await {
+                futures::future::Either::Left((response, kernel)) => {
+                    show(Some(&response), None, cx);
+                    if let Some(found) = kernel.await {
+                        show(Some(&response), Some(&found), cx);
+                    }
                 }
-                this.completion = Some(CompletionMenu {
-                    word_start,
-                    items,
-                    candidates: Vec::new(),
-                    selected: 0,
-                    incomplete,
-                    scroll: UniformListScrollHandle::new(),
-                    server: Some(server),
-                });
-                this.refilter_completions(cx);
-            })
-            .ok();
+                futures::future::Either::Right((found, request)) => {
+                    if let Some(found) = &found {
+                        show(None, Some(found), cx);
+                    }
+                    let response = request.await;
+                    show(Some(&response), found.as_ref(), cx);
+                }
+            }
         }));
+    }
+
+    /// Opens (or replaces) the menu with the server's items and then the
+    /// kernel's names the server did not offer.
+    fn show_server_completions(
+        &mut self,
+        generation: usize,
+        requested_at: usize,
+        server: &Arc<RunningServer>,
+        response: Option<&Result<Option<CompletionResponse>, lsp::Error>>,
+        kernel: Option<&(Vec<String>, Range<usize>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.completion_generation != generation {
+            return;
+        }
+        let (mut items, incomplete) = match response {
+            Some(Ok(Some(CompletionResponse::Array(items)))) => (items.clone(), false),
+            Some(Ok(Some(CompletionResponse::List(list)))) => {
+                (list.items.clone(), list.is_incomplete)
+            }
+            _ => (Vec::new(), false),
+        };
+        let head = self.primary().head;
+        let word_start = complete::word_start(&self.buffer, head);
+        let same_line = self.buffer.line_of(head) == self.buffer.line_of(requested_at);
+        if !same_line || head < word_start.min(requested_at) {
+            return;
+        }
+        if let Some((matches, range)) = kernel {
+            let encoding = server.encoding;
+            for label in matches {
+                let offered = items.iter().any(|item| {
+                    item.label == *label || item.insert_text.as_deref() == Some(label.as_str())
+                });
+                if offered {
+                    continue;
+                }
+                // A name replacing more than the word (`%ti` → `%timeit`).
+                let text_edit = (range.start != word_start
+                    && range.start <= head
+                    && range.end <= self.buffer.len())
+                .then(|| {
+                    CompletionTextEdit::Edit(lsp::types::TextEdit {
+                        range: lsp::types::Range::new(
+                            language::to_position(&self.buffer, range.start, encoding),
+                            language::to_position(&self.buffer, range.end, encoding),
+                        ),
+                        new_text: label.clone(),
+                    })
+                });
+                items.push(CompletionItem {
+                    label: label.clone(),
+                    detail: Some("kernel".into()),
+                    text_edit,
+                    data: Some(serde_json::json!({ KERNEL_ITEM: true })),
+                    ..CompletionItem::default()
+                });
+            }
+        }
+        if items.is_empty() {
+            return;
+        }
+        self.completion = Some(CompletionMenu {
+            word_start,
+            items,
+            candidates: Vec::new(),
+            selected: 0,
+            incomplete,
+            scroll: UniformListScrollHandle::new(),
+            server: Some(server.clone()),
+        });
+        self.refilter_completions(cx);
     }
 
     /// Asks the `CompletionProvider` (no language server) at the primary
@@ -237,6 +331,9 @@ impl Editor {
             .buffer
             .slice(menu.word_start..self.selections.primary().head);
         menu.candidates = complete::filter(&menu.items, &query);
+        // The server's items first, then the kernel's.
+        menu.candidates
+            .sort_by_key(|candidate| is_kernel_item(&menu.items[candidate.index]));
         // Nothing left, or the only match is exactly what was typed.
         let exhausted = menu.candidates.is_empty()
             || (menu.candidates.len() == 1 && menu.items[menu.candidates[0].index].label == query);
@@ -304,7 +401,10 @@ impl Editor {
             return;
         };
         let item = &menu.items[candidate.index];
-        let Some(server) = menu.resolver().filter(|_| item.documentation.is_none()) else {
+        let Some(server) = menu
+            .resolver()
+            .filter(|_| item.documentation.is_none() && !is_kernel_item(item))
+        else {
             self._resolve_task = None;
             return;
         };
@@ -362,7 +462,7 @@ impl Editor {
             .map_or(Encoding::Utf8, |server| server.encoding);
         let Some(server) = menu
             .resolver()
-            .filter(|_| item.additional_text_edits.is_none())
+            .filter(|_| item.additional_text_edits.is_none() && !is_kernel_item(&item))
         else {
             return self.apply_completion(&item, word_start, encoding, cx);
         };
@@ -390,7 +490,12 @@ impl Editor {
         if head < word_start || self.buffer.line_of(head) != self.buffer.line_of(word_start) {
             return;
         }
-        let accepted = complete::accept(&self.buffer, item, word_start, head, encoding);
+        // A cell's server items are in its notebook's document.
+        let mut item = item.clone();
+        if !is_kernel_item(&item) {
+            self.localize_completion(&mut item);
+        }
+        let accepted = complete::accept(&self.buffer, &item, word_start, head, encoding);
         // Accepted at the primary cursor; other cursors keep their text.
         let mut edits = accepted.edits;
         let mut cursor = accepted.cursor;

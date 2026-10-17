@@ -37,10 +37,16 @@ impl OpenEditors<'_, '_> {
 
 impl Documents for OpenEditors<'_, '_> {
     fn version(&mut self, path: &Path) -> Option<i32> {
+        if let Some(notebook) = self.workspace.lsp_store.read(self.cx).notebook(path) {
+            return Some(notebook.borrow().version());
+        }
         self.editor(path)?.read(self.cx).server_version()
     }
 
     fn text(&mut self, path: &Path) -> Option<String> {
+        if let Some(notebook) = self.workspace.lsp_store.read(self.cx).notebook(path) {
+            return Some(notebook.borrow().text());
+        }
         Some(self.editor(path)?.read(self.cx).text())
     }
 
@@ -50,6 +56,10 @@ impl Documents for OpenEditors<'_, '_> {
         edits: &[lsp::types::TextEdit],
         encoding: Encoding,
     ) -> Option<Result<(), String>> {
+        // A notebook's virtual document: the edits go to its cells.
+        if let Some(notebook) = self.workspace.lsp_store.read(self.cx).notebook(path) {
+            return Some(notebook.borrow().apply_edits(edits, encoding, self.cx));
+        }
         let editor = self.editor(path)?;
         Some(editor.update(self.cx, |editor, cx| {
             editor.apply_server_edits(edits, encoding, cx)
@@ -170,12 +180,13 @@ impl Workspace {
         workspace_edit::apply(&project, &operations, encoding, &mut documents)
     }
 
-    /// An editor's rename or code action: applies the edit, reports it in
-    /// that editor's status bar (failures above the panes, like other
-    /// errors), then runs the action's command.
+    /// An editor's rename or code action (`editor`: `None` for a notebook
+    /// cell's): applies the edit, reports it in that editor's status bar
+    /// (failures above the panes, like other errors), then runs the
+    /// action's command.
     pub(super) fn apply_editor_edit(
         &mut self,
-        editor: &Entity<Editor>,
+        editor: Option<&Entity<Editor>>,
         edit: WorkspaceEdit,
         server: Arc<RunningServer>,
         command: Option<Command>,
@@ -187,7 +198,7 @@ impl Workspace {
         if report.failure.is_some() {
             self.notice = Some(summary.into());
             cx.notify();
-        } else {
+        } else if let Some(editor) = editor {
             editor.update(cx, |editor, cx| editor.show_notice(summary, cx));
         }
         let Some(command) = command.filter(|_| report.failure.is_none()) else {

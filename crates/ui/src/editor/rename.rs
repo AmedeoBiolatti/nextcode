@@ -91,17 +91,14 @@ impl Editor {
                 let encoding = server.encoding;
                 let (range, placeholder) = match result {
                     Ok(Some(PrepareRenameResponse::Range(range))) => {
-                        (language::to_range(&this.buffer, range, encoding), None)
+                        (this.local_range(range, encoding), None)
                     }
                     Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
                         range,
                         placeholder,
-                    })) => (
-                        language::to_range(&this.buffer, range, encoding),
-                        Some(placeholder),
-                    ),
+                    })) => (this.local_range(range, encoding), Some(placeholder)),
                     Ok(Some(PrepareRenameResponse::DefaultBehavior { .. })) => match identifier {
-                        Some(range) => (range, None),
+                        Some(range) => (Some(range), None),
                         None => {
                             this.notice = Some("Nothing to rename here".into());
                             return cx.notify();
@@ -118,6 +115,10 @@ impl Editor {
                         });
                         return cx.notify();
                     }
+                };
+                let Some(range) = range else {
+                    this.notice = Some("This element cannot be renamed".into());
+                    return cx.notify();
                 };
                 this.open_rename(range, placeholder, position, server, window, cx);
             })

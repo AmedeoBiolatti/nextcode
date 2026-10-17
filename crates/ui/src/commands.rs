@@ -125,7 +125,10 @@ const LABELS: &[(&str, &str)] = &[
     ("notebook::MoveCellsUp", "Move Cells Up"),
     ("notebook::MoveCellsDown", "Move Cells Down"),
     ("notebook::ToggleOutputs", "Collapse/Expand Outputs"),
+    ("notebook::ToggleSource", "Collapse/Expand Cell Source"),
     ("notebook::ShowHelp", "Show Kernel Help at Cursor"),
+    ("notebook::FormatCell", "Format Cell"),
+    ("notebook::FormatNotebook", "Format Notebook"),
     (
         "notebook::ChooseInterpreter",
         "Choose Notebook Interpreter…",

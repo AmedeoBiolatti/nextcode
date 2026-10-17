@@ -73,13 +73,14 @@ fn serves_symbols(server: &RunningServer) -> bool {
 
 impl Editor {
     /// Asks the server for this document's symbols after `delay`, replacing
-    /// any pending request.
+    /// any pending request (not for a notebook cell: its document is the
+    /// whole notebook).
     fn request_symbols(&mut self, delay: Duration, cx: &mut Context<Self>) {
         self.symbols.task = None;
         let Some(doc) = &self.lsp else {
             return;
         };
-        if !serves_symbols(&doc.server) {
+        if !serves_symbols(&doc.server) || doc.cell.is_some() {
             return;
         }
         let server = doc.server.clone();

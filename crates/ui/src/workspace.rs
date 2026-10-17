@@ -1274,7 +1274,7 @@ impl Workspace {
                         command,
                         label,
                     } => this.apply_editor_edit(
-                        editor,
+                        Some(editor),
                         edit.clone(),
                         server.clone(),
                         command.clone(),
@@ -1418,7 +1418,28 @@ impl Workspace {
             self.jump_to(location, window, cx);
             return;
         }
-        let picker = cx.new(|cx| LocationPicker::new(title, locations, &self.project, cx));
+        // Locations in a notebook's virtual document read as its cells.
+        let store = self.lsp_store.read(cx);
+        let labels: Vec<Option<(String, String)>> = locations
+            .iter()
+            .map(|location| {
+                let notebook = store.notebook(&location.path)?;
+                let notebook = notebook.borrow();
+                let target = notebook.cell_position(location.range.start)?;
+                let name = notebook.notebook_path().file_name()?.to_string_lossy();
+                let preview = notebook.line_text(location.range.start.line);
+                Some((
+                    format!(
+                        "{name} [cell {}]:{}",
+                        target.number,
+                        target.position.line + 1
+                    ),
+                    preview.unwrap_or_default().trim().to_owned(),
+                ))
+            })
+            .collect();
+        let picker =
+            cx.new(|cx| LocationPicker::with_labels(title, locations, labels, &self.project, cx));
         let subscription =
             cx.subscribe_in(&picker, window, |this, _, event, window, cx| match event {
                 LocationPickerEvent::Open(location) => {
@@ -1438,6 +1459,9 @@ impl Workspace {
     fn jump_to(&mut self, location: &Location, window: &mut Window, cx: &mut Context<Self>) {
         self.record_position(cx);
         self.forward.clear();
+        if self.jump_to_notebook(location, window, cx) {
+            return;
+        }
         if let Some(editor) = self.open_editor(&location.path, window, cx) {
             editor.update(cx, |editor, cx| editor.go_to(location.range.start, cx));
         }

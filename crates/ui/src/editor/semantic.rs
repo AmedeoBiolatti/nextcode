@@ -353,13 +353,14 @@ impl SemanticState {
 impl Editor {
     /// Asks the server for this document's tokens after `delay`, replacing
     /// any pending request. No-op unless enabled and the server serves
-    /// full-document tokens.
+    /// full-document tokens; a notebook cell gets its tokens from the
+    /// notebook (`set_cell_semantic_tokens`).
     fn request_semantic_tokens(&mut self, delay: Duration, cx: &mut Context<Self>) {
         self.semantic.task = None;
         let Some(doc) = &self.lsp else {
             return;
         };
-        if !self.semantic.enabled || doc.server.semantic_legend.is_none() {
+        if !self.semantic.enabled || doc.server.semantic_legend.is_none() || doc.cell.is_some() {
             return;
         }
         let server = doc.server.clone();

@@ -18,9 +18,14 @@
 //! - `status` `{state, request?}`: `starting`, `idle`, `busy`,
 //!   `restarting`, `dead`; `request` is the request the kernel is busy/idle
 //!   for when known.
-//! - `output` `{request?, msg_type, content}`: iopub `stream`,
+//! - `output` `{request?, parent?, msg_type, content}`: iopub `stream`,
 //!   `display_data`, `execute_result`, `error`, `clear_output`,
-//!   `update_display_data` with the kernel's `content` unchanged.
+//!   `update_display_data` with the kernel's `content` unchanged; `parent`
+//!   is the iopub message's parent `msg_id` (ipywidgets' Output widget
+//!   captures the outputs of its `msg_id`).
+//! - `comm` `{request?, parent?, msg_type, content, buffers}`: iopub
+//!   `comm_open`, `comm_msg`, `comm_close` (ipywidgets) in order with the
+//!   outputs; `buffers` are the binary parts in base64.
 //! - `execute_input` `{request, execution_count}`.
 //! - `dead` `{message}`: the kernel process exited unexpectedly.
 //! - `log` `{message}`: bridge diagnostics.
@@ -76,6 +81,10 @@ pub enum Op {
         #[serde(skip_serializing_if = "Option::is_none")]
         marimo: Option<MarimoRun>,
     },
+    /// Sets a marimo UI element's value (its front-end form, as marimo's
+    /// front end sends it) in the kernel. Reply: `{names: [...]}`, the
+    /// globals bound to the element (cells using them re-run).
+    MarimoSetUi { object_id: String, value: Value },
     /// Reply: `null` once the interrupt was sent.
     Interrupt,
     /// Reply: the new kernel's `kernel_info_reply` content.
@@ -97,6 +106,17 @@ pub enum Op {
     /// Reply: `{name: {display_name, language, argv}}` from
     /// `jupyter_client`'s `KernelSpecManager`.
     KernelSpecs,
+    /// A shell `comm_msg` (`content: {comm_id, data}`, `buffers` base64)
+    /// whose header `msg_id` is `msg_id` (the kernel's echo and the
+    /// outputs it causes carry it as their parent). Reply: `null` once
+    /// sent.
+    CommMsg {
+        comm_id: String,
+        data: Value,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        buffers: Vec<String>,
+        msg_id: String,
+    },
 }
 
 /// How a marimo cell runs: its body in a namespace holding `refs` (taken
@@ -148,8 +168,20 @@ pub enum Event {
     Output {
         #[serde(default)]
         request: Option<u64>,
+        #[serde(default)]
+        parent: Option<String>,
         msg_type: String,
         content: Value,
+    },
+    Comm {
+        #[serde(default)]
+        request: Option<u64>,
+        #[serde(default)]
+        parent: Option<String>,
+        msg_type: String,
+        content: Value,
+        #[serde(default)]
+        buffers: Vec<String>,
     },
     ExecuteInput {
         request: u64,

@@ -260,16 +260,25 @@ pub enum Rich<'a> {
     Jpeg(&'a str),
     Svg(&'a str),
     Markdown(&'a str),
-    /// `text/html` (not rendered): the `text/plain` fallback, if any, is
-    /// shown with an "Open in browser" action.
+    /// `text/html`: rendered natively when it fits the safe subset
+    /// (`crate::html`), else the `text/plain` fallback, if any, with an
+    /// "Open in browser" action.
     Html {
         html: &'a str,
         plain: Option<&'a str>,
     },
     Latex(&'a str),
     Json(&'a Value),
-    /// ipywidgets: the text fallback and a note.
+    /// An ipywidgets view of model `model_id` (see `crate::widgets`), with
+    /// the text fallback.
     Widget {
+        model_id: Option<&'a str>,
+        plain: Option<&'a str>,
+    },
+    /// marimo UI elements with the Markdown/text around them
+    /// ([`MARIMO_UI_MIME`] parts), with the text fallback.
+    MarimoUi {
+        parts: &'a [Value],
         plain: Option<&'a str>,
     },
     Plain(&'a str),
@@ -278,15 +287,60 @@ pub enum Rich<'a> {
 }
 
 pub const WIDGET_MIME: &str = "application/vnd.jupyter.widget-view+json";
+/// marimo UI elements of a marimo cell's output (the bridge's helper):
+/// `{parts: [{markdown} | {text} | {element: {id, kind, label, value,
+/// args}}]}`.
+pub const MARIMO_UI_MIME: &str = "application/vnd.nextcode.marimo-ui+json";
 
-/// Order: widget view, `image/png`, `image/jpeg`, `image/svg+xml`,
-/// `text/markdown`, `text/html`, `text/latex`, `application/json`,
-/// `text/plain`.
+/// The parts of a bundle's marimo UI view ([`MARIMO_UI_MIME`]), if any.
+pub fn marimo_ui_parts(data: &MimeBundle) -> Option<&[Value]> {
+    data.get(MARIMO_UI_MIME)?
+        .get("parts")?
+        .as_array()
+        .map(Vec::as_slice)
+}
+
+/// Sets the value of element `object_id` in `output`'s marimo UI view (the
+/// element shows it after a change); whether it was there with another
+/// value.
+pub fn set_marimo_ui_value(output: &mut Output, object_id: &str, value: &Value) -> bool {
+    let (Output::DisplayData { data, .. } | Output::ExecuteResult { data, .. }) = output else {
+        return false;
+    };
+    let Some(parts) = data
+        .get_mut(MARIMO_UI_MIME)
+        .and_then(|ui| ui.get_mut("parts"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for part in parts {
+        if let Some(element) = part.get_mut("element")
+            && element.get("id").and_then(Value::as_str) == Some(object_id)
+            && element.get("value") != Some(value)
+        {
+            element["value"] = value.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Order: marimo UI view, widget view, `image/png`, `image/jpeg`,
+/// `image/svg+xml`, `text/markdown`, `text/html`, `text/latex`,
+/// `application/json`, `text/plain`.
 pub fn richest(data: &MimeBundle) -> Rich<'_> {
     let text = |mime: &str| data.get(mime).and_then(Value::as_str);
     let plain = text("text/plain");
-    if data.contains_key(WIDGET_MIME) {
-        return Rich::Widget { plain };
+    if let Some(parts) = marimo_ui_parts(data) {
+        return Rich::MarimoUi { parts, plain };
+    }
+    if let Some(view) = data.get(WIDGET_MIME) {
+        return Rich::Widget {
+            model_id: view.get("model_id").and_then(Value::as_str),
+            plain,
+        };
     }
     if let Some(png) = text("image/png") {
         return Rich::Png(png);
@@ -573,6 +627,7 @@ mod tests {
         assert_eq!(
             richest(&b),
             Rich::Widget {
+                model_id: Some("abc"),
                 plain: Some("IntSlider(value=0)")
             }
         );

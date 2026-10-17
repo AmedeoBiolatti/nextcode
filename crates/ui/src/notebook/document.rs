@@ -28,6 +28,7 @@ use notebook::{
     Cell, CellKind, Format, Kind, MarimoCell, Notebook, Output, ansi, ipynb, marimo,
     outputs::{self, Applied, OutputState},
     protocol::{self, Event, KernelState, MarimoRun, Op},
+    widgets::{self, CommMessage, WidgetStore},
 };
 use serde_json::Value;
 
@@ -191,6 +192,8 @@ pub struct NotebookDocument {
     run_serial: u64,
     finished: HashMap<CellId, u64>,
     idle_waiters: Vec<oneshot::Sender<()>>,
+    /// ipywidgets models of the kernel (or saved in the file).
+    widgets: WidgetStore,
 }
 
 impl EventEmitter<NotebookEvent> for NotebookDocument {}
@@ -267,7 +270,9 @@ impl NotebookDocument {
             run_serial: 0,
             finished: HashMap::new(),
             idle_waiters: Vec::new(),
+            widgets: WidgetStore::new(),
         };
+        this.load_widget_state();
         this.cells = cells.into_iter().map(|cell| this.doc_cell(cell)).collect();
         this.ensure_a_cell();
         this.refresh_graph();
@@ -284,6 +289,20 @@ impl NotebookDocument {
 
     pub fn is_marimo(&self) -> bool {
         matches!(self.format, Format::Marimo(_))
+    }
+
+    /// The language the notebook names: Jupyter's kernelspec (or
+    /// `language_info`) language, Python for marimo; `None` when unnamed.
+    pub fn language(&self) -> Option<&str> {
+        match &self.format {
+            Format::Ipynb(info) => info
+                .metadata
+                .get("kernelspec")
+                .and_then(|spec| spec.get("language"))
+                .or_else(|| info.metadata.get("language_info")?.get("name"))
+                .and_then(Value::as_str),
+            Format::Marimo(_) => Some("python"),
+        }
     }
 
     pub fn cells(&self) -> &[DocCell] {
@@ -598,6 +617,128 @@ impl NotebookDocument {
         }
     }
 
+    /// Collapses or expands a cell's outputs. An `.ipynb` saves it
+    /// (`metadata.jupyter.outputs_hidden` and `collapsed`, see
+    /// [`Cell::set_outputs_hidden`]); a marimo file has no place for it, so
+    /// there it lasts while the notebook is open (and across reloads).
+    pub fn set_outputs_hidden(&mut self, id: CellId, hidden: bool, cx: &mut Context<Self>) {
+        self.set_hidden(id, cx, |cell| cell.set_outputs_hidden(hidden));
+    }
+
+    /// Collapses or expands a cell's source (`metadata.jupyter.
+    /// source_hidden`; in memory only for marimo, like outputs).
+    pub fn set_source_hidden(&mut self, id: CellId, hidden: bool, cx: &mut Context<Self>) {
+        self.set_hidden(id, cx, |cell| cell.set_source_hidden(hidden));
+    }
+
+    fn set_hidden(&mut self, id: CellId, cx: &mut Context<Self>, change: impl FnOnce(&mut Cell)) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let cell = &mut self.cells[index].cell;
+        let before = (cell.outputs_hidden(), cell.source_hidden());
+        change(cell);
+        if (cell.outputs_hidden(), cell.source_hidden()) == before {
+            return;
+        }
+        if !self.is_marimo() {
+            self.touch(cx);
+        }
+        cx.emit(NotebookEvent::Outputs(id));
+        cx.notify();
+    }
+
+    /// marimo: sets UI element `object_id` (shown in cell `cell`'s output)
+    /// to `value`, in the form marimo's front end sends, as marimo does:
+    /// the kernel converts it (`UIElement._update`, `on_change`), then the
+    /// cells that use a global bound to the element run (with their
+    /// descendants; not the cell defining it). Resolves once they are
+    /// queued.
+    pub fn set_ui_value(
+        &mut self,
+        cell: CellId,
+        object_id: &str,
+        value: Value,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        self.show_ui_value(cell, object_id, value.clone(), cx);
+        let Some(kernel) = self.ready_kernel() else {
+            return Task::ready(Err("the kernel is not running".into()));
+        };
+        let (_, reply) = kernel.request(Op::MarimoSetUi {
+            object_id: object_id.to_owned(),
+            value,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = reply.await.unwrap_or_else(|_| Err(bridge_ended()))?;
+            let names: HashSet<&str> = result["names"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            this.update(cx, |this, cx| {
+                let users: Vec<CellId> = this
+                    .cells
+                    .iter()
+                    .filter(|cell| {
+                        cell.analysis.as_ref().is_some_and(|analysis| {
+                            analysis
+                                .refs
+                                .iter()
+                                .any(|name| names.contains(name.as_str()))
+                        })
+                    })
+                    .map(|cell| cell.id)
+                    .collect();
+                if !users.is_empty() {
+                    this.run(&users, cx);
+                }
+            })
+            .map_err(|err| err.to_string())
+        })
+    }
+
+    /// marimo: shows `value` in element `object_id` of cell `cell`'s output
+    /// without telling the kernel (a slider being dragged).
+    pub fn show_ui_value(
+        &mut self,
+        cell: CellId,
+        object_id: &str,
+        value: Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.index_of(cell) else {
+            return;
+        };
+        let mut changed = false;
+        for output in &mut self.cells[index].cell.outputs {
+            changed |= outputs::set_marimo_ui_value(output, object_id, &value);
+        }
+        if changed {
+            cx.emit(NotebookEvent::Outputs(cell));
+            cx.notify();
+        }
+    }
+
+    /// marimo: the value element `object_id` of cell `cell`'s output shows.
+    pub fn ui_value(&self, cell: CellId, object_id: &str) -> Option<Value> {
+        self.cell(cell)?
+            .cell
+            .outputs
+            .iter()
+            .find_map(|output| match output {
+                Output::DisplayData { data, .. } | Output::ExecuteResult { data, .. } => {
+                    outputs::marimo_ui_parts(data)?
+                        .iter()
+                        .filter_map(|part| part.get("element"))
+                        .find(|element| element["id"].as_str() == Some(object_id))
+                        .map(|element| element["value"].clone())
+                }
+                _ => None,
+            })
+    }
+
     /// Queues code cells to run (starting the kernel if needed). marimo:
     /// also their stale/never-run ancestors and their descendants, in
     /// dependency order; cells in error get the error as output.
@@ -675,6 +816,7 @@ impl NotebookDocument {
             return;
         };
         let (_, reply) = kernel.request(Op::Restart);
+        self.widgets.kernel_gone();
         let generation = self.generation;
         self.abort_running(None, cx);
         self.clear_queue(cx);
@@ -724,6 +866,72 @@ impl NotebookDocument {
                 cx.background_spawn(async move { kernel.shutdown_blocking(SHUTDOWN_TIMEOUT) })
             }
             None => Task::ready(()),
+        }
+    }
+
+    /// The ipywidgets models outputs show.
+    pub fn widgets(&self) -> &WidgetStore {
+        &self.widgets
+    }
+
+    /// Sets `key` of widget `model` (a control was used); the kernel hears
+    /// of it when `send` (drags send now and then, and at their end).
+    pub fn widget_update(
+        &mut self,
+        model: &str,
+        key: &str,
+        value: Value,
+        send: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let version = self.widgets.version();
+        let message = self.widgets.update(model, key, value, send);
+        self.send_comm(message);
+        if self.widgets.version() != version {
+            self.widgets_changed(cx);
+        }
+    }
+
+    /// A `custom` message to widget `model` (a Button's click).
+    pub fn widget_custom(&mut self, model: &str, content: Value) {
+        let message = self.widgets.custom(model, content);
+        self.send_comm(message);
+    }
+
+    fn send_comm(&self, message: Option<CommMessage>) {
+        if let (Some(message), Some(kernel)) = (message, self.ready_kernel()) {
+            drop(kernel.request(Op::CommMsg {
+                comm_id: message.comm_id,
+                data: message.data,
+                buffers: message.buffers,
+                msg_id: message.msg_id,
+            }));
+        }
+    }
+
+    /// Cells showing widgets redraw (and re-measure).
+    fn widgets_changed(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<CellId> = self
+            .cells
+            .iter()
+            .filter(|cell| {
+                cell.cell
+                    .outputs
+                    .iter()
+                    .any(|output| widgets::view_model_id(output).is_some())
+            })
+            .map(|cell| cell.id)
+            .collect();
+        for id in ids {
+            cx.emit(NotebookEvent::Outputs(id));
+        }
+        cx.notify();
+    }
+
+    /// The widget state saved in an `.ipynb` file's metadata.
+    fn load_widget_state(&mut self) {
+        if let Format::Ipynb(info) = &self.format {
+            self.widgets.load_metadata(info.metadata.get("widgets"));
         }
     }
 
@@ -847,6 +1055,23 @@ impl NotebookDocument {
 
     /// Writes the file in its format (blocks on the project write).
     pub fn save(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        // Widget state goes where Jupyter keeps it, once widgets were used.
+        if self.widgets.touched()
+            && let Format::Ipynb(info) = &mut self.format
+        {
+            let roots = self
+                .cells
+                .iter()
+                .flat_map(|cell| cell.cell.outputs.iter().filter_map(widgets::view_model_id));
+            match self.widgets.to_metadata(roots) {
+                Some(state) => {
+                    info.metadata.insert("widgets".into(), state);
+                }
+                None => {
+                    info.metadata.remove("widgets");
+                }
+            }
+        }
         let text = match &self.format {
             Format::Ipynb(info) => {
                 let cells: Vec<Cell> = self.cells.iter().map(|cell| cell.cell.clone()).collect();
@@ -881,43 +1106,59 @@ impl NotebookDocument {
         text != self.disk_text
     }
 
-    /// Replaces the cells with `text` (outputs of unchanged code cells are
-    /// kept for marimo, which saves none).
+    /// Replaces the cells with `text`. Cells are matched to the open ones
+    /// (see [`match_reloaded`]); matched cells keep their id (views keep
+    /// their editors), run state and, for marimo (which saves no outputs),
+    /// their outputs and collapsed state. In a marimo notebook a matched
+    /// cell whose code changed is stale, like after a local edit, and so
+    /// are the descendants of changed and new cells that ran. A Jupyter
+    /// cell keeps its outputs when its code is unchanged and the file has
+    /// none for it (a tool that strips outputs or rewrites only sources).
     pub fn reload(&mut self, text: &str, cx: &mut Context<Self>) -> Result<(), String> {
         let Notebook { cells, format } = Self::parse(&self.path, text)?;
         let marimo = matches!(format, Format::Marimo(_));
-        // Unchanged cells keep their id (views keep their editors) and run
-        // state; marimo ones also their outputs.
-        let mut previous: HashMap<(CellKind, String), VecDeque<DocCell>> = HashMap::new();
-        for cell in std::mem::take(&mut self.cells) {
-            previous
-                .entry((cell.cell.kind, cell.cell.source.clone()))
-                .or_default()
-                .push_back(cell);
-        }
+        let matched = match_reloaded(&self.cells, &cells);
+        let mut previous: Vec<Option<DocCell>> = std::mem::take(&mut self.cells)
+            .into_iter()
+            .map(Some)
+            .collect();
         self.format = format;
+        self.load_widget_state();
         let mut reloaded = Vec::with_capacity(cells.len());
-        for mut cell in cells {
-            let old = previous
-                .get_mut(&(cell.kind, cell.source.clone()))
-                .and_then(VecDeque::pop_front);
-            match old {
-                Some(old) => {
-                    if marimo {
-                        cell.outputs = old.cell.outputs;
-                        cell.execution_count = old.cell.execution_count;
-                    }
-                    reloaded.push(DocCell {
-                        id: old.id,
-                        analysis: self.analysis_of(&cell),
-                        cell,
-                        run: old.run,
-                        error: None,
-                        stale: old.stale,
-                    });
-                }
-                None => reloaded.push(self.doc_cell(cell)),
+        // Indices (in `reloaded`) of cells whose code changed or that are new.
+        let mut changed = Vec::new();
+        for (mut cell, old) in cells.into_iter().zip(matched) {
+            let Some(old) = old.and_then(|index| previous[index].take()) else {
+                changed.push(reloaded.len());
+                reloaded.push(self.doc_cell(cell));
+                continue;
+            };
+            let same = old.cell.source == cell.source;
+            let ran = self.ran.contains(&old.id) || matches!(old.run, RunState::Finished { .. });
+            let keep_outputs = if marimo {
+                true
+            } else {
+                same && cell.outputs.is_empty() && cell.execution_count.is_none()
+            };
+            if marimo {
+                cell.set_outputs_hidden(old.cell.outputs_hidden());
+                cell.set_source_hidden(old.cell.source_hidden());
             }
+            if keep_outputs {
+                cell.outputs = old.cell.outputs;
+                cell.execution_count = old.cell.execution_count;
+            }
+            if !same {
+                changed.push(reloaded.len());
+            }
+            reloaded.push(DocCell {
+                id: old.id,
+                analysis: self.analysis_of(&cell),
+                cell,
+                run: old.run,
+                error: None,
+                stale: marimo && (old.stale || (!same && ran)),
+            });
         }
         self.cells = reloaded;
         self.ensure_a_cell();
@@ -926,6 +1167,14 @@ impl NotebookDocument {
         self.undo.clear();
         self.redo.clear();
         self.refresh_graph();
+        if marimo {
+            for index in self.graph.run_order(&changed) {
+                let cell = &mut self.cells[index];
+                if self.ran.contains(&cell.id) || matches!(cell.run, RunState::Finished { .. }) {
+                    cell.stale = true;
+                }
+            }
+        }
         self.disk_text = text.to_owned();
         let was_dirty = self.is_dirty();
         self.version += 1;
@@ -1445,6 +1694,7 @@ impl NotebookDocument {
             task.detach();
         }
         self.replies = None;
+        self.widgets.kernel_gone();
         self.kernel.take()
     }
 
@@ -1486,9 +1736,24 @@ impl NotebookDocument {
             },
             Event::Output {
                 request,
+                parent,
                 msg_type,
                 content,
-            } => self.on_output(request, &msg_type, &content, cx),
+            } => self.on_output(request, parent.as_deref(), &msg_type, &content, cx),
+            Event::Comm {
+                parent,
+                msg_type,
+                content,
+                buffers,
+                ..
+            } => {
+                if self
+                    .widgets
+                    .apply(&msg_type, &content, &buffers, parent.as_deref())
+                {
+                    self.widgets_changed(cx);
+                }
+            }
             Event::ExecuteInput {
                 request,
                 execution_count,
@@ -1509,13 +1774,25 @@ impl NotebookDocument {
     fn on_output(
         &mut self,
         request: Option<u64>,
+        parent: Option<&str>,
         msg_type: &str,
         content: &Value,
         cx: &mut Context<Self>,
     ) {
+        // ipywidgets' Output widget captures the outputs of its `msg_id`.
+        if let Some(model) = parent.and_then(|parent| self.widgets.capturing(parent)) {
+            let model = model.to_owned();
+            if self.widgets.capture(&model, msg_type, content) {
+                self.widgets_changed(cx);
+            }
+            return;
+        }
+        // Outputs of widget callbacks (our comm messages) belong to no cell.
+        let callback = parent.is_some_and(|parent| self.widgets.is_own(parent));
         let target = self
             .running
             .as_ref()
+            .filter(|_| !callback)
             .filter(|running| request.is_none_or(|request| request == running.request))
             .and_then(|running| Some((running.cell, self.index_of(running.cell)?)));
         let applied = match (target, self.running.as_mut()) {
@@ -1746,6 +2023,75 @@ fn without_outputs(cell: &Cell) -> Cell {
     }
 }
 
+/// For each cell of a reloaded file, the open cell (index in `old`) it
+/// continues: first one of the same kind and text (in order), then a
+/// marimo cell with the same name, then by position: the first unmatched
+/// open cell of the same kind between the open cells its neighbours
+/// matched (a cell edited in place). Unmatched: a new cell.
+fn match_reloaded(old: &[DocCell], new: &[Cell]) -> Vec<Option<usize>> {
+    let mut matched = vec![None; new.len()];
+    let mut taken = vec![false; old.len()];
+    let mut by_text: HashMap<(CellKind, &str), VecDeque<usize>> = HashMap::new();
+    for (index, cell) in old.iter().enumerate() {
+        by_text
+            .entry((cell.cell.kind, cell.cell.source.as_str()))
+            .or_default()
+            .push_back(index);
+    }
+    for (slot, cell) in matched.iter_mut().zip(new) {
+        if let Some(index) = by_text
+            .get_mut(&(cell.kind, cell.source.as_str()))
+            .and_then(VecDeque::pop_front)
+        {
+            *slot = Some(index);
+            taken[index] = true;
+        }
+    }
+    fn name(cell: &Cell) -> Option<&str> {
+        cell.marimo
+            .as_ref()
+            .map(|marimo| marimo.name.as_str())
+            .filter(|name| !name.is_empty() && *name != "_")
+    }
+    for (slot, cell) in matched.iter_mut().zip(new) {
+        let Some(wanted) = name(cell).filter(|_| slot.is_none()) else {
+            continue;
+        };
+        if let Some(index) = (0..old.len()).find(|&index| {
+            !taken[index]
+                && old[index].cell.kind == cell.kind
+                && name(&old[index].cell) == Some(wanted)
+        }) {
+            *slot = Some(index);
+            taken[index] = true;
+        }
+    }
+    // The open cell matched by the next matched reloaded cell.
+    let mut next_anchor = vec![old.len(); new.len()];
+    let mut anchor = old.len();
+    for index in (0..new.len()).rev() {
+        next_anchor[index] = anchor;
+        if let Some(matched) = matched[index] {
+            anchor = matched;
+        }
+    }
+    let mut low = 0;
+    for (index, cell) in new.iter().enumerate() {
+        if let Some(matched) = matched[index] {
+            low = matched + 1;
+            continue;
+        }
+        let found = (low..next_anchor[index])
+            .find(|&candidate| !taken[candidate] && old[candidate].cell.kind == cell.kind);
+        if let Some(found) = found {
+            matched[index] = Some(found);
+            taken[found] = true;
+            low = found + 1;
+        }
+    }
+    matched
+}
+
 /// `text` without its leading whitespace-only lines.
 fn without_leading_blank_lines(mut text: &str) -> &str {
     while let Some(end) = text.find('\n') {
@@ -1793,6 +2139,7 @@ mod tests {
         );
         let mut count = 0;
         let mut sleeping: Option<(Value, u64)> = None;
+        let mut clicks = 0;
         for line in lines.map_while(Result::ok) {
             let request: Value = serde_json::from_str(&line).unwrap();
             let id = request["id"].clone();
@@ -1814,6 +2161,14 @@ mod tests {
                         sleeping = Some((id, count));
                         continue;
                     }
+                    if code == "interact" {
+                        fake_interact(&mut send, &id);
+                        send(
+                            json!({ "reply": id, "ok": true, "result": { "status": "ok", "execution_count": count } }),
+                        );
+                        send(json!({ "event": "status", "state": "idle", "request": id }));
+                        continue;
+                    }
                     let status = if code == "raise" {
                         send(output(
                             "error",
@@ -1831,6 +2186,10 @@ mod tests {
                         json!({ "reply": id, "ok": true, "result": { "status": status, "execution_count": count } }),
                     );
                     send(json!({ "event": "status", "state": "idle", "request": id }));
+                }
+                "comm_msg" => {
+                    send(json!({ "reply": id, "ok": true, "result": null }));
+                    clicks += fake_comm_msg(&mut send, &request, clicks);
                 }
                 "interrupt" => {
                     send(json!({ "reply": id, "ok": true, "result": null }));
@@ -1854,6 +2213,106 @@ mod tests {
                 }
                 _ => send(json!({ "reply": id, "ok": true, "result": {} })),
             }
+        }
+    }
+
+    /// What `interact(f, x=10)` beside a button and a label sends, in
+    /// ipywidgets' order: the comms open, the first call's output is
+    /// captured by the Output widget, then the box's view is displayed.
+    fn fake_interact(send: &mut impl FnMut(Value), request: &Value) {
+        let parent = format!("exec-{request}");
+        let open = |id: &str, name: &str, mut state: Value| {
+            state["_model_name"] = name.into();
+            state["_model_module"] = "@jupyter-widgets/controls".into();
+            state["_model_module_version"] = "2.0.0".into();
+            json!({
+                "event": "comm", "request": request, "parent": parent, "msg_type": "comm_open",
+                "content": {"comm_id": id, "target_name": "jupyter.widget",
+                            "data": {"state": state, "buffer_paths": []}},
+            })
+        };
+        send(open(
+            "slider",
+            "IntSliderModel",
+            json!({"value": 10, "min": 0, "max": 20}),
+        ));
+        send(open(
+            "out",
+            "OutputModel",
+            json!({"msg_id": "", "outputs": []}),
+        ));
+        send(open(
+            "button",
+            "ButtonModel",
+            json!({"description": "Click"}),
+        ));
+        send(open("label", "LabelModel", json!({"value": "clicked 0"})));
+        send(open(
+            "box",
+            "VBoxModel",
+            json!({"children": ["IPY_MODEL_slider", "IPY_MODEL_out", "IPY_MODEL_button", "IPY_MODEL_label"]}),
+        ));
+        fake_capture(send, request, &parent, "x=10\n");
+        send(json!({
+            "event": "output", "request": request, "parent": parent, "msg_type": "display_data",
+            "content": {"metadata": {}, "data": {
+                "text/plain": "VBox(children=(IntSlider(value=10), Output(), Button(), Label()))",
+                "application/vnd.jupyter.widget-view+json": {"model_id": "box", "version_major": 2, "version_minor": 0},
+            }},
+        }));
+    }
+
+    /// An Output widget capturing `text` printed under `parent` after
+    /// `clear_output(wait=True)`, as `interact` does.
+    fn fake_capture(send: &mut impl FnMut(Value), request: &Value, parent: &str, text: &str) {
+        let msg_id = |value: &str| {
+            json!({
+                "event": "comm", "request": request, "parent": parent, "msg_type": "comm_msg",
+                "content": {"comm_id": "out", "data": {"method": "update", "state": {"msg_id": value}, "buffer_paths": []}},
+            })
+        };
+        send(msg_id(parent));
+        send(json!({
+            "event": "output", "request": request, "parent": parent, "msg_type": "clear_output",
+            "content": {"wait": true},
+        }));
+        send(json!({
+            "event": "output", "request": request, "parent": parent, "msg_type": "stream",
+            "content": {"name": "stdout", "text": text},
+        }));
+        send(msg_id(""));
+    }
+
+    /// The kernel's side of a frontend comm message: a slider update is
+    /// echoed and re-runs the interact function; a button click updates
+    /// the label and prints from its callback. Returns the clicks seen.
+    fn fake_comm_msg(send: &mut impl FnMut(Value), request: &Value, clicks: usize) -> usize {
+        let msg_id = request["msg_id"].as_str().unwrap();
+        let data = &request["data"];
+        let message = |comm_id: &str, method: &str, state: Value| {
+            json!({
+                "event": "comm", "parent": msg_id, "msg_type": "comm_msg",
+                "content": {"comm_id": comm_id, "data": {"method": method, "state": state, "buffer_paths": []}},
+            })
+        };
+        match data["method"].as_str() {
+            Some("update") => {
+                let comm_id = request["comm_id"].as_str().unwrap();
+                send(message(comm_id, "echo_update", data["state"].clone()));
+                let value = &data["state"]["value"];
+                fake_capture(send, &Value::Null, msg_id, &format!("x={value}\n"));
+                0
+            }
+            Some("custom") => {
+                let value = format!("clicked {}", clicks + 1);
+                send(message("label", "update", json!({ "value": value })));
+                send(json!({
+                    "event": "output", "parent": msg_id, "msg_type": "stream",
+                    "content": {"name": "stdout", "text": "callback\n"},
+                }));
+                1
+            }
+            _ => 0,
         }
     }
 
@@ -2285,15 +2744,289 @@ mod tests {
             assert!(!d.changed_on_disk(&saved), "our own save");
         });
 
+        // An external edit of `a`: the cell keeps its place, id and output
+        // and turns stale with its descendants, as after a local edit.
         let edited = saved.replace("a = 1\n", "a = 3\n");
         assert!(d.read_with(cx, |d, _| d.changed_on_disk(&edited)));
         let ids = h.ids(cx);
         d.update(cx, |d, cx| d.reload(&edited, cx)).unwrap();
         assert!(h.events.borrow().contains(&NotebookEvent::Reloaded));
-        let reloaded = h.ids(cx);
-        assert_ne!(reloaded[0], ids[0], "a changed cell is new");
-        assert_eq!(reloaded[1..], ids[1..], "unchanged cells stay");
-        assert!(h.cell(0, cx).cell.outputs.is_empty());
+        assert_eq!(h.ids(cx), ids, "cells keep their ids");
+        assert_eq!(h.sources(cx)[0], "a = 3");
+        assert_eq!(text(&h.cell(0, cx)), "a = 1\n", "the old output stays");
         assert_eq!(text(&h.cell(2, cx)), "print(b)\n", "outputs kept");
+        let stale: Vec<bool> = (0..4).map(|index| h.cell(index, cx).stale).collect();
+        assert_eq!(
+            stale,
+            [true, true, true, true],
+            "a, its descendants, and z (edited before)"
+        );
+        assert!(!d.read_with(cx, |d, _| d.is_dirty()));
+        h.executed();
+        d.update(cx, |d, cx| d.run(&[ids[0]], cx));
+        h.settle(cx);
+        assert_eq!(h.executed(), ["a = 3", "b = a + 1", "print(b)"]);
+        assert!((0..3).all(|index| !h.cell(index, cx).stale));
+    }
+
+    #[gpui::test]
+    fn reloading_marimo_matches_cells_by_text_name_and_position(cx: &mut TestAppContext) {
+        let h = Harness::new("diff.py", MARIMO, &[], cx);
+        let d = &h.document;
+        d.update(cx, |d, cx| d.run_all(cx));
+        h.settle(cx);
+        let ids = h.ids(cx);
+        let z = ids[3];
+        d.update(cx, |d, cx| d.set_outputs_hidden(z, true, cx));
+        assert!(
+            !d.read_with(cx, |d, _| d.is_dirty()),
+            "marimo files keep no collapsed state"
+        );
+        // Externally: a new unrelated cell, `b`'s cell edited, `z` moved to
+        // the top as a named cell (`def zed`).
+        let marimo_file = |cells: &[&str]| {
+            let mut file =
+                "import marimo\n\n__generated_with = \"0.25.1\"\napp = marimo.App()\n\n\n"
+                    .to_owned();
+            for cell in cells {
+                file.push_str("@app.cell\n");
+                file.push_str(cell);
+                file.push_str("\n\n\n");
+            }
+            file.push_str("if __name__ == \"__main__\":\n    app.run()\n");
+            file
+        };
+        let a = "def _():\n    a = 1\n    return (a,)";
+        let c = "def _():\n    c = 1\n    return";
+        let print = "def _(b):\n    print(b)\n    return";
+        let b = "def _(a):\n    b = a * 100\n    return (b,)";
+        let file = marimo_file(&["def zed():\n    z = 5\n    return", c, a, b, print]);
+        d.update(cx, |d, cx| d.reload(&file, cx)).unwrap();
+        let reloaded = h.ids(cx);
+        assert_eq!(reloaded[0], z, "same text, moved");
+        assert!(!ids.contains(&reloaded[1]), "a new cell");
+        assert_eq!(reloaded[2..], ids[..3], "unchanged and edited in place");
+        let stale: Vec<bool> = (0..5).map(|index| h.cell(index, cx).stale).collect();
+        assert_eq!(stale, [false, false, false, true, true]);
+        assert!(h.cell(0, cx).cell.outputs_hidden(), "kept in memory");
+        assert_eq!(h.sources(cx)[3], "b = a * 100");
+        assert_eq!(text(&h.cell(4, cx)), "print(b)\n", "outputs kept");
+        h.executed();
+        d.update(cx, |d, cx| d.run(&[reloaded[4]], cx));
+        h.settle(cx);
+        assert_eq!(
+            h.executed(),
+            ["b = a * 100", "print(b)"],
+            "the stale ancestor runs first"
+        );
+
+        // A named cell edited and moved to the end is found by its name.
+        let file = marimo_file(&[c, a, b, print, "def zed():\n    z = 7\n    return"]);
+        d.update(cx, |d, cx| d.reload(&file, cx)).unwrap();
+        assert_eq!(h.ids(cx)[4], z);
+        assert!(h.cell(4, cx).stale);
+        assert!(h.cell(4, cx).cell.outputs_hidden());
+        assert_eq!(text(&h.cell(4, cx)), "z = 5\n");
+    }
+
+    /// `ipynb` cells with outputs: `(source, output text or "")`.
+    fn ipynb_with_outputs(cells: &[(&str, &str)]) -> String {
+        let cells: Vec<Value> = cells
+            .iter()
+            .map(|(source, output)| {
+                let outputs = if output.is_empty() {
+                    json!([])
+                } else {
+                    json!([{ "name": "stdout", "output_type": "stream", "text": output }])
+                };
+                let count = if output.is_empty() {
+                    Value::Null
+                } else {
+                    json!(1)
+                };
+                json!({
+                    "cell_type": "code", "execution_count": count, "metadata": {},
+                    "outputs": outputs, "source": source,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&json!({
+            "cells": cells, "metadata": {}, "nbformat": 4, "nbformat_minor": 4,
+        }))
+        .unwrap()
+    }
+
+    #[gpui::test]
+    fn reloading_ipynb_keeps_outputs_of_unchanged_cells_the_file_has_none_for(
+        cx: &mut TestAppContext,
+    ) {
+        let h = Harness::new(
+            "reload.ipynb",
+            &ipynb_with_outputs(&[("one", ""), ("two", ""), ("three", "")]),
+            &[],
+            cx,
+        );
+        let d = &h.document;
+        d.update(cx, |d, cx| d.run_all(cx));
+        h.settle(cx);
+        d.update(cx, |d, cx| d.save(cx)).unwrap();
+        let ids = h.ids(cx);
+        // An output-stripping tool rewrote the file, changing `two`; `three`
+        // has other outputs in the file.
+        let stripped = ipynb_with_outputs(&[("one", ""), ("TWO", ""), ("three", "file\n")]);
+        d.update(cx, |d, cx| d.reload(&stripped, cx)).unwrap();
+        assert_eq!(h.ids(cx), ids);
+        assert_eq!(text(&h.cell(0, cx)), "one\n", "kept");
+        assert_eq!(h.cell(0, cx).cell.execution_count, Some(1));
+        assert_eq!(text(&h.cell(1, cx)), "", "changed: the file's");
+        assert_eq!(text(&h.cell(2, cx)), "file\n", "the file's outputs win");
+        assert!(!h.cell(1, cx).stale, "Jupyter has no stale cells");
+    }
+
+    #[gpui::test]
+    fn collapsed_state_is_saved_in_ipynb_and_read_back(cx: &mut TestAppContext) {
+        let h = Harness::new(
+            "collapse.ipynb",
+            &ipynb_with_outputs(&[("one", "1\n"), ("two", "2\n")]),
+            &[],
+            cx,
+        );
+        let d = &h.document;
+        let ids = h.ids(cx);
+        d.update(cx, |d, cx| {
+            d.set_outputs_hidden(ids[0], true, cx);
+            d.set_source_hidden(ids[1], true, cx);
+        });
+        assert!(d.read_with(cx, |d, _| d.is_dirty()));
+        assert!(h.events.borrow().contains(&NotebookEvent::Outputs(ids[0])));
+        d.update(cx, |d, cx| d.save(cx)).unwrap();
+        let path = d.read_with(cx, |d, _| d.path().to_owned());
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let reopened = NotebookDocument::parse(&path, &saved).unwrap();
+        let flags: Vec<(bool, bool)> = reopened
+            .cells
+            .iter()
+            .map(|cell| (cell.outputs_hidden(), cell.source_hidden()))
+            .collect();
+        assert_eq!(flags, [(true, false), (false, true)]);
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            saved["cells"][0]["metadata"],
+            json!({ "collapsed": true, "jupyter": { "outputs_hidden": true } })
+        );
+        // Expanding again leaves no `jupyter` key behind.
+        d.update(cx, |d, cx| d.set_source_hidden(ids[1], false, cx));
+        d.update(cx, |d, cx| d.save(cx)).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["cells"][1]["metadata"], json!({}));
+    }
+
+    #[gpui::test]
+    fn widgets_follow_the_comm_stream_and_their_state_is_saved(cx: &mut TestAppContext) {
+        let h = Harness::new(
+            "widgets.ipynb",
+            &ipynb(&[("code", "interact"), ("code", "sleep")]),
+            &[],
+            cx,
+        );
+        let d = &h.document;
+        let ids = h.ids(cx);
+        d.update(cx, |d, cx| d.run(&ids[..1], cx));
+        h.settle(cx);
+        // The cell shows the box; the first call's print went to the
+        // Output widget.
+        let cell = h.cell(0, cx);
+        assert_eq!(cell.cell.outputs.len(), 1, "{:?}", cell.cell.outputs);
+        assert_eq!(widgets::view_model_id(&cell.cell.outputs[0]), Some("box"));
+        let captured = |cx: &mut TestAppContext| {
+            d.read_with(cx, |d, _| {
+                d.widgets()
+                    .get("out")
+                    .map(|out| {
+                        out.outputs
+                            .iter()
+                            .map(outputs::plain_text)
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default()
+            })
+        };
+        assert_eq!(captured(cx), "x=10\n");
+        assert!(h.events.borrow().contains(&NotebookEvent::Outputs(ids[0])));
+
+        // Moving the slider: the model changes at once, the kernel's echo
+        // is ignored and the re-run's output replaces nothing in the cell.
+        d.update(cx, |d, cx| {
+            d.widget_update("slider", "value", json!(13), true, cx)
+        });
+        h.wait(cx, |d| {
+            d.widgets().get("out").is_some_and(|out| {
+                out.outputs.len() == 1 && outputs::plain_text(&out.outputs[0]).contains("x=13")
+            })
+        });
+        let sent: Vec<Value> = h
+            .requests
+            .try_iter()
+            .filter(|request| request["op"] == "comm_msg")
+            .collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["comm_id"], "slider");
+        assert_eq!(sent[0]["data"]["state"], json!({"value": 13}));
+        assert!(sent[0]["msg_id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(
+            d.read_with(cx, |d, _| d.widgets().get("slider").unwrap().f64("value")),
+            Some(13.)
+        );
+
+        // A click while another cell runs: the label updates and the
+        // callback's print does not land in the running cell.
+        d.update(cx, |d, cx| d.run(&ids[1..], cx));
+        h.wait(cx, |d| matches!(d.cells()[1].run, RunState::Running { .. }));
+        d.update(cx, |d, _| {
+            d.widget_custom("button", json!({"event": "click"}))
+        });
+        h.wait(cx, |d| {
+            d.widgets().get("label").unwrap().str("value") == "clicked 1"
+        });
+        d.update(cx, |d, cx| d.interrupt(cx));
+        h.settle(cx);
+        assert!(!text(&h.cell(1, cx)).contains("callback"));
+
+        // Saved like Jupyter; a reopened notebook shows the last values
+        // without a kernel.
+        d.update(cx, |d, cx| d.save(cx)).unwrap();
+        let path = d.read_with(cx, |d, _| d.path().to_owned());
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let json: Value = serde_json::from_str(&saved).unwrap();
+        let state = &json["metadata"]["widgets"][widgets::STATE_MIME]["state"];
+        assert_eq!(state["slider"]["state"]["value"], 13);
+        assert_eq!(state["label"]["state"]["value"], "clicked 1");
+        assert_eq!(
+            state["out"]["state"]["outputs"][0]["text"],
+            json!(["x=13\n"])
+        );
+        let reopened = cx.new(|cx| {
+            let notebook = NotebookDocument::parse(&path, &saved).unwrap();
+            NotebookDocument::from_notebook(
+                Project::local(path.parent().unwrap().to_owned()),
+                path.clone(),
+                notebook,
+                saved.clone(),
+                cx,
+            )
+        });
+        reopened.read_with(cx, |d, _| {
+            let slider = d.widgets().get("slider").unwrap();
+            assert!(!slider.live);
+            assert_eq!(slider.f64("value"), Some(13.));
+            assert_eq!(
+                d.widgets().get("box").unwrap().references("children").len(),
+                4
+            );
+        });
+        // A restart ends the comms: the models stay as static state.
+        d.update(cx, |d, cx| d.restart(false, cx));
+        h.settle(cx);
+        assert!(d.read_with(cx, |d, _| !d.widgets().get("slider").unwrap().live));
     }
 }

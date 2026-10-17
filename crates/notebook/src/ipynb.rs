@@ -123,7 +123,9 @@ fn parse_cell(cell: Value) -> Result<Cell, String> {
     })
 }
 
-fn parse_output(output: &Value) -> Option<Output> {
+/// An nbformat output object (also the `outputs` state of ipywidgets'
+/// Output widget); `None` for unknown output types.
+pub fn parse_output(output: &Value) -> Option<Output> {
     let str_field = |key: &str| {
         output
             .get(key)
@@ -235,7 +237,8 @@ fn cell_json(info: &IpynbInfo, cell: &Cell) -> Value {
     Value::Object(map)
 }
 
-fn output_json(output: &Output) -> Value {
+/// An output as nbformat writes it.
+pub fn output_json(output: &Output) -> Value {
     let bundle = |data: &crate::model::MimeBundle| {
         let mut map: Map<String, Value> =
             data.iter().map(|(k, v)| (k.clone(), v.clone())).collect();

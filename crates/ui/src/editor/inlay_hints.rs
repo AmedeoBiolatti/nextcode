@@ -106,8 +106,8 @@ impl Editor {
         let encoding = doc.server.encoding;
         let last = lines.end.max(lines.start + 1) - 1;
         let range = lsp::types::Range::new(
-            language::to_position(&self.buffer, self.buffer.line_start(lines.start), encoding),
-            language::to_position(&self.buffer, self.buffer.line_end(last), encoding),
+            self.server_position(self.buffer.line_start(lines.start), encoding),
+            self.server_position(self.buffer.line_end(last), encoding),
         );
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier::new(doc.uri.clone()),
@@ -140,7 +140,10 @@ impl Editor {
                     let inlays = hints
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|hint| inlay(&this.buffer, hint, server.encoding))
+                        .filter_map(|mut hint| {
+                            hint.position = this.local_position(hint.position)?;
+                            Some(inlay(&this.buffer, hint, server.encoding))
+                        })
                         .collect();
                     if this.display.set_inlays(&this.buffer, inlays) {
                         cx.notify();

@@ -3450,26 +3450,177 @@ fn headless_mode_spell_checks_files_and_text() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// The interpreter for notebook tests: `NEXT_CODE_NOTEBOOK_PYTHON`, if it
-/// can import `modules`; `None` (after printing why) otherwise.
+/// The interpreter for notebook tests, when it can import `modules`:
+/// 1. `NEXT_CODE_NOTEBOOK_PYTHON` when set (and nothing else);
+/// 2. a virtualenv with ipykernel and marimo kept under cargo's target tmp
+///    dir, created once with `uv` (`uv venv` + `uv pip install`) when uv is
+///    installed; only that first creation needs the network, and it gives
+///    up after [`NOTEBOOK_ENV_TIMEOUT`];
+/// 3. `python3`/`python` from PATH when it already imports them.
+///
+/// `None` (after printing why: the test then passes as skipped) otherwise.
 fn notebook_python(modules: &[&str]) -> Option<PathBuf> {
     let imports = modules.join(", ");
-    let Some(python) = std::env::var_os("NEXT_CODE_NOTEBOOK_PYTHON") else {
-        println!("skipped: NEXT_CODE_NOTEBOOK_PYTHON is not set (an interpreter with {imports})");
-        return None;
-    };
-    let imported = background_command(&python)
-        .args(["-c", &format!("import {imports}")])
-        .output()
-        .is_ok_and(|output| output.status.success());
-    if !imported {
+    if let Some(python) = std::env::var_os("NEXT_CODE_NOTEBOOK_PYTHON") {
+        let python = PathBuf::from(python);
+        if python_imports(&python, &imports) {
+            return Some(python);
+        }
         println!(
-            "skipped: {} cannot import {imports}",
-            python.to_string_lossy()
+            "skipped: NEXT_CODE_NOTEBOOK_PYTHON ({}) cannot import {imports}",
+            python.display()
         );
         return None;
     }
-    Some(PathBuf::from(python))
+    let found = NOTEBOOK_ENV
+        .iter()
+        .cloned()
+        .chain(["python3", "python"].map(PathBuf::from))
+        .find(|python| python_imports(python, &imports));
+    if found.is_none() {
+        println!(
+            "skipped: no interpreter with {imports} (set NEXT_CODE_NOTEBOOK_PYTHON, or install \
+             uv so the tests create one)"
+        );
+    }
+    found
+}
+
+/// How long creating the cached notebook env may take.
+const NOTEBOOK_ENV_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The cached notebook env's interpreter, created on first use (once per
+/// test process; other processes find it done).
+static NOTEBOOK_ENV: std::sync::LazyLock<Option<PathBuf>> =
+    std::sync::LazyLock::new(cached_notebook_env);
+
+fn venv_python(venv: &std::path::Path) -> PathBuf {
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    }
+}
+
+fn python_imports(python: &std::path::Path, imports: &str) -> bool {
+    background_command(python)
+        .args(["-c", &format!("import {imports}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn cached_notebook_env() -> Option<PathBuf> {
+    const MODULES: &str = "ipykernel, jupyter_client, marimo";
+    let venv = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("notebook-env");
+    let python = venv_python(&venv);
+    if python_imports(&python, MODULES) {
+        return Some(python);
+    }
+    if !background_command("uv")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        println!(
+            "no notebook env at {} and no uv to create it",
+            venv.display()
+        );
+        return None;
+    }
+    // Built next to it and renamed into place, so a half-made env is never
+    // taken for a ready one (also by a concurrent test process).
+    let building = venv.with_file_name(format!("notebook-env-{}", std::process::id()));
+    fs::remove_dir_all(&building).ok();
+    let log = venv.with_file_name(format!("notebook-env-{}.log", std::process::id()));
+    println!(
+        "creating the notebook test env {} (uv venv; uv pip install ipykernel marimo)",
+        venv.display()
+    );
+    let deadline = Instant::now() + NOTEBOOK_ENV_TIMEOUT;
+    let built = run_until(
+        background_command("uv")
+            .args(["venv", "--quiet", "--relocatable"])
+            .arg(&building),
+        &log,
+        deadline,
+    )
+    .and_then(|()| {
+        run_until(
+            background_command("uv")
+                // Bytecode now: the tests' first imports run in parallel.
+                .args([
+                    "pip",
+                    "install",
+                    "--quiet",
+                    "--compile-bytecode",
+                    "--python",
+                ])
+                .arg(venv_python(&building))
+                .args(["ipykernel", "marimo"]),
+            &log,
+            deadline,
+        )
+    });
+    if let Err(err) = built {
+        let output = fs::read_to_string(&log).unwrap_or_default();
+        println!(
+            "could not create the notebook test env (offline?): {err}\n{}",
+            output.trim()
+        );
+        fs::remove_dir_all(&building).ok();
+        fs::remove_file(&log).ok();
+        return None;
+    }
+    fs::remove_file(&log).ok();
+    // A broken env from an earlier run makes way; if another process just
+    // put its env there, ours goes.
+    if !python_imports(&python, MODULES) {
+        fs::remove_dir_all(&venv).ok();
+    }
+    if fs::rename(&building, &venv).is_err() {
+        fs::remove_dir_all(&building).ok();
+    }
+    python_imports(&python, MODULES).then_some(python)
+}
+
+/// Runs `command` (output appended to `log`) until it exits or `deadline`
+/// passes (then it is killed).
+fn run_until(
+    command: &mut Command,
+    log: &std::path::Path,
+    deadline: Instant,
+) -> Result<(), String> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|err| err.to_string())?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(file.try_clone().map_err(|err| err.to_string())?)
+        .stderr(file)
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!("{command:?} failed ({status})"))
+            };
+        }
+        if Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            return Err(format!("{command:?} timed out"));
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// A notebook run's cells by index.
@@ -3736,25 +3887,441 @@ fn headless_mode_runs_marimo_cells_reactively_and_saves_them() {
     ] {
         assert!(saved.contains(expected), "{expected:?} in\n{saved}");
     }
-    let marimo = python.with_file_name("marimo");
-    if marimo.exists() {
-        let check = background_command(&marimo)
-            .arg("check")
-            .arg(root.join(path))
-            .output()
-            .unwrap();
-        assert!(
-            check.status.success(),
-            "marimo check: {}{}",
-            String::from_utf8_lossy(&check.stdout),
-            String::from_utf8_lossy(&check.stderr)
-        );
-    } else {
-        println!("marimo check skipped: no marimo CLI next to the interpreter");
-    }
+    marimo_check(&python, &root.join(path));
 
     ok(json!({ "cmd": "notebook_close", "path": path }));
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
     assert!(headless.child.wait().unwrap().success());
     fs::remove_dir_all(&root).ok();
+}
+
+/// `marimo check` of `file` with the marimo CLI next to `python` (skipped
+/// with a note when there is none).
+fn marimo_check(python: &std::path::Path, file: &std::path::Path) {
+    let marimo = python.with_file_name(format!("marimo{}", std::env::consts::EXE_SUFFIX));
+    if !marimo.exists() {
+        println!("marimo check skipped: no marimo CLI next to the interpreter");
+        return;
+    }
+    let check = background_command(&marimo)
+        .arg("check")
+        .arg(file)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "marimo check: {}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+const MARIMO_ASYNC: &str = "import marimo\n\n__generated_with = \"0.25.1\"\napp = marimo.App()\n\n\n\
+    @app.cell\nasync def _():\n    import asyncio\n    await asyncio.sleep(0.01)\n    a = 1\n    \
+    await asyncio.sleep(0, result=\"slept\")\n    return (a,)\n\n\n\
+    @app.cell\ndef _(a):\n    b = a + 1\n    return (b,)\n\n\n\
+    @app.cell\ndef _(b):\n    print(b)\n    return\n\n\n\
+    if __name__ == \"__main__\":\n    app.run()\n";
+
+/// A marimo cell with top-level `await` runs on the kernel's loop; an
+/// external edit reloads with the edited cell and its descendants stale
+/// (outputs kept) and a run brings them up to date; `async def` is saved.
+#[test]
+fn headless_mode_awaits_marimo_cells_and_marks_reloaded_cells_stale() {
+    let Some(python) = notebook_python(&["ipykernel", "jupyter_client", "marimo"]) else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!(
+        "next_code_headless_mo_async_{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("async_nb.py"), MARIMO_ASYNC).unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let path = "async_nb.py";
+    let mut ok = |request: Value| {
+        let reply = headless.call(request.clone());
+        assert_eq!(reply["ok"], true, "{request} → {reply}");
+        reply
+    };
+    ok(json!({ "cmd": "notebook_open", "path": path, "python": python.to_string_lossy() }));
+    let run = ok(json!({ "cmd": "notebook_run", "path": path }));
+    assert_eq!(ran_cells(&run), [0, 1, 2]);
+    let cells = run["result"]["cells"].as_array().unwrap();
+    assert_eq!(cells[0]["status"], "ok", "{run}");
+    assert_eq!(cells[0]["outputs"][0]["text_plain"], "'slept'", "{run}");
+    assert_eq!(cells[2]["outputs"][0]["text"], "2\n", "{run}");
+
+    // Unchanged on disk: nothing to reload.
+    let same = ok(json!({ "cmd": "notebook_reload", "path": path }));
+    assert_eq!(same["result"]["reloaded"], false);
+    fs::write(
+        root.join(path),
+        MARIMO_ASYNC.replace("    a = 1\n", "    a = 5\n"),
+    )
+    .unwrap();
+    let reload = ok(json!({ "cmd": "notebook_reload", "path": path }));
+    assert_eq!(reload["result"]["reloaded"], true);
+    let cells = reload["result"]["cells"].as_array().unwrap();
+    let stale: Vec<&Value> = cells.iter().map(|cell| &cell["stale"]).collect();
+    assert_eq!(stale, [true, true, true], "{reload}");
+    assert_eq!(
+        cells[2]["outputs"][0]["text"], "2\n",
+        "outputs kept: {reload}"
+    );
+    let run = ok(json!({ "cmd": "notebook_run", "path": path, "cells": [2] }));
+    assert_eq!(ran_cells(&run), [0, 1, 2], "stale ancestors first: {run}");
+    assert_eq!(run["result"]["cells"][2]["outputs"][0]["text"], "6\n");
+    let status = ok(json!({ "cmd": "notebook_status", "path": path }));
+    assert!(
+        status["result"]["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|cell| cell["stale"] == false),
+        "{status}"
+    );
+
+    ok(json!({ "cmd": "notebook_edit", "path": path, "cell": 1, "source": "b = a + 2" }));
+    ok(json!({ "cmd": "notebook_save", "path": path }));
+    let saved = fs::read_to_string(root.join(path)).unwrap();
+    assert!(
+        saved.contains("@app.cell\nasync def _():\n    import asyncio\n"),
+        "{saved}"
+    );
+    marimo_check(&python, &root.join(path));
+
+    ok(json!({ "cmd": "notebook_close", "path": path }));
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Collapsed outputs/sources are saved in the `.ipynb` (JupyterLab's and
+/// nbformat's keys) and read back on reopening; a Jupyter cell may
+/// `await`; a reload after an output-stripping rewrite keeps the outputs
+/// of unchanged cells.
+#[test]
+fn headless_mode_keeps_collapsed_cells_and_reloads_jupyter_notebooks() {
+    let Some(python) = notebook_python(&["ipykernel", "jupyter_client"]) else {
+        return;
+    };
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_nb_fold_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let notebook = |cells: Value| {
+        serde_json::to_string_pretty(&json!({
+            "cells": cells, "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+        }))
+        .unwrap()
+    };
+    let cell = |id: &str, source: &str, metadata: Value| {
+        json!({
+            "cell_type": "code", "execution_count": null, "id": id, "metadata": metadata,
+            "outputs": [], "source": source,
+        })
+    };
+    let awaited = "import asyncio\nawaited = await asyncio.sleep(0.01, result=21)\nprint(awaited)";
+    fs::write(
+        root.join("fold.ipynb"),
+        notebook(json!([
+            cell("first", awaited, json!({ "collapsed": true })),
+            cell("second", "awaited * 2", json!({})),
+        ])),
+    )
+    .unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let path = "fold.ipynb";
+    let mut ok = |request: Value| {
+        let reply = headless.call(request.clone());
+        assert_eq!(reply["ok"], true, "{request} → {reply}");
+        reply
+    };
+    let open =
+        ok(json!({ "cmd": "notebook_open", "path": path, "python": python.to_string_lossy() }));
+    assert_eq!(open["result"]["cells"][0]["outputs_hidden"], true, "{open}");
+    assert_eq!(open["result"]["cells"][1]["outputs_hidden"], false);
+    let run = ok(json!({ "cmd": "notebook_run", "path": path }));
+    let cells = run["result"]["cells"].as_array().unwrap();
+    assert_eq!(cells[0]["outputs"][0]["text"], "21\n", "{run}");
+    assert_eq!(cells[1]["outputs"][0]["text_plain"], "42", "{run}");
+
+    let edit = ok(json!({
+        "cmd": "notebook_edit", "path": path, "cell": 1,
+        "outputs_hidden": true, "source_hidden": true,
+    }));
+    assert_eq!(edit["result"]["outputs_hidden"], true);
+    ok(json!({ "cmd": "notebook_edit", "path": path, "cell": 0, "outputs_hidden": false }));
+    ok(json!({ "cmd": "notebook_save", "path": path }));
+    let saved: Value = serde_json::from_str(&fs::read_to_string(root.join(path)).unwrap()).unwrap();
+    assert_eq!(saved["cells"][0]["metadata"], json!({ "collapsed": false }));
+    assert_eq!(
+        saved["cells"][1]["metadata"],
+        json!({ "collapsed": true, "jupyter": { "outputs_hidden": true, "source_hidden": true } })
+    );
+    ok(json!({ "cmd": "notebook_close", "path": path }));
+    let reopened =
+        ok(json!({ "cmd": "notebook_open", "path": path, "python": python.to_string_lossy() }));
+    let cells = reopened["result"]["cells"].as_array().unwrap();
+    assert_eq!(
+        (&cells[1]["outputs_hidden"], &cells[1]["source_hidden"]),
+        (&json!(true), &json!(true)),
+        "{reopened}"
+    );
+    assert_eq!(cells[1]["outputs"][0]["text_plain"], "42", "outputs saved");
+
+    // A tool strips the outputs and changes the second cell's source.
+    let mut stripped = saved.clone();
+    for cell in stripped["cells"].as_array_mut().unwrap() {
+        cell["outputs"] = json!([]);
+        cell["execution_count"] = Value::Null;
+    }
+    stripped["cells"][1]["source"] = json!("awaited * 3");
+    fs::write(
+        root.join(path),
+        serde_json::to_string_pretty(&stripped).unwrap(),
+    )
+    .unwrap();
+    let reload = ok(json!({ "cmd": "notebook_reload", "path": path }));
+    let cells = reload["result"]["cells"].as_array().unwrap();
+    assert_eq!(cells[0]["outputs"][0]["text"], "21\n", "kept: {reload}");
+    assert_eq!(cells[1]["outputs"], json!([]), "changed: {reload}");
+    assert_eq!(cells[1]["source_hidden"], true);
+
+    ok(json!({ "cmd": "notebook_close", "path": path }));
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+/// marimo UI elements: described with their arguments and value; setting
+/// one runs the cells using it (not the one defining it) with the new
+/// value, as marimo does.
+#[test]
+fn headless_mode_sets_marimo_ui_elements_and_reruns_their_users() {
+    let Some(python) = notebook_python(&["ipykernel", "jupyter_client", "marimo"]) else {
+        return;
+    };
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_mo_ui_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let notebook = "import marimo\n\n__generated_with = \"0.25.1\"\napp = marimo.App()\n\n\n\
+        @app.cell\ndef _():\n    import marimo as mo\n    return (mo,)\n\n\n\
+        @app.cell\ndef _(mo):\n    size = mo.ui.slider(1, 10, value=3, label=\"Size\")\n    \
+        loud = mo.ui.checkbox(label=\"Loud\")\n    mo.md(f\"Pick {size} and {loud}\")\n    \
+        return loud, size\n\n\n\
+        @app.cell\ndef _(loud, size):\n    word = \"hi\" * size.value\n    \
+        print(word.upper() if loud.value else word)\n    return\n\n\n\
+        if __name__ == \"__main__\":\n    app.run()\n";
+    fs::write(root.join("ui.py"), notebook).unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let path = "ui.py";
+    let mut ok = |request: Value| {
+        let reply = headless.call(request.clone());
+        assert_eq!(reply["ok"], true, "{request} → {reply}");
+        reply
+    };
+    ok(json!({ "cmd": "notebook_open", "path": path, "python": python.to_string_lossy() }));
+    let run = ok(json!({ "cmd": "notebook_run", "path": path }));
+    let cells = run["result"]["cells"].as_array().unwrap();
+    assert_eq!(cells[2]["outputs"][0]["text"], "hihihi\n", "{run}");
+    let parts = &cells[1]["outputs"][0]["marimo_ui"];
+    assert_eq!(parts[0], json!({ "markdown": "Pick " }), "{run}");
+    let size = &parts[1]["element"];
+    assert_eq!(
+        (&size["kind"], &size["label"], &size["value"]),
+        (&json!("slider"), &json!("Size"), &json!(3))
+    );
+    let loud = &parts[3]["element"];
+    assert_eq!(
+        (&loud["kind"], &loud["value"]),
+        (&json!("checkbox"), &json!(false))
+    );
+    let set = |id: &Value, value: Value| json!({ "cmd": "notebook_set_ui", "path": path, "cell": 1, "element": id, "value": value });
+
+    let changed = ok(set(&size["id"], json!(2)));
+    assert_eq!(ran_cells(&changed), [2], "only the user re-runs: {changed}");
+    assert_eq!(
+        changed["result"]["cells"][0]["outputs"][0]["text"],
+        "hihi\n"
+    );
+    let changed = ok(set(&loud["id"], json!(true)));
+    assert_eq!(
+        changed["result"]["cells"][0]["outputs"][0]["text"],
+        "HIHI\n"
+    );
+    // The element's output shows the value it was set to.
+    let status = ok(json!({ "cmd": "notebook_status", "path": path }));
+    let parts = &status["result"]["cells"][1]["outputs"][0]["marimo_ui"];
+    assert_eq!(
+        (&parts[1]["element"]["value"], &parts[3]["element"]["value"]),
+        (&json!(2), &json!(true))
+    );
+    let missing = headless.call(set(&json!("nope"), json!(1)));
+    assert_eq!(missing["ok"], false, "{missing}");
+
+    headless.call(json!({ "cmd": "notebook_close", "path": path }));
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Windows → WSL, run by hand (`cargo test --test headless -- --ignored
+/// --nocapture notebooks_in_wsl`): a project in the distro named by
+/// `NEXT_CODE_TEST_WSL_DISTRO` (default `Ubuntu`, which needs `uv` and the
+/// Linux agent next to `next_code.exe`, see `scripts\build-wsl-agent.ps1`)
+/// with a `.venv` holding ipykernel and marimo. Notebooks open without an
+/// interpreter named (the project's `.venv` is found in the distro), run
+/// in the notebook's Linux folder (Jupyter and marimo, `await`, a UI
+/// element), save with LF line endings, and their kernels' ports are not
+/// forwarded as the user's.
+#[cfg(windows)]
+#[test]
+#[ignore]
+fn headless_mode_runs_notebooks_in_wsl() {
+    let distro = std::env::var("NEXT_CODE_TEST_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu".into());
+    let bash = |script: &str, input: &str| {
+        let mut child = background_command("wsl.exe")
+            .args(["-d", &distro, "--", "bash", "-lc", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let project = format!("/tmp/next_code_wsl_notebooks_{}", std::process::id());
+    bash(
+        &format!(
+            "rm -rf {project} && mkdir -p {project}/nb && cd {project} && uv venv -q .venv && \
+             uv pip install -q --python .venv/bin/python ipykernel marimo"
+        ),
+        "",
+    );
+    let ipynb = json!({
+        "cells": [
+            { "cell_type": "code", "execution_count": null, "id": "env", "metadata": {},
+              "outputs": [], "source": "import os, sys\nprint(sys.platform, os.getcwd())\nsys.executable" },
+            { "cell_type": "code", "execution_count": null, "id": "await", "metadata": {},
+              "outputs": [], "source": "import asyncio\nawait asyncio.sleep(0.01, result='é ✓')" },
+        ],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+    });
+    bash(
+        &format!("cat > {project}/nb/demo.ipynb"),
+        &format!("{ipynb:#}\n"),
+    );
+    bash(
+        &format!("cat > {project}/nb/reactive.py"),
+        &MARIMO_ASYNC.replace(
+            "\n\n\nif __name__",
+            "\n\n\n@app.cell\ndef _():\n    import marimo as mo\n    n = mo.ui.slider(1, 10, value=3)\n    \
+             n\n    return (n,)\n\n\n@app.cell\ndef _(n):\n    print(n.value * 2)\n    return\n\n\nif __name__",
+        ),
+    );
+
+    let mut headless = Headless::launch(
+        &[
+            "--wsl".as_ref(),
+            std::ffi::OsStr::new(&distro),
+            std::ffi::OsStr::new(&project),
+        ],
+        &[],
+    );
+    headless.next(|line| line["event"] == "ready");
+    let mut ok = |request: Value| {
+        let reply = headless.call(request.clone());
+        println!("{request}\n→ {reply}");
+        assert_eq!(reply["ok"], true, "{request} → {reply}");
+        reply
+    };
+    ok(json!({ "cmd": "notebook_open", "path": "nb/demo.ipynb" }));
+    let run = ok(json!({ "cmd": "notebook_run", "path": "nb/demo.ipynb" }));
+    let cells = run["result"]["cells"].as_array().unwrap();
+    assert_eq!(
+        cells[0]["outputs"][0]["text"],
+        format!("linux {project}/nb\n"),
+        "{run}"
+    );
+    assert_eq!(
+        cells[0]["outputs"][1]["text_plain"],
+        format!("'{project}/.venv/bin/python'")
+    );
+    assert_eq!(cells[1]["outputs"][0]["text_plain"], "'é ✓'");
+    ok(json!({ "cmd": "notebook_save", "path": "nb/demo.ipynb" }));
+
+    ok(json!({ "cmd": "notebook_open", "path": "nb/reactive.py" }));
+    let run = ok(json!({ "cmd": "notebook_run", "path": "nb/reactive.py" }));
+    let cells = run["result"]["cells"].as_array().unwrap();
+    assert_eq!(cells[2]["outputs"][0]["text"], "2\n", "{run}");
+    assert_eq!(cells[4]["outputs"][0]["text"], "6\n", "{run}");
+    let slider = cells[3]["outputs"][0]["marimo_ui"][0]["element"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{run}"))
+        .to_owned();
+    let set = ok(json!({
+        "cmd": "notebook_set_ui", "path": "nb/reactive.py", "cell": 3, "element": slider, "value": 7,
+    }));
+    assert_eq!(ran_cells(&set), [4], "{set}");
+    assert_eq!(set["result"]["cells"][0]["outputs"][0]["text"], "14\n");
+    ok(
+        json!({ "cmd": "notebook_edit", "path": "nb/reactive.py", "cell": 1, "source": "b = a + 2" }),
+    );
+    ok(json!({ "cmd": "notebook_save", "path": "nb/reactive.py" }));
+    let ports = ok(json!({ "cmd": "ports_list" }));
+    assert!(
+        ports["result"]["forwarded"]
+            .as_array()
+            .is_none_or(|forwarded| forwarded.is_empty()),
+        "kernel ports are not forwarded: {ports}"
+    );
+    ok(json!({ "cmd": "notebook_close", "path": "nb/demo.ipynb" }));
+    ok(json!({ "cmd": "notebook_close", "path": "nb/reactive.py" }));
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+
+    let saved = bash(
+        &format!("cat {project}/nb/demo.ipynb {project}/nb/reactive.py"),
+        "",
+    );
+    assert!(!saved.contains('\r'), "LF line endings");
+    assert!(
+        saved.contains(&format!("\"linux {project}/nb\\n\"")),
+        "outputs saved: {saved}"
+    );
+    assert!(saved.contains("    b = a + 2\n"), "{saved}");
+    bash(
+        &format!("{project}/.venv/bin/marimo check {project}/nb/reactive.py"),
+        "",
+    );
+    // `[l]`: not this script's own command line.
+    let kernels = bash(
+        &format!("pgrep -f 'next_code-kerne[l]-' | wc -l; rm -rf {project}"),
+        "",
+    );
+    assert_eq!(kernels.trim(), "0", "no kernel left running");
 }

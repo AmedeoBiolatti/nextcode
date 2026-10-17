@@ -52,9 +52,23 @@ pub struct LocationPicker {
 }
 
 impl LocationPicker {
+    #[cfg(test)]
     pub fn new(
         title: SharedString,
         locations: Vec<Location>,
+        project: &Project,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let labels = vec![None; locations.len()];
+        Self::with_labels(title, locations, labels, project, cx)
+    }
+
+    /// Like `new`, with the name (`file:line`) and preview of each location
+    /// given where `labels` has them (a notebook cell's), read otherwise.
+    pub fn with_labels(
+        title: SharedString,
+        locations: Vec<Location>,
+        labels: Vec<Option<(String, String)>>,
         project: &Project,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -62,7 +76,17 @@ impl LocationPicker {
         let mut files: HashMap<PathBuf, Option<String>> = HashMap::new();
         let entries = locations
             .into_iter()
-            .map(|location| {
+            .zip(labels.into_iter().chain(std::iter::repeat(None)))
+            .map(|(location, label)| {
+                let (_, dir) = project.display_parts(&location.path);
+                if let Some((name, preview)) = label {
+                    return Entry {
+                        name: name.into(),
+                        dir: dir.into(),
+                        preview: preview.into(),
+                        location,
+                    };
+                }
                 let text = files
                     .entry(location.path.clone())
                     .or_insert_with(|| project.read_text(&location.path).ok());
@@ -73,7 +97,7 @@ impl LocationPicker {
                     .unwrap_or_default()
                     .trim()
                     .to_owned();
-                let (file_name, dir) = project.display_parts(&location.path);
+                let (file_name, _) = project.display_parts(&location.path);
                 Entry {
                     name: format!("{file_name}:{}", line + 1).into(),
                     dir: dir.into(),

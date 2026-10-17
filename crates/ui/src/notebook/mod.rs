@@ -5,11 +5,15 @@
 //! crate.
 
 pub mod document;
+pub mod html;
 pub mod kernel;
 pub mod launch;
+pub mod lsp;
+pub mod marimo_ui;
 pub mod markdown;
 pub mod output;
 pub mod picker;
 pub mod view;
+pub mod widgets;
 
 pub use document::{CellId, KernelStatus, NotebookDocument, NotebookEvent, RunState};

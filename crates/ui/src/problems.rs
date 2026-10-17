@@ -150,39 +150,98 @@ impl ProblemsPanel {
                 .filter(|d| d.severity != Some(DiagnosticSeverity::HINT));
             by_path.entry(path).or_default().extend(shown);
         }
-        self.rows = rows(&self.project, by_path);
+        // A notebook's virtual document lists its problems per cell.
+        let cell_of = |path: &Path, position: lsp::types::Position| {
+            let notebook = store.notebook(path)?;
+            let notebook = notebook.borrow();
+            let target = notebook.cell_position(position)?;
+            Some(CellLabel {
+                notebook: notebook.notebook_path().to_path_buf(),
+                number: target.number,
+                first_line: position.line - target.position.line,
+            })
+        };
+        self.rows = rows(&self.project, by_path, cell_of);
         cx.notify();
     }
+}
+
+/// Where a problem of a notebook's virtual document is: the notebook, the
+/// cell's number (from 1) and the cell's first line in the document.
+struct CellLabel {
+    notebook: PathBuf,
+    number: usize,
+    first_line: u32,
+}
+
+/// One file's (or notebook cell's) problems.
+struct Group<'a> {
+    root: Option<usize>,
+    /// Shown as this file.
+    shown: PathBuf,
+    /// The cell's number in a notebook (0 for files).
+    cell: usize,
+    /// Problems open this file (a notebook's virtual document for cells).
+    target: &'a Path,
+    first_line: u32,
+    diagnostics: Vec<&'a lsp::types::Diagnostic>,
 }
 
 /// One row per file with problems, sorted by path, followed by its
 /// problems by severity then line. In a multi-root project files are
 /// grouped under a header per folder (in folder order) and shown relative
 /// to their folder; files outside every folder come last, under "Other
-/// files", with their full path.
+/// files", with their full path. A notebook's problems (`cell_of`) are
+/// grouped per cell as `notebook.ipynb [cell 3]`, lines counted in the
+/// cell.
 fn rows<'a>(
     project: &Project,
     files: impl IntoIterator<Item = (&'a Path, Vec<&'a lsp::types::Diagnostic>)>,
+    cell_of: impl Fn(&Path, lsp::types::Position) -> Option<CellLabel>,
 ) -> Vec<Row> {
     let multi_root = project.is_multi_root();
-    let mut files: Vec<(Option<usize>, &Path, Vec<&lsp::types::Diagnostic>)> = files
-        .into_iter()
-        .filter(|(_, shown)| !shown.is_empty())
-        .map(|(path, shown)| {
-            let root = match multi_root {
-                true => project.root_index_of(path),
-                false => Some(0),
+    let root_of = |path: &Path| match multi_root {
+        true => project.root_index_of(path),
+        false => Some(0),
+    };
+    let mut groups: Vec<Group> = Vec::new();
+    for (path, shown) in files {
+        let start = groups.len();
+        for diagnostic in shown {
+            let (shown, cell, first_line) = match cell_of(path, diagnostic.range.start) {
+                Some(label) => (label.notebook, label.number, label.first_line),
+                None => (path.to_path_buf(), 0, 0),
             };
-            (root, path, shown)
-        })
-        .collect();
-    files.sort_by_key(|(root, path, _)| (root.unwrap_or(usize::MAX), *path));
+            match groups[start..]
+                .iter_mut()
+                .find(|group| group.cell == cell && group.shown == shown)
+            {
+                Some(group) => group.diagnostics.push(diagnostic),
+                None => groups.push(Group {
+                    root: root_of(&shown),
+                    shown,
+                    cell,
+                    target: path,
+                    first_line,
+                    diagnostics: vec![diagnostic],
+                }),
+            }
+        }
+    }
+    groups.sort_by(|a, b| {
+        (a.root.unwrap_or(usize::MAX), &a.shown, a.cell).cmp(&(
+            b.root.unwrap_or(usize::MAX),
+            &b.shown,
+            b.cell,
+        ))
+    });
 
     let mut rows = Vec::new();
     // The current folder's header: (its folder, its row).
     let mut header: Option<(Option<usize>, usize)> = None;
-    for (root, path, mut diagnostics) in files {
-        diagnostics.sort_by_key(|d| {
+    for mut group in groups {
+        let root = group.root;
+        group.diagnostics.sort_by_key(|d| {
             (
                 Severity::of(d.severity),
                 d.range.start.line,
@@ -190,7 +249,8 @@ fn rows<'a>(
             )
         });
         let count = |severity| {
-            diagnostics
+            group
+                .diagnostics
                 .iter()
                 .filter(|d| Severity::of(d.severity) == severity)
                 .count()
@@ -217,22 +277,27 @@ fn rows<'a>(
                 *total_warnings += warnings;
             }
         }
+        let path = group.shown.as_path();
         let shown = match root {
             Some(root) => path
                 .strip_prefix(&project.roots()[root].path)
                 .unwrap_or(path),
             None => path,
         };
+        let shown = match group.cell {
+            0 => shown.display().to_string(),
+            cell => format!("{} [cell {cell}]", shown.display()),
+        };
         rows.push(Row::File {
-            path: shown.display().to_string().into(),
+            path: shown.into(),
             errors,
             warnings,
         });
-        for diagnostic in diagnostics {
+        for diagnostic in group.diagnostics {
             let start = diagnostic.range.start;
             rows.push(Row::Problem {
                 location: Location {
-                    path: path.to_path_buf(),
+                    path: group.target.to_path_buf(),
                     range: diagnostic.range,
                 },
                 severity: Severity::of(diagnostic.severity),
@@ -243,7 +308,12 @@ fn rows<'a>(
                     .unwrap_or_default()
                     .to_owned()
                     .into(),
-                position: format!("{}:{}", start.line + 1, start.character + 1).into(),
+                position: format!(
+                    "{}:{}",
+                    start.line - group.first_line + 1,
+                    start.character + 1
+                )
+                .into(),
                 code: diagnostic_origin(diagnostic).map(Into::into),
             });
         }
@@ -392,7 +462,7 @@ mod tests {
         let files = files
             .iter()
             .map(|(path, diagnostics)| (path.as_path(), diagnostics.iter().collect()));
-        rows(project, files)
+        rows(project, files, |_, _| None)
             .iter()
             .map(|row| match row {
                 Row::Root {
@@ -484,6 +554,73 @@ mod tests {
                 format!("src{MAIN_SEPARATOR}main.rs (1/0)"),
                 "  e".into(),
             ]
+        );
+    }
+
+    #[test]
+    fn notebook_problems_are_listed_per_cell_and_open_the_cell() {
+        let root = std::env::temp_dir().join("next_code_problems_notebook");
+        let project = Project::local(root.clone());
+        let notebook = root.join("nb.ipynb");
+        let document = root.join("nb.ipynb.nc-notebook.py");
+        let diagnostics = [
+            diagnostic(7, DiagnosticSeverity::ERROR, "undefined"),
+            diagnostic(2, DiagnosticSeverity::WARNING, "unused"),
+            diagnostic(12, DiagnosticSeverity::ERROR, "tenth"),
+        ];
+        let other = [diagnostic(0, DiagnosticSeverity::ERROR, "e")];
+        let file = root.join("a.py");
+        let files = vec![
+            (document.as_path(), diagnostics.iter().collect()),
+            (file.as_path(), other.iter().collect()),
+        ];
+        // Cells 1, 3 and 10 start at lines 0, 5 and 10 of the document.
+        let cell_of = |path: &Path, position: lsp::types::Position| {
+            (path == document).then(|| {
+                let (number, first_line) = match position.line {
+                    0..5 => (1, 0),
+                    5..10 => (3, 5),
+                    _ => (10, 10),
+                };
+                CellLabel {
+                    notebook: notebook.clone(),
+                    number,
+                    first_line,
+                }
+            })
+        };
+        let rows = rows(&project, files, cell_of);
+        let shown: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                Row::File { path, .. } => path.to_string(),
+                Row::Problem {
+                    message, position, ..
+                } => format!("  {message} {position}"),
+                Row::Root { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "a.py",
+                "  e 1:1",
+                "nb.ipynb [cell 1]",
+                "  unused 3:1",
+                "nb.ipynb [cell 3]",
+                "  undefined 3:1",
+                "nb.ipynb [cell 10]",
+                "  tenth 3:1",
+            ]
+        );
+        // Opening a problem goes to the document's position (the
+        // workspace maps it to the cell).
+        let Row::Problem { location, .. } = &rows[5] else {
+            panic!("a problem row");
+        };
+        assert_eq!(
+            (location.path.as_path(), location.range.start.line),
+            (document.as_path(), 7)
         );
     }
 }

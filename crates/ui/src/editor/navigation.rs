@@ -101,7 +101,7 @@ impl Editor {
         let doc = self.lsp.as_ref()?;
         Some(TextDocumentPositionParams::new(
             TextDocumentIdentifier::new(doc.uri.clone()),
-            language::to_position(&self.buffer, offset, doc.server.encoding),
+            self.server_position(offset, doc.server.encoding),
         ))
     }
 

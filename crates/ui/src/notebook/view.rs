@@ -27,6 +27,7 @@ use super::{
     markdown::{MarkdownImages, markdown},
     output::{OutputAction, OutputCache, OutputOptions, open_html, render_output},
     picker::{InterpreterPicker, InterpreterPickerEvent},
+    widgets::{self, WidgetInputs, WidgetRender, WidgetSink, apply_event, input_specs},
 };
 use crate::{
     editor::{CompletionProvider, Editor, EditorEvent},
@@ -72,6 +73,7 @@ actions!(
         MoveCellsUp,
         MoveCellsDown,
         ToggleOutputs,
+        ToggleSource,
         ChooseInterpreter,
         OpenInMarimo,
         ShowHelp,
@@ -82,6 +84,8 @@ actions!(
 
 #[cfg(test)]
 mod tests;
+
+mod language_server;
 
 const CONTEXT: &str = "Notebook";
 /// Width of the column left of each cell (execution count, run button,
@@ -143,6 +147,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("i i", Interrupt, command),
         KeyBinding::new("0 0", Restart, command),
     ]);
+    language_server::bind_keys(cx);
+    widgets::bind_keys(cx);
 }
 
 /// Cells copied with C/X, shared by every notebook of the app.
@@ -162,6 +168,20 @@ pub enum NotebookViewEvent {
     InstallKernel,
     /// Vim's `:q` in a cell (`discard`: `:q!`).
     Close { discard: bool },
+    /// Go to (or pick among) a cell editor's language-server locations
+    /// (in the notebook's virtual document or other files).
+    Navigate {
+        locations: Vec<language::Location>,
+        title: SharedString,
+    },
+    /// A cell editor's rename or code action edit (see
+    /// `EditorEvent::ApplyEdit`).
+    ApplyEdit {
+        edit: lsp::types::WorkspaceEdit,
+        server: std::sync::Arc<crate::lsp_store::RunningServer>,
+        command: Option<lsp::types::Command>,
+        label: SharedString,
+    },
 }
 
 impl EventEmitter<NotebookViewEvent> for NotebookView {}
@@ -173,8 +193,6 @@ struct CellState {
     _subscriptions: Vec<Subscription>,
     /// A Markdown cell shows its editor instead of the rendered text.
     editing: bool,
-    /// Outputs hidden (O, or a click on the output strip).
-    collapsed: bool,
     /// "Show more" was clicked: long text outputs show in full.
     expanded: bool,
     /// The kernel's help for the name at the cursor (Ctrl+K Ctrl+I).
@@ -188,7 +206,6 @@ impl CellState {
             editor: None,
             _subscriptions: Vec::new(),
             editing: false,
-            collapsed: false,
             expanded: false,
             help: None,
         }
@@ -218,6 +235,10 @@ pub struct NotebookView {
     /// editor's `Edited` is not sent back.
     syncing: bool,
     output_cache: OutputCache,
+    /// Text fields of ipywidgets shown in this view.
+    widget_inputs: WidgetInputs,
+    /// Text/number fields of marimo UI elements shown in this view.
+    marimo_inputs: WidgetInputs,
     /// `notebook.output_max_lines`, read once per frame.
     output_max_lines: usize,
     notice: Option<Notice>,
@@ -226,6 +247,8 @@ pub struct NotebookView {
     picker: Option<(Entity<InterpreterPicker>, Subscription)>,
     /// Redraws while a cell runs (live elapsed time).
     ticker: Option<Task<()>>,
+    /// The language-server document of the cells (`set_language_server`).
+    lsp: Option<(Entity<super::lsp::NotebookLsp>, Subscription)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -258,11 +281,14 @@ impl NotebookView {
             reveal: false,
             syncing: false,
             output_cache: OutputCache::default(),
+            widget_inputs: WidgetInputs::default(),
+            marimo_inputs: WidgetInputs::default(),
             output_max_lines: 200,
             notice: None,
             task_status: None,
             picker: None,
             ticker: None,
+            lsp: None,
             _subscriptions: vec![subscription],
         };
         view.update_ticker(cx);
@@ -537,6 +563,7 @@ impl NotebookView {
         let state = self.cells.entry(id).or_insert_with(|| CellState::new(kind));
         state.editor = Some(editor.clone());
         state._subscriptions = vec![events, focused];
+        self.link_editor(id, cx);
         Some(editor)
     }
 
@@ -578,6 +605,21 @@ impl NotebookView {
             EditorEvent::Close { discard } => {
                 cx.emit(NotebookViewEvent::Close { discard: *discard })
             }
+            EditorEvent::Navigate { locations, title } => cx.emit(NotebookViewEvent::Navigate {
+                locations: locations.clone(),
+                title: title.clone(),
+            }),
+            EditorEvent::ApplyEdit {
+                edit,
+                server,
+                command,
+                label,
+            } => cx.emit(NotebookViewEvent::ApplyEdit {
+                edit: edit.clone(),
+                server: server.clone(),
+                command: command.clone(),
+                label: label.clone(),
+            }),
             _ => {}
         }
     }
@@ -720,6 +762,9 @@ impl NotebookView {
         if let Some(state) = self.cells.get_mut(&id) {
             state.editing = state.kind == CellKind::Markdown;
         }
+        // A collapsed source shows again to be edited.
+        self.document
+            .update(cx, |document, cx| document.set_source_hidden(id, false, cx));
         let editor = self.ensure_editor(id, window, cx)?;
         window.focus(&editor.focus_handle(cx));
         Some(editor)
@@ -1097,12 +1142,25 @@ impl NotebookView {
         }
     }
 
-    fn toggle_collapsed(&mut self, id: CellId, cx: &mut Context<Self>) {
-        if let Some(state) = self.cells.get_mut(&id) {
-            state.collapsed = !state.collapsed;
+    fn toggle_source(&mut self, _: &ToggleSource, _: &mut Window, cx: &mut Context<Self>) {
+        for id in self.selected_ids(cx) {
+            self.document.update(cx, |document, cx| {
+                let hidden = document
+                    .cell(id)
+                    .is_some_and(|cell| cell.cell.source_hidden());
+                document.set_source_hidden(id, !hidden, cx);
+            });
         }
-        self.splice_cell(id);
-        cx.notify();
+    }
+
+    /// The document saves it (`.ipynb`) and tells every view.
+    fn toggle_collapsed(&mut self, id: CellId, cx: &mut Context<Self>) {
+        self.document.update(cx, |document, cx| {
+            let hidden = document
+                .cell(id)
+                .is_some_and(|cell| cell.cell.outputs_hidden());
+            document.set_outputs_hidden(id, !hidden, cx);
+        });
     }
 
     fn show_more(&mut self, id: CellId, cx: &mut Context<Self>) {
@@ -1155,6 +1213,63 @@ impl NotebookView {
 
     // Rendering.
 
+    /// Creates the editors of the text widgets cell `id`'s outputs show,
+    /// and shows values the kernel changed in them.
+    fn sync_widget_inputs(&mut self, id: CellId, window: &mut Window, cx: &mut Context<Self>) {
+        let document = self.document.read(cx);
+        let Some(cell) = document.cell(id) else {
+            return;
+        };
+        let roots: Vec<&str> = cell
+            .cell
+            .outputs
+            .iter()
+            .filter_map(notebook::widgets::view_model_id)
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
+        self.widget_inputs.prune(document.widgets());
+        let specs = input_specs(document.widgets(), &roots);
+        if specs.is_empty() {
+            return;
+        }
+        let handle = self.document.downgrade();
+        let sink: WidgetSink = Rc::new(move |event, cx| apply_event(&handle, event, cx));
+        self.widget_inputs.ensure(specs, &sink, window, cx);
+    }
+
+    /// Creates the editors of the number/text marimo elements cell `id`'s
+    /// outputs show (Enter sends their value; see `marimo_ui`).
+    fn sync_marimo_inputs(&mut self, id: CellId, window: &mut Window, cx: &mut Context<Self>) {
+        let document = self.document.read(cx);
+        if !document.is_marimo() {
+            return;
+        }
+        let Some(cell) = document.cell(id) else {
+            return;
+        };
+        let specs: Vec<_> = cell
+            .cell
+            .outputs
+            .iter()
+            .filter_map(|output| match output {
+                notebook::Output::DisplayData { data, .. }
+                | notebook::Output::ExecuteResult { data, .. } => {
+                    notebook::outputs::marimo_ui_parts(data)
+                }
+                _ => None,
+            })
+            .flat_map(super::marimo_ui::input_specs)
+            .collect();
+        if specs.is_empty() {
+            return;
+        }
+        // Fields send on Enter only (not continuous): nothing comes here.
+        let sink: WidgetSink = Rc::new(|_, _| {});
+        self.marimo_inputs.ensure(specs, &sink, window, cx);
+    }
+
     fn render_cell(
         &mut self,
         index: usize,
@@ -1164,11 +1279,16 @@ impl NotebookView {
         let Some(&id) = self.order.get(index) else {
             return div().into_any_element();
         };
-        let Some(kind) = self.document.read(cx).cell(id).map(|cell| cell.cell.kind) else {
+        let Some((kind, source_hidden)) = self
+            .document
+            .read(cx)
+            .cell(id)
+            .map(|cell| (cell.cell.kind, cell.cell.source_hidden()))
+        else {
             return div().into_any_element();
         };
         let editing = self.cells.get(&id).is_some_and(|state| state.editing);
-        let editor = if kind != CellKind::Markdown || editing {
+        let editor = if !source_hidden && (kind != CellKind::Markdown || editing) {
             self.ensure_editor(id, window, cx)
         } else {
             None
@@ -1177,12 +1297,12 @@ impl NotebookView {
         let editor_focused = editor
             .as_ref()
             .is_some_and(|editor| editor.focus_handle(cx).is_focused(window));
-        let (collapsed, expanded) = self
-            .cells
-            .get(&id)
-            .map_or((false, false), |state| (state.collapsed, state.expanded));
+        let expanded = self.cells.get(&id).is_some_and(|state| state.expanded);
         let max_lines = self.output_max_lines;
+        self.sync_widget_inputs(id, window, cx);
+        self.sync_marimo_inputs(id, window, cx);
         let this = cx.entity().downgrade();
+        let document_handle = self.document.downgrade();
 
         let document = self.document.clone();
         let document = document.read(cx);
@@ -1190,6 +1310,7 @@ impl NotebookView {
             return div().into_any_element();
         };
         let selected = self.selected_range(document).contains(&index);
+        let collapsed = cell.cell.outputs_hidden();
         let is_cursor = self.cursor == Some(id);
         let bar = if is_cursor && editor_focused {
             Some(theme::git_added())
@@ -1276,8 +1397,36 @@ impl NotebookView {
             .children(elapsed.map(|(text, color)| div().text_color(color).child(text)))
             .children(marker.map(|(text, color)| div().text_color(color).child(text)));
 
-        // The cell's text: its editor, or rendered Markdown.
+        // The cell's text: its editor, or rendered Markdown (or a line
+        // standing for a collapsed source).
         let content = match editor {
+            _ if source_hidden => div()
+                .id(("source-hidden", id))
+                .w_full()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(theme::muted())
+                .cursor_pointer()
+                .child(format!(
+                    "{} hidden ({} line{}): click to show",
+                    if kind == CellKind::Markdown {
+                        "Markdown"
+                    } else {
+                        "Code"
+                    },
+                    cell.cell.source.lines().count(),
+                    if cell.cell.source.lines().count() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.document
+                        .update(cx, |document, cx| document.set_source_hidden(id, false, cx));
+                }))
+                .into_any_element(),
             Some(editor) => div()
                 .w_full()
                 .px_2()
@@ -1421,6 +1570,7 @@ impl NotebookView {
                     .px_2()
                     .children(outputs.iter().enumerate().map(|(position, output)| {
                         let this = this.clone();
+                        let document_handle = document_handle.clone();
                         render_output(
                             ElementId::NamedInteger(format!("output-{id}").into(), position as u64),
                             output,
@@ -1428,6 +1578,11 @@ impl NotebookView {
                             OutputOptions {
                                 max_lines,
                                 expanded,
+                                widgets: Some(WidgetRender {
+                                    store: document.widgets(),
+                                    inputs: &self.widget_inputs,
+                                }),
+                                marimo_inputs: Some(&self.marimo_inputs),
                             },
                             move |action, _, cx| match action {
                                 OutputAction::ShowMore => {
@@ -1445,6 +1600,33 @@ impl NotebookView {
                                         })
                                         .ok();
                                     }
+                                }
+                                OutputAction::Widget(event) => {
+                                    apply_event(&document_handle, event, cx);
+                                }
+                                OutputAction::MarimoUi {
+                                    object_id,
+                                    value,
+                                    send,
+                                } => {
+                                    document_handle
+                                        .update(cx, |document, cx| {
+                                            let value = match value {
+                                                Some(value) => value,
+                                                None => match document.ui_value(id, &object_id) {
+                                                    Some(value) => value,
+                                                    None => return,
+                                                },
+                                            };
+                                            if send {
+                                                document
+                                                    .set_ui_value(id, &object_id, value, cx)
+                                                    .detach();
+                                            } else {
+                                                document.show_ui_value(id, &object_id, value, cx);
+                                            }
+                                        })
+                                        .ok();
                                 }
                             },
                             cx,
@@ -1668,8 +1850,8 @@ impl NotebookView {
             banners.push(
                 banner(
                     "nb-banner-marimo",
-                    "marimo notebook: cells re-run when what they use changes. mo.ui elements are \
-                     not interactive here — open in marimo."
+                    "marimo notebook: cells re-run when what they use changes, also when a mo.ui \
+                     element changes. Tables, forms and other elements: open in marimo."
                         .into(),
                     theme::muted(),
                 )
@@ -1803,9 +1985,12 @@ impl Render for NotebookView {
             .on_action(cx.listener(Self::move_cells_up))
             .on_action(cx.listener(Self::move_cells_down))
             .on_action(cx.listener(Self::toggle_outputs))
+            .on_action(cx.listener(Self::toggle_source))
             .on_action(cx.listener(Self::choose_interpreter))
             .on_action(cx.listener(Self::open_in_marimo))
             .on_action(cx.listener(Self::open_as_text))
+            .on_action(cx.listener(Self::format_cell))
+            .on_action(cx.listener(Self::format_notebook))
             .relative()
             .size_full()
             .flex()

@@ -1,9 +1,10 @@
 //! Headless notebooks: `notebook_open`, `notebook_run`, `notebook_edit`,
 //! `notebook_insert`, `notebook_delete`, `notebook_interrupt`,
-//! `notebook_restart`, `notebook_save`, `notebook_close` and
-//! `notebook_status`. The same [`NotebookDocument`] as a notebook tab, kept
-//! open by path until `notebook_close` (or exit, which shuts every kernel
-//! down).
+//! `notebook_restart`, `notebook_save`, `notebook_reload`,
+//! `notebook_set_ui` (marimo UI elements), `notebook_close` and
+//! `notebook_status`. The same [`NotebookDocument`] as
+//! a notebook tab, kept open by path until `notebook_close` (or exit, which
+//! shuts every kernel down).
 
 use notebook::{CellKind, Output, ansi, outputs};
 
@@ -37,6 +38,7 @@ fn output_json(output: &Output) -> Value {
                 "mimes": data.keys().collect::<Vec<_>>(),
                 "text_plain": data.get("text/plain").and_then(Value::as_str),
                 "text": text,
+                "marimo_ui": outputs::marimo_ui_parts(data),
             })
         }
         Output::Error {
@@ -68,6 +70,8 @@ fn cell_json(index: usize, cell: &DocCell) -> Value {
         "execution_count": cell.cell.execution_count,
         "status": status,
         "stale": cell.stale,
+        "outputs_hidden": cell.cell.outputs_hidden(),
+        "source_hidden": cell.cell.source_hidden(),
         "error": cell.error,
         "outputs": cell.cell.outputs.iter().map(output_json).collect::<Vec<_>>(),
     })
@@ -188,11 +192,27 @@ impl Session {
                 .detach();
             }
             "notebook_edit" => {
+                // `source`, `outputs_hidden`, `source_hidden`: any of them.
                 let result = document.update(cx, |document, cx| {
                     let index = cell_index(document, &request["cell"])?;
-                    let source = param_str(request, "source")?.to_owned();
                     let cell = document.cells()[index].id;
-                    document.set_source(cell, source, None, cx);
+                    let outputs_hidden = request["outputs_hidden"].as_bool();
+                    let source_hidden = request["source_hidden"].as_bool();
+                    match request["source"].as_str() {
+                        Some(source) => document.set_source(cell, source.to_owned(), None, cx),
+                        None if outputs_hidden.is_none() && source_hidden.is_none() => {
+                            return Err(
+                                "`source`, `outputs_hidden` or `source_hidden` is required".into(),
+                            );
+                        }
+                        None => {}
+                    }
+                    if let Some(hidden) = outputs_hidden {
+                        document.set_outputs_hidden(cell, hidden, cx);
+                    }
+                    if let Some(hidden) = source_hidden {
+                        document.set_source_hidden(cell, hidden, cx);
+                    }
                     Ok(cell_json(index, &document.cells()[index]))
                 });
                 out.reply(&id, result);
@@ -231,6 +251,41 @@ impl Session {
             "notebook_save" => {
                 let result = document.update(cx, |document, cx| document.save(cx));
                 out.reply(&id, result.map(|()| Value::Null));
+            }
+            "notebook_reload" => self.notebook_reload(id, document, cx),
+            "notebook_set_ui" => {
+                // marimo: `cell` (index), `element` (object id), `value`.
+                let started = document.update(cx, |document, cx| {
+                    let index = cell_index(document, &request["cell"])?;
+                    let element = param_str(request, "element")?.to_owned();
+                    let cell = document.cells()[index].id;
+                    let mark = document.run_mark();
+                    let set = document.set_ui_value(cell, &element, request["value"].clone(), cx);
+                    Ok((mark, set))
+                });
+                let (mark, set) = match started {
+                    Ok(started) => started,
+                    Err(err) => return out.reply(&id, Err(err)),
+                };
+                cx.spawn(async move |_, cx| {
+                    if let Err(err) = set.await {
+                        return out.reply(&id, Err(err));
+                    }
+                    let idle = document.update(cx, |document, _| document.when_idle());
+                    if let Ok(idle) = idle {
+                        idle.await.ok();
+                    }
+                    let result = document
+                        .read_with(cx, |document, _| {
+                            json!({
+                                "kernel": kernel_json(document),
+                                "cells": finished_json(document, mark),
+                            })
+                        })
+                        .map_err(|err| err.to_string());
+                    out.reply(&id, result);
+                })
+                .detach();
             }
             "notebook_close" => {
                 self.notebooks.remove(&path);
@@ -321,6 +376,46 @@ impl Session {
                     result
                 })
                 .map_err(|err| err.to_string());
+            out.reply(&id, result);
+        })
+        .detach();
+    }
+
+    /// `notebook_reload`: reads the file again and, when it changed since
+    /// it was read or saved, reloads it as a tab does (unchanged cells keep
+    /// their outputs; marimo marks changed cells and their descendants
+    /// stale; unsaved edits are dropped). Reply: `{reloaded, cells}`.
+    fn notebook_reload(
+        &mut self,
+        id: Value,
+        document: Entity<NotebookDocument>,
+        cx: &mut Context<Self>,
+    ) {
+        let out = self.out.clone();
+        let (project, path) = {
+            let document = document.read(cx);
+            (document.project().clone(), document.path().to_owned())
+        };
+        cx.spawn(async move |_, cx| {
+            let text = cx
+                .background_spawn(async move {
+                    project
+                        .read_text(&path)
+                        .map_err(|err| format!("Cannot read {}: {err}", path.display()))
+                })
+                .await;
+            let result = text.and_then(|text| {
+                document
+                    .update(cx, |document, cx| {
+                        let reloaded = document.changed_on_disk(&text);
+                        if reloaded {
+                            document.reload(&text, cx)?;
+                        }
+                        Ok(json!({ "reloaded": reloaded, "cells": cells_json(document) }))
+                    })
+                    .map_err(|err| err.to_string())
+                    .and_then(|result| result)
+            });
             out.reply(&id, result);
         })
         .detach();

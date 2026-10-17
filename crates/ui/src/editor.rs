@@ -22,6 +22,7 @@ use text::{Bias, Buffer, Change, Encoding};
 
 use crate::{
     lsp_store::RunningServer,
+    notebook::lsp::CellLink,
     project::Project,
     selectable::selectable,
     theme::{self, SyntaxStyle},
@@ -30,6 +31,7 @@ use crate::{
 mod blame;
 mod brackets;
 mod call_hierarchy;
+mod cell_server;
 mod code_actions;
 mod completion;
 mod debug_gutter;
@@ -633,6 +635,9 @@ struct LspDocument {
     server: Arc<RunningServer>,
     uri: Uri,
     version: i32,
+    /// A notebook cell: its place in the notebook's virtual document
+    /// (`uri`), which the notebook opens and closes.
+    cell: Option<CellLink>,
 }
 
 /// A view's open server document, moved between views of one file
@@ -903,6 +908,7 @@ impl Editor {
             server,
             uri,
             version: 1,
+            cell: None,
         });
         self.refresh_semantic_tokens(cx);
         self.symbols_attached(cx);
@@ -918,6 +924,7 @@ impl Editor {
         self.link = None;
         if let Some(doc) = self.lsp.take()
             && close
+            && doc.cell.is_none()
             && !doc.server.connection.has_exited()
         {
             doc.server
@@ -961,6 +968,11 @@ impl Editor {
         let Some(doc) = &mut self.lsp else {
             return false;
         };
+        if let Some(link) = &doc.cell {
+            link.sync(&self.buffer.slice(0..self.buffer.len()));
+            doc.version += 1;
+            return true;
+        }
         let server = &doc.server;
         let content_changes =
             if server.sync == TextDocumentSyncKind::INCREMENTAL && self.changes.len() == 1 {
@@ -1014,9 +1026,10 @@ impl Editor {
 
     /// A notebook cell editor: code features (tree-sitter highlighting for
     /// `language`, brackets and auto-close, undo, Vim, spell check,
-    /// completion from `set_completion_provider`) without gutter, status
-    /// bar, scrollbar, minimap, sticky scroll, breadcrumbs, find bar or
-    /// language server (a text area's chrome). Its element is as tall as
+    /// completion from `set_completion_provider`, the notebook's language
+    /// server through `attach_cell_server`) without gutter, status bar,
+    /// scrollbar, minimap, sticky scroll, breadcrumbs or find bar (a text
+    /// area's chrome). Its element is as tall as
     /// its content (screen rows × line height, at least one row), so a list
     /// can size it; popovers draw over neighbouring cells. Code cells don't
     /// wrap; Markdown cells (`Language::Markdown`) do. Save is left to the
@@ -1051,8 +1064,9 @@ impl Editor {
         }
     }
 
-    /// Completions from `provider` while no language server is attached
-    /// (identifier characters and `.` ask it, as does Ctrl+Space).
+    /// Completions from `provider`: alone while no language server is
+    /// attached (identifier characters and `.` ask it, as does
+    /// Ctrl+Space), after the server's items otherwise.
     pub fn set_completion_provider(&mut self, provider: Option<CompletionProvider>) {
         self.completion_provider = provider;
     }
@@ -1863,22 +1877,30 @@ impl Editor {
             .lsp
             .as_ref()
             .map_or(Encoding::Utf16, |doc| doc.server.encoding);
+        // A cell gets its notebook's diagnostics (virtual positions).
+        let cell = self.lsp.as_ref().is_some_and(|doc| doc.cell.is_some());
+        let shift = self.server_line_shift();
+        let lines = self.buffer.line_count() as u32;
+        let diagnostics = diagnostics.iter().filter(|diagnostic| {
+            !cell
+                || shift.is_some_and(|shift| {
+                    (shift..shift + lines).contains(&diagnostic.range.start.line)
+                })
+        });
         let offset = |position: lsp::types::Position| {
             let point = text::Point {
-                row: position.line as usize,
+                row: position.line.saturating_sub(shift.unwrap_or(0)) as usize,
                 column: position.character as usize,
             };
             self.buffer.offset_of(point, encoding)
         };
         self.diagnostics = diagnostics
-            .iter()
             .map(|diagnostic| {
+                let end = offset(diagnostic.range.end);
+                let start = offset(diagnostic.range.start).min(end);
                 let tags = diagnostic.tags.as_deref().unwrap_or_default();
                 EditorDiagnostic {
-                    range: self.visible_range(
-                        offset(diagnostic.range.start),
-                        offset(diagnostic.range.end),
-                    ),
+                    range: self.visible_range(start, end),
                     severity: match diagnostic.severity {
                         Some(DiagnosticSeverity::WARNING) => Severity::Warning,
                         Some(DiagnosticSeverity::INFORMATION) => Severity::Information,
@@ -3284,6 +3306,16 @@ impl Render for Editor {
                         ),
                 )
             });
+        if self.notebook_cell && self.rename.is_some() {
+            // A cell's rename input draws over the neighbouring cells.
+            return div()
+                .w_full()
+                .on_action(cx.listener(Self::confirm_rename))
+                .on_action(cx.listener(Self::cancel_rename))
+                .child(editor)
+                .children(self.render_rename().map(|rename| self.popover(rename)))
+                .into_any_element();
+        }
         if self.single_line || self.text_area {
             return editor.into_any_element();
         }

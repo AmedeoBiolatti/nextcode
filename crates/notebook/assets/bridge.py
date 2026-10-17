@@ -29,11 +29,15 @@
 #   iopub `status` busy/idle -> `status` events with `request`;
 #   `execute_input` -> `execute_input` event; `stream`, `display_data`,
 #   `execute_result`, `error`, `clear_output`, `update_display_data` ->
-#   `output` events with the content unchanged. The reply (`{status,
-#   execution_count, ename?, evalue?}`) comes once both the shell
-#   `execute_reply` and the iopub idle for the request arrived. With
-#   `marimo` {cell, defs, refs} the executed code is
-#   `__nc_marimo__.run(cell, code, defs, refs)` (Python literals).
+#   `output` events with the content unchanged and `parent` (the iopub
+#   message's parent msg_id); `comm_open`, `comm_msg`, `comm_close` ->
+#   `comm` events {msg_type, content, buffers (base64), parent}. The
+#   reply (`{status, execution_count, ename?, evalue?}`) comes once both
+#   the shell `execute_reply` and the iopub idle for the request arrived.
+#   With `marimo` {cell, defs, refs} the executed code is
+#   `__nc_marimo__.run(cell, code, defs, refs)` (Python literals), or
+#   `await __nc_marimo__.run_async(...)` when the code may use top-level
+#   `await` (IPython runs it on the kernel's asyncio loop).
 # - interrupt: `km.interrupt_kernel()`, reply null.
 # - restart: status `restarting`, pending requests fail,
 #   `km.restart_kernel(now=True)`, wait for ready, re-inject the helper,
@@ -42,6 +46,11 @@
 #   kill), replies null and exits.
 # - complete / inspect / is_complete: shell requests; reply: their content.
 # - kernelspecs: `{name: {display_name, language, argv}}`.
+# - marimo_set_ui {object_id, value}: a silent execute whose user
+#   expression is `__nc_marimo__.set_ui(object_id, json)`; reply `{names}`
+#   (the globals bound to the element), or an error.
+# - comm_msg {comm_id, data, buffers?, msg_id}: a shell `comm_msg` (buffers
+#   base64-decoded) whose header msg_id is the given one; reply null.
 # The kernel process is checked about every second; when it died: a `dead`
 # event, status `dead`, and pending requests fail.
 #
@@ -60,11 +69,20 @@
 # `_repr_mimebundle_` ({mime: data, 'text/plain': ...}; marimo's markdown,
 # whose `_mime_` is HTML labelled text/markdown, yields `text/html` and
 # `text/markdown` with the source: `mo.md` is wrapped once marimo is
-# imported so its results remember their markdown).
+# imported so its results remember their markdown). Values holding marimo
+# UI elements (`mo.ui.*`, also inside `mo.md` and layouts) add
+# `application/vnd.nextcode.marimo-ui+json` `{parts: [{markdown} | {text}
+# | {element: {id, kind, label, value, args}}]}` (the element's `data-*`
+# arguments, its current front-end value) and a readable `text/plain`.
+# `set_ui(object_id, json)` finds the element among `user_ns`'s values,
+# calls its `_update` (marimo's front-end path: conversion, `on_change`)
+# and returns the public names bound to it.
 
+import base64
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -74,6 +92,8 @@ POLL_SECONDS = 0.05
 ALIVE_SECONDS = 1.0
 READY_TIMEOUT = 60.0
 REQUEST_TIMEOUT = 30.0
+# marimo cells that may use top-level `await` (see `op_execute`).
+ASYNC_WORD = re.compile(r"\b(?:await|async)\b")
 FORWARDED = (
     "stream",
     "display_data",
@@ -87,8 +107,11 @@ MARIMO_HELPER = r'''
 def __nc_install_marimo_helper():
     import ast
     import builtins
+    import html
     import inspect
+    import json
     import linecache
+    import re
     import sys
 
     from IPython import get_ipython
@@ -109,7 +132,105 @@ def __nc_install_marimo_helper():
             text = getattr(value, "__nc_markdown__", None)
         return text if isinstance(text, str) else None
 
-    def rich(value):
+    # marimo UI elements (`mo.ui.*`) render as `<marimo-ui-element
+    # object-id='...'>` wrapping `<marimo-KIND data-ARG='json' ...>`, also
+    # inside `mo.md` and layouts: described as UI_MIME parts so the editor
+    # draws them natively.
+    UI_MIME = "application/vnd.nextcode.marimo-ui+json"
+    ELEMENT = re.compile(
+        r"<marimo-ui-element\b[^>]*?\bobject-id='([^']*)'[^>]*>(.*?)</marimo-ui-element>", re.S
+    )
+    COMPONENT = re.compile(r"<marimo-([a-z][a-z0-9-]*)\b([^>]*)>", re.S)
+    ATTRIBUTE = re.compile(r"\bdata-([a-z0-9-]+)='([^']*)'")
+    TAG = re.compile(r"<[^>]*>")
+
+    def ui_element_class():
+        module = sys.modules.get("marimo._plugins.ui._core.ui_element")
+        return getattr(module, "UIElement", None)
+
+    def live_elements(*namespaces):
+        """{object id: element} of the UI elements bound in `namespaces`."""
+        found = {}
+        element_class = ui_element_class()
+        if element_class is None:
+            return found
+        for namespace in namespaces:
+            for value in list(namespace.values()):
+                if isinstance(value, element_class):
+                    found.setdefault(getattr(value, "_id", None), value)
+        return found
+
+    def plain(markup):
+        return html.unescape(TAG.sub("", markup))
+
+    def describe(object_id, inner, live):
+        match = COMPONENT.search(inner)
+        if match is None:
+            return None
+        args = {}
+        for name, raw in ATTRIBUTE.findall(match.group(2)):
+            raw = html.unescape(raw)
+            try:
+                args[name] = json.loads(raw)
+            except ValueError:
+                args[name] = raw
+        value = args.pop("initial-value", None)
+        label = args.pop("label", None)
+        label = plain(label).strip() if isinstance(label, str) else ""
+        element = live.get(object_id)
+        if element is not None:
+            value = getattr(element, "_value_frontend", value)
+            raw_label = getattr(getattr(element, "_args", None), "label", None)
+            if isinstance(raw_label, str):
+                label = raw_label
+        return {
+            "id": object_id,
+            "kind": match.group(1),
+            "label": label,
+            "value": value,
+            "args": args,
+        }
+
+    def ui_parts(markup, markdown, live):
+        """[{markdown} | {text} | {element}] for `markup` holding elements
+        (of `markdown`, the source, when it holds them), else None."""
+        if "<marimo-ui-element" not in markup:
+            return None
+        is_markdown = markdown is not None and "<marimo-ui-element" in markdown
+        source = markdown if is_markdown else markup
+        parts = []
+
+        def text(segment):
+            if not is_markdown:
+                segment = plain(segment)
+            if segment.strip():
+                parts.append({"markdown" if is_markdown else "text": segment})
+
+        position = 0
+        for match in ELEMENT.finditer(source):
+            text(source[position:match.start()])
+            element = describe(match.group(1), match.group(2), live)
+            if element is not None:
+                parts.append({"element": element})
+            position = match.end()
+        text(source[position:])
+        return parts
+
+    def parts_text(parts):
+        out = []
+        for part in parts:
+            element = part.get("element")
+            if element is None:
+                out.append(part.get("markdown") or part.get("text") or "")
+            else:
+                out.append(
+                    "[%s%s: %s]"
+                    % (element["kind"], " " + element["label"] if element["label"] else "",
+                       json.dumps(element["value"]))
+                )
+        return "".join(out)
+
+    def rich(value, *namespaces):
         mime_of = getattr(value, "_mime_", None)
         if not callable(mime_of) or isinstance(value, type):
             return value
@@ -126,7 +247,16 @@ def __nc_install_marimo_helper():
             bundle["text/html"] = data
         else:
             bundle[mime] = data
-        if markdown is not None:
+        parts = None
+        if isinstance(data, str):
+            try:
+                parts = ui_parts(data, markdown, live_elements(*namespaces))
+            except Exception:
+                parts = None
+        if parts:
+            bundle[UI_MIME] = {"parts": parts}
+            bundle["text/plain"] = parts_text(parts)
+        elif markdown is not None:
             bundle["text/plain"] = markdown
         elif mime == "text/plain":
             bundle["text/plain"] = data
@@ -167,13 +297,23 @@ def __nc_install_marimo_helper():
     CellSyntaxError.__name__ = "SyntaxError"
     CellSyntaxError.__qualname__ = "SyntaxError"
 
+    # Cells with top-level `await` compile into coroutine code (marimo
+    # writes them as `async def`); `run_async` awaits them on the kernel's
+    # event loop.
+    TOP_LEVEL_AWAIT = getattr(ast, "PyCF_ALLOW_TOP_LEVEL_AWAIT", 0)
+
+    def is_coroutine(code):
+        return code is not None and bool(code.co_flags & inspect.CO_COROUTINE)
+
     class Helper(object):
         def __init__(self):
             self._published = {}
 
-        def run(self, cell, code, defs, refs):
+        def _prepare(self, cell, code, refs, flags):
+            """(user_ns, published before, namespace, body, last)."""
             __tracebackhide__ = True
-            user_ns = get_ipython().user_ns
+            shell = get_ipython()
+            user_ns = shell.user_ns
             filename = "<cell %s>" % cell
             linecache.cache[filename] = (
                 len(code),
@@ -186,15 +326,14 @@ def __nc_install_marimo_helper():
             for name in refs:
                 if name in user_ns:
                     namespace[name] = user_ns[name]
-            shell = get_ipython()
             try:
                 tree = ast.parse(code, filename, "exec")
                 last = None
                 if tree.body and isinstance(tree.body[-1], ast.Expr):
                     last = ast.Expression(tree.body.pop().value)
-                body = compile(tree, filename, "exec")
+                body = compile(tree, filename, "exec", flags)
                 if last is not None:
-                    last = compile(last, filename, "eval")
+                    last = compile(last, filename, "eval", flags)
             except (SyntaxError, ValueError) as error:
                 for name in previous:
                     user_ns.pop(name, None)
@@ -204,29 +343,25 @@ def __nc_install_marimo_helper():
                 failure = CellSyntaxError(str(error))
                 failure._render_traceback_ = lambda: stb
                 raise failure from None
+            return user_ns, previous, namespace, body, last
+
+        def _failed(self, error, user_ns, previous):
+            for name in previous:
+                user_ns.pop(name, None)
+            if isinstance(error, SystemExit):
+                return
+            tb = error.__traceback__
+            if tb is not None and tb.tb_frame.f_code in HELPER_CODES:
+                tb = tb.tb_next
             try:
-                patch_marimo()
-                exec(body, namespace)
-                value = None
-                if last is not None:
-                    patch_marimo()
-                    value = eval(last, namespace)
-            except BaseException as error:
-                for name in previous:
-                    user_ns.pop(name, None)
-                if isinstance(error, SystemExit):
-                    raise
-                tb = error.__traceback__
-                if tb is not None and tb.tb_frame.f_code is Helper.run.__code__:
-                    tb = tb.tb_next
-                try:
-                    stb = shell.InteractiveTB.structured_traceback(
-                        type(error), error, tb, tb_offset=0
-                    )
-                    error._render_traceback_ = lambda: stb
-                except Exception:
-                    pass
-                raise
+                stb = get_ipython().InteractiveTB.structured_traceback(
+                    type(error), error, tb, tb_offset=0
+                )
+                error._render_traceback_ = lambda: stb
+            except Exception:
+                pass
+
+        def _publish(self, cell, defs, user_ns, previous, namespace, value):
             published = set()
             for name in defs:
                 if name.startswith("_") or name not in namespace:
@@ -236,7 +371,62 @@ def __nc_install_marimo_helper():
             for name in previous - published:
                 user_ns.pop(name, None)
             self._published[cell] = published
-            return rich(value)
+            return rich(value, namespace, user_ns)
+
+        def set_ui(self, object_id, value_json):
+            """Sets a UI element's value as marimo's front end does
+            (`UIElement._update`, which converts it and calls `on_change`);
+            returns the public global names bound to it (the cells using
+            them re-run)."""
+            user_ns = get_ipython().user_ns
+            element = live_elements(user_ns).get(object_id)
+            if element is None:
+                raise LookupError("no UI element %s among the notebook's globals" % object_id)
+            element._update(json.loads(value_json))
+            return sorted(
+                name
+                for name, bound in list(user_ns.items())
+                if bound is element and not name.startswith("_")
+            )
+
+        def run(self, cell, code, defs, refs):
+            __tracebackhide__ = True
+            user_ns, previous, namespace, body, last = self._prepare(cell, code, refs, 0)
+            try:
+                patch_marimo()
+                exec(body, namespace)
+                value = None
+                if last is not None:
+                    patch_marimo()
+                    value = eval(last, namespace)
+            except BaseException as error:
+                self._failed(error, user_ns, previous)
+                raise
+            return self._publish(cell, defs, user_ns, previous, namespace, value)
+
+        async def run_async(self, cell, code, defs, refs):
+            __tracebackhide__ = True
+            user_ns, previous, namespace, body, last = self._prepare(
+                cell, code, refs, TOP_LEVEL_AWAIT
+            )
+            try:
+                patch_marimo()
+                if is_coroutine(body):
+                    await eval(body, namespace)
+                else:
+                    exec(body, namespace)
+                value = None
+                if last is not None:
+                    patch_marimo()
+                    value = eval(last, namespace)
+                    if is_coroutine(last):
+                        value = await value
+            except BaseException as error:
+                self._failed(error, user_ns, previous)
+                raise
+            return self._publish(cell, defs, user_ns, previous, namespace, value)
+
+    HELPER_CODES = (Helper.run.__code__, Helper.run_async.__code__)
 
     return Helper()
 
@@ -350,6 +540,7 @@ class Bridge(object):
         self.requests = {}
         self.executions = {}  # msg_id -> Execution (unanswered)
         self.shell_requests = {}  # msg_id -> request id (complete, ...)
+        self.ui_requests = set()  # msg_ids of marimo_set_ui executes
         self.last_alive_check = time.monotonic()
         self.stopping = False
 
@@ -439,7 +630,22 @@ class Bridge(object):
                     execution_count=content.get("execution_count") or 0,
                 )
         elif msg_type in FORWARDED:
-            self.out.event("output", request=request, msg_type=msg_type, content=content)
+            self.out.event(
+                "output", request=request, parent=parent, msg_type=msg_type, content=content
+            )
+        elif msg_type in ("comm_open", "comm_msg", "comm_close"):
+            buffers = [
+                base64.b64encode(bytes(buffer)).decode("ascii")
+                for buffer in message.get("buffers") or []
+            ]
+            self.out.event(
+                "comm",
+                request=request,
+                parent=parent,
+                msg_type=msg_type,
+                content=content,
+                buffers=buffers,
+            )
 
     def on_shell(self, message):
         parent = (message.get("parent_header") or {}).get("msg_id")
@@ -457,8 +663,31 @@ class Bridge(object):
             self.finish(parent)
             return
         request = self.shell_requests.pop(parent, None)
-        if request is not None:
+        if request is not None and parent in self.ui_requests:
+            self.ui_requests.discard(parent)
+            self.ui_set(request, content)
+        elif request is not None:
             self.out.reply(request, content)
+
+    def ui_set(self, request, content):
+        """Replies to `marimo_set_ui` from its silent execute's reply."""
+        result = (content.get("user_expressions") or {}).get("names") or {}
+        if content.get("status") != "ok":
+            result = content
+        if result.get("status") != "ok":
+            self.out.fail(
+                request,
+                "%s: %s" % (result.get("ename", "Error"), result.get("evalue", "")),
+            )
+            return
+        import ast
+
+        try:
+            names = ast.literal_eval((result.get("data") or {}).get("text/plain", "[]"))
+        except (ValueError, SyntaxError) as error:
+            self.out.fail(request, "unexpected reply: %s" % error)
+            return
+        self.out.reply(request, {"names": [str(name) for name in names]})
 
     def finish(self, msg_id):
         execution = self.executions[msg_id]
@@ -473,6 +702,7 @@ class Bridge(object):
         for request in self.shell_requests.values():
             self.out.fail(request, error)
         self.shell_requests.clear()
+        self.ui_requests.clear()
 
     def remember(self, msg_id, request):
         self.requests[msg_id] = request
@@ -572,6 +802,15 @@ class Bridge(object):
                 metadata={"debugger": True},
             )
         km.shutdown_wait_time = 1.0
+        # Its name is on the kernel's command line (`-f FILE`): next_code's
+        # port forwarding (WSL, containers) skips the kernel's ZeroMQ ports
+        # by it (`next_code-kernel-`).
+        import tempfile
+        import uuid
+
+        km.connection_file = os.path.join(
+            tempfile.gettempdir(), "next_code-kernel-%s.json" % uuid.uuid4().hex
+        )
         self.out.event("status", state="starting")
         km.start_kernel(
             cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=None
@@ -635,7 +874,12 @@ class Bridge(object):
         code = args.get("code") or ""
         marimo = args.get("marimo")
         if marimo is not None:
-            code = "__nc_marimo__.run(%r, %r, %r, %r)" % (
+            # Anything that may hold top-level `await`/`async for`/`async
+            # with` runs awaited (IPython's autoawait, on the kernel's
+            # loop); a false positive just runs on that path too.
+            run = "await __nc_marimo__.run_async" if ASYNC_WORD.search(code) else "__nc_marimo__.run"
+            code = "%s(%r, %r, %r, %r)" % (
+                run,
                 str(marimo.get("cell", "")),
                 code,
                 [str(name) for name in marimo.get("defs") or []],
@@ -644,6 +888,22 @@ class Bridge(object):
         msg_id = self.kc.execute(code, silent=False, store_history=True, allow_stdin=False)
         self.remember(msg_id, request)
         self.executions[msg_id] = Execution(request)
+
+    def op_marimo_set_ui(self, request, args):
+        self.require_kernel()
+        expression = "__nc_marimo__.set_ui(%r, %r)" % (
+            str(args.get("object_id", "")),
+            json.dumps(args.get("value")),
+        )
+        msg_id = self.kc.execute(
+            "pass",
+            silent=True,
+            store_history=False,
+            allow_stdin=False,
+            user_expressions={"names": expression},
+        )
+        self.shell_requests[msg_id] = request
+        self.ui_requests.add(msg_id)
 
     def op_complete(self, request, args):
         self.require_kernel()
@@ -674,6 +934,21 @@ class Bridge(object):
                 "argv": spec.get("argv", []),
             }
         self.out.reply(request, specs)
+
+    def op_comm_msg(self, request, args):
+        self.require_kernel()
+        session = self.kc.session
+        message = session.msg(
+            "comm_msg",
+            content={"comm_id": args.get("comm_id"), "data": args.get("data") or {}},
+        )
+        msg_id = args.get("msg_id")
+        if msg_id:
+            message["header"]["msg_id"] = str(msg_id)
+            message["msg_id"] = str(msg_id)
+        buffers = [base64.b64decode(data) for data in args.get("buffers") or []]
+        session.send(self.kc.shell_channel.socket, message, buffers=buffers)
+        self.out.reply(request, None)
 
     def op_invalid(self, request, args):
         raise ValueError(args.get("error", "invalid request"))

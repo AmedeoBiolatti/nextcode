@@ -580,6 +580,7 @@ mod tests {
             next_event(&mut events, TIMEOUT),
             Some(Event::Output {
                 request: Some(first),
+                parent: None,
                 msg_type: "execute_result".into(),
                 content: json!({"data": {"text/plain": "2"}}),
             })
@@ -814,6 +815,7 @@ mod tests {
                     request: Some(request),
                     msg_type,
                     content,
+                    ..
                 } = event
                     && request == id
                 {
@@ -973,6 +975,276 @@ mod tests {
             marimo("d", &["mo"], &[]),
         );
         assert_eq!(outputs[0].1["data"]["text/markdown"], "# hi", "{outputs:?}");
+
+        // Top-level `await` (marimo writes `async def`) on the kernel's
+        // loop: statements, `async for` and the trailing expression.
+        let (reply, outputs) = real.run(
+            "import asyncio\n\
+             async def twice(n):\n    await asyncio.sleep(0.01)\n    return 2 * n\n\
+             async def count():\n    for i in range(3):\n        yield i\n\
+             late = await twice(z)\n\
+             seen = [i async for i in count()]\n\
+             _loop = asyncio.get_running_loop()\n\
+             await twice(late)",
+            marimo("e", &["asyncio", "twice", "count", "late", "seen"], &["z"]),
+        );
+        assert_eq!(reply["status"], "ok", "{reply} {outputs:?}");
+        assert_eq!(text_plain(&outputs), ["12"], "{outputs:?}");
+        let (_, outputs) = real.run("late, seen", marimo("f", &[], &["late", "seen"]));
+        assert_eq!(text_plain(&outputs), ["(6, [0, 1, 2])"]);
+        let (reply, outputs) = real.run(
+            "import asyncio\nawait asyncio.sleep(0)\nraise ValueError('async')",
+            marimo("g", &["asyncio"], &[]),
+        );
+        assert_eq!(reply["status"], "error");
+        let traceback = outputs[0].1["traceback"].to_string();
+        assert!(traceback.contains("<cell g>:3"), "{traceback}");
+        assert!(!traceback.contains("__nc_marimo__"), "{traceback}");
+        // A word `await` in a string runs on the async path unharmed.
+        let (_, outputs) = real.run("'await me'", marimo("h", &[], &[]));
+        assert_eq!(text_plain(&outputs), ["'await me'"]);
+
+        // Jupyter cells: IPython's autoawait.
+        let (reply, outputs) = real.run("import asyncio\nawait asyncio.sleep(0.01)\n7", None);
+        assert_eq!(reply["status"], "ok");
+        assert_eq!(text_plain(&outputs), ["7"]);
+        std::fs::remove_dir_all(&real.cwd).ok();
+    }
+
+    #[test]
+    fn real_bridge_describes_and_sets_marimo_ui_elements() {
+        let Some(python) = python() else { return };
+        let mut real = Real::spawn(&python, "ui");
+        let ui = |outputs: &[(String, Value)]| {
+            outputs[0].1["data"][notebook::outputs::MARIMO_UI_MIME]["parts"].clone()
+        };
+        let (_, outputs) = real.run(
+            "import marimo as mo\nn = mo.ui.slider(1, 10, value=3, label='n')\nn",
+            marimo("a", &["mo", "n"], &[]),
+        );
+        let parts = ui(&outputs);
+        let slider = &parts[0]["element"];
+        assert_eq!(slider["kind"], "slider", "{parts}");
+        assert_eq!(
+            (&slider["label"], &slider["value"]),
+            (&json!("n"), &json!(3))
+        );
+        assert_eq!(
+            (&slider["args"]["start"], &slider["args"]["stop"]),
+            (&json!(1), &json!(10))
+        );
+        assert_eq!(text_plain(&outputs), ["[slider n: 3]"]);
+        let id = slider["id"].as_str().unwrap().to_owned();
+
+        // Elements inside `mo.md`, between Markdown parts.
+        let (_, outputs) = real.run(
+            "pick = mo.ui.dropdown(['a', 'b'], value='a')\nmo.md(f'**Pick** {pick} now')",
+            marimo("b", &["pick"], &["mo"]),
+        );
+        let parts = ui(&outputs);
+        assert_eq!(parts[0], json!({ "markdown": "**Pick** " }), "{parts}");
+        assert_eq!(parts[1]["element"]["kind"], "dropdown");
+        assert_eq!(parts[1]["element"]["value"], json!(["a"]));
+        assert_eq!(parts[1]["element"]["args"]["options"], json!(["a", "b"]));
+        assert_eq!(parts[2], json!({ "markdown": " now" }));
+
+        // Setting a value: the names bound to it come back.
+        let reply = real
+            .call(Op::MarimoSetUi {
+                object_id: id,
+                value: json!(7),
+            })
+            .unwrap();
+        assert_eq!(reply["names"], json!(["n"]));
+        let (_, outputs) = real.run("n.value * 2", marimo("c", &[], &["n"]));
+        assert_eq!(text_plain(&outputs), ["14"]);
+        let pick = parts[1]["element"]["id"].as_str().unwrap().to_owned();
+        real.call(Op::MarimoSetUi {
+            object_id: pick,
+            value: json!(["b"]),
+        })
+        .unwrap();
+        let (_, outputs) = real.run("pick.value", marimo("d", &[], &["pick"]));
+        assert_eq!(text_plain(&outputs), ["'b'"]);
+        let missing = real
+            .call(Op::MarimoSetUi {
+                object_id: "nope".into(),
+                value: json!(1),
+            })
+            .unwrap_err();
+        assert!(missing.contains("LookupError"), "{missing}");
+        std::fs::remove_dir_all(&real.cwd).ok();
+    }
+
+    /// Feeds the bridge's events to `store` (comms, and outputs Output
+    /// widgets capture) until `done(store, events seen)` holds; the events.
+    fn pump_widgets(
+        real: &mut Real,
+        store: &mut notebook::widgets::WidgetStore,
+        done: impl Fn(&notebook::widgets::WidgetStore, &[Event]) -> bool,
+    ) -> Vec<Event> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seen = Vec::new();
+        while !done(store, &seen) {
+            assert!(
+                Instant::now() < deadline,
+                "widgets did not get there: {seen:?}"
+            );
+            let Some(event) = next_event(&mut real.events, Duration::from_millis(200)) else {
+                continue;
+            };
+            match &event {
+                Event::Comm {
+                    msg_type,
+                    content,
+                    buffers,
+                    parent,
+                    ..
+                } => {
+                    store.apply(msg_type, content, buffers, parent.as_deref());
+                }
+                Event::Output {
+                    parent: Some(parent),
+                    msg_type,
+                    content,
+                    ..
+                } => {
+                    if let Some(model) = store.capturing(parent).map(str::to_owned) {
+                        store.capture(&model, msg_type, content);
+                    }
+                }
+                _ => {}
+            }
+            seen.push(event);
+        }
+        seen
+    }
+
+    fn send_comm(real: &mut Real, message: notebook::widgets::CommMessage) {
+        real.call(Op::CommMsg {
+            comm_id: message.comm_id,
+            data: message.data,
+            buffers: message.buffers,
+            msg_id: message.msg_id,
+        })
+        .unwrap();
+    }
+
+    /// Words the kernel printed to stdout so far.
+    fn printed(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Output {
+                    msg_type, content, ..
+                } if msg_type == "stream" => content["text"].as_str(),
+                _ => None,
+            })
+            .flat_map(str::split_whitespace)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn real_bridge_forwards_widget_comms_both_ways() {
+        use notebook::widgets::WidgetStore;
+
+        let Some(python) = python() else { return };
+        let mut real = Real::spawn(&python, "widgets");
+        let (probe, _) = real.run("import ipywidgets", None);
+        if probe["status"] != "ok" {
+            println!("skipped: ipywidgets is not installed for {python}");
+            return;
+        }
+        let mut store = WidgetStore::new();
+        let text = |store: &WidgetStore, id: &str| -> String {
+            store.get(id).map_or_else(String::new, |model| {
+                model
+                    .outputs
+                    .iter()
+                    .map(notebook::outputs::plain_text)
+                    .collect()
+            })
+        };
+        let view = |events: &[Event]| {
+            events.iter().find_map(|event| match event {
+                Event::Output {
+                    msg_type, content, ..
+                } if msg_type == "display_data" => {
+                    let view = &content["data"][notebook::outputs::WIDGET_MIME];
+                    view["model_id"].as_str().map(str::to_owned)
+                }
+                _ => None,
+            })
+        };
+
+        // interact: a box of an IntSlider and an Output capturing f's print.
+        let _interact = real.kernel.request(Op::Execute {
+            code: "import ipywidgets as w\n\
+                   def f(x):\n    print('x =', x)\n\
+                   ui = w.interact(f, x=5)"
+                .into(),
+            marimo: None,
+        });
+        let events = pump_widgets(&mut real, &mut store, |store, events| {
+            view(events)
+                .and_then(|root| store.get(&root).map(|model| model.references("children")))
+                .is_some_and(|children| {
+                    children.len() == 2 && text(store, children[1]).contains("x = 5")
+                })
+        });
+        let root = view(&events).unwrap();
+        let children: Vec<String> = store
+            .get(&root)
+            .unwrap()
+            .references("children")
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let (slider, out) = (children[0].as_str(), children[1].as_str());
+        assert_eq!(store.get(slider).unwrap().name, "IntSliderModel");
+        assert_eq!(store.get(out).unwrap().name, "OutputModel");
+
+        // The slider moves: the kernel echoes our change and re-runs f
+        // into the Output (cleared first).
+        let message = store.update(slider, "value", json!(7), true).unwrap();
+        let msg_id = message.msg_id.clone();
+        send_comm(&mut real, message);
+        let events = pump_widgets(&mut real, &mut store, |store, _| {
+            text(store, out).contains("x = 7")
+        });
+        assert_eq!(text(&store, out), "x = 7\n");
+        assert_eq!(store.get(slider).unwrap().f64("value"), Some(7.));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Comm { parent: Some(parent), content, .. }
+                if *parent == msg_id && content["data"]["method"] == "echo_update"
+        )));
+
+        // A button's click runs its handler, which updates a label.
+        let _buttons = real.kernel.request(Op::Execute {
+            code: "b = w.Button(description='go')\nl = w.Label('0')\n\
+                   def on(_):\n    l.value = str(int(l.value) + 1)\n\
+                   b.on_click(on)\n\
+                   img = w.Image(value=bytes([137, 80, 78, 71]), format='png')\n\
+                   print(b.model_id, l.model_id, img.model_id)"
+                .into(),
+            marimo: None,
+        });
+        let events = pump_widgets(&mut real, &mut store, |_, events| {
+            printed(events).len() == 3
+        });
+        let ids = printed(&events);
+        let (button, label, image) = (ids[0].as_str(), ids[1].as_str(), ids[2].as_str());
+        // Binary state arrives as buffers.
+        assert_eq!(store.get(image).unwrap().buffer("value"), Some("iVBORw=="));
+        let click = store.custom(button, json!({"event": "click"})).unwrap();
+        send_comm(&mut real, click);
+        pump_widgets(&mut real, &mut store, |store, _| {
+            store
+                .get(label)
+                .is_some_and(|label| label.str("value") == "1")
+        });
         std::fs::remove_dir_all(&real.cwd).ok();
     }
 

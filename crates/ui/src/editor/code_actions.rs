@@ -183,8 +183,8 @@ impl Editor {
         let encoding = doc.server.encoding;
         let to_lsp = |range: &Range<usize>| {
             lsp::types::Range::new(
-                language::to_position(&self.buffer, range.start, encoding),
-                language::to_position(&self.buffer, range.end, encoding),
+                self.server_position(range.start, encoding),
+                self.server_position(range.end, encoding),
             )
         };
         let diagnostics = self

@@ -499,8 +499,20 @@ impl ReplaceReport {
 
 /// `path` as notices name it: relative to the root, or as
 /// [`Project::display_path`] (`api › src/a.py`) when the project has
-/// several folders.
+/// several folders. A notebook's virtual document is named as the
+/// notebook.
 fn shown(project: &Project, path: &Path) -> String {
+    let notebook;
+    let path = match path.file_name().and_then(|name| {
+        name.to_str()?
+            .strip_suffix(crate::notebook::lsp::VIRTUAL_SUFFIX)
+    }) {
+        Some(name) => {
+            notebook = path.with_file_name(name);
+            &notebook
+        }
+        None => path,
+    };
     if project.is_multi_root() {
         project.display_path(path)
     } else {

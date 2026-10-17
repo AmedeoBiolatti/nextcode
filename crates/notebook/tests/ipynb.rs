@@ -62,7 +62,8 @@ fn jupyter_saved_notebook_round_trips() {
     assert!(matches!(
         outputs::richest(data),
         outputs::Rich::Widget {
-            plain: Some("IntSlider(value=0)")
+            plain: Some("IntSlider(value=0)"),
+            ..
         }
     ));
     // pandas: html + plain.
@@ -188,4 +189,90 @@ fn unknown_keys_are_kept() {
     let notebook = Notebook::parse(Kind::Ipynb, text).unwrap();
     assert!(notebook.cells[0].extra.contains_key("zz_custom"));
     assert_eq!(notebook.to_text(), text);
+}
+
+/// A notebook in Jupyter's layout with one code cell per `metadata` (each
+/// as Jupyter indents a cell's metadata).
+fn with_cell_metadata(metadata: &[&str]) -> String {
+    let cells: Vec<String> = metadata
+        .iter()
+        .enumerate()
+        .map(|(i, metadata)| {
+            format!(
+                "  {{\n   \"cell_type\": \"code\",\n   \"execution_count\": 1,\n   \"id\": \"c{i}\",\n   \
+                 \"metadata\": {metadata},\n   \"outputs\": [\n    {{\n     \"name\": \"stdout\",\n     \
+                 \"output_type\": \"stream\",\n     \"text\": [\n      \"out\\n\"\n     ]\n    }}\n   ],\n   \
+                 \"source\": [\n    \"print('out')\"\n   ]\n  }}"
+            )
+        })
+        .collect();
+    format!(
+        "{{\n \"cells\": [\n{}\n ],\n \"metadata\": {{}},\n \"nbformat\": 4,\n \"nbformat_minor\": 5\n}}\n",
+        cells.join(",\n")
+    )
+}
+
+#[test]
+fn collapsed_cells_read_and_write_like_jupyter_front_ends() {
+    let text = with_cell_metadata(&[
+        // JupyterLab: outputs collapsed.
+        "{\n    \"collapsed\": true\n   }",
+        // JupyterLab: input collapsed.
+        "{\n    \"jupyter\": {\n     \"source_hidden\": true\n    }\n   }",
+        // nbformat's key (VS Code and others).
+        "{\n    \"jupyter\": {\n     \"outputs_hidden\": true\n    },\n    \"tags\": []\n   }",
+        // Classic Notebook writes `collapsed: false` for expanded outputs.
+        "{\n    \"collapsed\": false\n   }",
+        "{}",
+    ]);
+    let mut notebook = Notebook::parse(Kind::Ipynb, &text).unwrap();
+    let flags = |notebook: &Notebook| -> Vec<(bool, bool)> {
+        notebook
+            .cells
+            .iter()
+            .map(|cell| (cell.outputs_hidden(), cell.source_hidden()))
+            .collect()
+    };
+    assert_eq!(
+        flags(&notebook),
+        [
+            (true, false),
+            (false, true),
+            (true, false),
+            (false, false),
+            (false, false)
+        ]
+    );
+    assert_eq!(notebook.to_text(), text, "unchanged state round-trips");
+
+    let cells = &mut notebook.cells;
+    cells[0].set_outputs_hidden(false);
+    cells[1].set_source_hidden(false);
+    cells[2].set_outputs_hidden(false);
+    cells[3].set_outputs_hidden(true);
+    cells[4].set_outputs_hidden(true);
+    cells[4].set_source_hidden(true);
+    let written = notebook.to_text();
+    assert_eq!(
+        written,
+        with_cell_metadata(&[
+            "{\n    \"collapsed\": false\n   }",
+            "{}",
+            "{\n    \"tags\": []\n   }",
+            "{\n    \"collapsed\": true,\n    \"jupyter\": {\n     \"outputs_hidden\": true\n    }\n   }",
+            "{\n    \"collapsed\": true,\n    \"jupyter\": {\n     \"outputs_hidden\": true,\n     \
+             \"source_hidden\": true\n    }\n   }",
+        ])
+    );
+    let reread = Notebook::parse(Kind::Ipynb, &written).unwrap();
+    assert_eq!(
+        flags(&reread),
+        [
+            (false, false),
+            (false, false),
+            (false, false),
+            (true, false),
+            (true, true)
+        ]
+    );
 }

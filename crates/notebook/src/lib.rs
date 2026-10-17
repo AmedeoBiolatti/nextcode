@@ -8,11 +8,13 @@
 //! mode build on it.
 
 pub mod ansi;
+pub mod html;
 pub mod ipynb;
 pub mod marimo;
 pub mod model;
 pub mod outputs;
 pub mod protocol;
+pub mod widgets;
 
 pub use model::*;
 
