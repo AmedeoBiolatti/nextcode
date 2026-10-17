@@ -72,6 +72,11 @@ impl PortsPanel {
         self.edit(Editing::Forward, "", window, cx);
     }
 
+    /// The forwarded-ports model the panel shows.
+    pub fn ports(&self) -> &Entity<Ports> {
+        &self.ports
+    }
+
     fn edit(&mut self, editing: Editing, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.editing = Some(editing);
         self.message = None;

@@ -196,7 +196,7 @@ impl Default for Palette {
 impl Palette {
     /// Color for a 256-color index or one of alacritty's named slots
     /// (foreground 256, background 257, cursor 258, dim 259–266, 267–268).
-    fn indexed(&self, index: usize) -> Rgb {
+    pub fn indexed(&self, index: usize) -> Rgb {
         match index {
             0..=15 => self.ansi[index],
             16..=231 => {

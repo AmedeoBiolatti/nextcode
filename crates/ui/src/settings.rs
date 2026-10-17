@@ -30,7 +30,8 @@
 //!   "git": { "staging_area": false, "update_method": "merge", "inline_blame": false },
 //!   "editor": { "minimap": { "enabled": true, "max_columns": 120, "side": "right" },
 //!     "sticky_scroll": { "enabled": true, "max_lines": 5 } },
-//!   "spell": { "enabled": true, "languages": ["en_US"], "check_code": true, "in_problems": false } }
+//!   "spell": { "enabled": true, "languages": ["en_US"], "check_code": true, "in_problems": false },
+//!   "notebook": { "output_max_lines": 200 } }
 //! ```
 //!
 //! A file's effective settings layer, later winning key by key: these, a
@@ -77,6 +78,7 @@ pub struct Settings {
     pub git: GitSettings,
     pub spell: SpellSettings,
     pub editor: EditorSettings,
+    pub notebook: NotebookSettings,
     /// Vim emulation in file editors ("Toggle Vim Mode" flips it until
     /// the editor exits).
     pub vim_mode: bool,
@@ -105,6 +107,7 @@ impl Default for Settings {
             git: GitSettings::default(),
             spell: SpellSettings::default(),
             editor: EditorSettings::default(),
+            notebook: NotebookSettings::default(),
             vim_mode: false,
             vim: VimSettings::default(),
             raw: Arc::new(json!({})),
@@ -182,6 +185,22 @@ impl Default for StickyScrollSettings {
         Self {
             enabled: true,
             max_lines: 5,
+        }
+    }
+}
+
+/// `"notebook"`: notebook tabs (Jupyter `.ipynb`, marimo `.py`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotebookSettings {
+    /// Lines of a cell's text output shown before "Show more".
+    pub output_max_lines: usize,
+}
+
+impl Default for NotebookSettings {
+    fn default() -> Self {
+        Self {
+            output_max_lines: 200,
         }
     }
 }

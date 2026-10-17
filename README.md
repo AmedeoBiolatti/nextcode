@@ -17,6 +17,7 @@ Native, AI-first IDE written in Rust on [gpui](https://crates.io/crates/gpui).
 | `crates/remote` | Agent client and the bootstraps that install and start it in WSL or a container (`docker exec`) |
 | `crates/devcontainer` | `devcontainer.json` (JSONC) and bringing dev containers up with the docker CLI |
 | `crates/python` | `pyproject.toml` / `uv.lock`, uv command lines, pytest node ids |
+| `crates/notebook` | Notebooks: `.ipynb` and marimo file formats (round-trip exact), marimo's static analysis and cell graph, kernel output folding, ANSI colours, the kernel bridge (`assets/bridge.py`) and its JSON-lines protocol |
 | `crates/git` | Git through its CLI: porcelain v2 status, stage/unstage/discard/commit, hunk patches, branches, worktrees, fetch/pull/push, history, diffs |
 | `crates/spell` | Spell checking: Hunspell dictionaries through `spellbook` (bundled en_US), word lists, word splitting, which parts of a document are prose |
 | `crates/ui` | `next_code` binary: editor, docks, LSP, terminal, search, problems, git and Python panels, diffs, fuzzy file finder (`Ctrl+P`) |
@@ -191,6 +192,71 @@ editor at their line and column: compiler-style `path:line:column`,
 (`src/lib.rs`). Relative paths are resolved against the project root. OSC 8
 hyperlinks (`ls --hyperlink`, `gcc`, `cargo` with hyperlinks on) open their
 target. A link wrapped over several rows is one link.
+
+## Notebooks
+
+Jupyter notebooks (`.ipynb`, nbformat 4) and [marimo](https://marimo.io)
+notebooks (a `.py` file with `import marimo`, `app = marimo.App(…)` and
+`@app.cell` functions) open in a notebook tab; other `.py` files open as
+text. A marimo tab has **Open as Text**; a marimo file shown as text offers
+**Open as Notebook** (also in the command palette).
+
+- **Cells**: code cells are editors (highlighting, brackets, undo, Vim,
+  spell checking, completion from the kernel); Markdown cells render
+  (headings, emphasis, lists, tables, code, links, images from attachments,
+  `data:` URIs or files next to the notebook) and switch to an editor on
+  Enter or double-click. The gutter shows `[n]` / `[*]`, a run button and the
+  elapsed time; marimo cells also show *stale* (edited since they ran) and
+  *error*. Only the cells on screen get editors, so long notebooks scroll
+  smoothly.
+- **Toolbar**: Run All, Run Above, Run Below, Interrupt, Restart, Restart &
+  Run All, Clear Outputs, Save, the kernel status (idle, busy, starting,
+  dead) and the interpreter; clicking it picks another one (the project's
+  virtualenvs, uv's Pythons, Jupyter kernelspecs, or a typed path).
+- **Keys** (Jupyter's): edit mode — Shift+Enter run and select below (a new
+  cell after the last), Ctrl+Enter run, Alt+Enter run and insert below, Esc
+  command mode (with Vim, from Normal mode), Ctrl+Shift+- split at the
+  cursor, Up/Down across cell edges, Ctrl+K Ctrl+I the kernel's help for the
+  name at the cursor. Command mode — Enter edit, A/B insert above/below,
+  D D delete, Z / Shift+Z undo / redo cell operations, M/Y/R Markdown /
+  code / raw, Up/Down/J/K select, Shift+Up/Down/J/K extend, Home/End,
+  C/X/V copy/cut/paste cells (Shift+V above), Ctrl+Shift+Up/Down move, O
+  collapse outputs, I I interrupt, 0 0 restart, Ctrl+S save. Text edits undo
+  per cell.
+- **Outputs** scroll with the cells: streams (ANSI colours, `\r` progress
+  lines), errors with coloured tracebacks, PNG/JPEG/SVG images, Markdown,
+  JSON (pretty), LaTeX as text, plain text. HTML (e.g. pandas tables) shows
+  its text version with **Open in browser**; ipywidgets show their text and
+  a note. `clear_output(wait=True)` and display updates work. Text outputs
+  are selectable; text longer than `"notebook": { "output_max_lines": 200 }`
+  (`settings.json`) shows **Show more**.
+- **Files**: saving keeps everything the file had (metadata, cell ids,
+  attachments, `nbformat_minor`) and writes Jupyter's own JSON layout
+  (sorted keys, the file's indentation, a final newline), so `git diff`
+  shows only what changed; outputs and execution counts are saved. marimo
+  files are written as marimo writes them (header, `__generated_with`, cell
+  names and options kept; each cell's parameters and returns recomputed
+  from its code). Changes on disk reload a clean notebook; a modified one
+  asks.
+- **Kernel**: an ipykernel in the project's interpreter (the folder's
+  `.venv`, else `uv run python` in a uv project, else `python3`/`python`),
+  started on the first run, in the notebook's folder, where the project
+  lives (also in WSL and dev containers). A small Python bridge drives it
+  with `jupyter_client` (no ZeroMQ in the editor); it is sent to the
+  interpreter on stdin, so nothing is installed. Without ipykernel a banner
+  offers **Install ipykernel** (`uv add --dev ipykernel` in uv projects,
+  else `python -m pip install ipykernel`, in a terminal) and **Choose
+  Interpreter**. Closing the tab or the editor stops the kernel; a kernel
+  whose editor died exits by itself.
+- **marimo**: cells run in one kernel with marimo's rules: running a cell
+  also runs its stale or never-run ancestors and then every cell that uses
+  what it defines, in dependency order; a name defined by two cells, or a
+  cycle, is an error on those cells; cells after a failure are skipped.
+  Each cell runs with only the names it uses and publishes the names it
+  defines (`_private` names stay in the cell); `mo.md(…)` and other marimo
+  outputs render. `mo.ui` elements are not interactive here: **Open in
+  marimo** runs `marimo edit` in a terminal and opens its URL in the browser
+  (forwarding the port for WSL and containers).
 
 ## Run configurations and tests
 
@@ -1790,7 +1856,12 @@ the project lives), `git_status`, `git_diff`, `git_apply_hunk`,
 `debug_download_codelldb` (with `debug_event` events: `stopped`, `running`,
 `output`, `breakpoints`, `terminated`, `adapter_missing`), `ports_list`,
 `ports_forward`, `ports_stop` (with `port_forwarded`, `port_released`,
-`port_available` events), `shutdown`;
+`port_available` events), `notebook_open` (`python`?/`kernel_name`? pick
+the kernel), `notebook_run` (`cells`? indices; waits, returns the outputs of
+every cell that ran, marimo dependents included), `notebook_edit`,
+`notebook_insert`, `notebook_delete`, `notebook_interrupt`,
+`notebook_restart`, `notebook_save`, `notebook_close`, `notebook_status`,
+`shutdown`;
 `--devcontainer` opens the folder's container (with `progress` events).
 `--workspace FILE` (or a `*.next_code-workspace` / `*.code-workspace` path
 as the project) opens a [multi-root workspace](#multi-root-workspaces):

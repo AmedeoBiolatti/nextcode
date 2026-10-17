@@ -49,6 +49,7 @@ use std::{
     any::TypeId,
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
+    rc::Rc,
 };
 
 use gpui::{
@@ -91,6 +92,7 @@ pub fn selectable(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Se
         text,
         right_click_through: false,
         double_click_through: false,
+        links: None,
     }
 }
 
@@ -100,6 +102,25 @@ pub struct SelectableText {
     styled: StyledText,
     right_click_through: bool,
     double_click_through: bool,
+    links: Option<Links>,
+}
+
+/// What a click on a link does, given the link's index.
+type LinkHandler = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+
+/// Clickable ranges of the text and what a click on one does.
+#[derive(Clone)]
+struct Links {
+    ranges: Rc<[Range<usize>]>,
+    on_click: LinkHandler,
+}
+
+impl Links {
+    /// The link under `position`, by index.
+    fn at(&self, layout: &TextLayout, position: Point<Pixels>) -> Option<usize> {
+        let index = layout.index_for_position(position).ok()?;
+        self.ranges.iter().position(|range| range.contains(&index))
+    }
 }
 
 impl SelectableText {
@@ -127,6 +148,22 @@ impl SelectableText {
     /// expands or edits something.
     pub fn double_click_through(mut self) -> Self {
         self.double_click_through = true;
+        self
+    }
+
+    /// Links: the pointer is a hand over these byte ranges, and a plain
+    /// click on one (not a selection) calls `on_click` with its index.
+    pub fn with_links(
+        mut self,
+        ranges: Vec<Range<usize>>,
+        on_click: impl Fn(usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        if !ranges.is_empty() {
+            self.links = Some(Links {
+                ranges: ranges.into(),
+                on_click: Rc::new(on_click),
+            });
+        }
         self
     }
 }
@@ -322,7 +359,17 @@ impl Element for SelectableText {
         let Prepainted { hitbox, owner } = prepainted;
         let owner = *owner;
         let layout = self.styled.layout().clone();
-        window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        let hovered_link = self
+            .links
+            .as_ref()
+            .filter(|_| hitbox.is_hovered(window))
+            .and_then(|links| links.at(&layout, window.mouse_position()));
+        let cursor = if hovered_link.is_some() {
+            CursorStyle::PointingHand
+        } else {
+            CursorStyle::IBeam
+        };
+        window.set_cursor_style(cursor, hitbox);
         let (selected, pressed) = match cx.try_global::<State>() {
             Some(state) => (
                 state
@@ -411,6 +458,38 @@ impl Element for SelectableText {
                         open_menu(owner, &layout, &text, event, window, cx)
                     }
                     _ => {}
+                }
+            });
+        }
+
+        if let Some(links) = self.links.clone() {
+            // The pointer entering or leaving a link changes the cursor.
+            let (moved_hitbox, moved_layout, moved) =
+                (hitbox.clone(), layout.clone(), links.clone());
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, _| {
+                if phase == DispatchPhase::Bubble {
+                    let link = moved_hitbox
+                        .is_hovered(window)
+                        .then(|| moved.at(&moved_layout, event.position))
+                        .flatten();
+                    if link != hovered_link {
+                        window.refresh();
+                    }
+                }
+            });
+            // A plain click opens the link; a drag or a double click
+            // selected instead.
+            let (hitbox, layout) = (hitbox.clone(), layout.clone());
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || event.button != MouseButton::Left
+                    || !hitbox.is_hovered(window)
+                    || has_selection(owner, cx)
+                {
+                    return;
+                }
+                if let Some(index) = links.at(&layout, event.position) {
+                    (links.on_click)(index, window, cx);
                 }
             });
         }

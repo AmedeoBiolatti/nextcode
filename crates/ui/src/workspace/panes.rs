@@ -81,6 +81,13 @@ impl Pane {
             .position(|tab| tab.path == path && tab.editor().is_some())
     }
 
+    /// The notebook tab of `path` in this pane.
+    pub(super) fn notebook_index(&self, path: &Path) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.path == path && tab.notebook().is_some())
+    }
+
     fn index_of(&self, view: EntityId) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.entity_id() == view)
     }
@@ -401,7 +408,8 @@ impl Workspace {
 
     /// Closes tab `index` of `pane` without asking. The language server
     /// document moves to another view of the file, or is closed with the
-    /// last one. A pane left empty goes away (unless it is the only one).
+    /// last one; a notebook's kernel stops with its last view. A pane left
+    /// empty goes away (unless it is the only one).
     pub(super) fn remove_tab(
         &mut self,
         pane: PaneId,
@@ -412,6 +420,12 @@ impl Workspace {
         let Some(tab) = self.take_tab(pane, index) else {
             return;
         };
+        if let Some(view) = tab.notebook()
+            && !self.has_other_view(&tab)
+        {
+            let document = view.read(cx).document().clone();
+            document.update(cx, |document, cx| document.shutdown(cx));
+        }
         if let Some(editor) = tab.editor() {
             let heir = self.panes.iter().find_map(|pane| {
                 let index = pane.editor_index(&tab.path)?;
@@ -467,9 +481,13 @@ impl Workspace {
         let Some(tab) = self.pane(from).and_then(|pane| pane.tabs.get(index)) else {
             return;
         };
+        let existing = self.pane(to).and_then(|pane| match tab.content {
+            TabContent::Editor(_) => pane.editor_index(&tab.path),
+            TabContent::Notebook(_) => pane.notebook_index(&tab.path),
+            _ => None,
+        });
         if from != to
-            && tab.editor().is_some()
-            && let Some(existing) = self.pane(to).and_then(|pane| pane.editor_index(&tab.path))
+            && let Some(existing) = existing
         {
             self.activate(to, existing, window, cx);
             self.remove_tab(from, index, window, cx);
@@ -518,21 +536,27 @@ impl Workspace {
     }
 
     /// Opens the active file of `pane` in a new pane on `side` (a second
-    /// view of the same buffer, at the same position).
+    /// view of the same buffer or notebook, at the same position).
     fn split(&mut self, pane: PaneId, side: Side, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.pane(pane).and_then(Pane::active_tab) else {
             return;
         };
-        let Some(source) = tab.editor().cloned() else {
-            self.notice = Some("Only file tabs can be split".into());
-            return cx.notify();
+        let state = match &tab.content {
+            TabContent::Editor(source) => Some(source.read(cx).state()),
+            TabContent::Notebook(_) => None,
+            _ => {
+                self.notice = Some("Only file tabs can be split".into());
+                return cx.notify();
+            }
         };
         let path = tab.path.clone();
-        let state = source.read(cx).state();
         let new = self.split_pane(pane, side);
         self.active_pane = new;
-        if let Some(editor) = self.open_editor(&path, window, cx) {
-            editor.update(cx, |editor, cx| editor.restore_state(&state, cx));
+        // A notebook's tab gets another view of its document.
+        if let Some(editor) = self.open_editor(&path, window, cx)
+            && let Some(state) = &state
+        {
+            editor.update(cx, |editor, cx| editor.restore_state(state, cx));
         }
         self.prune_empty_panes();
     }
@@ -693,10 +717,10 @@ impl Workspace {
         let Some(tabs) = self.pane(pane).map(|pane| &pane.tabs) else {
             return;
         };
-        let losing: Vec<(Entity<Editor>, SharedString)> = tabs
+        let losing: Vec<(TabContent, SharedString)> = tabs
             .iter()
             .filter(|tab| tab.is_dirty(cx) && !self.has_other_view(tab))
-            .filter_map(|tab| Some((tab.editor()?.clone(), tab.title.clone())))
+            .map(|tab| (tab.content.clone(), tab.title.clone()))
             .collect();
         if losing.is_empty() {
             return self.discard_pane(pane, window, cx);
@@ -716,9 +740,7 @@ impl Workspace {
             };
             this.update_in(cx, |this, window, cx| {
                 let close = match answer {
-                    0 => losing
-                        .iter()
-                        .all(|(editor, _)| editor.update(cx, |editor, cx| editor.save(cx))),
+                    0 => losing.iter().all(|(content, _)| content.save(cx)),
                     1 => true,
                     _ => false,
                 };
@@ -740,14 +762,18 @@ impl Workspace {
         }
     }
 
-    /// Whether the file of an editor tab is also shown by another tab.
+    /// Whether the file of a file tab is also shown by another tab of the
+    /// same kind (views of one buffer, or of one notebook document).
     pub(super) fn has_other_view(&self, tab: &Tab) -> bool {
-        tab.editor().is_some()
-            && self
-                .all_tabs()
-                .filter(|other| other.path == tab.path && other.editor().is_some())
-                .count()
-                > 1
+        let same = |other: &Tab| match (&tab.content, &other.content) {
+            (TabContent::Editor(_), TabContent::Editor(_))
+            | (TabContent::Notebook(_), TabContent::Notebook(_)) => other.path == tab.path,
+            _ => false,
+        };
+        let others = self.all_tabs().filter(|other| same(other)).count();
+        // `tab` may already be out of the panes (`remove_tab`).
+        let listed = self.find_view(tab.entity_id()).is_some();
+        others > usize::from(listed)
     }
 
     /// Drags a split's handle to `position`.

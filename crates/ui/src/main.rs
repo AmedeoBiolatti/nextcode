@@ -26,6 +26,7 @@ mod location_picker;
 mod lsp_store;
 mod menus;
 mod outline_panel;
+mod notebook;
 mod ports;
 mod problems;
 mod project;
@@ -225,6 +226,9 @@ fn run() -> anyhow::Result<()> {
         ports::panel::bind_keys(cx);
         git_log::bind_keys(cx);
         workflows::bind_keys(cx);
+        // After `editor::bind_keys`: cell editors' keys win over the editor's.
+        notebook::view::bind_keys(cx);
+        notebook::picker::bind_keys(cx);
         theme::refresh(cx);
         app_state::init(cx);
         cx.on_window_closed(|cx| {

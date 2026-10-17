@@ -34,6 +34,11 @@ devcontainer.workspace = true
 python.workspace = true
 run.workspace = true
 workflow.workspace = true
+notebook.workspace = true
+# Already in the tree (gpui): notebook image outputs are base64.
+base64.workspace = true
+# Markdown cells and `text/markdown` outputs.
+pulldown-cmark.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

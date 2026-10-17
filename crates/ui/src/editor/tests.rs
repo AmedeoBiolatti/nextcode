@@ -1,6 +1,6 @@
 //! Editing behavior through the editor's commands, on real buffers.
 
-use std::path::PathBuf;
+use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 use gpui::{Modifiers, TestAppContext, WindowHandle};
 
@@ -858,4 +858,150 @@ fn wrapped_rows_count_inlay_hints(cx: &mut TestAppContext) {
     assert_eq!(row_count(window, cx), 4);
     update(window, cx, |e, _, _| e.clear_inlay_hints());
     assert_eq!(row_count(window, cx), 2);
+}
+
+/// A notebook cell editor in a column, as tall as its content.
+struct CellHost(Entity<Editor>);
+
+impl Render for CellHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().flex().flex_col().child(self.0.clone())
+    }
+}
+
+fn cell(
+    text: &str,
+    language: Option<Language>,
+    cx: &mut TestAppContext,
+) -> (Entity<Editor>, WindowHandle<CellHost>) {
+    let editor = cx.new(|cx| Editor::notebook_cell(text, language, cx));
+    let host = editor.clone();
+    let window = cx.add_window(|_, _| CellHost(host));
+    cx.run_until_parked();
+    (editor, window)
+}
+
+fn in_cell<R>(
+    (editor, window): &(Entity<Editor>, WindowHandle<CellHost>),
+    cx: &mut TestAppContext,
+    f: impl FnOnce(&mut Editor, &mut Window, &mut Context<Editor>) -> R,
+) -> R {
+    window
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |e, cx| f(e, window, cx))
+        })
+        .unwrap()
+}
+
+/// The cell's height in lines, and whether its text starts at its left
+/// edge (no gutter).
+fn cell_geometry(editor: &Entity<Editor>, cx: &mut TestAppContext) -> (f32, bool) {
+    editor.read_with(cx, |e, _| {
+        let layout = e.layout.as_ref().expect("laid out");
+        (
+            layout.bounds.size.height / layout.line_height,
+            layout.text_bounds.left() == layout.bounds.left(),
+        )
+    })
+}
+
+#[gpui::test]
+fn notebook_cells_are_as_tall_as_their_rows_without_a_gutter(cx: &mut TestAppContext) {
+    let code = cell("x = 1", Some(Language::Python), cx);
+    assert_eq!(cell_geometry(&code.0, cx), (1., true));
+    in_cell(&code, cx, |e, _, cx| e.set_text("a = 1\nb = 2\nc = 3", cx));
+    cx.run_until_parked();
+    assert_eq!(cell_geometry(&code.0, cx), (3., true));
+    in_cell(&code, cx, |e, _, cx| e.set_text("", cx));
+    cx.run_until_parked();
+    assert_eq!(cell_geometry(&code.0, cx).0, 1., "at least one row");
+
+    // Markdown cells wrap; code cells don't.
+    let long = "word ".repeat(10);
+    let prose = cell(&long, Some(Language::Markdown), cx);
+    in_cell(&prose, cx, |e, _, cx| {
+        e.wrap_columns = Some(16);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cell_geometry(&prose.0, cx).0 >= 3., "wrapped rows count");
+    in_cell(&code, cx, |e, _, cx| {
+        e.wrap_columns = Some(16);
+        e.set_text(&long, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(cell_geometry(&code.0, cx).0, 1.);
+}
+
+#[gpui::test]
+fn up_on_the_first_row_and_down_on_the_last_leave_the_cell(cx: &mut TestAppContext) {
+    let cell = cell("ab\ncd", Some(Language::Python), cx);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    cx.update(|cx| {
+        let events = events.clone();
+        cx.subscribe(&cell.0, move |_, event, _| {
+            if let EditorEvent::CellBoundary { up } = event {
+                events.borrow_mut().push(*up);
+            }
+        })
+        .detach();
+    });
+    in_cell(&cell, cx, |e, _, cx| e.set_cursor(1, cx));
+    in_cell(&cell, cx, |e, w, cx| e.up(&Up, w, cx));
+    assert_eq!(*events.borrow(), [true]);
+    assert_eq!(in_cell(&cell, cx, |e, _, _| e.cursor()), 1, "stays");
+    in_cell(&cell, cx, |e, w, cx| e.down(&Down, w, cx));
+    assert_eq!(*events.borrow(), [true], "moved to the second line");
+    in_cell(&cell, cx, |e, w, cx| e.down(&Down, w, cx));
+    assert_eq!(*events.borrow(), [true, false]);
+    // With a selection, Up selects/moves inside the cell as usual.
+    in_cell(&cell, cx, |e, _, cx| e.select_text_range(0, 1, cx));
+    in_cell(&cell, cx, |e, w, cx| e.up(&Up, w, cx));
+    assert_eq!(events.borrow().len(), 2);
+}
+
+#[gpui::test]
+fn provider_completions_show_and_replace_their_range(cx: &mut TestAppContext) {
+    let cell = cell("os.p", Some(Language::Python), cx);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let provider: CompletionProvider = {
+        let calls = calls.clone();
+        Rc::new(move |text: String, offset: usize, _: &mut App| {
+            calls.borrow_mut().push((text, offset));
+            let matches = ["path", "pardir", "sep"].map(String::from).to_vec();
+            Task::ready(Some((matches, 3..offset)))
+        })
+    };
+    in_cell(&cell, cx, |e, _, cx| {
+        e.set_completion_provider(Some(provider));
+        e.set_cursor(4, cx);
+    });
+    in_cell(&cell, cx, |e, w, cx| {
+        e.replace_text_in_range(None, "a", w, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(*calls.borrow(), [("os.pa".to_owned(), 5)]);
+    let labels = in_cell(&cell, cx, |e, _, _| {
+        let menu = e.completion.as_ref().expect("menu open");
+        menu.candidates
+            .iter()
+            .map(|c| menu.items[c.index].label.clone())
+            .collect::<Vec<_>>()
+    });
+    assert!(labels.contains(&"path".to_owned()) && labels.contains(&"pardir".to_owned()));
+    assert!(!labels.contains(&"sep".to_owned()), "filtered by `pa`");
+    let path = labels.iter().position(|label| label == "path").unwrap();
+    in_cell(&cell, cx, |e, _, cx| e.accept_completion(Some(path), cx));
+    assert_eq!(
+        in_cell(&cell, cx, |e, _, _| (e.text(), e.cursor())),
+        ("os.path".to_owned(), 7)
+    );
+    assert!(in_cell(&cell, cx, |e, _, _| e.completion.is_none()));
+
+    // Ctrl+Space asks too.
+    in_cell(&cell, cx, |e, w, cx| {
+        e.show_completions(&ShowCompletions, w, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(calls.borrow().len(), 2);
 }

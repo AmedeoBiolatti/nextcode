@@ -19,13 +19,28 @@ const ROW_HEIGHT: f32 = 22.;
 pub(crate) struct CompletionMenu {
     /// Start of the word being completed; the query runs from here to the cursor.
     word_start: usize,
-    items: Vec<CompletionItem>,
-    candidates: Vec<Candidate>,
+    pub(super) items: Vec<CompletionItem>,
+    pub(super) candidates: Vec<Candidate>,
     selected: usize,
     /// The server's list is partial; re-request as the query changes.
     incomplete: bool,
     scroll: UniformListScrollHandle,
-    server: Arc<RunningServer>,
+    /// `None`: the items came from the editor's `CompletionProvider`.
+    server: Option<Arc<RunningServer>>,
+}
+
+impl CompletionMenu {
+    /// The menu's server when it resolves items (`completionItem/resolve`).
+    fn resolver(&self) -> Option<&Arc<RunningServer>> {
+        self.server.as_ref().filter(|server| {
+            server
+                .capabilities
+                .completion_provider
+                .as_ref()
+                .and_then(|provider| provider.resolve_provider)
+                == Some(true)
+        })
+    }
 }
 
 impl Editor {
@@ -40,6 +55,13 @@ impl Editor {
             return;
         }
         let Some(server) = self.server() else {
+            // A provider (notebook kernel): after `.` and in identifiers.
+            if self.completion_provider.is_some()
+                && (typed == '.'
+                    || ((typed.is_alphanumeric() || typed == '_') && self.completion.is_none()))
+            {
+                self.request_completions(None, cx);
+            }
             return;
         };
         let Some(provider) = &server.capabilities.completion_provider else {
@@ -68,7 +90,7 @@ impl Editor {
 
     fn request_completions(&mut self, trigger: Option<String>, cx: &mut Context<Self>) {
         let Some(server) = self.server() else {
-            return;
+            return self.request_provider_completions(cx);
         };
         let Some(position) = self.position_params(self.primary().head) else {
             return;
@@ -117,7 +139,56 @@ impl Editor {
                     selected: 0,
                     incomplete,
                     scroll: UniformListScrollHandle::new(),
-                    server,
+                    server: Some(server),
+                });
+                this.refilter_completions(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Asks the `CompletionProvider` (no language server) at the primary
+    /// cursor; its candidates replace their range, which starts the word
+    /// the menu filters by.
+    fn request_provider_completions(&mut self, cx: &mut Context<Self>) {
+        let Some(provider) = self.completion_provider.clone() else {
+            return;
+        };
+        self.completion_generation += 1;
+        let generation = self.completion_generation;
+        let requested_at = self.primary().head;
+        let request = provider(self.text(), requested_at, cx);
+        self._completion_task = Some(cx.spawn(async move |this, cx| {
+            let response = request.await;
+            this.update(cx, |this, cx| {
+                if this.completion_generation != generation {
+                    return;
+                }
+                let Some((matches, range)) = response else {
+                    return;
+                };
+                let head = this.primary().head;
+                let word_start = range.start.min(requested_at);
+                let same_line = word_start <= this.buffer.len()
+                    && this.buffer.line_of(head) == this.buffer.line_of(word_start);
+                if matches.is_empty() || !same_line || head < word_start {
+                    return;
+                }
+                let items = matches
+                    .into_iter()
+                    .map(|label| CompletionItem {
+                        label,
+                        ..CompletionItem::default()
+                    })
+                    .collect();
+                this.completion = Some(CompletionMenu {
+                    word_start,
+                    items,
+                    candidates: Vec::new(),
+                    selected: 0,
+                    incomplete: false,
+                    scroll: UniformListScrollHandle::new(),
+                    server: None,
                 });
                 this.refilter_completions(cx);
             })
@@ -132,6 +203,9 @@ impl Editor {
             return;
         };
         let primary = self.primary();
+        // A provider's range may start before the identifier (`%ti` for
+        // `%timeit`, a path); a server's word is an identifier.
+        let provider = menu.server.is_none();
         let still_in_word = primary.is_empty()
             && primary.head >= menu.word_start
             && self.buffer.line_of(primary.head) == self.buffer.line_of(menu.word_start)
@@ -139,7 +213,13 @@ impl Editor {
                 .buffer
                 .slice(menu.word_start..primary.head)
                 .chars()
-                .all(|c| c.is_alphanumeric() || c == '_');
+                .all(|c| {
+                    c.is_alphanumeric()
+                        || c == '_'
+                        || (provider
+                            && !c.is_whitespace()
+                            && !"()[]{},;:=+*<>!&|^~@#'\"`".contains(c))
+                });
         if !still_in_word {
             self.close_menu(cx);
         } else if menu.incomplete {
@@ -224,20 +304,12 @@ impl Editor {
             return;
         };
         let item = &menu.items[candidate.index];
-        let resolvable = menu
-            .server
-            .capabilities
-            .completion_provider
-            .as_ref()
-            .and_then(|provider| provider.resolve_provider)
-            == Some(true);
-        if item.documentation.is_some() || !resolvable {
+        let Some(server) = menu.resolver().filter(|_| item.documentation.is_none()) else {
             self._resolve_task = None;
             return;
-        }
+        };
         let index = candidate.index;
-        let request = menu
-            .server
+        let request = server
             .connection
             .request::<ResolveCompletionItem>(item.clone());
         let label = item.label.clone();
@@ -272,7 +344,7 @@ impl Editor {
     /// Accepts the selected (or `index`-th) candidate. Auto-import edits may
     /// only arrive via `completionItem/resolve`, so unresolved items are
     /// resolved first.
-    fn accept_completion(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+    pub(super) fn accept_completion(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
         let Some(menu) = self.completion.take() else {
             return;
         };
@@ -283,19 +355,18 @@ impl Editor {
             return;
         };
         let item = menu.items[candidate.index].clone();
-        let resolvable = menu
+        let word_start = menu.word_start;
+        let encoding = menu
             .server
-            .capabilities
-            .completion_provider
             .as_ref()
-            .and_then(|provider| provider.resolve_provider)
-            == Some(true);
-        let (word_start, encoding) = (menu.word_start, menu.server.encoding);
-        if item.additional_text_edits.is_some() || !resolvable {
+            .map_or(Encoding::Utf8, |server| server.encoding);
+        let Some(server) = menu
+            .resolver()
+            .filter(|_| item.additional_text_edits.is_none())
+        else {
             return self.apply_completion(&item, word_start, encoding, cx);
-        }
-        let request = menu
-            .server
+        };
+        let request = server
             .connection
             .request::<ResolveCompletionItem>(item.clone());
         self._completion_task = Some(cx.spawn(async move |this, cx| {

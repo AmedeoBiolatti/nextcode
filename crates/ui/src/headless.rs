@@ -124,6 +124,16 @@
 //! | `ports_list` | | `{available, listening: [{port, addresses, pid, command}], forwarded: [{port, host, local_port, address, url, origin, label, connections, process}], error}` after a fresh scan (`origin`: `auto` \| `user` \| `dev_container`; `available` false for local projects) |
 //! | `ports_forward` | `port` (number or `"host:port"`), `host`?, `local_port`? (required when given; default: the same port, else the next free one) | `{local_port, url}`; a user port, saved for the project |
 //! | `ports_stop` | `port`, `host`? | `null`; an automatically forwarded port stays unforwarded while it keeps listening |
+//! | `notebook_open` | `path` (`.ipynb`, or a marimo `.py`; missing: a new notebook), `python`? (the kernel's interpreter; default: the project's, as the editor picks it), `kernel_name`? (a kernelspec) | `{kind: "ipynb" \| "marimo", kernel, cells}`; the notebook stays open (by path) until `notebook_close`; opening it again replaces it |
+//! | `notebook_run` | `path`, `cells`? (indices; default: all) | `{kernel, cells}` once nothing runs or is queued: `cells` are those that ran, failed or were skipped by this request (marimo adds stale/never-run ancestors and descendants, in dependency order; Jupyter stops at the first error). The kernel starts on the first run |
+//! | `notebook_edit` | `path`, `cell` (index), `source` | the cell (marimo: marks it `stale` if it ran) |
+//! | `notebook_insert` | `path`, `index`? (default: the end), `kind`? (`code` \| `markdown` \| `raw`), `source`? | the new cell |
+//! | `notebook_delete` | `path`, `cell` | `null` (deleting the last cell leaves an empty code cell) |
+//! | `notebook_interrupt` | `path` | `null`: queued cells are dequeued, the running one interrupted |
+//! | `notebook_restart` | `path`, `run_all`? | `{kernel, cells}` as `notebook_run` once restarted (and run) |
+//! | `notebook_save` | `path` | `null`: written in its format (ipynb with outputs; marimo's layout with signatures recomputed) |
+//! | `notebook_close` | `path` | `null` once the kernel process exited |
+//! | `notebook_status` | `path` | `{kernel, interpreter, cells}` |
 //! | `workflows_list` | | `[{id, name, path, source, error, inputs: [{id, label, type, description, default, required, placeholder, options?: [{value, label}], min?, max?, integer?}], steps: [{id, path, kind: "step", title, depends_on: {"<id>": "ready" \| "completed"}, project, run, check, ready, timeout, stop_grace_period, artifacts: [{label, path or url}]} or {id, path, kind: "group", title, depends_on, project, steps: [...]}], outcome}]`: the user's workflows (`<config>/next_code/workflows/*.yaml`) and the project's (`.next_code/workflows/`), read again for every workflow command; `path` is the qualified id (`group/step`); `run`/`project` show `${inputs.…}` unexpanded; durations as written in files (`10m`, `3s`); files of the old JSON format are listed with an `error` saying to convert them |
 //! | `workflow_convert` | `name`/`path`/`id` of an old-format file (`.json`/`.jsonc`) | `{path, backup, problems}`: writes the YAML file beside it (comments kept; an error if it exists) and renames the old one to `.bak`; `problems` are the converted file's (as the old one had them) |
 //! | `workflow_run` | `name`, `path` (or its end) or `id`, `inputs`? (`{"<id>": value}`: JSON types, or strings that parse for numbers and booleans) | `{run, id}`; starts it afresh (a run of it going is stopped first, each command with its step's grace; a step starts once its old command is gone); inputs not given get their defaults (not the GUI form's remembered values); invalid or missing required ones are an error listing each (``input `workers`: must be ≤ 64``); progress comes as `workflow_event`s |
@@ -133,7 +143,15 @@
 //! | `workflow_restart` | `name`/`path`/`id`, `step` | `true`: the step (a group: each of its steps) starts again once its old command is gone (same terminal) |
 //! | `workflow_retry` | `name`/`path`/`id`, `step`? | without `step`: `true` if it had run, failed steps start again; with it: whether that step (a group: any of its steps) had failed and starts again |
 //! | `workflow_check_artifacts` | `name`/`path`/`id`, `step` | `true` if the step has artifacts and got to where it runs: they are looked up again (see `workflow_status`) |
-//! | `shutdown` | | stops language servers and workflow commands, and exits |
+//! | `shutdown` | | stops language servers, workflow commands and notebook kernels, and exits |
+//!
+//! Notebook cells are `{index, kind, source, execution_count, status
+//! ("idle" \| "queued" \| "running" \| "ok" \| "error"), stale, error (marimo:
+//! why it cannot run), outputs: [{output_type, text, name?, mimes?,
+//! text_plain?, ename?, evalue?, traceback? (ANSI stripped)}]}`; `kernel` is
+//! `{status ("not_started" \| "starting" \| "idle" \| "busy" \| "restarting" \|
+//! "dead" \| "missing" \| "failed"), python, message?, missing?}` (`missing`:
+//! modules the interpreter lacks, e.g. `ipykernel`).
 //!
 //! Events: `progress` (while a dev container opens), `ready` (after
 //! connecting), `files_changed`, `diagnostics`, `server_status`,
@@ -196,6 +214,7 @@ use crate::{
 mod debug;
 mod edits;
 mod files;
+mod notebooks;
 mod ports;
 mod runs;
 mod workflows;
@@ -321,8 +340,11 @@ async fn serve(
         }
     }
 
-    // Stdin closed or `shutdown`: end workflow commands, stop language
-    // servers, then exit.
+    // Stdin closed or `shutdown`: end workflow commands and notebook
+    // kernels, stop language servers, then exit.
+    if let Ok(stopping) = session.update(cx, |session, cx| session.close_notebooks(cx)) {
+        stopping.await;
+    }
     if let Ok(stopping) = session.update(cx, |session, cx| {
         session
             .workflows
@@ -390,6 +412,8 @@ struct Session {
     ports: Entity<crate::ports::Ports>,
     /// Workflows (the same model as a window's).
     workflows: Entity<crate::workflows::Workflows>,
+    /// Open notebooks by path (`notebook_*`).
+    notebooks: HashMap<PathBuf, Entity<crate::notebook::NotebookDocument>>,
     _subscription: Subscription,
     _ports_subscription: Subscription,
     _workflows_subscription: Subscription,
@@ -586,6 +610,7 @@ impl Session {
             debug: debug::HeadlessDebug::new(cx),
             ports,
             workflows,
+            notebooks: HashMap::new(),
             _subscription: subscription,
             _ports_subscription: ports_subscription,
             _workflows_subscription: workflows_subscription,
@@ -809,6 +834,9 @@ impl Session {
             command if command.starts_with("debug_") => self.debug(id, command, &request, cx),
             command if command.starts_with("ports_") => self.ports(id, command, &request, cx),
             command if command.starts_with("workflow") => self.workflows(id, command, &request, cx),
+            command if command.starts_with("notebook_") => {
+                self.notebooks(id, command, &request, cx)
+            }
             "shutdown" => {
                 self.out.reply(&id, Ok(Value::Null));
                 return true;

@@ -1,10 +1,10 @@
-//! Session restore: per project, the editor tabs of each pane, the active
-//! tab and pane, the split structure and sizes, and each editor's
-//! selections and scroll. Kept in `session.json` next to the project's
-//! saved layout (`layout::project_state_dir`), written shortly after a
-//! change and when the project closes, read when it opens. Files that no
-//! longer exist are skipped; diff, history and comparison tabs are not
-//! kept. `"restore_session": false` in settings.json turns it off.
+//! Session restore: per project, the editor and notebook tabs of each
+//! pane, the active tab and pane, the split structure and sizes, and each
+//! editor's selections and scroll. Kept in `session.json` next to the
+//! project's saved layout (`layout::project_state_dir`), written shortly
+//! after a change and when the project closes, read when it opens. Files
+//! that no longer exist are skipped; diff, history and comparison tabs are
+//! not kept. `"restore_session": false` in settings.json turns it off.
 //!
 //! ```json
 //! { "root": { "split": { "axis": "horizontal", "ratio": 0.5,
@@ -108,15 +108,17 @@ impl Workspace {
                 let mut tabs = Vec::new();
                 let mut active = 0;
                 for (index, tab) in pane.tabs.iter().enumerate() {
-                    let Some(editor) = tab.editor() else {
-                        continue;
+                    let editor = match &tab.content {
+                        TabContent::Editor(editor) => Some(editor.read(cx).state()),
+                        TabContent::Notebook(_) => None,
+                        _ => continue,
                     };
                     if index <= pane.active {
                         active = tabs.len();
                     }
                     tabs.push(TabState {
                         path: tab.path.clone(),
-                        editor: Some(editor.read(cx).state()),
+                        editor,
                     });
                 }
                 Node::Pane { tabs, active }
@@ -219,10 +221,13 @@ impl Workspace {
                     ) {
                         continue;
                     }
-                    let Some(editor) = self.open_editor(&tab.path, window, cx) else {
+                    let before = self.pane(id).map_or(0, |pane| pane.tabs.len());
+                    // A notebook opens in a notebook tab (no editor).
+                    let editor = self.open_editor(&tab.path, window, cx);
+                    if self.pane(id).map_or(0, |pane| pane.tabs.len()) == before {
                         continue;
-                    };
-                    if let Some(state) = &tab.editor {
+                    }
+                    if let (Some(editor), Some(state)) = (editor, &tab.editor) {
                         editor.update(cx, |editor, cx| editor.restore_state(state, cx));
                     }
                     if index <= *active {

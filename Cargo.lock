@@ -3583,6 +3583,7 @@ name = "next_code"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "dap",
  "devcontainer",
  "dirs 7.0.0",
@@ -3594,8 +3595,10 @@ dependencies = [
  "language",
  "lsp",
  "next_code_agent",
+ "notebook",
  "nucleo-matcher",
  "parking_lot",
+ "pulldown-cmark",
  "python",
  "regex",
  "remote",
@@ -3688,6 +3691,16 @@ name = "noop_proc_macro"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
+
+[[package]]
+name = "notebook"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tree-sitter",
+ "tree-sitter-python",
+]
 
 [[package]]
 name = "notify"
@@ -4377,6 +4390,17 @@ checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
 dependencies = [
  "ar_archive_writer",
  "cc",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags 2.13.2",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]

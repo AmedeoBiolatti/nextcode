@@ -240,6 +240,10 @@ pub(super) fn init(cx: &mut App) {
         if keystroke.modifiers.control && keystroke.key == "[" && !ctrl_keys() {
             return;
         }
+        // Shift+Enter runs a notebook cell, in every mode.
+        if keystroke.key == "enter" && keystroke.modifiers.shift && editor.read(cx).notebook_cell {
+            return;
+        }
         let Some(key) = Key::from_keystroke(keystroke) else {
             return;
         };
@@ -271,6 +275,7 @@ impl Editor {
     fn vim_eligible(&self) -> bool {
         !self.single_line
             && (!self.text_area
+                || self.notebook_cell
                 || (self.vim.commit_message && crate::settings::current().vim.in_commit_message))
     }
 
@@ -426,6 +431,20 @@ impl Editor {
             && (!ctrl_keys() || (self.vim.pending.is_empty() && !vim_ctrl_key(c)))
         {
             return false;
+        }
+        // In a notebook cell, k/Up on the first row and j/Down on the last
+        // go to the neighbouring cell.
+        if self.notebook_cell && self.vim.pending.is_empty() && self.vim.mode == Mode::Normal {
+            let up = match key {
+                Key::Up | Key::Char('k') => Some(true),
+                Key::Down | Key::Char('j') => Some(false),
+                _ => None,
+            };
+            if let Some(up) = up
+                && self.cell_boundary(up, cx)
+            {
+                return true;
+            }
         }
         self.vim.pending.push(key);
         let visual = matches!(self.vim.mode, Mode::Visual(_));

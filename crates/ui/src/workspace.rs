@@ -33,6 +33,7 @@ use crate::{
     layout::{DockPosition, Layout, PanelId},
     location_picker::{LocationPicker, LocationPickerEvent},
     lsp_store::{LspStore, LspStoreEvent, ServerStatus},
+    notebook::view::{NotebookView, NotebookViewEvent, OpenAsNotebook},
     outline_panel::OutlinePanel,
     ports::{Ports, PortsEvent, panel::PortsPanel},
     problems::{ProblemsEvent, ProblemsPanel},
@@ -57,6 +58,7 @@ mod folders;
 mod git_flows;
 mod git_gutter;
 mod log_window;
+mod notebooks;
 mod panes;
 mod runs;
 mod session;
@@ -157,10 +159,32 @@ struct NavEntry {
     offset: usize,
 }
 
+#[derive(Clone)]
 enum TabContent {
     Editor(Entity<Editor>),
     Diff(Entity<DiffView>),
     Compare(Entity<CompareView>),
+    Notebook(Entity<NotebookView>),
+}
+
+impl TabContent {
+    fn entity_id(&self) -> gpui::EntityId {
+        match self {
+            Self::Editor(editor) => editor.entity_id(),
+            Self::Diff(diff) => diff.entity_id(),
+            Self::Compare(view) => view.entity_id(),
+            Self::Notebook(view) => view.entity_id(),
+        }
+    }
+
+    /// Writes a file tab's unsaved changes; false if that failed.
+    fn save(&self, cx: &mut App) -> bool {
+        match self {
+            Self::Editor(editor) => editor.update(cx, |editor, cx| editor.save(cx)),
+            Self::Notebook(view) => view.update(cx, |view, cx| view.save_document(cx)),
+            Self::Diff(_) | Self::Compare(_) => true,
+        }
+    }
 }
 
 /// What a revision picker was opened for.
@@ -190,11 +214,19 @@ impl Tab {
         }
     }
 
+    fn notebook(&self) -> Option<&Entity<NotebookView>> {
+        match &self.content {
+            TabContent::Notebook(view) => Some(view),
+            _ => None,
+        }
+    }
+
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.content {
             TabContent::Editor(editor) => editor.focus_handle(cx),
             TabContent::Diff(diff) => diff.focus_handle(cx),
             TabContent::Compare(view) => view.focus_handle(cx),
+            TabContent::Notebook(view) => view.focus_handle(cx),
         }
     }
 
@@ -203,20 +235,20 @@ impl Tab {
             TabContent::Editor(editor) => editor.clone().into(),
             TabContent::Diff(diff) => diff.clone().into(),
             TabContent::Compare(view) => view.clone().into(),
+            TabContent::Notebook(view) => view.clone().into(),
         }
     }
 
     fn entity_id(&self) -> gpui::EntityId {
-        match &self.content {
-            TabContent::Editor(editor) => editor.entity_id(),
-            TabContent::Diff(diff) => diff.entity_id(),
-            TabContent::Compare(view) => view.entity_id(),
-        }
+        self.content.entity_id()
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
-        self.editor()
-            .is_some_and(|editor| editor.read(cx).buffer().is_dirty())
+        match &self.content {
+            TabContent::Editor(editor) => editor.read(cx).buffer().is_dirty(),
+            TabContent::Notebook(view) => view.read(cx).is_dirty(cx),
+            TabContent::Diff(_) | TabContent::Compare(_) => false,
+        }
     }
 }
 
@@ -236,6 +268,8 @@ pub(crate) enum OfferKind {
     DownloadCodeLldb,
     /// A forwarded port's application listens: open it in the browser.
     PortAvailable { port: u16, url: String },
+    /// The active tab shows a marimo notebook as text.
+    OpenAsNotebook { path: PathBuf },
 }
 
 impl OfferKind {
@@ -245,6 +279,7 @@ impl OfferKind {
             Self::PythonSync => "Sync",
             Self::DownloadCodeLldb => "Download CodeLLDB",
             Self::PortAvailable { .. } => "Open in Browser",
+            Self::OpenAsNotebook { .. } => "Open as Notebook",
         }
     }
 }
@@ -306,6 +341,9 @@ pub struct Workspace {
     connection_error: Option<SharedString>,
     /// Files with an open "changed on disk" prompt, so it is asked once.
     reload_prompts: HashSet<PathBuf>,
+    /// marimo notebooks the user chose to see as text (Open as Text) this
+    /// session: they open in text editors.
+    text_notebooks: HashSet<PathBuf>,
     /// Owns the watch: dropping it stops watching.
     _watcher: Task<()>,
     _disconnects: Option<Task<()>>,
@@ -546,9 +584,12 @@ impl Workspace {
         // window, or the app quits) and restored once the workspace exists.
         let release_subscription = cx.on_release(|this, cx| {
             this.save_session(cx).ok();
+            this.shutdown_notebooks(cx);
         });
         let quit_subscription = cx.on_app_quit(|this, cx| {
             this.save_session(cx).ok();
+            // No kernel outlives the app.
+            this.shutdown_notebooks(cx);
             async {}
         });
         cx.defer_in(window, |this, window, cx| this.restore_session(window, cx));
@@ -592,6 +633,7 @@ impl Workspace {
             offers: Vec::new(),
             connection_error: None,
             reload_prompts: HashSet::new(),
+            text_notebooks: HashSet::new(),
             _watcher: watcher,
             _disconnects: disconnects,
             git_gutters: Default::default(),
@@ -735,6 +777,7 @@ impl Workspace {
                 self.prompt_reload(editor, path, window, cx);
             }
         }
+        self.notebooks_changed_on_disk(&batch, window, cx);
     }
 
     /// Opens (or activates) a diff tab.
@@ -992,7 +1035,7 @@ impl Workspace {
             match &tab.content {
                 TabContent::Diff(diff) => diff.update(cx, |diff, cx| diff.reload(cx)),
                 TabContent::Compare(view) => view.update(cx, |view, cx| view.reload(cx)),
-                TabContent::Editor(_) => {}
+                TabContent::Editor(_) | TabContent::Notebook(_) => {}
             }
         }
     }
@@ -1152,7 +1195,8 @@ impl Workspace {
 
     /// Opens (or activates) `path` in the active pane and returns its
     /// editor. A file open in another pane gets a second view of the same
-    /// buffer there.
+    /// buffer there. Notebooks open in notebook tabs instead (`None`); one
+    /// that cannot be read as a notebook opens as text.
     fn open_editor(
         &mut self,
         path: &Path,
@@ -1164,15 +1208,32 @@ impl Workspace {
             self.activate(pane, index, window, cx);
             return self.active_tab().and_then(Tab::editor).cloned();
         }
+        // Notebooks open in notebook tabs, sharing the open document.
+        if self.has_notebook_tab(path) {
+            if let Err(err) = self.open_notebook(path, None, window, cx) {
+                self.notice = Some(err.into());
+                cx.notify();
+            }
+            return None;
+        }
         let existing = self
             .all_tabs()
             .filter(|tab| tab.path == path)
             .find_map(Tab::editor)
             .cloned();
+        let mut notebook_error = None;
         let buffer = match &existing {
             Some(editor) => editor.read(cx).buffer().link(),
             None => match self.project.read_text(path) {
-                Ok(text) => Buffer::with_path(&text, path.to_path_buf()),
+                Ok(text) => {
+                    if self.opens_as_notebook(path, &text) {
+                        match self.open_notebook(path, Some(&text), window, cx) {
+                            Ok(_) => return None,
+                            Err(err) => notebook_error = Some(err),
+                        }
+                    }
+                    Buffer::with_path(&text, path.to_path_buf())
+                }
                 Err(err) => {
                     self.notice = Some(format!("Cannot open {}: {err}", path.display()).into());
                     cx.notify();
@@ -1253,6 +1314,8 @@ impl Workspace {
                             }
                         }
                     }
+                    // Only notebook cell editors emit it.
+                    EditorEvent::CellBoundary { .. } => {}
                 },
             );
         if let Some(language) = editor.read(cx).language() {
@@ -1289,6 +1352,9 @@ impl Workspace {
         let index = tabs.len() - 1;
         self.refresh_diagnostics(path, cx);
         self.activate(pane, index, window, cx);
+        if let Some(err) = notebook_error {
+            self.notice = Some(err.into());
+        }
         self.refresh_git_gutters(cx);
         Some(editor)
     }
@@ -1335,6 +1401,7 @@ impl Workspace {
         self.notice = None;
         self.file_tree.update(cx, |tree, cx| tree.select(&path, cx));
         self.claim_server(pane, index, cx);
+        self.offer_notebook_view(pane, index, cx);
         self.schedule_session_save(cx);
         cx.notify();
     }
@@ -1454,6 +1521,7 @@ impl Workspace {
             OfferKind::ReopenInContainer { config } => self.reopen_in(config, cx),
             OfferKind::DownloadCodeLldb => self.download_codelldb(window, cx),
             OfferKind::PortAvailable { url, .. } => cx.open_url(&url),
+            OfferKind::OpenAsNotebook { path } => self.reopen_as_notebook(&path, window, cx),
         }
     }
 
@@ -1505,14 +1573,16 @@ impl Workspace {
     }
 
     fn save_all(&mut self, _: &SaveAll, _: &mut Window, cx: &mut Context<Self>) {
-        // Once per file, through the view holding its server document.
-        let dirty: Vec<Entity<Editor>> = self
-            .all_tabs()
-            .filter(|tab| tab.lsp_owner && tab.is_dirty(cx))
-            .filter_map(|tab| tab.editor().cloned())
+        // Once per file, through the view holding its server document (a
+        // notebook's first view).
+        let dirty: Vec<TabContent> = self
+            .file_tabs()
+            .into_iter()
+            .filter(|tab| tab.is_dirty(cx))
+            .map(|tab| tab.content.clone())
             .collect();
-        for editor in dirty {
-            editor.update(cx, |editor, cx| editor.save(cx));
+        for content in dirty {
+            content.save(cx);
         }
     }
 
@@ -1756,10 +1826,8 @@ impl Workspace {
         let Some(tab) = self.pane(pane).and_then(|pane| pane.tabs.get(index)) else {
             return;
         };
-        let Some(editor) = tab
-            .editor()
-            .filter(|_| tab.is_dirty(cx) && !self.has_other_view(tab))
-            .cloned()
+        let Some(content) =
+            (tab.is_dirty(cx) && !self.has_other_view(tab)).then(|| tab.content.clone())
         else {
             self.remove_tab(pane, index, window, cx);
             return;
@@ -1778,12 +1846,12 @@ impl Workspace {
             };
             this.update_in(cx, |this, window, cx| {
                 let close = match answer {
-                    0 => editor.update(cx, |editor, cx| editor.save(cx)),
+                    0 => content.save(cx),
                     1 => true,
                     _ => false,
                 };
                 // The tabs may have changed while the prompt was open.
-                if close && let Some((pane, index)) = this.find_view(editor.entity_id()) {
+                if close && let Some((pane, index)) = this.find_view(content.entity_id()) {
                     this.remove_tab(pane, index, window, cx);
                 }
             })
@@ -1794,8 +1862,9 @@ impl Workspace {
 
     /// Open files with unsaved changes (a file open in two panes counts once).
     pub fn dirty_count(&self, cx: &App) -> usize {
-        self.all_tabs()
-            .filter(|tab| tab.lsp_owner && tab.is_dirty(cx))
+        self.file_tabs()
+            .into_iter()
+            .filter(|tab| tab.is_dirty(cx))
             .count()
     }
 }
@@ -1849,6 +1918,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::run_tests))
             .on_action(cx.listener(Self::run_test_file))
             .on_action(cx.listener(Self::run_test_at_cursor))
+            .on_action(cx.listener(Self::open_as_notebook))
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
             .on_action(cx.listener(Self::toggle_files))

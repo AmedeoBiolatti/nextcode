@@ -15,6 +15,11 @@ dirs = "7"
 futures = "0.3"
 gpui = "=0.2.2"
 devcontainer = { path = "crates/devcontainer" }
+notebook = { path = "crates/notebook" }
+# Already in the tree (gpui): notebook image outputs.
+base64 = "0.22"
+# CommonMark for notebook Markdown cells/outputs (no default features: no CLI).
+pulldown-cmark = { version = "0.13", default-features = false }
 grep-matcher = "0.1.9"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"

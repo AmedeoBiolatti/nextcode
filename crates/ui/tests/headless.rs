@@ -3449,3 +3449,312 @@ fn headless_mode_spell_checks_files_and_text() {
     assert!(headless.child.wait().unwrap().success());
     fs::remove_dir_all(&root).ok();
 }
+
+/// The interpreter for notebook tests: `NEXT_CODE_NOTEBOOK_PYTHON`, if it
+/// can import `modules`; `None` (after printing why) otherwise.
+fn notebook_python(modules: &[&str]) -> Option<PathBuf> {
+    let imports = modules.join(", ");
+    let Some(python) = std::env::var_os("NEXT_CODE_NOTEBOOK_PYTHON") else {
+        println!("skipped: NEXT_CODE_NOTEBOOK_PYTHON is not set (an interpreter with {imports})");
+        return None;
+    };
+    let imported = background_command(&python)
+        .args(["-c", &format!("import {imports}")])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !imported {
+        println!(
+            "skipped: {} cannot import {imports}",
+            python.to_string_lossy()
+        );
+        return None;
+    }
+    Some(PathBuf::from(python))
+}
+
+/// A notebook run's cells by index.
+fn ran_cells(reply: &Value) -> Vec<u64> {
+    reply["result"]["cells"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{reply}"))
+        .iter()
+        .map(|cell| cell["index"].as_u64().unwrap())
+        .collect()
+}
+
+const JUPYTER_CELL_INTRO: &str = r##"  {
+   "cell_type": "markdown",
+   "id": "intro",
+   "metadata": {},
+   "source": [
+    "# Doubling\n",
+    "A *small* notebook."
+   ]
+  },"##;
+
+const JUPYTER_CELL_SKIPPED: &str = r##"  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "skipped",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "print('never')"
+   ]
+  }"##;
+
+const JUPYTER_METADATA: &str = r##" "metadata": {
+  "custom": {
+   "keep": true
+  },
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+"##;
+
+/// A Jupyter notebook in Jupyter's own layout: run (outputs, counts, the
+/// stop at the first error), save (outputs written, the rest unchanged
+/// byte for byte), close (the kernel process ends).
+#[test]
+fn headless_mode_runs_saves_and_closes_a_jupyter_notebook() {
+    let Some(python) = notebook_python(&["ipykernel", "jupyter_client"]) else {
+        return;
+    };
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_ipynb_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("nb")).unwrap();
+    let code_cell = |id: &str, lines: &[&str]| {
+        let source: Vec<String> = lines.iter().map(|line| json!(line).to_string()).collect();
+        format!(
+            "  {{\n   \"cell_type\": \"code\",\n   \"execution_count\": null,\n   \"id\": \"{id}\",\n   \
+             \"metadata\": {{}},\n   \"outputs\": [],\n   \"source\": [\n    {}\n   ]\n  }},",
+            source.join(",\n    ")
+        )
+    };
+    let fixture = [
+        "{\n \"cells\": [".to_owned(),
+        JUPYTER_CELL_INTRO.to_owned(),
+        code_cell("define", &["x = 21"]),
+        code_cell("double", &["print(x * 2)"]),
+        code_cell("pid", &["import os\n", "print(os.getpid())\n", "x"]),
+        code_cell("fail", &["1 / 0"]),
+        JUPYTER_CELL_SKIPPED.to_owned(),
+        " ],".to_owned(),
+        JUPYTER_METADATA.to_owned(),
+    ]
+    .join("\n");
+    let file = root.join("nb").join("double.ipynb");
+    fs::write(&file, &fixture).unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let path = "nb/double.ipynb";
+    let open = headless.call(json!({
+        "cmd": "notebook_open", "path": path, "python": python.to_string_lossy(),
+    }));
+    assert_eq!(open["ok"], true, "{open}");
+    assert_eq!(open["result"]["kind"], "ipynb");
+    let cells = open["result"]["cells"].as_array().unwrap();
+    assert_eq!(cells.len(), 6);
+    assert_eq!(cells[0]["kind"], "markdown");
+    assert_eq!(cells[3]["source"], "import os\nprint(os.getpid())\nx");
+
+    let run = headless.call(json!({ "cmd": "notebook_run", "path": path }));
+    assert_eq!(run["ok"], true, "{run}");
+    assert_eq!(
+        ran_cells(&run),
+        [1, 2, 3, 4],
+        "markdown never runs; the error stops the rest: {run}"
+    );
+    let ran = run["result"]["cells"].as_array().unwrap();
+    for (cell, count) in ran.iter().zip(1..) {
+        assert_eq!(cell["execution_count"], count, "{cell}");
+    }
+    assert_eq!(ran[0]["status"], "ok");
+    assert_eq!(ran[1]["outputs"][0]["output_type"], "stream");
+    assert_eq!(ran[1]["outputs"][0]["text"], "42\n", "{run}");
+    let pid: u32 = ran[2]["outputs"][0]["text"]
+        .as_str()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("{run}"));
+    assert_eq!(ran[2]["outputs"][1]["output_type"], "execute_result");
+    assert_eq!(ran[2]["outputs"][1]["text_plain"], "21");
+    let error = &ran[3];
+    assert_eq!(error["status"], "error");
+    assert_eq!(error["outputs"][0]["ename"], "ZeroDivisionError", "{error}");
+    assert!(
+        !error["outputs"][0]["traceback"]
+            .to_string()
+            .contains("\\u001b"),
+        "tracebacks lose their colours: {error}"
+    );
+    let status = headless.call(json!({ "cmd": "notebook_status", "path": path }));
+    assert_eq!(status["result"]["cells"][5]["status"], "idle", "{status}");
+    assert!(
+        status["result"]["interpreter"].as_str().is_some(),
+        "{status}"
+    );
+
+    let save = headless.call(json!({ "cmd": "notebook_save", "path": path }));
+    assert_eq!(save["ok"], true, "{save}");
+    let saved = fs::read_to_string(root.join(path)).unwrap();
+    for unchanged in [JUPYTER_CELL_INTRO, JUPYTER_CELL_SKIPPED, JUPYTER_METADATA] {
+        assert!(
+            saved.contains(unchanged),
+            "kept byte for byte:\n{unchanged}\nin\n{saved}"
+        );
+    }
+    let notebook: Value = serde_json::from_str(&saved).unwrap();
+    let double = &notebook["cells"][2];
+    assert_eq!(double["execution_count"], 2);
+    assert_eq!(
+        double["outputs"],
+        json!([{ "name": "stdout", "output_type": "stream", "text": ["42\n"] }])
+    );
+    assert_eq!(
+        notebook["cells"][4]["outputs"][0]["ename"],
+        "ZeroDivisionError"
+    );
+    assert_eq!(notebook["cells"][5]["execution_count"], Value::Null);
+
+    let close = headless.call(json!({ "cmd": "notebook_close", "path": path }));
+    assert_eq!(close["ok"], true, "{close}");
+    if cfg!(target_os = "linux") {
+        let process = PathBuf::from(format!("/proc/{pid}"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "kernel {pid} still runs after notebook_close"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let closed = headless.call(json!({ "cmd": "notebook_run", "path": path }));
+    assert_eq!(closed["ok"], false, "{closed}");
+
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+const MARIMO_NOTEBOOK: &str = "import marimo\n\n__generated_with = \"0.25.1\"\napp = marimo.App(width=\"medium\")\n\n\n\
+    @app.cell\ndef _():\n    a = 1\n    return (a,)\n\n\n\
+    @app.cell\ndef _(a):\n    b = a + 1\n    return (b,)\n\n\n\
+    @app.cell\ndef _(b):\n    print(b)\n    return\n\n\n\
+    if __name__ == \"__main__\":\n    app.run()\n";
+
+/// A marimo notebook: reactive re-runs after an edit, multiple
+/// definitions reported on both cells, saved in marimo's layout.
+#[test]
+fn headless_mode_runs_marimo_cells_reactively_and_saves_them() {
+    let Some(python) = notebook_python(&["ipykernel", "jupyter_client", "marimo"]) else {
+        return;
+    };
+    let root =
+        std::env::temp_dir().join(format!("next_code_headless_marimo_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("reactive.py"), MARIMO_NOTEBOOK).unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let path = "reactive.py";
+    let mut ok = |request: Value| {
+        let reply = headless.call(request.clone());
+        assert_eq!(reply["ok"], true, "{request} → {reply}");
+        reply
+    };
+    let open = ok(json!({
+        "cmd": "notebook_open", "path": path, "python": python.to_string_lossy(),
+    }));
+    assert_eq!(open["result"]["kind"], "marimo");
+    assert_eq!(open["result"]["cells"][1]["source"], "b = a + 1");
+
+    let run = ok(json!({ "cmd": "notebook_run", "path": path }));
+    assert_eq!(ran_cells(&run), [0, 1, 2]);
+    assert_eq!(
+        run["result"]["cells"][2]["outputs"][0]["text"], "2\n",
+        "{run}"
+    );
+
+    let edit = ok(json!({ "cmd": "notebook_edit", "path": path, "cell": 0, "source": "a = 10" }));
+    assert_eq!(edit["result"]["stale"], true, "{edit}");
+    let run = ok(json!({ "cmd": "notebook_run", "path": path, "cells": [0] }));
+    assert_eq!(ran_cells(&run), [0, 1, 2], "descendants re-run: {run}");
+    assert_eq!(
+        run["result"]["cells"][2]["outputs"][0]["text"], "11\n",
+        "{run}"
+    );
+    assert_eq!(run["result"]["cells"][0]["stale"], false);
+
+    let insert =
+        ok(json!({ "cmd": "notebook_insert", "path": path, "index": 3, "source": "a = 2" }));
+    assert!(insert["result"]["error"].is_string(), "{insert}");
+    let status = ok(json!({ "cmd": "notebook_status", "path": path }));
+    let error = status["result"]["cells"][0]["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{status}"));
+    println!("multiple definitions: {error}");
+    let run = ok(json!({ "cmd": "notebook_run", "path": path, "cells": [3] }));
+    assert_eq!(ran_cells(&run), [1, 2, 3], "{run}");
+    let cells = run["result"]["cells"].as_array().unwrap();
+    assert_eq!(cells[2]["outputs"][0]["ename"], "MarimoError", "{run}");
+    for skipped in &cells[..2] {
+        assert_eq!(skipped["status"], "error");
+        assert!(
+            skipped["outputs"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("An ancestor raised an exception"),
+            "{skipped}"
+        );
+    }
+
+    ok(json!({ "cmd": "notebook_delete", "path": path, "cell": 3 }));
+    ok(json!({ "cmd": "notebook_save", "path": path }));
+    let saved = fs::read_to_string(root.join(path)).unwrap();
+    for expected in [
+        "__generated_with = \"0.25.1\"\napp = marimo.App(width=\"medium\")\n",
+        "@app.cell\ndef _():\n    a = 10\n    return (a,)\n",
+        "@app.cell\ndef _(a):\n    b = a + 1\n    return (b,)\n",
+        "@app.cell\ndef _(b):\n    print(b)\n    return\n",
+    ] {
+        assert!(saved.contains(expected), "{expected:?} in\n{saved}");
+    }
+    let marimo = python.with_file_name("marimo");
+    if marimo.exists() {
+        let check = background_command(&marimo)
+            .arg("check")
+            .arg(root.join(path))
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "marimo check: {}{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+    } else {
+        println!("marimo check skipped: no marimo CLI next to the interpreter");
+    }
+
+    ok(json!({ "cmd": "notebook_close", "path": path }));
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}

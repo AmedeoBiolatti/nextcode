@@ -3,9 +3,9 @@
 use std::{ops::Range, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
-    FontStyle, FontWeight, Global, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+    AnyElement, App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, CursorStyle,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, Font, FontStyle, FontWeight, Global, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
     InspectorElementId, KeyBinding, KeyContext, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString,
     StrikethroughStyle, Style, Task, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
@@ -68,7 +68,6 @@ use inlay_hints::RowInlays;
 use lines::IndentStyle;
 use selections::{Selection, SelectionSet, is_whole_word, is_word_char};
 
-pub use git_gutter::{CloseHunkPopup, GitBase, NextChange, PreviousChange, RollbackLines};
 pub use brackets::JumpToBracket;
 pub use call_hierarchy::ShowCallHierarchy;
 pub use code_actions::{
@@ -89,6 +88,7 @@ pub use find::{
 };
 pub use folds::{Fold, FoldAll, FoldRecursively, ToggleFold, Unfold, UnfoldAll, UnfoldRecursively};
 pub use format::{FormatDocument, FormatSelection};
+pub use git_gutter::{CloseHunkPopup, GitBase, NextChange, PreviousChange, RollbackLines};
 pub use go_to_line::{CancelGoToLine, ConfirmGoToLine, GoToLine};
 pub use inlay_hints::ToggleInlayHints;
 pub use lines::{
@@ -420,9 +420,13 @@ pub enum EditorEvent {
         kind: GutterMarkerKind,
     },
     /// Stage Hunk: the file's index entry becomes `contents`.
-    StageHunk { contents: String },
+    StageHunk {
+        contents: String,
+    },
     /// Show Diff from the hunk popup: the file's diff at current `line`.
-    ShowChangeDiff { line: usize },
+    ShowChangeDiff {
+        line: usize,
+    },
     /// Annotations were turned on: run blame (see `Editor::set_blame`).
     LoadBlame,
     /// A click on an annotation: show this commit.
@@ -434,7 +438,18 @@ pub enum EditorEvent {
     Close {
         discard: bool,
     },
+    /// A notebook cell editor (`Editor::notebook_cell`): Up on its first
+    /// screen row (`up`) or Down on its last moves to the neighbouring cell.
+    CellBoundary {
+        up: bool,
+    },
 }
+
+/// Completions not from a language server (a notebook kernel): the text and
+/// the cursor's byte offset in, candidates and the byte range of the text
+/// they replace out (`None`: nothing to offer).
+pub type CompletionProvider =
+    std::rc::Rc<dyn Fn(String, usize, &mut App) -> Task<Option<(Vec<String>, Range<usize>)>>>;
 
 impl EventEmitter<EditorEvent> for Editor {}
 
@@ -487,6 +502,12 @@ pub struct Editor {
     /// Multi-line text field (a commit message): no gutter, status bar,
     /// find bar or breadcrumbs; lines wrap.
     text_area: bool,
+    /// Notebook cell (`Editor::notebook_cell`): code features without the
+    /// file chrome; as tall as its content; Up/Down past the ends emit
+    /// `EditorEvent::CellBoundary`.
+    notebook_cell: bool,
+    /// Completions when no language server is attached.
+    completion_provider: Option<CompletionProvider>,
     lsp: Option<LspDocument>,
     /// Language-server status shown in the status bar, with its color.
     lsp_status: Option<(SharedString, fn() -> Hsla)>,
@@ -783,6 +804,8 @@ impl Editor {
             syntax,
             single_line: false,
             text_area: false,
+            notebook_cell: false,
+            completion_provider: None,
             lsp: None,
             lsp_status: None,
             changes: Vec::new(),
@@ -987,6 +1010,51 @@ impl Editor {
             word_wrap: Some(true),
             ..Self::new(Buffer::new(""), cx)
         }
+    }
+
+    /// A notebook cell editor: code features (tree-sitter highlighting for
+    /// `language`, brackets and auto-close, undo, Vim, spell check,
+    /// completion from `set_completion_provider`) without gutter, status
+    /// bar, scrollbar, minimap, sticky scroll, breadcrumbs, find bar or
+    /// language server (a text area's chrome). Its element is as tall as
+    /// its content (screen rows × line height, at least one row), so a list
+    /// can size it; popovers draw over neighbouring cells. Code cells don't
+    /// wrap; Markdown cells (`Language::Markdown`) do. Save is left to the
+    /// parent, and Up on the first row / Down on the last emit
+    /// `EditorEvent::CellBoundary`.
+    ///
+    /// Its key context adds `notebook_cell`, and `cell_escape` while
+    /// Escape has nothing to close in the editor (no completion menu,
+    /// signature help, code actions, snippet or extra cursors). A parent
+    /// binds its keys in `Editor && notebook_cell` (Escape in
+    /// `Editor && cell_escape`) after `bind_keys`: at the same context depth
+    /// the later binding wins over the editor's own (Shift+Enter,
+    /// Ctrl+Enter, Alt+Enter). Vim sees keys first: Escape leaves insert
+    /// or visual mode, and reaches the parent from normal mode; Vim never
+    /// takes Shift+Enter in a cell, and its k/j past the ends emit
+    /// `CellBoundary` like Up/Down.
+    pub fn notebook_cell(text: &str, language: Option<Language>, cx: &mut Context<Self>) -> Self {
+        let mut buffer = Buffer::new(text);
+        let syntax = language.map(|language| Syntax::new(language, &buffer));
+        buffer.drain_changes();
+        let sample: Vec<String> = (0..buffer.line_count().min(INDENT_SAMPLE_LINES))
+            .map(|line| buffer.line_text(line))
+            .collect();
+        let indent = IndentStyle::detect(sample.iter().map(String::as_str), language);
+        Self {
+            notebook_cell: true,
+            text_area: true,
+            word_wrap: Some(language == Some(Language::Markdown)),
+            syntax,
+            indent,
+            ..Self::new(buffer, cx)
+        }
+    }
+
+    /// Completions from `provider` while no language server is attached
+    /// (identifier characters and `.` ask it, as does Ctrl+Space).
+    pub fn set_completion_provider(&mut self, provider: Option<CompletionProvider>) {
+        self.completion_provider = provider;
     }
 
     /// An editor for a file of `project`; the buffer must have its path.
@@ -1361,11 +1429,57 @@ impl Editor {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        self.vertical(-1, false, cx);
+        if !self.cell_boundary(true, cx) {
+            self.vertical(-1, false, cx);
+        }
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        self.vertical(1, false, cx);
+        if !self.cell_boundary(false, cx) {
+            self.vertical(1, false, cx);
+        }
+    }
+
+    /// In a notebook cell, Up on the first screen row (Down on the last)
+    /// with one cursor and no selection leaves the cell: emits
+    /// `CellBoundary` and returns true.
+    fn cell_boundary(&mut self, up: bool, cx: &mut Context<Self>) -> bool {
+        let s = self.primary();
+        if !self.notebook_cell || self.selections.len() > 1 || !s.is_empty() {
+            return false;
+        }
+        let (row, _) = self.display.point(&self.buffer, s.head, s.at_row_end);
+        let at_edge = if up {
+            row == 0
+        } else {
+            row + 1 >= self.display.row_count()
+        };
+        if at_edge {
+            cx.emit(EditorEvent::CellBoundary { up });
+        }
+        at_edge
+    }
+
+    /// A popover over the text; a notebook cell's draws over the cells
+    /// around it (its own bounds are only its text).
+    fn popover(&self, popover: impl IntoElement) -> AnyElement {
+        if self.notebook_cell {
+            gpui::deferred(popover).with_priority(1).into_any_element()
+        } else {
+            popover.into_any_element()
+        }
+    }
+
+    /// The primary cursor's screen row: its top (from the top of a notebook
+    /// cell's text) and height, to scroll the notebook to it.
+    pub fn cursor_row_bounds(&self) -> (Pixels, Pixels) {
+        let s = self.primary();
+        let (row, _) = self.display.point(&self.buffer, s.head, s.at_row_end);
+        let line_height = self
+            .layout
+            .as_ref()
+            .map_or(px(theme::EDITOR_LINE_HEIGHT), |layout| layout.line_height);
+        (line_height * row as f32, line_height)
     }
 
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -1845,6 +1959,14 @@ impl Editor {
         if event.modifiers.shift && delta.x == px(0.) {
             delta = point(delta.y, px(0.));
         }
+        // A notebook cell shows all its rows: vertical scrolling is the
+        // notebook's (the event goes on to it).
+        if self.notebook_cell {
+            if delta.x == px(0.) {
+                return;
+            }
+            delta.y = px(0.);
+        }
         // Upper bounds are clamped in `layout`, which knows the viewport.
         self.scroll.x = (self.scroll.x - delta.x).max(px(0.));
         self.scroll.y = (self.scroll.y - delta.y).max(px(0.));
@@ -1863,6 +1985,17 @@ impl Editor {
         ((width - em_width) / em_width)
             .floor()
             .max(MIN_WRAP_COLUMNS as f32) as usize
+    }
+
+    /// A notebook cell's screen rows when its text is `width` wide (wrapped
+    /// if it wraps; at least one).
+    fn content_rows(&mut self, width: Option<Pixels>, em_width: Pixels) -> usize {
+        let columns = match width {
+            Some(width) if self.wraps() => Some(self.wrap_columns(width, em_width)),
+            _ => None,
+        };
+        self.display.set_wrap(&self.buffer, columns);
+        self.display.row_count().max(1)
     }
 
     /// Shapes the visible rows and resolves scrolling for `bounds`.
@@ -1907,11 +2040,8 @@ impl Editor {
                 if blame > px(0.) {
                     blame_left = Some(bounds.left() + debug_width + bulb);
                 }
-                let numbers = debug_width
-                    + bulb
-                    + blame
-                    + GUTTER_PADDING / 2.
-                    + em_width * digits as f32;
+                let numbers =
+                    debug_width + bulb + blame + GUTTER_PADDING / 2. + em_width * digits as f32;
                 let changes = if self.project.is_some() || self.git.base.is_some() {
                     change_left = Some(bounds.left() + numbers + px(2.));
                     git_gutter::CHANGE_COLUMN
@@ -1969,7 +2099,11 @@ impl Editor {
             self.scroll.y =
                 self.sticky_autoscroll(cursor_row, self.scroll.y, line_height, viewport.height);
         }
-        let max_scroll_y = line_height * self.display.row_count().saturating_sub(1) as f32;
+        let max_scroll_y = if self.notebook_cell {
+            px(0.)
+        } else {
+            line_height * self.display.row_count().saturating_sub(1) as f32
+        };
         self.scroll.y = self.scroll.y.min(max_scroll_y).max(px(0.));
 
         let first_row = (self.scroll.y / line_height).floor() as usize;
@@ -2260,7 +2394,12 @@ impl Editor {
             }
             if let (Some(label), Some(left)) = (&row.blame, layout.blame_left) {
                 label
-                    .paint(point(left + layout.em_width / 2., top), line_height, window, cx)
+                    .paint(
+                        point(left + layout.em_width / 2., top),
+                        line_height,
+                        window,
+                        cx,
+                    )
                     .ok();
             }
             self.paint_change_marker(layout, row, top, window);
@@ -2268,7 +2407,10 @@ impl Editor {
         if let Some(left) = layout.blame_left {
             let right = left + layout.em_width * blame::BLAME_COLUMNS - px(1.);
             window.paint_quad(fill(
-                Bounds::from_corners(point(right, bounds.top()), point(right + px(1.), bounds.bottom())),
+                Bounds::from_corners(
+                    point(right, bounds.top()),
+                    point(right + px(1.), bounds.bottom()),
+                ),
                 theme::border(),
             ));
         }
@@ -2701,8 +2843,36 @@ impl Element for EditorElement {
     ) -> (LayoutId, ()) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = relative(1.).into();
-        (window.request_layout(style, [], cx), ())
+        if !self.editor.read(cx).notebook_cell {
+            style.size.height = relative(1.).into();
+            return (window.request_layout(style, [], cx), ());
+        }
+        // A notebook cell: its rows (wrapped at the width it gets) tall.
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let run = TextRun {
+            len: 1,
+            font: text_style.font(),
+            color: text_style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let em_width = window
+            .text_system()
+            .shape_line("m".into(), font_size, &[run], None)
+            .width;
+        let line_height = window.line_height();
+        let editor = self.editor.clone();
+        let id = window.request_measured_layout(style, move |known, available, _, cx| {
+            let width = known.width.or(match available.width {
+                AvailableSpace::Definite(width) => Some(width),
+                _ => None,
+            });
+            let rows = editor.update(cx, |editor, _| editor.content_rows(width, em_width));
+            size(width.unwrap_or_default(), line_height * rows as f32)
+        });
+        (id, ())
     }
 
     fn prepaint(
@@ -2794,9 +2964,10 @@ impl Render for Editor {
             self.snippet_selections_changed();
             self.follow_spelling(cx);
         }
-        // Alt+Z in another editor.
+        // Alt+Z in another editor (notebook cells wrap by cell kind).
         if let Some(&WordWrapOverride(wrap)) = cx.try_global::<WordWrapOverride>()
             && self.word_wrap != Some(wrap)
+            && !self.notebook_cell
         {
             self.word_wrap = Some(wrap);
         }
@@ -2870,10 +3041,28 @@ impl Render for Editor {
                 if self.hunk_popup_open() {
                     context.add("showing_hunk_popup");
                 }
+                if self.notebook_cell {
+                    context.add("notebook_cell");
+                    let closable = self.completion.is_some()
+                        || self.signature.popover.is_some()
+                        || self.selections.len() > 1
+                        || self.code_actions.menu.is_some()
+                        || self.in_snippet();
+                    if !closable {
+                        context.add("cell_escape");
+                    }
+                }
                 context
             })
             .track_focus(&self.focus_handle)
-            .size_full()
+            // A notebook cell is as tall as its text.
+            .map(|editor| {
+                if self.notebook_cell {
+                    editor.w_full()
+                } else {
+                    editor.size_full()
+                }
+            })
             .flex()
             .flex_col()
             .bg(theme::background())
@@ -2950,7 +3139,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
-            .on_action(cx.listener(Self::save_action))
+            // A notebook cell has no file: its notebook saves.
+            .when(!self.notebook_cell, |editor| {
+                editor.on_action(cx.listener(Self::save_action))
+            })
             .on_action(cx.listener(Self::next_diagnostic))
             .on_action(cx.listener(Self::prev_diagnostic))
             .on_action(cx.listener(Self::go_to_definition))
@@ -2987,7 +3179,7 @@ impl Render for Editor {
             .child(
                 div()
                     .id("editor-text")
-                    .flex_1()
+                    .when(!self.notebook_cell, |text| text.flex_1())
                     .relative()
                     .overflow_hidden()
                     .cursor(if self.link.is_some() {
@@ -3012,12 +3204,14 @@ impl Render for Editor {
                     .child(EditorElement {
                         editor: cx.entity(),
                     })
-                    .when(focused, |text| text.children(self.render_hover()))
                     .when(focused, |text| {
-                        text.children(self.render_signature_help(cx))
+                        text.children(self.render_hover().map(|p| self.popover(p)))
                     })
-                    .children(self.render_completions(cx))
-                    .children(self.render_code_actions(cx))
+                    .when(focused, |text| {
+                        text.children(self.render_signature_help(cx).map(|p| self.popover(p)))
+                    })
+                    .children(self.render_completions(cx).map(|p| self.popover(p)))
+                    .children(self.render_code_actions(cx).map(|p| self.popover(p)))
                     .when(focused, |text| text.children(self.render_blame_hover())),
             )
             .when(!self.single_line && !self.text_area, |editor| {

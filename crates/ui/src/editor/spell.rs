@@ -406,7 +406,8 @@ impl Editor {
         if !settings.spell(self.language()) {
             return None;
         }
-        let scope = if self.text_area {
+        // Notebook cells are code (or Markdown), checked like files.
+        let scope = if self.text_area && !self.notebook_cell {
             Scope::Prose
         } else {
             Scope::of(

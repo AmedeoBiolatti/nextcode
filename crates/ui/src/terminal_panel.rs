@@ -141,7 +141,7 @@ pub fn spawn_program(
     }))
 }
 
-fn to_hsla(color: Rgb) -> Hsla {
+pub(crate) fn to_hsla(color: Rgb) -> Hsla {
     rgb((u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)).into()
 }
 
