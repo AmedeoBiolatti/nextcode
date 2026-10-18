@@ -5,6 +5,7 @@ use gpui::{Action, FocusHandle, KeybindingKeystroke, Modifiers, Window};
 
 /// Display labels where the action's name alone reads poorly.
 const LABELS: &[(&str, &str)] = &[
+    ("pinpoint::CopyContextForAgent", "Copy Context for Agent"),
     ("app::OpenProject", "Open Project…"),
     ("app::OpenProjectInNewWindow", "Open Project in New Window…"),
     ("app::OpenRecent", "Open Recent…"),
@@ -46,6 +47,9 @@ const LABELS: &[(&str, &str)] = &[
     ("workspace::ToggleCommit", "Commit Tool Window"),
     ("workspace::ToggleGitLog", "Git Tool Window"),
     ("workspace::ToggleProblems", "Problems Panel"),
+    ("workspace::ToggleNotes", "Notes Panel"),
+    ("notes::AddNote", "Add Note"),
+    ("notes::ToggleResolvedNotes", "Show/Hide Resolved Notes"),
     ("workspace::TogglePorts", "Ports Panel"),
     ("ports::ForwardPort", "Forward a Port…"),
     ("workspace::ToggleCallHierarchy", "Call Hierarchy Panel"),
@@ -279,6 +283,8 @@ const HIDDEN: &[&str] = &[
     "editor::ConfirmBreakpointEdit",
     "editor::CancelBreakpointEdit",
     "editor::NextBreakpointField",
+    "notes::SubmitNote",
+    "notes::CancelNote",
     "debugger::AddWatch",
     "debugger::SubmitConsoleInput",
     "debugger::PreviousConsoleInput",

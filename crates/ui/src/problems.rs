@@ -91,6 +91,10 @@ pub struct ProblemsPanel {
     _subscription: Subscription,
 }
 
+/// One listed problem for `next_code context`: location, severity, message
+/// and code.
+pub(crate) type ContextProblem<'a> = (&'a Location, &'static str, &'a str, Option<&'a str>);
+
 impl ProblemsPanel {
     pub fn new(project: Project, store: Entity<LspStore>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&store, |this, _, event, cx| {
@@ -139,6 +143,45 @@ impl ProblemsPanel {
             self.spelling.insert(path.to_path_buf(), diagnostics);
         }
         self.rebuild(cx);
+    }
+
+    /// Error and warning totals and every listed problem, in panel order
+    /// (`next_code context`).
+    pub(crate) fn context_problems(&self) -> (usize, usize, Vec<ContextProblem<'_>>) {
+        let (mut errors, mut warnings, mut problems) = (0, 0, Vec::new());
+        for row in &self.rows {
+            match row {
+                Row::File {
+                    errors: e,
+                    warnings: w,
+                    ..
+                } => {
+                    errors += e;
+                    warnings += w;
+                }
+                Row::Problem {
+                    location,
+                    severity,
+                    message,
+                    code,
+                    ..
+                } => {
+                    let severity = match severity {
+                        Severity::Error => "error",
+                        Severity::Warning => "warning",
+                        Severity::Info => "info",
+                    };
+                    problems.push((
+                        location,
+                        severity,
+                        message.as_ref(),
+                        code.as_ref().map(|code| code.as_ref()),
+                    ));
+                }
+                Row::Root { .. } => {}
+            }
+        }
+        (errors, warnings, problems)
     }
 
     /// Rebuilds the rows (see [`rows`]). Hints (e.g. "unused") are left to

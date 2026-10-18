@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 futures.workspace = true
+notes.workspace = true
 parking_lot.workspace = true
 proto.workspace = true
 search.workspace = true

@@ -140,6 +140,11 @@ impl TestsPanel {
         self.discovering || self._run.is_some()
     }
 
+    /// The line above the tree: what runs, or the last outcome.
+    pub(crate) fn status_text(&self) -> Option<&str> {
+        self.status.as_ref().map(|status| status.as_ref())
+    }
+
     /// Finds tests again (keeping results of tests that still exist).
     pub fn discover(&mut self, cx: &mut Context<Self>) {
         self._debounce = None;

@@ -25,6 +25,7 @@ workflow_lsp.workspace = true
 nucleo-matcher.workspace = true
 parking_lot.workspace = true
 pinpoint_cli.workspace = true
+notes.workspace = true
 regex.workspace = true
 serde.workspace = true
 search.workspace = true

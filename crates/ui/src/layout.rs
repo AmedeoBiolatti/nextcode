@@ -25,10 +25,12 @@ pub enum PanelId {
     Debug,
     DebugConsole,
     Tests,
+    /// Sticky notes of the project.
+    Notes,
 }
 
 impl PanelId {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Files,
         Self::Search,
         Self::Commit,
@@ -42,6 +44,7 @@ impl PanelId {
         Self::Debug,
         Self::DebugConsole,
         Self::Tests,
+        Self::Notes,
     ];
 
     pub fn title(self) -> &'static str {
@@ -59,6 +62,7 @@ impl PanelId {
             Self::Debug => "Debug",
             Self::DebugConsole => "Debug Console",
             Self::Tests => "Tests",
+            Self::Notes => "Notes",
         }
     }
 
@@ -78,6 +82,7 @@ impl PanelId {
             Self::Debug => "debug",
             Self::DebugConsole => "debug-console",
             Self::Tests => "tests",
+            Self::Notes => "notes",
         }
     }
 
@@ -92,6 +97,7 @@ impl PanelId {
             | Self::Ports
             | Self::GitLog
             | Self::CallHierarchy
+            | Self::Notes
             | Self::DebugConsole => DockPosition::Bottom,
         }
     }
@@ -213,6 +219,7 @@ impl Default for Layout {
                     PanelId::Ports,
                     PanelId::CallHierarchy,
                     PanelId::DebugConsole,
+                    PanelId::Notes,
                 ],
                 active: Some(PanelId::Terminal),
                 size: 260.,
@@ -450,7 +457,8 @@ mod tests {
                 PanelId::GitLog,
                 PanelId::Ports,
                 PanelId::CallHierarchy,
-                PanelId::DebugConsole
+                PanelId::DebugConsole,
+                PanelId::Notes
             ]
         );
         assert_eq!(layout.left.active, Some(PanelId::Commit));
@@ -473,7 +481,8 @@ mod tests {
                 PanelId::GitLog,
                 PanelId::Ports,
                 PanelId::CallHierarchy,
-                PanelId::DebugConsole
+                PanelId::DebugConsole,
+                PanelId::Notes
             ]
         );
         layout.move_panel(PanelId::Problems, DockPosition::Bottom, Some(99));
@@ -485,6 +494,7 @@ mod tests {
                 PanelId::Ports,
                 PanelId::CallHierarchy,
                 PanelId::DebugConsole,
+                PanelId::Notes,
                 PanelId::Problems
             ]
         );

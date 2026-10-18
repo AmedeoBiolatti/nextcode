@@ -32,6 +32,12 @@ Point at parts of the running NextCode window (see docs/pinpoint-for-agents.md).
         wait for the user's next pick (--pick turns the picker on first)
   windows
         open windows and their project roots
+  context [--max-lines N] [--around N]
+        what the user is looking at: focused area, active file, cursor,
+        selection, lines around the cursor (--around, default 20; 0: none),
+        diagnostics, tabs, terminal tail, Problems, Tests, debugger, notebook
+        cell, workflow run; texts capped at --max-lines (default 40).
+        Also `next_code context` / `next_code_agent context`.
 
 Common options: --window ID (else the window whose project holds the current
 directory, else the active one), --format json (raw JSON reply),
@@ -93,10 +99,11 @@ pub fn parse(args: &[String]) -> Result<Value, String> {
         "pins" => flags_only(rest, "pins", &[("--clear", "clear")])?,
         "pick" => flags_only(rest, "pick", &[])?,
         "windows" => flags_only(rest, "windows", &[])?,
+        "context" => context(rest)?,
         "wait-pin" | "wait_pin" => wait_pin(rest)?,
         other => {
             return Err(format!(
-                "unknown command {other:?}: use list, find, highlight, clear, pick, pins, wait-pin or windows"
+                "unknown command {other:?}: use list, find, highlight, clear, pick, pins, wait-pin, windows or context"
             ));
         }
     };
@@ -311,6 +318,26 @@ fn wait_pin(args: &[&str]) -> Result<Value, String> {
     Ok(request)
 }
 
+fn context(args: &[&str]) -> Result<Value, String> {
+    let mut request = json!({ "cmd": "context" });
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--max-lines" => {
+                request["max_lines"] = number(value_of(args, index)?, "--max-lines")?.into();
+                index += 1;
+            }
+            "--around" => {
+                request["around"] = number(value_of(args, index)?, "--around")?.into();
+                index += 1;
+            }
+            other => return Err(format!("context: unexpected {other:?}")),
+        }
+        index += 1;
+    }
+    Ok(request)
+}
+
 /// Prints `reply` (to stdout; errors to stderr) and returns the exit code.
 pub fn print_reply(request: &Value, reply: &Value) -> i32 {
     let (out, code) = render(request, reply);
@@ -335,6 +362,7 @@ pub fn render(request: &Value, reply: &Value) -> (String, i32) {
     let text = match request.get("cmd").and_then(Value::as_str) {
         Some("list" | "find") => nodes_text(reply),
         Some("highlight") => highlight_text(reply),
+        Some("context") => context_markdown(reply),
         _ => pretty(reply),
     };
     (text, code)
@@ -476,6 +504,367 @@ fn highlight_text(reply: &Value) -> String {
     text
 }
 
+/// A `context` reply as compact Markdown for an agent's prompt (the
+/// CLI's default output and what Copy Context for Agent copies).
+pub fn context_markdown(reply: &Value) -> String {
+    let str_of = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    let num = |value: &Value, key: &str| value.get(key).and_then(Value::as_u64);
+    let flag = |value: &Value, key: &str| value.get(key).and_then(Value::as_bool) == Some(true);
+    let items = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut out = String::from("# What the user is looking at (NextCode)\n");
+    let mut head = Vec::new();
+    if let Some(title) = str_of(reply, "title").filter(|t| !t.is_empty()) {
+        head.push(format!("window \"{title}\""));
+    }
+    head.push(format!(
+        "focus: {}",
+        str_of(reply, "focus").unwrap_or_else(|| "nothing".into())
+    ));
+    out.push_str(&format!("{}\n", head.join(" · ")));
+    if let Some(project) = reply.get("project") {
+        let roots: Vec<String> = items(project, "roots")
+            .iter()
+            .filter_map(|root| str_of(root, "path"))
+            .collect();
+        let remote = if flag(project, "remote") { " (remote)" } else { "" };
+        out.push_str(&format!("project: {}{remote}\n", roots.join(", ")));
+    }
+
+    if let Some(editor) = reply.get("editor") {
+        let file = str_of(editor, "file").unwrap_or_else(|| "untitled".into());
+        let language = str_of(editor, "language");
+        let fence_language = language.as_deref().unwrap_or("").to_lowercase();
+        let mut facts = Vec::new();
+        if let Some(language) = &language {
+            facts.push(language.clone());
+        }
+        if flag(editor, "dirty") {
+            facts.push("unsaved changes".into());
+        }
+        if let Some(count) = num(editor, "line_count") {
+            facts.push(format!("{count} lines"));
+        }
+        out.push_str(&format!("\n## Editor: {file} ({})\n", facts.join(", ")));
+        let cursors: Vec<String> = items(editor, "cursors").iter().map(point).collect();
+        let mut line = format!("cursor {}", cursors.join(", "));
+        if let Some([first, last]) = editor
+            .get("visible_lines")
+            .and_then(Value::as_array)
+            .and_then(|lines| <&[Value; 2]>::try_from(lines.as_slice()).ok())
+        {
+            line.push_str(&format!(" · lines {first}–{last} on screen"));
+        }
+        out.push_str(&format!("{line}\n"));
+        for selection in items(editor, "selections") {
+            let range = format!(
+                "{}–{}",
+                selection.get("start").map(point).unwrap_or_default(),
+                selection.get("end").map(point).unwrap_or_default()
+            );
+            let cut = if flag(&selection, "truncated") { ", truncated" } else { "" };
+            out.push_str(&format!("\n### Selection {range}{cut}\n"));
+            fenced(&mut out, &fence_language, &str_of(&selection, "text").unwrap_or_default());
+        }
+        if let Some(around) = editor.get("around") {
+            let start = num(around, "start_line").unwrap_or(1);
+            let text = str_of(around, "text").unwrap_or_default();
+            let numbered: Vec<String> = text
+                .lines()
+                .enumerate()
+                .map(|(index, line)| {
+                    format!("{:>4}| {line}", start as usize + index)
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect();
+            let end = start as usize + numbered.len().max(1) - 1;
+            out.push_str(&format!("\n### Around the cursor (lines {start}–{end})\n"));
+            fenced(&mut out, &fence_language, &numbered.join("\n"));
+        }
+        let diagnostics = items(editor, "diagnostics");
+        if !diagnostics.is_empty() {
+            let total = num(editor, "diagnostics_total").unwrap_or(diagnostics.len() as u64);
+            out.push_str(&format!("\n### Diagnostics in this file ({total})\n"));
+            for diagnostic in &diagnostics {
+                let origin = match (str_of(diagnostic, "source"), str_of(diagnostic, "code")) {
+                    (Some(source), Some(code)) => format!(" [{source} {code}]"),
+                    (Some(source), None) => format!(" [{source}]"),
+                    (None, Some(code)) => format!(" [{code}]"),
+                    (None, None) => String::new(),
+                };
+                let here = if flag(diagnostic, "at_cursor") { " ← at cursor" } else { "" };
+                out.push_str(&format!(
+                    "- {}:{} {}{origin}: {}{here}\n",
+                    num(diagnostic, "line").unwrap_or(0),
+                    num(diagnostic, "column").unwrap_or(0),
+                    str_of(diagnostic, "severity").unwrap_or_default(),
+                    one_line(&str_of(diagnostic, "message").unwrap_or_default()),
+                ));
+            }
+        }
+        let notes = items(editor, "notes");
+        if !notes.is_empty() {
+            out.push_str(&format!("\n### Notes in this file ({})\n", notes.len()));
+            for note in &notes {
+                let to = str_of(note, "to").map(|to| format!(" → {to}")).unwrap_or_default();
+                let replies = num(note, "replies").filter(|n| *n > 0);
+                let replies = replies.map(|n| format!(" (+{n} replies)")).unwrap_or_default();
+                out.push_str(&format!(
+                    "- {} line {} [{}{to}] {}: {}{replies}\n",
+                    str_of(note, "id").unwrap_or_default(),
+                    num(note, "line").unwrap_or(0),
+                    str_of(note, "status").unwrap_or_default(),
+                    str_of(note, "author").unwrap_or_default(),
+                    one_line(&str_of(note, "text").unwrap_or_default()),
+                ));
+            }
+        }
+    }
+
+    if let Some(notebook) = reply.get("notebook") {
+        let file = str_of(notebook, "file").unwrap_or_default();
+        let dirty = if flag(notebook, "dirty") { ", unsaved changes" } else { "" };
+        out.push_str(&format!(
+            "\n## Notebook: {file} ({} cells{dirty})\n",
+            num(notebook, "cells").unwrap_or(0)
+        ));
+        if let Some(cell) = notebook.get("cell") {
+            let kind = str_of(cell, "kind").unwrap_or_default();
+            out.push_str(&format!(
+                "\n### Cell {} ({kind}, {})\n",
+                num(cell, "index").unwrap_or(0),
+                str_of(cell, "run").unwrap_or_default()
+            ));
+            let language = if kind == "code" { "python" } else { "" };
+            fenced(&mut out, language, &str_of(cell, "source").unwrap_or_default());
+            if let Some(error) = str_of(cell, "error").or_else(|| str_of(cell, "marimo_error")) {
+                out.push_str(&format!("error: {}\n", one_line(&error)));
+            }
+            for output in items(cell, "outputs") {
+                out.push_str(&format!(
+                    "output ({}):\n",
+                    str_of(&output, "type").unwrap_or_default()
+                ));
+                fenced(&mut out, "", &str_of(&output, "text").unwrap_or_default());
+            }
+        }
+    }
+
+    if let Some(workflow) = reply.get("workflow") {
+        out.push_str(&format!(
+            "\n## Workflow: {} ({}) — {}\n",
+            str_of(workflow, "name").unwrap_or_default(),
+            str_of(workflow, "file").unwrap_or_default(),
+            str_of(workflow, "outcome").unwrap_or_default()
+        ));
+        for step in items(workflow, "steps") {
+            let mut line = format!(
+                "- {}: {}",
+                str_of(&step, "id").unwrap_or_default(),
+                str_of(&step, "status").unwrap_or_default()
+            );
+            if let Some(error) = str_of(&step, "error").or_else(|| str_of(&step, "reason")) {
+                line.push_str(&format!(" — {}", one_line(&error)));
+            } else if let Some(detail) = str_of(&step, "detail") {
+                line.push_str(&format!(" ({})", one_line(&detail)));
+            }
+            out.push_str(&format!("{line}\n"));
+            if let Some(lines) = str_of(&step, "last_lines") {
+                fenced(&mut out, "", &lines);
+            }
+        }
+    }
+
+    let tabs = items(reply, "tabs");
+    if !tabs.is_empty() {
+        out.push_str("\n## Open tabs\n");
+        for tab in &tabs {
+            let mut marks = Vec::new();
+            let label = match str_of(tab, "kind").filter(|kind| kind != "editor") {
+                Some(kind) => {
+                    marks.push(kind);
+                    str_of(tab, "title").unwrap_or_default()
+                }
+                None => str_of(tab, "file").unwrap_or_default(),
+            };
+            if flag(tab, "active") {
+                marks.push("active".into());
+            }
+            if flag(tab, "dirty") {
+                marks.push("unsaved".into());
+            }
+            if marks.is_empty() {
+                out.push_str(&format!("- {label}\n"));
+            } else {
+                out.push_str(&format!("- {label} ({})\n", marks.join(", ")));
+            }
+        }
+    }
+    let panels: Vec<String> = items(reply, "open_panels")
+        .iter()
+        .filter_map(|panel| panel.as_str().map(str::to_owned))
+        .collect();
+    if !panels.is_empty() {
+        out.push_str(&format!("open panels: {}\n", panels.join(", ")));
+    }
+
+    if let Some(terminal) = reply.get("terminal") {
+        let state = match (flag(terminal, "running"), num(terminal, "exit_code")) {
+            (true, _) => String::new(),
+            (false, Some(code)) => format!(" (exited {code})"),
+            (false, None) => match terminal.get("exit_code") {
+                Some(code) => format!(" (exited {code})"),
+                None => " (ended)".into(),
+            },
+        };
+        let cut = if flag(terminal, "truncated") { ", last lines" } else { "" };
+        out.push_str(&format!(
+            "\n## Terminal: {}{state}{cut}\n",
+            str_of(terminal, "run_name")
+                .or_else(|| str_of(terminal, "title"))
+                .unwrap_or_default()
+        ));
+        fenced(&mut out, "", &str_of(terminal, "lines").unwrap_or_default());
+    }
+
+    if let Some(problems) = reply.get("problems") {
+        let (errors, warnings) = (
+            num(problems, "errors").unwrap_or(0),
+            num(problems, "warnings").unwrap_or(0),
+        );
+        let list = items(problems, "items");
+        if errors + warnings > 0 || !list.is_empty() {
+            out.push_str(&format!(
+                "\n## Problems: {errors} errors, {warnings} warnings\n"
+            ));
+            for problem in &list {
+                out.push_str(&format!(
+                    "- {}:{}:{} {}: {}\n",
+                    str_of(problem, "file").unwrap_or_default(),
+                    num(problem, "line").unwrap_or(0),
+                    num(problem, "column").unwrap_or(0),
+                    str_of(problem, "severity").unwrap_or_default(),
+                    one_line(&str_of(problem, "message").unwrap_or_default()),
+                ));
+            }
+            let total = num(problems, "total").unwrap_or(0) as usize;
+            if total > list.len() {
+                out.push_str(&format!("- … {} more\n", total - list.len()));
+            }
+        }
+    }
+
+    if let Some(tests) = reply.get("tests") {
+        let running = if flag(tests, "running") { " (running)" } else { "" };
+        out.push_str(&format!(
+            "\n## Tests{running}: {} passed, {} failed, {} skipped\n",
+            num(tests, "passed").unwrap_or(0),
+            num(tests, "failed").unwrap_or(0),
+            num(tests, "skipped").unwrap_or(0)
+        ));
+        if let Some(status) = str_of(tests, "status") {
+            out.push_str(&format!("{status}\n"));
+        }
+        for failure in items(tests, "failures") {
+            let location = match (str_of(&failure, "file"), num(&failure, "line")) {
+                (Some(file), Some(line)) => format!(" ({file}:{line})"),
+                (Some(file), None) => format!(" ({file})"),
+                _ => String::new(),
+            };
+            let message = str_of(&failure, "message")
+                .map(|m| format!(": {}", one_line(&m)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "- {} {}{location}{message}\n",
+                str_of(&failure, "status").unwrap_or_default(),
+                str_of(&failure, "id").unwrap_or_default()
+            ));
+            if let Some(output) = str_of(&failure, "output_tail") {
+                fenced(&mut out, "", &output);
+            }
+        }
+    }
+
+    if let Some(debugger) = reply.get("debugger") {
+        let mut title = format!(
+            "\n## Debugger: {} — {}",
+            str_of(debugger, "name").unwrap_or_default(),
+            str_of(debugger, "state").unwrap_or_default()
+        );
+        if let Some(reason) = str_of(debugger, "stop_reason") {
+            title.push_str(&format!(" ({reason})"));
+        }
+        if let Some(location) = debugger.get("location") {
+            title.push_str(&format!(
+                " at {}:{}",
+                str_of(location, "file").unwrap_or_default(),
+                num(location, "line").unwrap_or(0)
+            ));
+        }
+        out.push_str(&format!("{title}\n"));
+        if let Some(error) = str_of(debugger, "error") {
+            out.push_str(&format!("error: {}\n", one_line(&error)));
+        }
+        for frame in items(debugger, "frames") {
+            let mark = if flag(&frame, "selected") { "▶ " } else { "" };
+            out.push_str(&format!(
+                "- {mark}{} {}:{}\n",
+                str_of(&frame, "name").unwrap_or_default(),
+                str_of(&frame, "file").unwrap_or_else(|| "?".into()),
+                num(&frame, "line").unwrap_or(0)
+            ));
+        }
+        let locals = items(debugger, "locals");
+        if !locals.is_empty() {
+            out.push_str(&format!(
+                "{}:\n",
+                str_of(debugger, "scope").unwrap_or_else(|| "Locals".into())
+            ));
+            for local in &locals {
+                let kind = str_of(local, "type").map(|t| format!(": {t}")).unwrap_or_default();
+                out.push_str(&format!(
+                    "  - {}{kind} = {}\n",
+                    str_of(local, "name").unwrap_or_default(),
+                    str_of(local, "value").unwrap_or_default()
+                ));
+            }
+        }
+    }
+    out.trim_end().to_owned()
+}
+
+/// `{"line", "column"}` as `line:column`.
+fn point(value: &Value) -> String {
+    let get = |key| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+    format!("{}:{}", get("line"), get("column"))
+}
+
+fn one_line(text: &str) -> String {
+    let mut line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > 300 {
+        line = line.chars().take(299).collect::<String>() + "…";
+    }
+    line
+}
+
+/// Appends `text` in a code fence longer than any backtick run inside it.
+fn fenced(out: &mut String, language: &str, text: &str) {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest.max(2) + 1);
+    out.push_str(&format!("{fence}{language}\n{text}\n{fence}\n"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +875,60 @@ mod tests {
 
     fn parsed(text: &str) -> Value {
         parse(&args(text)).unwrap()
+    }
+
+    #[test]
+    fn context_options() {
+        assert_eq!(
+            parsed("context --max-lines 80 --around 0 --format json"),
+            json!({"cmd": "context", "max_lines": 80, "around": 0, "output": "json"})
+        );
+        assert!(parse(&args("context --frob")).unwrap_err().contains("unexpected"));
+    }
+
+    #[test]
+    fn context_reads_as_markdown() {
+        let reply = json!({
+            "ok": true, "title": "app", "focus": "panel:terminal",
+            "project": {"roots": [{"name": "app", "path": "/home/me/app"}], "remote": true},
+            "editor": {
+                "file": "/home/me/app/main.py", "language": "Python", "dirty": true, "line_count": 9,
+                "cursors": [{"line": 3, "column": 5}], "visible_lines": [1, 9],
+                "selections": [{"start": {"line": 2, "column": 1}, "end": {"line": 3, "column": 5},
+                                "text": "a = 1\nb = ```", "truncated": false}],
+                "around": {"start_line": 2, "text": "a = 1\nb = 2"},
+                "diagnostics": [{"line": 3, "column": 1, "severity": "error", "source": "pyright",
+                                 "message": "bad\nthing", "at_cursor": true}],
+                "diagnostics_total": 1
+            },
+            "tabs": [{"file": "/home/me/app/main.py", "kind": "editor", "dirty": true, "active": true},
+                     {"title": "Compare main", "kind": "compare"}],
+            "terminal": {"title": "bash", "lines": "$ false", "running": false, "exit_code": 1},
+            "problems": {"errors": 1, "warnings": 0, "total": 1,
+                         "items": [{"file": "/home/me/app/main.py", "line": 3, "column": 1,
+                                    "severity": "error", "message": "bad"}]},
+            "tests": {"passed": 2, "failed": 1, "skipped": 0, "running": false,
+                      "failures": [{"id": "t.py::test_x", "file": "t.py", "line": 4,
+                                    "status": "failed", "message": "assert 1 == 2"}]}
+        });
+        let text = context_markdown(&reply);
+        for expected in [
+            "window \"app\" · focus: panel:terminal",
+            "project: /home/me/app (remote)",
+            "## Editor: /home/me/app/main.py (Python, unsaved changes, 9 lines)",
+            "cursor 3:5 · lines 1–9 on screen",
+            "### Selection 2:1–3:5\n````python\na = 1\nb = ```\n````",
+            "### Around the cursor (lines 2–3)\n```python\n   2| a = 1\n   3| b = 2\n```",
+            "- 3:1 error [pyright]: bad thing ← at cursor",
+            "- /home/me/app/main.py (active, unsaved)\n- Compare main (compare)",
+            "## Terminal: bash (exited 1)\n```\n$ false\n```",
+            "## Problems: 1 errors, 0 warnings\n- /home/me/app/main.py:3:1 error: bad",
+            "## Tests: 2 passed, 1 failed, 0 skipped\n- failed t.py::test_x (t.py:4): assert 1 == 2",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
+        let (rendered, code) = render(&json!({"cmd": "context"}), &reply);
+        assert_eq!((rendered, code), (text, 0));
     }
 
     #[test]

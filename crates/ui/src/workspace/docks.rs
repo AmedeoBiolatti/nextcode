@@ -33,6 +33,7 @@ actions!(
         ToggleGitLog,
         TogglePython,
         ToggleProblems,
+        ToggleNotes,
         TogglePorts,
         ToggleCallHierarchy,
         ToggleOutline,
@@ -102,6 +103,7 @@ impl Workspace {
         match panel {
             PanelId::Files => Some(self.file_tree.clone().into()),
             PanelId::Problems => Some(self.problems.clone().into()),
+            PanelId::Notes => Some(self.notes_panel.clone().into()),
             PanelId::Ports => Some(self.ports_panel.clone().into()),
             PanelId::Terminal => Some(self.terminal.clone().into()),
             PanelId::Search => Some(self.search.clone().into()),
@@ -114,6 +116,27 @@ impl Workspace {
             PanelId::DebugConsole => Some(self.debug.console.clone().into()),
             PanelId::Tests => Some(self.runs.tests.clone().into()),
         }
+    }
+
+    /// A count beside a panel's title: notes waiting for the person.
+    fn panel_badge(&self, panel: PanelId, cx: &App) -> Option<impl IntoElement + use<>> {
+        let count = match panel {
+            PanelId::Notes => self.notes_badge(cx),
+            _ => 0,
+        };
+        (count > 0).then(|| {
+            div()
+                .ml_1()
+                .px_1()
+                .flex_none()
+                .rounded_md()
+                .text_xs()
+                .bg(theme::accent())
+                .text_color(theme::background())
+                .child(count.to_string())
+                .pin("badge")
+                .label(format!("{count} waiting for you"))
+        })
     }
 
     /// Persists the layout for this project; failures only cost the layout.
@@ -539,6 +562,7 @@ impl Workspace {
             .when(active, |tab| tab.border_b_2().border_color(theme::accent()))
             .hover(|style| style.text_color(theme::text()))
             .child(div().min_w_0().truncate().child(panel.title()))
+            .children(self.panel_badge(panel, cx))
             .on_click(cx.listener(move |this, _, _, cx| this.show_panel(panel, cx)))
             .on_mouse_down(
                 MouseButton::Right,
@@ -583,7 +607,11 @@ impl Workspace {
                 .text_color(theme::muted())
                 .cursor_pointer()
                 .hover(|style| style.bg(theme::hover_row()).text_color(theme::text()))
+                .flex()
+                .when(vertical, |button| button.flex_col())
+                .items_center()
                 .child(label)
+                .children(self.panel_badge(panel, cx))
                 .on_click(cx.listener(move |this, _, _, cx| this.show_panel(panel, cx)))
                 .on_mouse_down(
                     MouseButton::Right,

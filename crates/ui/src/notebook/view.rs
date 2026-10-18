@@ -250,6 +250,8 @@ pub struct NotebookView {
     ticker: Option<Task<()>>,
     /// The language-server document of the cells (`set_language_server`).
     lsp: Option<(Entity<super::lsp::NotebookLsp>, Subscription)>,
+    /// Sticky notes on cells: the store, folder index and file.
+    notes: Option<(Entity<crate::note_store::NoteStore>, usize, String)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -290,6 +292,7 @@ impl NotebookView {
             picker: None,
             ticker: None,
             lsp: None,
+            notes: None,
             _subscriptions: vec![subscription],
         };
         view.update_ticker(cx);
@@ -300,12 +303,40 @@ impl NotebookView {
         &self.document
     }
 
+    /// Shows the notes on this notebook's cells (`cell`) in the cell
+    /// editors; marimo notebooks have no cell numbers in their notes.
+    pub fn set_note_store(
+        &mut self,
+        store: Entity<crate::note_store::NoteStore>,
+        root: usize,
+        file: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document.read(cx).is_marimo() {
+            return;
+        }
+        for (index, id) in self.order.clone().into_iter().enumerate() {
+            if let Some(editor) = self.cells.get(&id).and_then(|state| state.editor.clone()) {
+                let (store, file) = (store.clone(), file.clone());
+                editor.update(cx, |editor, cx| {
+                    editor.set_note_target(store, root, file, Some(index + 1), cx)
+                });
+            }
+        }
+        self.notes = Some((store, root, file));
+    }
+
     pub fn path(&self, cx: &App) -> PathBuf {
         self.document.read(cx).path().to_path_buf()
     }
 
     pub fn is_dirty(&self, cx: &App) -> bool {
         self.document.read(cx).is_dirty()
+    }
+
+    /// The selected cell (`next_code context`).
+    pub(crate) fn cursor_cell(&self) -> Option<CellId> {
+        self.cursor
     }
 
     /// Shows the progress or outcome of a long task (Open in marimo,
@@ -579,6 +610,14 @@ impl NotebookView {
         state.editor = Some(editor.clone());
         state._subscriptions = vec![events, focused];
         self.link_editor(id, cx);
+        if let Some((store, root, file)) = self.notes.clone() {
+            let cell = self.document.read(cx).cells().iter().position(|c| c.id == id);
+            if let Some(cell) = cell {
+                editor.update(cx, |editor, cx| {
+                    editor.set_note_target(store, root, file, Some(cell + 1), cx)
+                });
+            }
+        }
         Some(editor)
     }
 

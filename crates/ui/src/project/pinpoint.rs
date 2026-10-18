@@ -7,7 +7,7 @@
 //! `ref`s below a project folder become project paths (as
 //! [`crate::pinpoint::file_key`] writes them) before dispatch, and every
 //! `file` and code `reference` of the answer goes back as the remote
-//! absolute path.
+//! absolute path (`context` answers too: their `file`s are project paths).
 
 use std::io;
 
@@ -325,5 +325,30 @@ mod tests {
                 "resolved": [{ "ref": "workspace/editor-area/pane:1" }],
             })
         );
+    }
+
+    #[test]
+    fn context_answers_name_files_by_their_remote_path() {
+        let single = folders(&[("/home/me/proj", "proj")]);
+        let mut answer = json!({
+            "ok": true,
+            "project": { "roots": [{ "name": "proj", "path": "/home/me/proj" }], "remote": true },
+            "editor": { "file": "app.py", "path": "/home/me/proj/app.py", "line_count": 3 },
+            "tabs": [{ "file": "app.py", "title": "app.py" }, { "file": "tests/test_app.py" }],
+            "problems": { "items": [{ "file": "app.py", "line": 2 }] },
+            "tests": { "failures": [{ "id": "tests/test_app.py::test_x", "file": "tests/test_app.py" }] },
+            "debugger": { "location": { "file": "app.py", "line": 2 } },
+        });
+        to_remote(&mut answer, &single);
+        assert_eq!(answer["editor"]["file"], "/home/me/proj/app.py");
+        assert_eq!(answer["tabs"][1]["file"], "/home/me/proj/tests/test_app.py");
+        assert_eq!(answer["problems"]["items"][0]["file"], "/home/me/proj/app.py");
+        assert_eq!(
+            answer["tests"]["failures"][0]["file"],
+            "/home/me/proj/tests/test_app.py"
+        );
+        // Test ids are not paths.
+        assert_eq!(answer["tests"]["failures"][0]["id"], "tests/test_app.py::test_x");
+        assert_eq!(answer["debugger"]["location"]["file"], "/home/me/proj/app.py");
     }
 }

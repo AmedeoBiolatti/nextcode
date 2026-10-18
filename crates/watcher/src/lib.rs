@@ -146,6 +146,9 @@ fn debounce_loop(
 ) {
     let git_dir = root.join(".git");
     let gitignore_path = root.join(".gitignore");
+    // NextCode's sticky notes are git-excluded but must reach the app, which
+    // shows notes agents add.
+    let notes_path = root.join(".next_code").join("notes.json");
     let mut ignore = load_ignore(root);
     loop {
         let Ok(first) = raw.recv() else {
@@ -184,7 +187,8 @@ fn debounce_loop(
             .into_iter()
             .filter_map(|(path, kind)| Some(FileEvent { path, kind: kind? }))
             .filter(|event| {
-                !event.path.starts_with(&git_dir) && !is_ignored(&ignore, root, &event.path)
+                event.path == notes_path
+                    || (!event.path.starts_with(&git_dir) && !is_ignored(&ignore, root, &event.path))
             })
             .collect();
         events.sort_by(|a, b| a.path.cmp(&b.path));
@@ -378,6 +382,21 @@ mod tests {
         let events = collect(&mut rx, |events| events.iter().any(|e| e.path == visible));
         let paths: Vec<&Path> = events.iter().map(|e| e.path.as_path()).collect();
         assert_eq!(paths, [visible.as_path()]);
+    }
+
+    #[test]
+    fn the_notes_file_is_reported_even_when_excluded() {
+        let dir = TempDir::new("notes");
+        fs::write(dir.0.join(".gitignore"), "/.next_code/\n").unwrap();
+        fs::create_dir_all(dir.0.join(".next_code")).unwrap();
+        let (_watcher, mut rx) = watch(&dir.0, DEBOUNCE).unwrap();
+        let notes = dir.0.join(".next_code").join("notes.json");
+        fs::write(dir.0.join(".next_code").join("other.json"), "x").unwrap();
+        fs::write(&notes, "{}").unwrap();
+
+        let events = collect(&mut rx, |events| events.iter().any(|e| e.path == notes));
+        let paths: Vec<&Path> = events.iter().map(|e| e.path.as_path()).collect();
+        assert_eq!(paths, [notes.as_path()]);
     }
 
     #[test]

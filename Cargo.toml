@@ -38,6 +38,7 @@ nucleo-matcher = "0.3"
 notify = "8"
 python = { path = "crates/python" }
 parking_lot = "0.12"
+notes = { path = "crates/notes" }
 percent-encoding = "2"
 pinpoint_cli = { path = "crates/pinpoint_cli" }
 postcard = { version = "1", default-features = false, features = ["use-std"] }

@@ -297,6 +297,23 @@ impl TerminalView {
         self.run_name.as_ref().map(|name| name.as_ref())
     }
 
+    /// The tab as `next_code context` reports it (read on request only:
+    /// the screen snapshot copies the grid).
+    pub(crate) fn context_facts(&self) -> crate::pinpoint::context::TerminalFacts {
+        crate::pinpoint::context::TerminalFacts {
+            // The shell's whole title (the tab cuts long ones); the run name
+            // is reported apart.
+            title: match self.title.trim() {
+                "" => self.profile.to_owned(),
+                title => title.to_owned(),
+            },
+            folder: self.folder.as_ref().map(ToString::to_string),
+            run_name: self.run_name.as_ref().map(ToString::to_string),
+            screen: self.terminal.snapshot().text(),
+            exit: self.exit,
+        }
+    }
+
     /// Whether the process exited, and its exit code when known (tests).
     #[cfg(test)]
     pub fn exit(&self) -> Option<Option<i32>> {
@@ -999,6 +1016,11 @@ impl TerminalPanel {
         window.focus(&view.focus_handle(cx));
         cx.notify();
         true
+    }
+
+    /// The shown tab's view and the number of tabs (`next_code context`).
+    pub(crate) fn active_view(&self) -> (Option<&Entity<TerminalView>>, usize) {
+        (self.tabs.get(self.active).map(|(view, _)| view), self.tabs.len())
     }
 
     /// The tabs' views (tests).

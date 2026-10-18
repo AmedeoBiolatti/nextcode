@@ -390,6 +390,17 @@ impl Editor {
                         .pin("item:copy-reference")
                         .label("Copy Reference"),
                     )
+                    .when(self.notes_enabled(), |menu| {
+                        menu.child(
+                            item("text-menu-add-note", "Add Note", Some("Ctrl+K Ctrl+N"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.text_menu = None;
+                                    this.add_note(&super::AddNote, window, cx);
+                                }))
+                                .pin("item:add-note")
+                                .label("Add Note"),
+                        )
+                    })
                     .pin("text-menu")
                     .label("Text menu"),
             ),

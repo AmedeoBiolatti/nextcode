@@ -29,6 +29,8 @@ mod lsp_store;
 mod menus;
 mod outline_panel;
 mod notebook;
+mod note_store;
+mod notes_panel;
 mod ports;
 mod problems;
 mod pinpoint;
@@ -85,14 +87,28 @@ enum Launch {
 
 fn run() -> anyhow::Result<()> {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    if args.first().is_some_and(|arg| arg == "pinpoint") {
+    // `next_code context …` is `next_code pinpoint context …`.
+    if let Some(skip) = args.first().and_then(|arg| match arg.to_str() {
+        Some("pinpoint") => Some(1),
+        Some("context") => Some(0),
+        _ => None,
+    }) {
         // A one-shot client of the running editor: no GUI here.
+        startup::attach_console();
+        let args: Vec<String> = args[skip..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        std::process::exit(pinpoint::server::run_cli(&args));
+    }
+    if args.first().is_some_and(|arg| arg == "notes") {
+        // Edits the project's notes file directly: no GUI, no running editor.
         startup::attach_console();
         let args: Vec<String> = args[1..]
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        std::process::exit(pinpoint::server::run_cli(&args));
+        std::process::exit(notes::cli::run(&args, "next_code"));
     }
     if args.first().is_some_and(|arg| arg == "--automation") {
         startup::attach_console();

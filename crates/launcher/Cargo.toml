@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 dirs.workspace = true
 instance.workspace = true
+notes.workspace = true
 
 [build-dependencies]
 # Icon and version info (`build.rs`), as the editor has.

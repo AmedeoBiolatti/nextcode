@@ -2,8 +2,9 @@
 //! hands its command line to the editor already running (which opens the
 //! window in a fraction of the time a process start takes) and starts
 //! `next_code_editor` next to it when none is. Tool invocations
-//! (`--headless`, `--automation`, `pinpoint`, `--help`) run the editor
-//! binary in place with this process's console.
+//! (`--headless`, `--automation`, `pinpoint`, `context`, `--help`) run the editor
+//! binary in place with this process's console; `notes` runs here (it only
+//! edits the project's notes file).
 
 // No console window of its own; `attach_console` borrows the parent's for
 // output.
@@ -119,13 +120,23 @@ fn classify(args: &[OsString]) -> Mode {
     }
     match args.first().and_then(|arg| arg.to_str()) {
         Some("--quit") => Mode::Quit,
-        Some("pinpoint" | "--automation" | "--headless" | "--help" | "-h") => Mode::Tool,
+        Some("pinpoint" | "context" | "--automation" | "--headless" | "--help" | "-h") => {
+            Mode::Tool
+        }
         _ => Mode::Open,
     }
 }
 
 fn run() -> i32 {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "notes") {
+        attach_console();
+        let args: Vec<String> = args[1..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        return notes::cli::run(&args, "next_code");
+    }
     let editor = match editor_path() {
         Ok(editor) => editor,
         Err(message) => return fail(&message),
@@ -390,6 +401,7 @@ mod tests {
         assert_eq!(classify(&args(&["--headless", "."])), Mode::Tool);
         assert_eq!(classify(&args(&["--automation", "--", "."])), Mode::Tool);
         assert_eq!(classify(&args(&["pinpoint", "list"])), Mode::Tool);
+        assert_eq!(classify(&args(&["context", "--around", "5"])), Mode::Tool);
         assert_eq!(classify(&args(&["--help"])), Mode::Tool);
     }
 }

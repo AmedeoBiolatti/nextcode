@@ -737,6 +737,17 @@ impl Editor {
                             .pin("item:annotate")
                             .label(annotate),
                     )
+                    .when(self.notes_enabled(), |menu| {
+                        menu.child(
+                            item("gutter-add-note", "Add Note")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.gutter_menu = None;
+                                    this.open_note_composer(line, line, None, window, cx);
+                                }))
+                                .pin("item:add-note")
+                                .label("Add Note"),
+                        )
+                    })
                     .when(changed, |menu| {
                         menu.child(
                             item("gutter-rollback", "Rollback Lines")

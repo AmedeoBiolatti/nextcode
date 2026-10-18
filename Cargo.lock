@@ -3688,6 +3688,7 @@ dependencies = [
  "lsp",
  "next_code_agent",
  "notebook",
+ "notes",
  "nucleo-matcher",
  "parking_lot",
  "pinpoint_cli",
@@ -3721,6 +3722,7 @@ dependencies = [
  "alacritty_terminal",
  "futures",
  "libc",
+ "notes",
  "parking_lot",
  "pinpoint_cli",
  "proto",
@@ -3737,6 +3739,7 @@ dependencies = [
  "dirs 7.0.0",
  "embed-resource",
  "instance",
+ "notes",
  "windows-sys 0.61.2",
 ]
 
@@ -3782,6 +3785,14 @@ dependencies = [
  "serde_json",
  "tree-sitter",
  "tree-sitter-python",
+]
+
+[[package]]
+name = "notes"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

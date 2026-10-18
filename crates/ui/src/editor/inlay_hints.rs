@@ -77,7 +77,7 @@ impl Editor {
     }
 
     /// Buffer lines on screen, from the last layout and the current scroll.
-    fn visible_lines(&self) -> Range<usize> {
+    pub(crate) fn visible_lines(&self) -> Range<usize> {
         let Some(layout) = &self.layout else {
             return 0..DEFAULT_LINES.min(self.buffer.line_count());
         };

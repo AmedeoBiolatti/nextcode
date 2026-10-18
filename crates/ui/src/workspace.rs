@@ -60,6 +60,7 @@ mod git_flows;
 mod git_gutter;
 mod log_window;
 mod notebooks;
+mod notes;
 mod panes;
 mod pinpoint_text;
 mod runs;
@@ -303,6 +304,12 @@ pub(crate) enum OfferKind {
     PortAvailable { port: u16, url: String },
     /// The active tab shows a marimo notebook as text.
     OpenAsNotebook { path: PathBuf },
+    /// An agent wrote to the person on this note: show it.
+    NoteMessage {
+        root: usize,
+        file: String,
+        id: String,
+    },
 }
 
 impl OfferKind {
@@ -313,6 +320,7 @@ impl OfferKind {
             Self::DownloadCodeLldb => "Download CodeLLDB",
             Self::PortAvailable { .. } => "Open in Browser",
             Self::OpenAsNotebook { .. } => "Open as Notebook",
+            Self::NoteMessage { .. } => "Show Note",
         }
     }
 
@@ -324,6 +332,7 @@ impl OfferKind {
             Self::DownloadCodeLldb => "offer:download-codelldb".into(),
             Self::PortAvailable { port, .. } => format!("offer:port-{port}"),
             Self::OpenAsNotebook { .. } => "offer:open-as-notebook".into(),
+            Self::NoteMessage { id, .. } => format!("offer:note-{id}"),
         }
     }
 }
@@ -333,6 +342,9 @@ pub struct Workspace {
     project: Project,
     file_tree: Entity<FileTree>,
     problems: Entity<ProblemsPanel>,
+    /// Sticky notes: the project's, and the Notes panel.
+    note_store: Entity<crate::note_store::NoteStore>,
+    notes_panel: Entity<crate::notes_panel::NotesPanel>,
     /// Forwarded ports (WSL and container projects); the panel holds the
     /// model.
     ports_panel: Entity<PortsPanel>,
@@ -441,6 +453,8 @@ impl Workspace {
             this.on_lsp_event(event, cx);
         });
         let problems = cx.new(|cx| ProblemsPanel::new(project.clone(), lsp_store.clone(), cx));
+        let (note_store, notes_panel, notes_subscriptions) =
+            Self::notes_setup(&project, window, cx);
         let terminal = cx.new(|cx| TerminalPanel::new(project.clone(), cx));
         let search = cx.new(|cx| SearchPanel::new(project.clone(), cx));
         let workspace = cx.entity().downgrade();
@@ -644,6 +658,8 @@ impl Workspace {
             project,
             file_tree,
             problems,
+            note_store,
+            notes_panel,
             ports_panel,
             terminal,
             search,
@@ -694,7 +710,10 @@ impl Workspace {
                 release_subscription,
                 quit_subscription,
                 ports_subscription,
-            ],
+            ]
+            .into_iter()
+            .chain(notes_subscriptions)
+            .collect(),
         }
     }
 
@@ -771,6 +790,10 @@ impl Workspace {
                 .update(cx, |log, cx| log.repository_changed(cx));
         }
         self.run_files_changed(&batch, cx);
+        self.note_store.update(cx, |store, cx| {
+            let paths = batch.events.iter().map(|event| event.path.as_path());
+            store.files_changed(paths, batch.rescan, cx)
+        });
         // An edited `.next_code/words.txt` (project dictionary).
         crate::editor::spell::files_changed(
             batch.events.iter().map(|event| event.path.as_path()),
@@ -1379,6 +1402,7 @@ impl Workspace {
             });
         }
         self.debug_editor_opened(&editor, path, cx);
+        self.show_notes_in(&editor, cx);
         self.set_test_markers(&editor, path, cx);
         let title = path
             .file_name()
@@ -1590,6 +1614,9 @@ impl Workspace {
             OfferKind::DownloadCodeLldb => self.download_codelldb(window, cx),
             OfferKind::PortAvailable { url, .. } => cx.open_url(&url),
             OfferKind::OpenAsNotebook { path } => self.reopen_as_notebook(&path, window, cx),
+            OfferKind::NoteMessage { root, file, id } => {
+                self.open_note(root, &file, &id, window, cx)
+            }
         }
     }
 
@@ -1943,6 +1970,86 @@ impl Workspace {
             .filter(|tab| tab.is_dirty(cx))
             .count()
     }
+
+    /// What `next_code context` reads (see `pinpoint::context`): handles
+    /// only, the caller reads what it reports.
+    pub(crate) fn context_parts(&self, window: &Window, cx: &App) -> pinpoint::context::Parts {
+        use pinpoint::context::{ActiveView, TabPart};
+        let active_id = self.active_tab().map(Tab::entity_id);
+        let tabs = self
+            .all_tabs()
+            .map(|tab| TabPart {
+                path: tab.path.clone(),
+                title: tab.title.to_string(),
+                kind: match tab.content {
+                    TabContent::Editor(_) => "editor",
+                    TabContent::Notebook(_) => "notebook",
+                    TabContent::Diff(_) => "diff",
+                    TabContent::Compare(_) => "compare",
+                },
+                dirty: tab.is_dirty(cx),
+                active: Some(tab.entity_id()) == active_id,
+            })
+            .collect();
+        let active = self.active_tab().map(|tab| match &tab.content {
+            TabContent::Editor(editor) => ActiveView::Editor(editor.clone()),
+            TabContent::Notebook(view) => ActiveView::Notebook(view.clone()),
+            TabContent::Diff(_) | TabContent::Compare(_) => ActiveView::Other,
+        });
+        let open_panels: Vec<PanelId> = [&self.layout.left, &self.layout.right, &self.layout.bottom]
+            .into_iter()
+            .filter(|dock| dock.open)
+            .filter_map(|dock| dock.active)
+            .collect();
+        // Focus inside a tab or a panel names the area; a panel without its
+        // own focus handle (Problems) never does.
+        let focused = if self
+            .active_tab()
+            .is_some_and(|tab| tab.focus_handle(cx).contains_focused(window, cx))
+        {
+            Some("editor".to_owned())
+        } else {
+            open_panels
+                .iter()
+                .copied()
+                .find(|panel| {
+                    let handle = match panel {
+                        PanelId::Files => self.file_tree.focus_handle(cx),
+                        PanelId::Search => self.search.focus_handle(cx),
+                        PanelId::Commit => self.commit.focus_handle(cx),
+                        PanelId::Python => self.python.focus_handle(cx),
+                        PanelId::Terminal => {
+                            let (view, _) = self.terminal.read(cx).active_view();
+                            match view {
+                                Some(view) => view.focus_handle(cx),
+                                None => self.terminal.focus_handle(cx),
+                            }
+                        }
+                        PanelId::Problems | PanelId::Notes => return false,
+                        PanelId::GitLog => self.git_log.focus_handle(cx),
+                        PanelId::Ports => self.ports_panel.focus_handle(cx),
+                        PanelId::Outline => self.outline.focus_handle(cx),
+                        PanelId::CallHierarchy => self.call_hierarchy.focus_handle(cx),
+                        PanelId::Debug => self.debug.panel.focus_handle(cx),
+                        PanelId::DebugConsole => self.debug.console.focus_handle(cx),
+                        PanelId::Tests => self.runs.tests.focus_handle(cx),
+                    };
+                    handle.contains_focused(window, cx)
+                })
+                .map(|panel| format!("panel:{}", panel.key()))
+        };
+        pinpoint::context::Parts {
+            project: self.project.clone(),
+            tabs,
+            active,
+            focused,
+            open_panels,
+            terminal: self.terminal.clone(),
+            problems: self.problems.clone(),
+            tests: self.runs.tests.clone(),
+            debug_session: self.debug_session(),
+        }
+    }
 }
 
 impl Focusable for Workspace {
@@ -2004,6 +2111,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_python))
             .on_action(cx.listener(Self::toggle_problems))
+            .on_action(cx.listener(Self::toggle_notes))
             .on_action(cx.listener(Self::toggle_ports))
             .on_action(cx.listener(Self::forward_port))
             .on_action(cx.listener(Self::toggle_call_hierarchy))

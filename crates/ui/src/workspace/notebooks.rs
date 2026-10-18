@@ -84,9 +84,16 @@ impl Workspace {
             let document = document.clone();
             cx.new(|cx| NotebookLsp::new(document, store, cx))
         });
+        let notes = self
+            .project
+            .relative(path)
+            .map(|(root, file)| (self.note_store.clone(), root, file));
         let view = cx.new(|cx| {
             let mut view = NotebookView::new(document, window, cx);
             view.set_language_server(language_server, cx);
+            if let Some((store, root, file)) = notes {
+                view.set_note_store(store, root, file, cx);
+            }
             view
         });
         let subscription = cx.subscribe_in(&view, window, Self::on_notebook_event);

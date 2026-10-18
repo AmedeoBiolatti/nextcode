@@ -36,6 +36,7 @@ pub const COMMANDS: &[&str] = &[
     "wait_pin",
     "pick",
     "windows",
+    "context",
 ];
 
 /// Runs `request` on the UI thread and answers through `reply` (from that
@@ -115,7 +116,7 @@ fn handle(request: Value, reply: Reply, cx: &mut App) {
             reply(json!({ "ok": true, "pins": pins, "last_seq": picker::last_seq() }))
         }
         "wait_pin" => wait_pin(&request, reply, cx),
-        "list" | "find" | "highlight" | "clear" | "pick" => {
+        "list" | "find" | "highlight" | "clear" | "pick" | "context" => {
             let handle = match choose_window(&request, cx) {
                 Ok(handle) => handle,
                 Err(error) => return reply(error),
@@ -125,6 +126,7 @@ fn handle(request: Value, reply: Reply, cx: &mut App) {
                 "find" => reply(find(&request, window)),
                 "highlight" => highlight_cmd(&request, reply, window, cx),
                 "clear" => reply(clear(&request, window, cx)),
+                "context" => reply(super::context::context(&request, window, cx)),
                 _ => {
                     picker::start(window);
                     reply(json!({

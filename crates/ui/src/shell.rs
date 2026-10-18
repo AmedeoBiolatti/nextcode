@@ -1443,6 +1443,14 @@ impl Shell {
         }
     }
 
+    /// The shown workflow tab (`next_code context`).
+    pub(crate) fn active_workflow(&self) -> Option<Entity<WorkflowView>> {
+        match &self.tabs.get(self.active)?.content {
+            Content::Workflow(view) => Some(view.clone()),
+            _ => None,
+        }
+    }
+
     /// Starts a workflow step's command in a terminal tab of the project at
     /// `location`.
     #[allow(clippy::too_many_arguments)]

@@ -1,7 +1,10 @@
 //! `next_code_agent serve`: speaks the agent protocol on stdin/stdout.
 //! `next_code_agent pinpoint <command> …`: asks the editor serving this
 //! machine's project to list or highlight parts of its window (the same
-//! commands as `next_code pinpoint`).
+//! commands as `next_code pinpoint`); `next_code_agent context …` is
+//! `next_code_agent pinpoint context …` (what the user is looking at).
+//! `next_code_agent notes <command> …`: reads and writes the project's
+//! sticky notes (the same commands as `next_code notes`).
 //! `next_code_agent --version`: prints the banner and exits.
 
 use std::process::ExitCode;
@@ -22,12 +25,19 @@ fn main() -> ExitCode {
         }
         #[cfg(unix)]
         Some("pinpoint") => next_code_agent::pinpoint::cli(&args[1..]),
+        #[cfg(unix)]
+        Some("context") => next_code_agent::pinpoint::cli(&args),
+        Some("notes") => {
+            ExitCode::from(notes::cli::run(&args[1..], "next_code_agent").clamp(0, 255) as u8)
+        }
         Some("--version") => {
             print!("{}", proto::banner());
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: next_code_agent serve | pinpoint <command> … | --version");
+            eprintln!(
+                "usage: next_code_agent serve | pinpoint <command> … | context … | notes <command> … | --version"
+            );
             ExitCode::from(2)
         }
     }

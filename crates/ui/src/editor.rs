@@ -48,6 +48,7 @@ mod inlay_hints;
 mod lines;
 mod minimap;
 mod navigation;
+mod notes;
 mod pin_text;
 mod pins;
 mod project_settings;
@@ -101,6 +102,7 @@ pub use lines::{
     MoveLineUp, Outdent, ToggleBlockComment, ToggleLineComment,
 };
 pub use navigation::{FindReferences, GoToDefinition, GoToImplementation, GoToTypeDefinition};
+pub use self::notes::AddNote;
 pub use rename::{CancelRename, ConfirmRename, RenameSymbol};
 pub use selections::{
     AddCursorAbove, AddCursorBelow, CollapseSelections, EditorState, SelectAllOccurrences,
@@ -287,6 +289,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-shift-c", pin_text::CopyReference, ctx),
     ]);
     vim::init(cx);
+    self::notes::bind_keys(cx);
     cx.bind_keys([KeyBinding::new(
         "escape",
         CloseHunkPopup,
@@ -578,6 +581,8 @@ pub struct Editor {
     sticky: sticky_scroll::StickyState,
     /// Vim emulation (`"vim_mode"`).
     vim: vim::VimState,
+    /// Sticky notes on this file's lines.
+    notes: self::notes::NotesState,
 }
 
 /// A mouse drag in progress.
@@ -862,6 +867,7 @@ impl Editor {
             minimap: Default::default(),
             sticky: Default::default(),
             vim: Default::default(),
+            notes: Default::default(),
         }
     }
 
@@ -1127,6 +1133,40 @@ impl Editor {
         &self.buffer
     }
 
+    /// Selections (primary first), lines on screen and diagnostics, read
+    /// when an agent asks what the person looks at (`pinpoint::context`).
+    pub(crate) fn context_facts(&self) -> crate::pinpoint::context::EditorFacts {
+        let primary = self.primary();
+        let mut selections = vec![(primary.anchor, primary.head)];
+        selections.extend(
+            self.selections
+                .all()
+                .iter()
+                .map(|s| (s.anchor, s.head))
+                .filter(|s| *s != (primary.anchor, primary.head)),
+        );
+        let visible = self.visible_lines();
+        let diagnostics = self
+            .diagnostics
+            .iter()
+            .map(|d| crate::pinpoint::context::DiagnosticFact {
+                range: d.range.clone(),
+                severity: d.severity.label(),
+                message: d.message.to_string(),
+                source: d.lsp.source.clone(),
+                code: d.lsp.code.as_ref().map(|code| match code {
+                    lsp::types::NumberOrString::Number(n) => n.to_string(),
+                    lsp::types::NumberOrString::String(s) => s.clone(),
+                }),
+            })
+            .collect();
+        crate::pinpoint::context::EditorFacts {
+            selections,
+            visible: visible.start..visible.end.min(self.buffer.line_count()),
+            diagnostics,
+        }
+    }
+
     /// The width the text was last laid out at.
     #[cfg(test)]
     pub(crate) fn text_width(&self) -> Option<Pixels> {
@@ -1380,6 +1420,7 @@ impl Editor {
         self.snippet_edited();
         self.spell_edited();
         self.debug_gutter_edited(cx);
+        self.notes_edited(cx);
         // Folds move with the text (or open when edited inside); edited
         // lines wrap again.
         self.display.edit(&self.buffer, &self.changes);
@@ -1668,6 +1709,7 @@ impl Editor {
                 || self.blame_click(event.position, cx)
                 || self.debug_gutter_click(event.position, cx)
                 || self.lightbulb_click(event.position, cx)
+                || self.note_marker_click(event.position, window, cx)
                 || self.fold_click(event.position, cx))
         {
             return;
@@ -2431,6 +2473,7 @@ impl Editor {
                 chevron.paint(point(x, top), line_height, window, cx).ok();
             }
             if row.number.is_some() {
+                self.paint_note_marker(layout, row.row.line, top, window, cx);
                 self.paint_lightbulb(layout, row.row.line, top, window);
                 self.paint_debug_gutter(layout, row.row.line, top, window, cx);
             }
@@ -2929,8 +2972,15 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<(Hitbox, CursorStyle)> {
-        self.editor.update(cx, |editor, _| {
+        self.editor.update(cx, |editor, cx| {
+            let before = editor.note_geometry();
             editor.layout(bounds, window);
+            // Cards are placed while rendering, from the last layout; a
+            // notify while drawing is dropped, so ask after this frame.
+            if editor.note_geometry() != before {
+                let id = cx.entity_id();
+                window.on_next_frame(move |_, cx| cx.notify(id));
+            }
             editor.record_pins(&self.pin_prefix, window);
             editor.record_text_pins(&self.pin_prefix, window);
             let Some(layout) = editor.layout.as_ref() else {
@@ -3223,6 +3273,10 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::next_tab_stop))
                     .on_action(cx.listener(Self::previous_tab_stop))
                     .on_action(cx.listener(Self::end_snippet))
+                    .on_action(cx.listener(Self::add_note))
+                    .on_action(cx.listener(Self::submit_note))
+                    .on_action(cx.listener(Self::cancel_note))
+                    .on_action(cx.listener(Self::toggle_resolved_notes))
             })
             .child(
                 div()
@@ -3262,7 +3316,8 @@ impl Render for Editor {
                     })
                     .children(self.render_completions(cx).map(|p| self.popover(p)))
                     .children(self.render_code_actions(cx).map(|p| self.popover(p)))
-                    .when(focused, |text| text.children(self.render_blame_hover())),
+                    .when(focused, |text| text.children(self.render_blame_hover()))
+                    .children(self.render_notes(cx)),
             )
             .when(!self.single_line && !self.text_area, |editor| {
                 editor.child(

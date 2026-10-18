@@ -30,6 +30,7 @@
 //! Agents reach all this through [`control::dispatch`] (see
 //! `docs/pinpoint-for-agents.md`).
 
+pub mod context;
 pub mod control;
 mod highlight;
 mod overlay;
@@ -286,8 +287,8 @@ pub fn init(cx: &mut App) {
     server::start(cx);
 }
 
-/// "Pinpoint: Pick Element" (with its shortcut) and "Pinpoint: Clear
-/// Highlights".
+/// "Pinpoint: Pick Element" (with its shortcut), "Pinpoint: Clear
+/// Highlights" and "Pinpoint: Copy Context for Agent".
 fn register_actions(cx: &mut App) {
     picker::bind_keys(cx);
     // Global actions run while their window is being updated: touch it once
@@ -304,6 +305,15 @@ fn register_actions(cx: &mut App) {
             highlight::clear(Some(handle.window_id()), None);
             cx.defer(move |cx| {
                 handle.update(cx, |_, window, _| window.refresh()).ok();
+            });
+        }
+    });
+    cx.on_action(|_: &context::CopyContextForAgent, cx| {
+        if let Some(handle) = action_window(cx) {
+            cx.defer(move |cx| {
+                handle
+                    .update(cx, |_, window, cx| context::copy_to_clipboard(window, cx))
+                    .ok();
             });
         }
     });

@@ -684,6 +684,18 @@ impl WorkflowView {
             .map_or(Outcome::Idle, |active| active.run.outcome())
     }
 
+    /// The workflow file and its latest run (`next_code context`).
+    pub(crate) fn context_run<'a>(
+        &self,
+        cx: &'a App,
+    ) -> (&std::path::Path, &Project, Option<&'a super::ActiveRun>) {
+        (
+            &self.path,
+            &self.project,
+            self.workflows.read(cx).run_of(&self.id),
+        )
+    }
+
     fn schedule_reparse(&mut self, cx: &mut Context<Self>) {
         self._reparse = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(REPARSE_DELAY).await;

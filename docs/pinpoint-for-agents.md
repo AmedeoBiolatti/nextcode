@@ -15,6 +15,7 @@ next_code pinpoint find "Commit"                 # by label or text
 next_code pinpoint highlight menu-bar/run --note "Run the app" --step 1
 next_code pinpoint clear
 next_code pinpoint wait-pin --pick --timeout 120 # let the user point at something
+next_code context                                # what the user is looking at
 next_code pinpoint --help
 ```
 
@@ -133,6 +134,7 @@ raw request.
 | `pick` | | turns the picker on in the window |
 | `pins` | `clear`? | `pins: [pin]` (oldest first), `last_seq` |
 | `wait_pin` | `timeout`? (s, 120), `since`? (a `seq`; default: picks after this request), `pick`? (turn the picker on first) | `pin` |
+| `context` | `max_lines`? (40), `around`? (20) | what the user is looking at; see [below](#what-the-user-is-looking-at-context) |
 
 Node fields: `label` is what a person calls the element (a button's tooltip),
 `text` what it shows (when its owner reports it), `bounds` window pixels,
@@ -211,6 +213,44 @@ clipboard and added to the list `pins` and `wait_pin` read:
 The user may also paste a reference into the chat (`nextcode://ui/…`,
 `src/main.rs:12:5-12:18`, or the editor's **Copy Reference**): every reference
 is a valid target, so you can highlight exactly what they meant.
+
+## What the user is looking at (`context`)
+
+Instead of asking the user to paste the error, the selection or the failing
+test, ask NextCode what they are looking at:
+
+```sh
+next_code context                    # Markdown, ready to read
+next_code context --format json      # the raw reply
+next_code context --around 5 --max-lines 80
+next_code_agent context              # inside WSL or a dev container
+```
+
+`next_code context` is `next_code pinpoint context` (same window choice,
+`--window`, `--format json`). The person can hand you the same thing with
+**Pinpoint: Copy Context for Agent** (command palette), which copies the
+Markdown to the clipboard. Everything is read when you ask (nothing is
+tracked meanwhile) from the window's shown project tab:
+
+| Member | What |
+| --- | --- |
+| `window`, `title`, `project` | window id and title; `project.roots: [{name, path}]`, `project.remote` |
+| `focus` | `editor`, `notebook`, `workflow`, `panel:<key>` (`panel:terminal`, `panel:tests`, …) or null |
+| `editor` | the active text tab: `file` (project path, as `file_key` writes it), `path` (absolute), `language`, `dirty`, `line_count`, `cursors: [{line, column}]` (primary first), `selections: [{start, end, text, truncated}]`, `visible_lines: [first, last]`, `around: {start_line, text, truncated}` (`around` lines above and below the cursor), `diagnostics: [{line, column, end_line, end_column, severity, message, source, code, at_cursor}]`, `diagnostics_total`, `notes: [{id, line, end_line, anchor (exact/moved/fuzzy/orphaned), status (open/resolved), to, author, text, replies, visible}]` (sticky notes on the file, where they are now; see [notes-for-agents.md](notes-for-agents.md)) |
+| `notebook` | the active notebook tab: `file`, `path`, `dirty`, `cells`, `cell: {index (1-based), kind, source, source_truncated, execution_count, run (idle/queued/running/ok/failed), outputs: [{type, text, truncated}], error ("Name: value")}` |
+| `workflow` | a shown workflow tab instead of a project: `name`, `file`, `path`, `outcome` (idle/running/ready/failed/stopped), `steps: [{id, status, detail?, error?, last_lines?, reason?}]` |
+| `tabs` | open tabs: `{file, title, kind (editor/notebook/diff/compare), dirty, active}` |
+| `open_panels` | the panels shown in open docks (`terminal`, `tests`, …) |
+| `terminal` | the Terminal panel's shown tab: `title`, `tabs` (count), `lines` (last `max_lines` lines of the screen), `truncated`, `running`, `exit_code` (once its process ended), `folder`, `run_name` |
+| `problems` | `errors`, `warnings`, `total`, `items: [{file, line, column, severity, message, code}]` |
+| `tests` | after tests were found or run: `status` (the panel's status line), `running`, `passed`, `failed`, `skipped`, `failures: [{id, label, file, line, status, message, output_tail, output_truncated}]` |
+| `debugger` | the last debug session: `name`, `state` (starting/running/paused/stopping/ended), `stop_reason`, `location: {file, line}`, `frames: [{name, file, line, selected}]` (top 10), `scope` + `locals: [{name, value, type}]` (what the Debug panel already fetched), `exit_code`, `error` |
+
+Lines and columns are 1-based (columns count characters). Size and privacy:
+each text is cut to `max_lines` lines (a terminal and outputs keep their last
+lines) and 8000 characters, lists to 50 entries, and no file content is sent
+beyond the selections and the `around` lines (`--around 0`: none). From WSL or
+a dev container, `file`s and paths come back as that machine's absolute paths.
 
 ## Text and code
 
@@ -353,6 +393,7 @@ Without `--pick` the user starts picking with the shortcut.
   echoed). Connections may send several requests.
 - **`--automation`**: `{"cmd": "pinpoint", "request": {…}}` forwards to the
   editor and returns its reply as `result`.
+- **`next_code context`** is the same client (`next_code pinpoint context`).
 - Agents inside WSL or a dev container use the remote agent binary (see
   [below](#from-inside-wsl-or-a-dev-container)).
 

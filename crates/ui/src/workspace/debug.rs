@@ -110,6 +110,11 @@ impl DebugState {
 }
 
 impl Workspace {
+    /// The last debug session, ended ones too (`next_code context`).
+    pub(crate) fn debug_session(&self) -> Option<Entity<DebugSession>> {
+        self.debug.session.clone()
+    }
+
     /// Starts debugging `request`, or explains in a notice why it cannot.
     /// A running session is stopped first.
     pub fn start_debugging(
