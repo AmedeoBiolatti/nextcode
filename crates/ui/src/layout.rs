@@ -62,6 +62,25 @@ impl PanelId {
         }
     }
 
+    /// Its stable pinpoint key (`panel:<key>`): the saved name, kebab-cased.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::Search => "search",
+            Self::Commit => "commit",
+            Self::Python => "python",
+            Self::Terminal => "terminal",
+            Self::Problems => "problems",
+            Self::GitLog => "git-log",
+            Self::Ports => "ports",
+            Self::Outline => "outline",
+            Self::CallHierarchy => "call-hierarchy",
+            Self::Debug => "debug",
+            Self::DebugConsole => "debug-console",
+            Self::Tests => "tests",
+        }
+    }
+
     fn default_position(self) -> DockPosition {
         match self {
             Self::Files | Self::Search | Self::Commit | Self::Python | Self::Tests => {

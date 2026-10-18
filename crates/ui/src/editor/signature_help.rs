@@ -297,12 +297,16 @@ impl Editor {
                 .gap_1()
                 .text_color(theme::muted())
                 .font_family(theme::UI_FONT)
-                .child(arrow("▲", -1, cx))
+                .child(
+                    arrow("▲", -1, cx)
+                        .pin("previous")
+                        .label("Previous Signature"),
+                )
                 .child(selectable(
                     "counter",
                     format!("{}/{}", popover.active + 1, popover.help.signatures.len()),
                 ))
-                .child(arrow("▼", 1, cx))
+                .child(arrow("▼", 1, cx).pin("next").label("Next Signature"))
         });
         Some(
             div()
@@ -350,6 +354,8 @@ impl Editor {
                     "signature-doc",
                     &signature_docs,
                 ))
+                .pin("signature-help")
+                .label("Signature Help")
                 .into_any_element(),
         )
     }

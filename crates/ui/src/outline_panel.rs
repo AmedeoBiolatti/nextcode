@@ -13,6 +13,7 @@ use syntax::Language;
 
 use crate::{
     editor::{Editor, SymbolsStatus, symbol_kind_badge},
+    pinpoint::Pin,
     selectable::selectable,
     theme,
 };
@@ -223,9 +224,18 @@ impl OutlinePanel {
         index: usize,
         symbols: &[Symbol<usize>],
         language: Option<Language>,
+        line_of: impl Fn(usize) -> usize,
     ) -> RowData {
         let symbol = &symbols[index];
         let (badge, color) = symbol_kind_badge(symbol.kind, language);
+        let path = name_path(symbols, index);
+        let duplicated = symbols.iter().enumerate().any(|(other, s)| {
+            other != index && s.name == symbol.name && name_path(symbols, other) == path
+        });
+        let mut key = format!("symbol:{}", path.replace('\u{1f}', "/"));
+        if duplicated {
+            key = format!("{key}#{}", line_of(symbol.selection_range.start) + 1);
+        }
         let chevron = model::has_children(symbols, index).then(|| {
             if self.collapsed.contains(&name_path(symbols, index)) {
                 "▸"
@@ -234,6 +244,7 @@ impl OutlinePanel {
             }
         });
         RowData {
+            key,
             index,
             depth: symbol.depth,
             name: symbol.name.clone(),
@@ -256,6 +267,7 @@ impl OutlinePanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let RowData {
+            key,
             index,
             depth,
             name,
@@ -264,6 +276,28 @@ impl OutlinePanel {
             color,
             chevron,
         } = row;
+        let toggle = div()
+            .id(("chevron", index))
+            .w(px(12.))
+            .flex_none()
+            .text_xs()
+            .text_color(theme::muted())
+            .children(chevron)
+            .when(chevron.is_some(), |chevron| {
+                chevron.on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle(index, cx);
+                }))
+            });
+        // Leaves keep the spacer but have nothing to toggle.
+        let toggle = match chevron {
+            Some(glyph) => toggle
+                .pin("toggle")
+                .label(if glyph == "▸" { "Expand" } else { "Collapse" })
+                .into_any_element(),
+            None => toggle.into_any_element(),
+        };
+        let label = name.clone();
         div()
             .id(index)
             .h(px(ROW_HEIGHT))
@@ -285,21 +319,7 @@ impl OutlinePanel {
                 row.border_1().border_color(theme::accent())
             })
             .on_click(cx.listener(move |this, _, window, cx| this.open(index, window, cx)))
-            .child(
-                div()
-                    .id(("chevron", index))
-                    .w(px(12.))
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .children(chevron)
-                    .when(chevron.is_some(), |chevron| {
-                        chevron.on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle(index, cx);
-                        }))
-                    }),
-            )
+            .child(toggle)
             .child(
                 div()
                     .w(px(14.))
@@ -323,10 +343,14 @@ impl OutlinePanel {
                     .text_color(theme::muted())
                     .child(selectable("detail", detail)),
             )
+            .pin(key)
+            .label(label)
+            .interactive(true)
     }
 }
 
 struct RowData {
+    key: String,
     index: usize,
     depth: usize,
     name: String,
@@ -451,7 +475,11 @@ impl Render for OutlinePanel {
                     let data: Vec<RowData> = range
                         .filter_map(|row| rows.get(row).copied())
                         .filter(|&index| index < symbols.len())
-                        .map(|index| this.row_data(index, symbols, editor.language()))
+                        .map(|index| {
+                            this.row_data(index, symbols, editor.language(), |offset| {
+                                editor.buffer().line_of(offset)
+                            })
+                        })
                         .collect();
                     data.into_iter()
                         .map(|row| this.render_row(row, current, cx).into_any_element())
@@ -459,7 +487,8 @@ impl Render for OutlinePanel {
                 }),
             )
             .track_scroll(self.scroll.clone())
-            .size_full(),
+            .size_full()
+            .pin("symbols"),
         )
     }
 }

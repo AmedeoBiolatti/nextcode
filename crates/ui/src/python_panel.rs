@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    pinpoint::Pin,
     project::Project,
     selectable::selectable,
     theme,
@@ -460,27 +461,37 @@ impl PythonPanel {
             .gap_1()
             .child(
                 Self::button("py-sync", "Sync")
-                    .on_click(cx.listener(|this, _, _, cx| this.sync(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.sync(cx)))
+                    .pin("sync")
+                    .label("Sync"),
             )
             .child(
                 Self::button("py-lock", "Lock")
-                    .on_click(cx.listener(|this, _, _, cx| this.lock(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.lock(cx)))
+                    .pin("lock")
+                    .label("Lock"),
             )
             .child(
-                Self::button("py-upgrade", "Upgrade all").on_click(cx.listener(
-                    |this, _, _, cx| {
+                Self::button("py-upgrade", "Upgrade all")
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.run("uv lock --upgrade", python::uv::lock(true), false, cx)
-                    },
-                )),
+                    }))
+                    .pin("upgrade-all")
+                    .label("Upgrade all"),
             )
             .child(
                 Self::button("py-pin", "Python…")
-                    .on_click(cx.listener(|this, _, _, cx| this.choose_python(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.choose_python(cx)))
+                    .pin("python-version")
+                    .label("Python…"),
             )
             .child(
                 Self::button("py-refresh", "⟳")
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-            );
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
+                    .pin("refresh")
+                    .label("Refresh"),
+            )
+            .pin("toolbar");
         let status = match (info.in_sync, &info.uv) {
             (_, None) => Some((
                 "uv is not installed where the project lives",
@@ -501,6 +512,7 @@ impl PythonPanel {
                 .child(Self::section("Pin a Python version"))
                 .children(interpreters.iter().enumerate().map(|(index, interpreter)| {
                     let version = interpreter.version.clone();
+                    let pin_id = format!("python:{} {}", interpreter.implementation, version);
                     let detail = interpreter
                         .path
                         .clone()
@@ -521,17 +533,21 @@ impl PythonPanel {
                                 .child(selectable("path", detail)),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| this.pin(version.clone(), cx)))
+                        .pin(pin_id)
                 }))
+                .pin("interpreters")
         });
 
-        let run = |id: &'static str, label: String, request: RunRequest| {
+        let run = |id: &'static str, key: &'static str, label: String, request: RunRequest| {
             Self::row(id)
                 .cursor_pointer()
                 .child(div().text_color(theme::accent_text()).child("▶"))
-                .child(div().text_color(theme::text()).child(label))
+                .child(div().text_color(theme::text()).child(label.clone()))
                 .on_click(
                     cx.listener(move |_, _, _, cx| cx.emit(PythonPanelEvent::Run(request.clone()))),
                 )
+                .pin(key)
+                .label(label)
         };
         let scripts = info
             .project
@@ -552,6 +568,7 @@ impl PythonPanel {
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(PythonPanelEvent::Run(request.clone()))
                     }))
+                    .pin(format!("script:{name}"))
                     .into_any_element()
             });
 
@@ -562,6 +579,7 @@ impl PythonPanel {
             }
         }
         let dependencies = kinds.into_iter().flat_map(|kind| {
+            let kind_key = crate::pinpoint::kebab(&kind.label());
             let header = Self::section(&kind.label()).into_any_element();
             let rows = info
                 .dependencies
@@ -611,7 +629,9 @@ impl PythonPanel {
                                         false,
                                         cx,
                                     )
-                                })),
+                                }))
+                                .pin("upgrade")
+                                .label("Upgrade"),
                         )
                         .child(
                             div()
@@ -628,8 +648,11 @@ impl PythonPanel {
                                         true,
                                         cx,
                                     )
-                                })),
+                                }))
+                                .pin("remove")
+                                .label("Remove"),
                         )
+                        .pin(format!("dep:{kind_key}:{name}"))
                         .into_any_element()
                 });
             std::iter::once(header).chain(rows).collect::<Vec<_>>()
@@ -679,17 +702,25 @@ impl PythonPanel {
             .children(scripts)
             .child(run(
                 "py-run-file",
+                "run-file",
                 "Current file".into(),
                 RunRequest::CurrentFile,
             ))
-            .child(run("py-tests", "All tests".into(), RunRequest::Tests))
+            .child(run(
+                "py-tests",
+                "run-tests",
+                "All tests".into(),
+                RunRequest::Tests,
+            ))
             .child(run(
                 "py-test-file",
+                "run-test-file",
                 "Tests in current file".into(),
                 RunRequest::TestFile,
             ))
             .child(run(
                 "py-test-cursor",
+                "run-test-at-cursor",
                 "Test at cursor".into(),
                 RunRequest::TestAtCursor,
             ))
@@ -711,11 +742,15 @@ impl PythonPanel {
                             .border_color(theme::border())
                             .rounded_sm()
                             .bg(theme::background())
-                            .child(self.add_input.clone()),
+                            .child(self.add_input.clone())
+                            .pin("add-input")
+                            .label("Add dependency"),
                     )
                     .child(
                         Self::button("py-add-kind", self.add_kind.label())
-                            .on_click(cx.listener(|this, _, _, cx| this.cycle_kind(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.cycle_kind(cx)))
+                            .pin("add-kind")
+                            .label("Dependency kind"),
                     ),
             )
             .children(dependencies)

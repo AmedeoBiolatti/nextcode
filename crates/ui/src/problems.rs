@@ -16,6 +16,7 @@ use lsp::types::DiagnosticSeverity;
 use crate::{
     editor::spell::SpellingProblem,
     lsp_store::{LspStore, LspStoreEvent, diagnostic_origin},
+    pinpoint::{self, Pin},
     project::Project,
     selectable::selectable,
     theme,
@@ -38,10 +39,15 @@ enum Row {
     },
     File {
         path: SharedString,
+        /// `file:<file key>`, its pinpoint id.
+        pin: SharedString,
         errors: usize,
         warnings: usize,
     },
     Problem {
+        /// `problem:<file key>:<line>:<column>`, `:<n>` for the n-th at
+        /// one position.
+        pin: SharedString,
         location: Location,
         severity: Severity,
         message: SharedString,
@@ -284,18 +290,34 @@ fn rows<'a>(
                 .unwrap_or(path),
             None => path,
         };
-        let shown = match group.cell {
-            0 => shown.display().to_string(),
-            cell => format!("{} [cell {cell}]", shown.display()),
+        let (shown, key) = match group.cell {
+            0 => (
+                shown.display().to_string(),
+                pinpoint::file_key(project, path),
+            ),
+            cell => (
+                format!("{} [cell {cell}]", shown.display()),
+                format!("{}@cell:{cell}", pinpoint::file_key(project, path)),
+            ),
         };
         rows.push(Row::File {
             path: shown.into(),
+            pin: format!("file:{key}").into(),
             errors,
             warnings,
         });
+        let mut seen: HashMap<(u32, u32), usize> = HashMap::new();
         for diagnostic in group.diagnostics {
             let start = diagnostic.range.start;
+            let line = start.line - group.first_line + 1;
+            let repeat = seen.entry((line, start.character)).or_default();
+            *repeat += 1;
+            let mut pin = format!("problem:{key}:{line}:{}", start.character + 1);
+            if *repeat > 1 {
+                pin.push_str(&format!(":{repeat}"));
+            }
             rows.push(Row::Problem {
+                pin: pin.into(),
                 location: Location {
                     path: group.target.to_path_buf(),
                     range: diagnostic.range,
@@ -365,9 +387,13 @@ impl Render for ProblemsPanel {
                                         "counts",
                                         format!("{errors} errors, {warnings} warnings"),
                                     )),
-                            ),
+                            )
+                            .pin(format!("root:{name}"))
+                            .label(name.clone())
+                            .into_any_element(),
                         Row::File {
                             path,
+                            pin,
                             errors,
                             warnings,
                         } => div()
@@ -383,8 +409,12 @@ impl Render for ProblemsPanel {
                             .child(div().text_xs().text_color(theme::muted()).child(selectable(
                                 "counts",
                                 format!("{errors} errors, {warnings} warnings"),
-                            ))),
+                            )))
+                            .pin(pin.clone())
+                            .label(path.clone())
+                            .into_any_element(),
                         Row::Problem {
+                            pin,
                             location,
                             severity,
                             message,
@@ -430,12 +460,16 @@ impl Render for ProblemsPanel {
                                         .text_color(theme::muted())
                                         .child(selectable("position", position.clone())),
                                 )
+                                .pin(pin.clone())
+                                .label(message.clone())
+                                .into_any_element()
                         }
                     })
                     .collect()
             }),
         )
         .size_full()
+        .pin("problems")
         .into_any_element()
     }
 }
@@ -474,6 +508,7 @@ mod tests {
                     path,
                     errors,
                     warnings,
+                    ..
                 } => format!("{path} ({errors}/{warnings})"),
                 Row::Problem { message, .. } => format!("  {message}"),
             })

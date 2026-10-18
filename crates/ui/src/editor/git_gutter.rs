@@ -148,7 +148,7 @@ impl Editor {
     }
 
     /// The change touching `line`, if any.
-    fn change_at(&self, line: usize) -> Option<&LineChange> {
+    pub(super) fn change_at(&self, line: usize) -> Option<&LineChange> {
         let count = self.buffer.line_count();
         self.git
             .changes
@@ -575,39 +575,67 @@ impl Editor {
                                     .text_color(theme::muted())
                                     .child(selectable("hunk-title", title)),
                             )
-                            .child(button("hunk-previous", "↑").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    if let Some(line) = this.git.popup.as_ref().map(|p| p.line) {
-                                        this.go_to_change(line, false, true, cx);
-                                    }
-                                },
-                            )))
-                            .child(button("hunk-next", "↓").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    if let Some(line) = this.git.popup.as_ref().map(|p| p.line) {
-                                        this.go_to_change(line, true, true, cx);
-                                    }
-                                },
-                            )))
-                            .child(button("hunk-rollback", "Rollback").on_click(
-                                cx.listener(|this, _, _, cx| this.rollback_popup_change(cx)),
-                            ))
+                            .child(
+                                button("hunk-previous", "↑")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(line) = this.git.popup.as_ref().map(|p| p.line)
+                                        {
+                                            this.go_to_change(line, false, true, cx);
+                                        }
+                                    }))
+                                    .pin("previous")
+                                    .label("Previous Change"),
+                            )
+                            .child(
+                                button("hunk-next", "↓")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(line) = this.git.popup.as_ref().map(|p| p.line)
+                                        {
+                                            this.go_to_change(line, true, true, cx);
+                                        }
+                                    }))
+                                    .pin("next")
+                                    .label("Next Change"),
+                            )
+                            .child(
+                                button("hunk-rollback", "Rollback")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.rollback_popup_change(cx)
+                                        }),
+                                    )
+                                    .pin("rollback")
+                                    .label("Rollback"),
+                            )
                             .when(index, |row| {
-                                row.child(button("hunk-stage", "Stage Hunk").on_click(
-                                    cx.listener(|this, _, _, cx| this.stage_popup_change(cx)),
-                                ))
+                                row.child(
+                                    button("hunk-stage", "Stage Hunk")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.stage_popup_change(cx)
+                                            }),
+                                        )
+                                        .pin("stage")
+                                        .label("Stage Hunk"),
+                                )
                             })
                             .child(
-                                button("hunk-diff", "Show Diff").on_click(
-                                    cx.listener(|this, _, _, cx| this.show_popup_diff(cx)),
-                                ),
+                                button("hunk-diff", "Show Diff")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.show_popup_diff(cx)),
+                                    )
+                                    .pin("show-diff")
+                                    .label("Show Diff"),
                             )
-                            .child(button("hunk-close", "✕").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.git.popup = None;
-                                    cx.notify();
-                                },
-                            ))),
+                            .child(
+                                button("hunk-close", "✕")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.git.popup = None;
+                                        cx.notify();
+                                    }))
+                                    .pin("close")
+                                    .label("Close"),
+                            ),
                     )
                     .child(
                         div()
@@ -625,7 +653,9 @@ impl Editor {
                                 code_line(("hunk-new", i), text, "+", theme::diff_added())
                             }))
                             .children(more("hunk-more-new", popup.more_new)),
-                    ),
+                    )
+                    .pin("hunk-popup")
+                    .label("Change"),
             ),
         ))
     }
@@ -697,31 +727,38 @@ impl Editor {
                         this.gutter_menu = None;
                         cx.notify();
                     }))
-                    .child(item("gutter-annotate", annotate).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.gutter_menu = None;
-                            let shown = !this.blame.shown;
-                            this.set_blame_shown(shown, cx);
-                        },
-                    )))
+                    .child(
+                        item("gutter-annotate", annotate)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.gutter_menu = None;
+                                let shown = !this.blame.shown;
+                                this.set_blame_shown(shown, cx);
+                            }))
+                            .pin("item:annotate")
+                            .label(annotate),
+                    )
                     .when(changed, |menu| {
                         menu.child(
-                            item("gutter-rollback", "Rollback Lines").on_click(cx.listener(
-                                move |this, _, _, cx| {
+                            item("gutter-rollback", "Rollback Lines")
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     this.gutter_menu = None;
                                     this.rollback_line(line, cx);
-                                },
-                            )),
+                                }))
+                                .pin("item:rollback-lines")
+                                .label("Rollback Lines"),
                         )
                         .child(
-                            item("gutter-show-change", "Show Change").on_click(cx.listener(
-                                move |this, _, _, cx| {
+                            item("gutter-show-change", "Show Change")
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     this.gutter_menu = None;
                                     this.open_hunk_popup(line, cx);
-                                },
-                            )),
+                                }))
+                                .pin("item:show-change")
+                                .label("Show Change"),
                         )
-                    }),
+                    })
+                    .pin("gutter-menu")
+                    .label("Gutter menu"),
             ),
         ))
     }

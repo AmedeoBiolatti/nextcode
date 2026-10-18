@@ -2,8 +2,11 @@
 //! the requested project operations (files, watching, search, processes,
 //! TCP tunnels for port forwarding) on the machine it runs on. The editor
 //! starts it inside a WSL distro or dev container and talks to it over the
-//! process's stdin/stdout.
+//! process's stdin/stdout. It also relays `next_code_agent pinpoint` calls
+//! made on that machine to the editor ([`pinpoint`]).
 
+#[cfg(unix)]
+pub mod pinpoint;
 mod ports;
 mod process;
 #[cfg(target_os = "linux")]
@@ -103,6 +106,9 @@ enum Stream {
     Search(#[allow(dead_code)] search::SearchHandle),
     /// A process or a tunnel.
     Process(Arc<dyn Process>),
+    /// Dropping the server stops listening.
+    #[cfg(unix)]
+    Pinpoint(Arc<pinpoint::Server>),
 }
 
 impl Stream {
@@ -150,7 +156,11 @@ impl EventSink {
 fn is_streaming(request: &Request) -> bool {
     matches!(
         request,
-        Request::Watch { .. } | Request::Search { .. } | Request::Spawn(_) | Request::Tunnel { .. }
+        Request::Watch { .. }
+            | Request::Search { .. }
+            | Request::Spawn(_)
+            | Request::Tunnel { .. }
+            | Request::Pinpoint { .. }
     )
 }
 
@@ -240,6 +250,20 @@ impl Agent {
                 if let Some(process) = self.process(id) {
                     process.close_input();
                 }
+            }
+            ClientMessage::PinpointReply { id, call, reply } => {
+                #[cfg(unix)]
+                {
+                    let server = match self.streams.lock().get(&id) {
+                        Some(Slot::Running(Stream::Pinpoint(server))) => Some(server.clone()),
+                        _ => None,
+                    };
+                    if let Some(server) = server {
+                        server.reply(call, reply);
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = (id, call, reply);
             }
         }
     }
@@ -351,6 +375,23 @@ impl Agent {
                 Ok(Response::Done)
             }
             Request::ListeningPorts => Ok(Response::Ports(ports::listening())),
+            #[cfg(unix)]
+            Request::Pinpoint { roots } => {
+                let sink = self.sink(id);
+                let server = pinpoint::Server::start(
+                    &pinpoint::runtime_dir(),
+                    &pinpoint::unique_name(),
+                    &roots,
+                    move |call, request| sink.send(Event::Pinpoint { call, request }),
+                )?;
+                self.install(id, Stream::Pinpoint(Arc::new(server)));
+                Ok(Response::Done)
+            }
+            #[cfg(not(unix))]
+            Request::Pinpoint { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "pinpoint needs Unix sockets",
+            )),
         }
     }
 

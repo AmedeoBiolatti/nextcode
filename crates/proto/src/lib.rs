@@ -36,6 +36,16 @@
 //! reader ever waits for a slow socket). [`ClientMessage::CloseInput`] and
 //! [`Event::TunnelEof`] are half-closes; [`Event::TunnelClosed`] is final.
 //!
+//! # Pinpoint
+//!
+//! [`Request::Pinpoint`] is the one stream the agent drives: while it runs,
+//! `next_code_agent pinpoint …` processes on the agent's machine (CLI agents
+//! inside WSL or a container) reach the editor through it. Each of their
+//! requests arrives as an [`Event::Pinpoint`] with an agent-chosen `call`
+//! number, and the client answers it with [`ClientMessage::PinpointReply`].
+//! Both carry JSON text (the pinpoint control commands), opaque to the
+//! protocol.
+//!
 //! Shutdown is closing the agent's stdin: the agent stops its watchers and
 //! searches, terminates the processes it started, and exits.
 
@@ -47,7 +57,7 @@ pub use watcher::Batch;
 pub use worktree::{DirEntry, FileKind};
 
 /// Bumped on every incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Bytes a tunnel's sender may have in flight in each direction before the
 /// receiver grants more (see the crate docs).
@@ -118,6 +128,13 @@ pub enum ClientMessage {
         id: RequestId,
         bytes: u32,
     },
+    /// The answer to the [`Event::Pinpoint`] numbered `call` of the
+    /// [`Request::Pinpoint`] stream `id`: JSON text.
+    PinpointReply {
+        id: RequestId,
+        call: u64,
+        reply: String,
+    },
 }
 
 /// Paths are absolute POSIX paths on the agent's side.
@@ -178,6 +195,13 @@ pub enum Request {
     /// TCP sockets listening on the agent's machine ([`Response::Ports`];
     /// empty where `/proc/net/tcp` does not exist).
     ListeningPorts,
+    /// Serves pinpoint requests of the agent's machine until cancelled (see
+    /// the crate docs): streams [`Event::Pinpoint`]; never ends by itself.
+    /// `roots` are the project's folders, which pick the editor serving a
+    /// caller's working directory.
+    Pinpoint {
+        roots: Vec<String>,
+    },
 }
 
 /// A listening TCP socket.
@@ -260,6 +284,12 @@ pub enum Event {
     /// The tunnel is closed, after all its data; `error` when it broke.
     TunnelClosed {
         error: Option<String>,
+    },
+    /// A pinpoint request (JSON text), answered with
+    /// [`ClientMessage::PinpointReply`] carrying the same `call`.
+    Pinpoint {
+        call: u64,
+        request: String,
     },
 }
 
@@ -426,6 +456,17 @@ mod tests {
             ClientMessage::Credit {
                 id: 3,
                 bytes: TUNNEL_WINDOW,
+            },
+            ClientMessage::Request {
+                id: 4,
+                request: Request::Pinpoint {
+                    roots: vec!["/home/me/p".into()],
+                },
+            },
+            ClientMessage::PinpointReply {
+                id: 4,
+                call: 9,
+                reply: r#"{"ok":true}"#.into(),
             },
         ];
         let mut wire = Vec::new();

@@ -127,6 +127,7 @@ impl Default for MenuBar {
                         plain("editor::Cut"),
                         plain("editor::Copy"),
                         plain("editor::Paste"),
+                        plain("editor::CopyReference"),
                         separator(),
                         plain("editor::Find"),
                         plain("editor::FindReplace"),

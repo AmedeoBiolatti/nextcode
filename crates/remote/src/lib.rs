@@ -7,8 +7,8 @@ pub mod launch;
 pub mod wsl;
 
 pub use client::{
-    AgentClient, Initialized, PipedProcess, REQUEST_TIMEOUT, RunOutput, StreamHandle, Transport,
-    TunnelHandle, agent_path,
+    AgentClient, Initialized, PinpointReply, PipedProcess, REQUEST_TIMEOUT, RunOutput,
+    StreamHandle, Transport, TunnelHandle, agent_path,
 };
 pub use launch::Connection;
 pub use proto::ListeningPort;

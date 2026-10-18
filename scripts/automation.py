@@ -13,6 +13,7 @@ import secrets
 import shutil
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -188,6 +189,29 @@ def main():
             run(['xdotool', 'windowsize', '--sync', window, str(args.width), str(args.height)])
             run(['xdotool', 'windowfocus', '--sync', window])
 
+            def pinpoint(inner):
+                # Forwarded to the editor's own control server (see
+                # `crates/ui/src/pinpoint/server.rs`): its instance file
+                # lives in the data dir set above.
+                if not isinstance(inner, dict) or not isinstance(inner.get('cmd'), str):
+                    raise ValueError('pinpoint needs "request": {"cmd": ...}')
+                path = os.path.join(env['XDG_DATA_HOME'], 'next_code', 'pinpoint', f'{app.pid}.json')
+                try:
+                    with open(path) as file:
+                        instance = json.load(file)
+                except (OSError, ValueError) as error:
+                    raise ValueError(f'the editor has not started its pinpoint server: {error}')
+                timeout = 15 + float(inner.get('timeout') or 0)
+                with socket.create_connection(('127.0.0.1', instance['port']), timeout=timeout) as connection:
+                    connection.sendall((json.dumps({**inner, 'token': instance['token']}) + '\n').encode())
+                    reply = b''
+                    while not reply.endswith(b'\n'):
+                        chunk = connection.recv(65536)
+                        if not chunk:
+                            break
+                        reply += chunk
+                return json.loads(reply)
+
             def execute(request):
                 cmd = request.get('cmd')
                 if cmd == 'info':
@@ -195,7 +219,8 @@ def main():
                             'height': args.height, 'coordinates': 'display pixels',
                             'commands': ['info', 'key_down', 'key_up', 'key', 'text',
                                          'mouse_move', 'mouse_down', 'mouse_up', 'click',
-                                         'scroll', 'screenshot', 'wait', 'opened', 'shutdown']}
+                                         'scroll', 'screenshot', 'wait', 'opened', 'pinpoint',
+                                         'shutdown']}
                 if cmd in ('key_down', 'key_up', 'key'):
                     verb = {'key_down': 'keydown', 'key_up': 'keyup', 'key': 'key'}[cmd]
                     run(['xdotool', verb, '--', string(request, 'key')])
@@ -234,6 +259,8 @@ def main():
                     # URLs and files the editor asked the desktop to open.
                     with open(opened_log) as log:
                         return log.read().splitlines()
+                elif cmd == 'pinpoint':
+                    return pinpoint(request.get('request'))
                 elif cmd == 'shutdown':
                     threading.Thread(target=server.shutdown, daemon=True).start()
                 else:

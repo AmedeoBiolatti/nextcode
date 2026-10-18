@@ -9,6 +9,7 @@ use run::{Configuration, Source};
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    pinpoint::Pin,
     selectable::selectable,
     theme,
 };
@@ -224,12 +225,17 @@ impl Render for ConfigurationPicker {
                                     },
                                 )),
                         )
+                        .pin(format!("item:{}", data.name))
+                        .label(data.name.clone())
                     }
-                    Entry::Edit => row.child(
-                        div()
-                            .text_color(theme::accent_text())
-                            .child("Edit Configurations…"),
-                    ),
+                    Entry::Edit => row
+                        .child(
+                            div()
+                                .text_color(theme::accent_text())
+                                .child("Edit Configurations…"),
+                        )
+                        .pin("item:edit-configurations")
+                        .label("Edit Configurations…"),
                 }
             });
         div()
@@ -257,9 +263,13 @@ impl Render for ConfigurationPicker {
                     .py_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(self.query.clone()),
+                    .child(self.query.clone())
+                    .pin("input")
+                    .label("Configuration name"),
             )
             .children(rows)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .pin("run-config-picker")
+            .label("Select Run Configuration")
     }
 }

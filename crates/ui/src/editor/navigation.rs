@@ -518,6 +518,8 @@ impl Editor {
                     .font_family(theme::UI_FONT)
                     .child(div().text_color(severity.color()).child(severity.label()))
                     .child(selectable(("diagnostic", index), message.clone()))
+                    .pin(format!("diagnostic:{}", index + 1))
+                    .label(message.clone())
                     .into_any_element()
             });
         let separator = (!hover.messages.is_empty() && !hover.docs.is_empty())
@@ -553,7 +555,9 @@ impl Editor {
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .children(diagnostics)
                 .children(separator)
-                .children(markdown_blocks("doc", &hover.docs)),
+                .children(markdown_blocks("doc", &hover.docs))
+                .pin("hover")
+                .label("Hover"),
         )
     }
 }

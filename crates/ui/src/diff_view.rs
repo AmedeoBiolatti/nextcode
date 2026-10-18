@@ -14,7 +14,9 @@ use gpui::{
     uniform_list,
 };
 
-use crate::{commit_panel::short_revision, project::Project, selectable::selectable, theme};
+use crate::{
+    commit_panel::short_revision, pinpoint::Pin, project::Project, selectable::selectable, theme,
+};
 
 mod highlight;
 use highlight::DiffHighlights;
@@ -200,8 +202,12 @@ impl DiffView {
         let line = line + 1;
         let index = if self.options.side_by_side {
             self.split.iter().position(|row| match row {
-                SplitRow::Pair { right: Some(side), .. } => side.line >= line,
-                SplitRow::Pair { left: Some(side), .. } => side.line >= line,
+                SplitRow::Pair {
+                    right: Some(side), ..
+                } => side.line >= line,
+                SplitRow::Pair {
+                    left: Some(side), ..
+                } => side.line >= line,
                 _ => false,
             })
         } else {
@@ -361,7 +367,9 @@ impl DiffView {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.apply_hunk(hunk, action, window, cx)
                     }))
+                    .pin(label.to_lowercase())
             }))
+            .pin(format!("hunk:{}", hunk + 1))
             .into_any_element()
     }
 
@@ -473,6 +481,7 @@ impl DiffView {
                     .hover(|style| style.bg(theme::hover_row()))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.open_line(target, cx)))
+                    .pin(format!("line:{}:{}", line_key(*old), line_key(*new)))
                     .into_any_element()
             }
         }
@@ -515,6 +524,7 @@ impl DiffView {
                                             this.open_line(target, cx)
                                         }))
                                 })
+                                .pin(id)
                                 .into_any_element()
                             }
                             None => div()
@@ -540,6 +550,11 @@ impl DiffView {
                             .bg(theme::border()),
                     )
                     .child(half(right, "right"))
+                    .pin(format!(
+                        "row:{}:{}",
+                        line_key(left.as_ref().map(|l| l.line)),
+                        line_key(right.as_ref().map(|l| l.line))
+                    ))
                     .into_any_element()
             }
         }
@@ -563,7 +578,14 @@ impl DiffView {
             .hover(|style| style.text_color(theme::text()))
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| this.set_options(options, cx)))
+            .pin(id)
+            .label(label)
     }
+}
+
+/// A diff line number for a pin key; `-` when the side has no line.
+fn line_key(line: Option<usize>) -> String {
+    line.map_or_else(|| "-".to_owned(), |line| line.to_string())
 }
 
 impl Focusable for DiffView {
@@ -658,6 +680,7 @@ impl Render for DiffView {
             .track_scroll(self.scroll.clone())
             .flex_1()
             .w_full()
+            .pin("rows")
             .into_any_element(),
             (None, Some(diff)) => uniform_list(
                 "diff-rows",
@@ -669,6 +692,7 @@ impl Render for DiffView {
             .track_scroll(self.scroll.clone())
             .flex_1()
             .w_full()
+            .pin("rows")
             .into_any_element(),
             (None, None) => div().into_any_element(),
         };
@@ -700,7 +724,7 @@ impl Render for DiffView {
                             .truncate()
                             .child(selectable("header", header)),
                     )
-                    .child(toolbar),
+                    .child(toolbar.pin("toolbar")),
             )
             .child(body)
     }

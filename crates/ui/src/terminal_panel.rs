@@ -18,7 +18,9 @@ use terminal::{
 };
 use worktree::FileKind;
 
-use crate::{project::Project, selectable::selectable, theme};
+use crate::{pinpoint::Pin, project::Project, selectable::selectable, theme};
+
+mod pin_text;
 
 const CONTEXT: &str = "Terminal";
 
@@ -561,7 +563,12 @@ impl TerminalView {
     }
 
     /// Resizes the pty to fit `bounds` and shapes the visible screen.
-    fn layout(&mut self, bounds: Bounds<Pixels>, window: &mut Window) -> TerminalLayout {
+    fn layout(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        pin_path: &str,
+        window: &mut Window,
+    ) -> TerminalLayout {
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
@@ -679,6 +686,7 @@ impl TerminalView {
             )
         });
         let selection = self.selection_bounds(&snapshot, bounds.origin, cell_width, line_height);
+        pin_text::record(&snapshot, pin_path, bounds.origin, self.cell_size, window);
         TerminalLayout {
             lines,
             backgrounds,
@@ -750,7 +758,10 @@ impl Render for TerminalView {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
-            .child(TerminalElement { view: cx.entity() })
+            .child(TerminalElement {
+                view: cx.entity(),
+                pin_path: SharedString::default(),
+            })
     }
 }
 
@@ -766,6 +777,8 @@ struct TerminalLayout {
 
 struct TerminalElement {
     view: Entity<TerminalView>,
+    /// The enclosing pin (`…/terminal:<n>`), whose text is the screen's.
+    pin_path: SharedString,
 }
 
 impl IntoElement for TerminalElement {
@@ -795,6 +808,7 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, ()) {
+        self.pin_path = crate::pinpoint::current_path().unwrap_or_default();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         style.size.height = relative(1.).into();
@@ -810,7 +824,8 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> TerminalLayout {
-        self.view.update(cx, |view, _| view.layout(bounds, window))
+        self.view
+            .update(cx, |view, _| view.layout(bounds, &self.pin_path, window))
     }
 
     fn paint(
@@ -1195,6 +1210,7 @@ impl Render for TerminalPanel {
         }
         let tabs = self.tabs.iter().enumerate().map(|(index, (view, _))| {
             let active = index == self.active;
+            let title = view.read(cx).tab_title();
             div()
                 .id(("terminal-tab", index))
                 .h_full()
@@ -1217,7 +1233,13 @@ impl Render for TerminalPanel {
                     }
                     cx.notify();
                 }))
-                .child(view.read(cx).tab_title())
+                .child(
+                    title
+                        .clone()
+                        .pin("title")
+                        .text(title.clone())
+                        .interactive(false),
+                )
                 .child(
                     div()
                         .id(("terminal-close", index))
@@ -1227,10 +1249,17 @@ impl Render for TerminalPanel {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.close(index, window, cx);
-                        })),
+                        }))
+                        .pin("close")
+                        .label("Close Terminal"),
                 )
+                .pin(format!("tab:{}", index + 1))
+                .label(title)
+                .interactive(true)
         });
         let new_buttons = profiles(&self.project).into_iter().map(|profile| {
+            let new_key = format!("new:{}", profile.name);
+            let new_label = format!("New {} Terminal", profile.name);
             div()
                 .id(SharedString::from(format!("new-terminal-{}", profile.name)))
                 .px_2()
@@ -1242,6 +1271,8 @@ impl Render for TerminalPanel {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.spawn(&profile, window, cx);
                 }))
+                .pin(new_key)
+                .label(new_label)
         });
         div()
             .track_focus(&self.focus_handle)
@@ -1258,7 +1289,8 @@ impl Render for TerminalPanel {
                     .border_color(theme::border())
                     .children(tabs)
                     .child(div().flex_1())
-                    .children(new_buttons),
+                    .children(new_buttons)
+                    .pin("tabs"),
             )
             .children(self.error.clone().map(|error| {
                 div()
@@ -1269,10 +1301,11 @@ impl Render for TerminalPanel {
                     .child(selectable("error", error))
             }))
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .children(self.tabs.get(self.active).map(|(view, _)| view.clone())),
+                div().flex_1().min_h_0().children(
+                    self.tabs
+                        .get(self.active)
+                        .map(|(view, _)| view.clone().pin(format!("terminal:{}", self.active + 1))),
+                ),
             )
     }
 }

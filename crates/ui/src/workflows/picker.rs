@@ -11,6 +11,7 @@ use gpui::{
 use super::{Discovered, Source, Workflows};
 use crate::{
     editor::{self, Editor, EditorEvent},
+    pinpoint::{self, Pin},
     selectable::selectable,
     theme,
 };
@@ -149,7 +150,9 @@ impl Render for WorkflowPicker {
                     .py_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(self.query.clone()),
+                    .child(self.query.clone())
+                    .pin("input")
+                    .label("Workflow name"),
             )
             .children(
                 self.rows
@@ -158,6 +161,16 @@ impl Render for WorkflowPicker {
                     .skip(first)
                     .take(VISIBLE_ROWS)
                     .map(|(index, found)| {
+                        // Where it lives, then its file.
+                        let pin = format!(
+                            "item:{}/{}",
+                            pinpoint::kebab(&found.source.label()),
+                            found
+                                .path
+                                .file_name()
+                                .map(|name| name.to_string_lossy())
+                                .unwrap_or_default()
+                        );
                         div()
                             .id(index)
                             .h(px(ROW_HEIGHT))
@@ -198,6 +211,8 @@ impl Render for WorkflowPicker {
                                     format!("{} · {}", found.source.label(), found.path.display()),
                                 ),
                             ))
+                            .pin(pin)
+                            .label(found.name.clone())
                     }),
             )
             .when(self.rows.is_empty(), |picker| {
@@ -211,9 +226,13 @@ impl Render for WorkflowPicker {
                             "empty",
                             "No workflows. Run > New Workflow… creates one in the user folder; \
                              projects can have .next_code/workflows/*.yaml.",
-                        )),
+                        ))
+                        .pin("empty")
+                        .interactive(false),
                 )
             })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .pin("workflow-picker")
+            .label("Open Workflow")
     }
 }

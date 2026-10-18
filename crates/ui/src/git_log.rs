@@ -33,6 +33,7 @@ use crate::{
     compare_view::render_change_node,
     diff_view::DiffSource,
     editor::{self, Editor, EditorEvent},
+    pinpoint::Pin,
     project::Project,
     selectable::selectable,
     theme,
@@ -978,6 +979,8 @@ impl GitLogPanel {
                     .text_color(theme::muted())
                     .child(selectable("time", relative_time(commit.time)).right_click_through()),
             )
+            .pin(format!("commit:{}", commit.id))
+            .label(commit.subject.clone())
             .into_any_element()
     }
 
@@ -1020,6 +1023,8 @@ impl GitLogPanel {
                     this.open_popup(kind, position, cx);
                 }),
             )
+            .pin(format!("filter:{}", label.to_lowercase()))
+            .label(label)
     }
 
     /// "199 commits", "1000+ commits" while more pages remain, "Loading…".
@@ -1073,7 +1078,9 @@ impl GitLogPanel {
                             .flex_1()
                             .min_w_0()
                             .h(px(20.))
-                            .child(self.text_input.clone()),
+                            .child(self.text_input.clone())
+                            .pin("text-filter")
+                            .label("Filter commits"),
                     ),
             )
             .child(self.filter_button(FilterKind::Branch, "Branch", branch, cx))
@@ -1099,7 +1106,9 @@ impl GitLogPanel {
                                 this.date_label = None;
                                 this._debounce = Task::ready(());
                                 this.set_filter(|filter| *filter = LogFilter::default(), cx);
-                            })),
+                            }))
+                            .pin("clear-filters")
+                            .label("Clear filters"),
                     )
                 },
             )
@@ -1112,8 +1121,11 @@ impl GitLogPanel {
                     .text_color(theme::muted())
                     .hover(|style| style.text_color(theme::text()))
                     .child("⟳")
-                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
+                    .pin("refresh")
+                    .label("Refresh"),
             )
+            .pin("toolbar")
     }
 
     fn popup_item(
@@ -1159,6 +1171,8 @@ impl GitLogPanel {
                             this.switch_repository(index, cx);
                             cx.notify();
                         }))
+                        .pin(format!("repository:{}", repository_key(repository.root())))
+                        .label(repository_name(repository).to_owned())
                         .into_any_element(),
                     );
                 }
@@ -1169,6 +1183,7 @@ impl GitLogPanel {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.set_filter(|filter| filter.revisions.clear(), cx)
                         }))
+                        .pin("item:all")
                         .into_any_element(),
                 );
                 let names = std::iter::once("HEAD".to_owned()).chain(
@@ -1178,12 +1193,14 @@ impl GitLogPanel {
                 );
                 for (index, name) in names.enumerate() {
                     let checked = self.filter.revisions == [name.clone()];
+                    let name_key = name.clone();
                     items.push(
                         Self::popup_item(("branch", index), name.clone(), checked)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let name = name.clone();
                                 this.set_filter(|filter| filter.revisions = vec![name], cx)
                             }))
+                            .pin(format!("branch:{name_key}"))
                             .into_any_element(),
                     );
                 }
@@ -1194,6 +1211,7 @@ impl GitLogPanel {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.set_filter(|filter| filter.authors.clear(), cx)
                         }))
+                        .pin("item:all")
                         .into_any_element(),
                 );
                 let mut authors: Vec<String> = Vec::new();
@@ -1215,12 +1233,14 @@ impl GitLogPanel {
                     } else {
                         author.clone()
                     };
+                    let author_key = author.clone();
                     items.push(
                         Self::popup_item(("user", index), label, checked)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let author = author.clone();
                                 this.set_filter(|filter| filter.authors = vec![author], cx)
                             }))
+                            .pin(format!("user:{author_key}"))
                             .into_any_element(),
                     );
                 }
@@ -1232,6 +1252,7 @@ impl GitLogPanel {
                             this.date_label = None;
                             this.set_filter(|filter| filter.since = None, cx)
                         }))
+                        .pin("item:all")
                         .into_any_element(),
                 );
                 for (index, (label, age)) in DATE_RANGES.into_iter().enumerate() {
@@ -1241,6 +1262,7 @@ impl GitLogPanel {
                                 this.date_label = Some(label);
                                 this.set_filter(|filter| filter.since = Some(now() - age), cx)
                             }))
+                            .pin(format!("item:{}", crate::pinpoint::kebab(label)))
                             .into_any_element(),
                     );
                 }
@@ -1253,6 +1275,7 @@ impl GitLogPanel {
                                 .update(cx, |input, cx| input.set_text("", cx));
                             this.set_filter(|filter| filter.paths.clear(), cx)
                         }))
+                        .pin("item:all")
                         .into_any_element(),
                 );
                 items.push(
@@ -1281,6 +1304,8 @@ impl GitLogPanel {
                         .border_color(theme::border())
                         .bg(theme::background())
                         .child(div().flex_1().h(px(20.)).child(self.path_input.clone()))
+                        .pin("paths-input")
+                        .label("Paths")
                         .into_any_element(),
                 );
             }
@@ -1307,7 +1332,8 @@ impl GitLogPanel {
                         this.popup = None;
                         cx.notify();
                     }))
-                    .children(items),
+                    .children(items)
+                    .pin("filter-popup"),
             ),
         ))
     }
@@ -1346,11 +1372,12 @@ impl GitLogPanel {
                         };
                         range
                             .map(|index| {
+                                let node = &details.nodes[index];
                                 // Full width, so the whole row is the target.
                                 div()
                                     .w_full()
                                     .child(render_change_node(
-                                        &details.nodes[index],
+                                        node,
                                         &changes,
                                         index,
                                         cx.listener(move |this, event: &ClickEvent, _, cx| {
@@ -1363,6 +1390,7 @@ impl GitLogPanel {
                     }),
                 )
                 .flex_1()
+                .pin("files")
                 .into_any_element()
             }
         };
@@ -1413,7 +1441,10 @@ impl GitLogPanel {
                     .child(
                         div()
                             .text_color(theme::text())
-                            .child(selectable("message", message)),
+                            .child(selectable("message", message))
+                            .pin("message")
+                            .label("Commit message")
+                            .interactive(false),
                     )
                     .child(
                         div()
@@ -1421,23 +1452,38 @@ impl GitLogPanel {
                             .font_family(theme::MONO_FONT)
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(selectable("hash", commit.id.clone())),
+                            .child(selectable("hash", commit.id.clone()))
+                            .pin("hash")
+                            .label("Commit hash")
+                            .interactive(false),
                     )
-                    .child(div().text_xs().text_color(theme::muted()).child(selectable(
-                        "author",
-                        format!(
-                            "{} <{}> on {}",
-                            commit.author,
-                            commit.email,
-                            absolute_time(commit.time)
-                        ),
-                    )))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(selectable(
+                                "author",
+                                format!(
+                                    "{} <{}> on {}",
+                                    commit.author,
+                                    commit.email,
+                                    absolute_time(commit.time)
+                                ),
+                            ))
+                            .pin("author")
+                            .label("Author")
+                            .interactive(false),
+                    )
                     .children(branches.map(|branches| {
                         div()
                             .text_xs()
                             .text_color(theme::muted())
                             .child(selectable("branches", branches))
+                            .pin("branches")
+                            .label("Branches")
+                            .interactive(false)
                     }))
+                    .pin("info")
                     .into_any_element()
             }
             commits => div()
@@ -1469,7 +1515,10 @@ impl GitLogPanel {
                                 .text_color(theme::text())
                                 .child(selectable(("subject", index), commit.subject.clone())),
                         )
+                        .pin(format!("commit:{}", commit.id))
+                        .label(commit.subject.clone())
                 }))
+                .pin("info")
                 .into_any_element(),
         };
         div()
@@ -1498,6 +1547,7 @@ impl GitLogPanel {
                     .border_color(theme::border())
                     .child(info),
             )
+            .pin("details")
             .into_any_element()
     }
 
@@ -1537,7 +1587,8 @@ impl GitLogPanel {
                             .cursor_pointer()
                             .hover(|style| style.bg(theme::hover_row()))
                             .child("Abort")
-                            .on_click(cx.listener(|this, _, _, cx| this.abort(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.abort(cx)))
+                            .pin("abort"),
                     )
                 })
                 .child(
@@ -1549,8 +1600,11 @@ impl GitLogPanel {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.report = None;
                             cx.notify();
-                        })),
-                ),
+                        }))
+                        .pin("close")
+                        .label("Close"),
+                )
+                .pin("report"),
         )
     }
 
@@ -1608,6 +1662,7 @@ impl GitLogPanel {
             )
             .track_scroll(self.scroll.clone())
             .flex_1()
+            .pin("commits")
             .into_any_element(),
         };
         div()
@@ -1747,7 +1802,10 @@ impl Render for GitLogPanel {
                             .pb_1()
                             .border_b_2()
                             .border_color(theme::accent())
-                            .child("Log"),
+                            .child("Log")
+                            .pin("tab:log")
+                            .label("Log")
+                            .interactive(false),
                     )
                     .child(div().flex_1())
                     .child(
@@ -1755,7 +1813,9 @@ impl Render for GitLogPanel {
                             .pb_1()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(self.status_text()),
+                            .child(self.status_text())
+                            .pin("status")
+                            .interactive(false),
                     ),
             )
             .child(body)

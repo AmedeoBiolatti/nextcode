@@ -8,7 +8,7 @@ use std::{
     path::Path,
     process::Child,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc as std_mpsc,
     },
@@ -364,8 +364,18 @@ impl AgentClient {
         request: Request,
         sink: impl FnMut(Event) + Send + 'static,
     ) -> io::Result<StreamHandle> {
+        self.start_stream_with_id(request, |_| sink)
+    }
+
+    /// [`Self::start_stream`] with a sink made for the stream's id (events
+    /// may arrive before this returns).
+    fn start_stream_with_id<S: FnMut(Event) + Send + 'static>(
+        self: &Arc<Self>,
+        request: Request,
+        sink: impl FnOnce(RequestId) -> S,
+    ) -> io::Result<StreamHandle> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.shared.streams.lock().insert(id, Box::new(sink));
+        self.shared.streams.lock().insert(id, Box::new(sink(id)));
         let handle = StreamHandle {
             id,
             client: self.clone(),
@@ -378,6 +388,32 @@ impl AgentClient {
                 Err(err)
             }
         }
+    }
+
+    /// Serves `next_code_agent pinpoint` calls made on the agent's machine
+    /// by CLI agents working in `roots` (the project's folders): `handler`
+    /// gets each request (JSON text) on the reader thread, so it must not
+    /// block; it answers through the [`PinpointReply`]. Dropping the handle
+    /// stops serving.
+    pub fn serve_pinpoint(
+        self: &Arc<Self>,
+        roots: Vec<String>,
+        handler: impl Fn(String, PinpointReply) + Send + 'static,
+    ) -> io::Result<StreamHandle> {
+        let client = Arc::downgrade(self);
+        self.start_stream_with_id(Request::Pinpoint { roots }, move |id| {
+            move |event| {
+                if let Event::Pinpoint { call, request } = event {
+                    let reply = PinpointReply {
+                        client: client.clone(),
+                        id,
+                        call,
+                        sent: false,
+                    };
+                    handler(request, reply);
+                }
+            }
+        })
     }
 
     pub fn read_dir(&self, path: &str) -> io::Result<Vec<DirEntry>> {
@@ -812,6 +848,44 @@ impl Drop for AgentClient {
                 child.kill().ok();
                 child.wait().ok();
             });
+        }
+    }
+}
+
+/// The answer to one pinpoint call (see [`AgentClient::serve_pinpoint`]);
+/// dropped unanswered, it answers with an error so the caller never hangs.
+pub struct PinpointReply {
+    /// Weak: the stream's sink, which makes replies, lives in the client.
+    client: Weak<AgentClient>,
+    id: RequestId,
+    call: u64,
+    sent: bool,
+}
+
+impl PinpointReply {
+    /// Sends `reply` (JSON text) to the caller.
+    pub fn send(mut self, reply: String) {
+        self.sent = true;
+        self.deliver(reply);
+    }
+
+    fn deliver(&self, reply: String) {
+        if let Some(client) = self.client.upgrade() {
+            client
+                .send(&ClientMessage::PinpointReply {
+                    id: self.id,
+                    call: self.call,
+                    reply,
+                })
+                .ok();
+        }
+    }
+}
+
+impl Drop for PinpointReply {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.deliver(r#"{"ok":false,"error":"the editor dropped the request"}"#.into());
         }
     }
 }

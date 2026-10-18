@@ -534,16 +534,30 @@ impl Editor {
                         .flex()
                         .items_center()
                         .gap_1()
-                        .child(input(&find.query, FIND_INPUT, "Find"))
-                        .child(toggle("find-case", "Aa", options.case_sensitive, |o| {
-                            o.case_sensitive = !o.case_sensitive
-                        }))
-                        .child(toggle("find-word", "ab", options.whole_word, |o| {
-                            o.whole_word = !o.whole_word
-                        }))
-                        .child(toggle("find-regex", ".*", options.regex, |o| {
-                            o.regex = !o.regex
-                        }))
+                        .child(
+                            input(&find.query, FIND_INPUT, "Find")
+                                .pin("find-input")
+                                .label("Find"),
+                        )
+                        .child(
+                            toggle("find-case", "Aa", options.case_sensitive, |o| {
+                                o.case_sensitive = !o.case_sensitive
+                            })
+                            .pin("match-case")
+                            .label("Match Case"),
+                        )
+                        .child(
+                            toggle("find-word", "ab", options.whole_word, |o| {
+                                o.whole_word = !o.whole_word
+                            })
+                            .pin("whole-word")
+                            .label("Match Whole Word"),
+                        )
+                        .child(
+                            toggle("find-regex", ".*", options.regex, |o| o.regex = !o.regex)
+                                .pin("regex")
+                                .label("Use Regular Expression"),
+                        )
                         .child(
                             div()
                                 .min_w(px(80.))
@@ -556,24 +570,37 @@ impl Editor {
                                 })
                                 .when(!empty_query, |count| {
                                     count.child(selectable("find-count", self.find_count()))
-                                }),
+                                })
+                                .pin("count"),
                         )
                         .child(
                             button("find-prev", "↑")
-                                .on_click(cx.listener(|this, _, _, cx| this.find_step(false, cx))),
+                                .on_click(cx.listener(|this, _, _, cx| this.find_step(false, cx)))
+                                .pin("previous")
+                                .label("Previous Match"),
                         )
                         .child(
                             button("find-next", "↓")
-                                .on_click(cx.listener(|this, _, _, cx| this.find_step(true, cx))),
+                                .on_click(cx.listener(|this, _, _, cx| this.find_step(true, cx)))
+                                .pin("next")
+                                .label("Next Match"),
                         )
-                        .child(button("find-all", "All").on_click(cx.listener(
-                            |this, _, window, cx| {
-                                this.select_all_matches(&SelectAllMatches, window, cx)
-                            },
-                        )))
-                        .child(button("find-close", "✕").on_click(cx.listener(
-                            |this, _, window, cx| this.close_find(&CloseFind, window, cx),
-                        ))),
+                        .child(
+                            button("find-all", "All")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.select_all_matches(&SelectAllMatches, window, cx)
+                                }))
+                                .pin("select-all")
+                                .label("Select All Matches"),
+                        )
+                        .child(
+                            button("find-close", "✕")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_find(&CloseFind, window, cx)
+                                }))
+                                .pin("close")
+                                .label("Close"),
+                        ),
                 )
                 .when(find.replace_open, |bar| {
                     bar.child(
@@ -581,15 +608,31 @@ impl Editor {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(input(&find.replacement, REPLACE_INPUT, "Replace"))
-                            .child(button("replace-next", "Replace").on_click(cx.listener(
-                                |this, _, window, cx| this.replace_next(&ReplaceNext, window, cx),
-                            )))
-                            .child(button("replace-all", "Replace All").on_click(cx.listener(
-                                |this, _, window, cx| this.replace_all(&ReplaceAll, window, cx),
-                            ))),
+                            .child(
+                                input(&find.replacement, REPLACE_INPUT, "Replace")
+                                    .pin("replace-input")
+                                    .label("Replace"),
+                            )
+                            .child(
+                                button("replace-next", "Replace")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.replace_next(&ReplaceNext, window, cx)
+                                    }))
+                                    .pin("replace")
+                                    .label("Replace"),
+                            )
+                            .child(
+                                button("replace-all", "Replace All")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.replace_all(&ReplaceAll, window, cx)
+                                    }))
+                                    .pin("replace-all")
+                                    .label("Replace All"),
+                            ),
                     )
-                }),
+                })
+                .pin("find-bar")
+                .label("Find"),
         )
     }
 }

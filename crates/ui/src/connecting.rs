@@ -11,6 +11,7 @@ use futures::{
 use gpui::{Context, EventEmitter, SharedString, Task, Window, div, prelude::*, px};
 
 use crate::{
+    pinpoint::Pin,
     project::{Location, Project},
     selectable::selectable,
     theme,
@@ -180,6 +181,10 @@ impl Render for Connecting {
                     .cursor_pointer()
                     .child("Retry")
                     .on_click(cx.listener(|this, _, window, cx| this.connect(None, window, cx)))
+                    .pin("retry")
+                    .label("Retry")
             }))
+            .pin("connecting")
+            .label(self.heading())
     }
 }

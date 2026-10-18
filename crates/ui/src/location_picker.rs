@@ -8,7 +8,12 @@ use gpui::{
 };
 use language::Location;
 
-use crate::{project::Project, selectable::selectable, theme};
+use crate::{
+    pinpoint::{self, Pin},
+    project::Project,
+    selectable::selectable,
+    theme,
+};
 
 actions!(location_picker, [SelectPrev, SelectNext, Confirm, Dismiss]);
 
@@ -41,6 +46,8 @@ struct Entry {
     dir: SharedString,
     /// The target line's text, trimmed.
     preview: SharedString,
+    /// Its pinpoint id: `item:<file key>:<line>:<column>` (1-based).
+    pin: SharedString,
 }
 
 pub struct LocationPicker {
@@ -79,11 +86,20 @@ impl LocationPicker {
             .zip(labels.into_iter().chain(std::iter::repeat(None)))
             .map(|(location, label)| {
                 let (_, dir) = project.display_parts(&location.path);
+                let start = location.range.start;
+                let pin = format!(
+                    "item:{}:{}:{}",
+                    pinpoint::file_key(project, &location.path),
+                    start.line + 1,
+                    start.character + 1
+                )
+                .into();
                 if let Some((name, preview)) = label {
                     return Entry {
                         name: name.into(),
                         dir: dir.into(),
                         preview: preview.into(),
+                        pin,
                         location,
                     };
                 }
@@ -101,6 +117,7 @@ impl LocationPicker {
                 Entry {
                     name: format!("{file_name}:{}", line + 1).into(),
                     dir: dir.into(),
+                    pin,
                     preview: preview.into(),
                     location,
                 }
@@ -187,7 +204,9 @@ impl Render for LocationPicker {
                     .child(selectable(
                         "title",
                         format!("{} ({})", self.title, self.entries.len()),
-                    )),
+                    ))
+                    .pin("title")
+                    .interactive(false),
             )
             .child(
                 uniform_list(
@@ -238,6 +257,8 @@ impl Render for LocationPicker {
                                             .text_color(theme::muted())
                                             .child(selectable("dir", entry.dir.clone())),
                                     )
+                                    .pin(entry.pin.clone())
+                                    .label(entry.name.clone())
                             })
                             .collect()
                     }),
@@ -245,6 +266,8 @@ impl Render for LocationPicker {
                 .track_scroll(self.scroll.clone())
                 .h(px(ROW_HEIGHT * rows as f32)),
             )
+            .pin("location-picker")
+            .label(self.title.clone())
     }
 }
 

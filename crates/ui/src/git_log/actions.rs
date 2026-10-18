@@ -10,7 +10,12 @@ use gpui::{
 };
 
 use super::{CopyRevision, GitLogEvent, GitLogPanel};
-use crate::{commit_panel::short_revision, selectable::selectable, theme};
+use crate::{
+    commit_panel::short_revision,
+    pinpoint::{Pin, kebab},
+    selectable::selectable,
+    theme,
+};
 
 const DIALOG_CONTEXT: &str = "GitResetDialog";
 
@@ -412,6 +417,7 @@ impl GitLogPanel {
                         })
                         .when(!enabled, |item| item.text_color(theme::muted()))
                         .child(action.label())
+                        .pin(format!("item:{}", kebab(action.label())))
                         .into_any_element(),
                 );
             }
@@ -436,7 +442,8 @@ impl GitLogPanel {
                         this.menu = None;
                         cx.notify();
                     }))
-                    .children(children),
+                    .children(children)
+                    .pin("menu"),
             ),
         ))
     }
@@ -610,6 +617,8 @@ impl Render for ResetDialog {
                                     .child(selectable("description", mode.description())),
                             ),
                     )
+                    .pin(format!("mode:{}", kebab(mode.label())))
+                    .label(mode.label())
             }))
             .child(
                 div()
@@ -618,13 +627,20 @@ impl Render for ResetDialog {
                     .justify_end()
                     .gap_2()
                     .child(
-                        button("reset-cancel", "Cancel", false).on_click(
-                            cx.listener(|_, _, _, cx| cx.emit(ResetDialogEvent::Dismissed)),
-                        ),
+                        button("reset-cancel", "Cancel", false)
+                            .on_click(
+                                cx.listener(|_, _, _, cx| cx.emit(ResetDialogEvent::Dismissed)),
+                            )
+                            .pin("cancel"),
                     )
-                    .child(button("reset-confirm", "Reset", true).on_click(cx.listener(
-                        |this, _, _, cx| cx.emit(ResetDialogEvent::Confirmed(this.mode)),
-                    ))),
+                    .child(
+                        button("reset-confirm", "Reset", true)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.emit(ResetDialogEvent::Confirmed(this.mode))
+                            }))
+                            .pin("reset"),
+                    ),
             )
+            .pin("reset-dialog")
     }
 }

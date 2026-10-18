@@ -13,7 +13,7 @@ use super::{
     ClearConsole, NextConsoleInput, PreviousConsoleInput, SubmitConsoleInput,
     session::{DebugSession, DebugSessionEvent, OutputCategory},
 };
-use crate::{editor::Editor, selectable::selectable, theme};
+use crate::{editor::Editor, pinpoint::Pin, selectable::selectable, theme};
 
 const ROW_HEIGHT: f32 = 18.;
 const HISTORY_LIMIT: usize = 100;
@@ -187,6 +187,7 @@ impl Render for DebugConsole {
                                 .text_sm()
                                 .text_color(color(line.category))
                                 .child(selectable(("line", index), line.text.clone()))
+                                .pin(format!("line:{}", index + 1))
                                 .into_any_element()
                         })
                         .collect()
@@ -204,6 +205,7 @@ impl Render for DebugConsole {
             }))
             .flex_1()
             .min_h_0()
+            .pin("output")
             .into_any_element()
         };
         div()
@@ -235,7 +237,9 @@ impl Render for DebugConsole {
                             .h(px(20.))
                             .font_family(theme::MONO_FONT)
                             .text_sm()
-                            .child(self.input.clone()),
+                            .child(self.input.clone())
+                            .pin("input")
+                            .label("Evaluate Expression"),
                     )
                     .child(
                         div()
@@ -248,7 +252,9 @@ impl Render for DebugConsole {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.clear(&ClearConsole, window, cx)
                             }))
-                            .child("Clear"),
+                            .child("Clear")
+                            .pin("clear")
+                            .label("Clear Console"),
                     ),
             )
     }

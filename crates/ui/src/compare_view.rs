@@ -14,6 +14,7 @@ use crate::{
     change_tree::{self, Node},
     commit_panel::{change_color, short_revision},
     diff_view::DiffSource,
+    pinpoint::Pin,
     selectable::selectable,
     theme,
 };
@@ -225,6 +226,7 @@ pub fn render_change_node(
         .on_click(on_click);
     match node {
         Node::Dir {
+            path,
             label,
             depth,
             collapsed,
@@ -234,6 +236,8 @@ pub fn render_change_node(
             .text_color(theme::muted())
             .child(if *collapsed { "▸" } else { "▾" })
             .child(text("label", label.clone()))
+            .pin(format!("dir:{path}"))
+            .label(path.clone())
             .into_any_element(),
         Node::File {
             item,
@@ -266,6 +270,8 @@ pub fn render_change_node(
                         .text_color(change_color(change.change))
                         .child(change.change.letter().to_string()),
                 )
+                .pin(format!("file:{}", change.path))
+                .label(change.path.clone())
                 .into_any_element()
         }
     }
@@ -292,17 +298,25 @@ impl Render for CompareView {
             .border_b_1()
             .border_color(theme::border())
             .text_sm()
-            .child(Self::button("base", base, cx, |this, cx| {
-                cx.emit(CompareEvent::ChangeBase(this.repository.clone()))
-            }))
+            .child(
+                Self::button("base", base, cx, |this, cx| {
+                    cx.emit(CompareEvent::ChangeBase(this.repository.clone()))
+                })
+                .pin("base"),
+            )
             .child(div().text_color(theme::muted()).child("↔"))
-            .child(Self::button("target", target, cx, |this, cx| {
-                cx.emit(CompareEvent::ChangeTarget(this.repository.clone()))
-            }))
+            .child(
+                Self::button("target", target, cx, |this, cx| {
+                    cx.emit(CompareEvent::ChangeTarget(this.repository.clone()))
+                })
+                .pin("target"),
+            )
             .when(can_swap, |header| {
-                header.child(Self::button("swap", "⇄ Swap", cx, |this, cx| {
-                    this.swap(cx)
-                }))
+                header.child(
+                    Self::button("swap", "⇄ Swap", cx, |this, cx| this.swap(cx))
+                        .pin("swap")
+                        .label("Swap"),
+                )
             })
             .child(div().flex_1())
             .child(
@@ -311,16 +325,20 @@ impl Render for CompareView {
                     .text_color(theme::muted())
                     .child(selectable("count", format!("{count} files"))),
             )
-            .child(Self::button(
-                "layout",
-                if self.as_tree { "List" } else { "Tree" },
-                cx,
-                |this, cx| {
-                    this.as_tree = !this.as_tree;
-                    this.rebuild();
-                    cx.notify();
-                },
-            ));
+            .child(
+                Self::button(
+                    "layout",
+                    if self.as_tree { "List" } else { "Tree" },
+                    cx,
+                    |this, cx| {
+                        this.as_tree = !this.as_tree;
+                        this.rebuild();
+                        cx.notify();
+                    },
+                )
+                .pin("layout")
+                .label(if self.as_tree { "List" } else { "Tree" }),
+            );
         let note = matches!(self.target, Side::Worktree).then(|| {
             div()
                 .px_3()
@@ -353,6 +371,7 @@ impl Render for CompareView {
                 }),
             )
             .flex_1()
+            .pin("files")
             .into_any_element(),
             (None, None) => div()
                 .p_3()
@@ -368,7 +387,7 @@ impl Render for CompareView {
             .flex_col()
             .bg(theme::background())
             .text_color(theme::text())
-            .child(header)
+            .child(header.pin("toolbar"))
             .children(note)
             .child(body)
     }

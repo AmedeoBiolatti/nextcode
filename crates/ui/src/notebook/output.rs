@@ -36,7 +36,9 @@ use super::{
     markdown::{MarkdownImages, markdown},
     widgets::{WidgetEvent, WidgetInputs, WidgetRender, widget_output},
 };
-use crate::{git_dialogs::button, selectable::selectable, terminal_panel::to_hsla, theme};
+use crate::{
+    git_dialogs::button, pinpoint::Pin, selectable::selectable, terminal_panel::to_hsla, theme,
+};
 
 #[derive(Clone, Copy)]
 pub struct OutputOptions<'a> {
@@ -671,6 +673,8 @@ fn open_button(html: String, on_action: OnAction) -> impl IntoElement {
     button("open-html", "Open in browser".into(), false)
         .text_sm()
         .on_click(move |_, window, cx| on_action(OutputAction::OpenHtml(html.clone()), window, cx))
+        .pin("open-in-browser")
+        .label("Open in browser")
 }
 
 /// `text` as a plain text output.
@@ -713,11 +717,13 @@ fn text_block(text: &CachedText, options: &OutputOptions, on_action: &OnAction) 
                 n => format!("Show more ({n} more lines)"),
             };
             block.child(
-                button("show-more", label.into(), false)
+                button("show-more", label.clone().into(), false)
                     .mt_1()
                     .font_family(theme::UI_FONT)
                     .text_sm()
-                    .on_click(move |_, window, cx| on_action(OutputAction::ShowMore, window, cx)),
+                    .on_click(move |_, window, cx| on_action(OutputAction::ShowMore, window, cx))
+                    .pin("show-more")
+                    .label(label),
             )
         })
 }

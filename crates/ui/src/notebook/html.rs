@@ -28,7 +28,7 @@ use notebook::html::{
 use parking_lot::Mutex;
 
 use super::output::{DecodedImage, Lru, content_hash, decode_image, image_element};
-use crate::{selectable::selectable, theme};
+use crate::{pinpoint::Pin, selectable::selectable, theme};
 
 /// Table text size and line height.
 const TABLE_FONT_SIZE: f32 = 13.;
@@ -105,10 +105,23 @@ pub fn render_html(id: impl Into<ElementId>, blocks: &[Block]) -> AnyElement {
 }
 
 fn render_blocks(blocks: &[Block], background: Option<Hsla>) -> Vec<AnyElement> {
+    // Tables are what agents point at: the first is `table`, others by block.
+    let first_table = blocks
+        .iter()
+        .position(|block| matches!(block, Block::Table(_)));
     blocks
         .iter()
         .enumerate()
-        .map(|(index, block)| render_block(index, block, background))
+        .map(|(index, block)| {
+            let table_id: Option<SharedString> = matches!(block, Block::Table(_)).then(|| {
+                if Some(index) == first_table {
+                    "table".into()
+                } else {
+                    format!("table:{}", index + 1).into()
+                }
+            });
+            render_block(index, block, background, table_id)
+        })
         .collect()
 }
 
@@ -275,7 +288,12 @@ fn aligned(element: AnyElement, align: Option<Align>) -> gpui::Div {
     .child(element)
 }
 
-fn render_block(index: usize, block: &Block, background: Option<Hsla>) -> AnyElement {
+fn render_block(
+    index: usize,
+    block: &Block,
+    background: Option<Hsla>,
+    table_id: Option<SharedString>,
+) -> AnyElement {
     let frame = div().id(index).w_full().min_w_0();
     match block {
         Block::Text {
@@ -351,7 +369,7 @@ fn render_block(index: usize, block: &Block, background: Option<Hsla>) -> AnyEle
             .children(render_blocks(blocks, background)),
         Block::Rule => frame.h(px(1.)).bg(theme::border()),
         Block::Image(image) => frame.child(render_image(image)),
-        Block::Table(table) => frame.child(render_table(table, background)),
+        Block::Table(table) => frame.child(render_table(table, background, table_id)),
         Block::Box {
             blocks,
             background: color,
@@ -446,7 +464,8 @@ fn render_image(image: &html::Image) -> AnyElement {
     }
 }
 
-fn render_table(table: &Table, background: Option<Hsla>) -> AnyElement {
+/// `id`: the pin of its grid (the drawn table, not the full-width block).
+fn render_table(table: &Table, background: Option<Hsla>, id: Option<SharedString>) -> AnyElement {
     let widths = &table.widths;
     let width_of = |column: usize, span: usize| -> f32 {
         widths
@@ -504,6 +523,9 @@ fn render_table(table: &Table, background: Option<Hsla>) -> AnyElement {
                     })
                     .when(row.ellipsis, |cell| cell.text_color(theme::muted()));
                     cell.child(inline_text(("text", cell_index), &data.inline, behind))
+                        .pin(format!("cell:{}:{}", index + 1, slot.column + 1))
+                        .interactive(false)
+                        .into_any_element()
                 }
                 SlotKind::Covered {
                     row: source,
@@ -514,12 +536,16 @@ fn render_table(table: &Table, background: Option<Hsla>) -> AnyElement {
                     cell.mt(px(-1.))
                         .pt(px(3.))
                         .when_some(data.background.map(to_hsla), |cell, color| cell.bg(color))
+                        .into_any_element()
                 }
-                SlotKind::Empty => cell,
+                SlotKind::Empty => cell.into_any_element(),
             };
             element = element.child(cell);
         }
-        element.into_any_element()
+        element
+            .pin(format!("row:{}", index + 1))
+            .interactive(false)
+            .into_any_element()
     };
     let head = (head_rows > 0).then(|| {
         div()
@@ -549,7 +575,8 @@ fn render_table(table: &Table, background: Option<Hsla>) -> AnyElement {
         .bg(background.unwrap_or_else(theme::background))
         .text_size(px(TABLE_FONT_SIZE))
         .line_height(px(TABLE_LINE_HEIGHT))
-        .child(StickyHead { head, body });
+        .child(StickyHead { head, body })
+        .pin(id.unwrap_or_else(|| "table".into()));
     let mut scroller = div()
         .id("table-scroll")
         .w_full()

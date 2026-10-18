@@ -28,6 +28,7 @@ use search::{FileMatches, PathFilter, Replacer, SearchEvent, SearchLimits, Searc
 use crate::{
     debugger::panel::Tooltip,
     editor::{self, Editor, EditorEvent},
+    pinpoint::{self, Pin},
     project::{Project, SearchHandle},
     selectable::selectable,
     theme,
@@ -744,6 +745,11 @@ impl SearchPanel {
         on: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let (id, name) = match toggle {
+            Toggle::CaseSensitive => ("match-case", "Match Case"),
+            Toggle::WholeWord => ("whole-word", "Whole Word"),
+            Toggle::Regex => ("regex", "Regular Expression"),
+        };
         div()
             .id(label)
             .px_1()
@@ -761,6 +767,8 @@ impl SearchPanel {
             })
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| this.toggle(toggle, cx)))
+            .pin(id)
+            .label(name)
     }
 
     /// The hover actions of a result row: Replace (replace mode) and ×.
@@ -808,19 +816,23 @@ impl SearchPanel {
             .invisible()
             .group_hover("search-row", |style| style.visible())
             .children(replace.map(|(label, tooltip)| {
-                button("search-replace", label, tooltip).on_click(cx.listener(
-                    move |this, _, window, cx| {
+                button("search-replace", label, tooltip)
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.replace(scope, window, cx);
-                    },
-                ))
+                    }))
+                    .pin("replace")
+                    .label(tooltip)
             }))
-            .child(button("search-exclude", "×", exclude).on_click(cx.listener(
-                move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.exclude(scope, cx);
-                },
-            )))
+            .child(
+                button("search-exclude", "×", exclude)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.exclude(scope, cx);
+                    }))
+                    .pin("exclude")
+                    .label(exclude),
+            )
     }
 
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -841,6 +853,8 @@ impl SearchPanel {
                 let result = &self.results[file];
                 let (name, dir) = self.project.display_parts(&result.path);
                 let count: usize = result.lines.iter().map(|line| line.matches.len()).sum();
+                let key = pinpoint::file_key(&self.project, &result.path);
+                let label = self.project.display_path(&result.path);
                 base.px_2()
                     .text_sm()
                     .child(
@@ -865,6 +879,8 @@ impl SearchPanel {
                             .child(selectable("count", count.to_string())),
                     )
                     .child(self.render_actions(index, row, cx))
+                    .pin(format!("file:{key}"))
+                    .label(label)
             }
             Row::Line { file, line } | Row::Match { file, line, .. } => {
                 let result = &self.results[file];
@@ -900,6 +916,12 @@ impl SearchPanel {
                     .map(|(range, mark)| (range, highlight(mark)))
                     .collect();
                 let (path, line_number) = (result.path.clone(), found.line);
+                let key = pinpoint::file_key(&self.project, &result.path);
+                let id = match row {
+                    Row::Match { .. } => format!("match:{key}:{}:{}", line_number + 1, column + 1),
+                    _ => format!("match:{key}:{}", line_number + 1),
+                };
+                let label = text.clone();
                 base.pl(px(20.))
                     .pr_2()
                     .cursor_pointer()
@@ -928,6 +950,9 @@ impl SearchPanel {
                             .child(selectable("text", text).with_highlights(highlights)),
                     )
                     .child(self.render_actions(index, row, cx))
+                    .pin(id)
+                    .label(label)
+                    .interactive(true)
             }
         }
     }
@@ -1017,11 +1042,17 @@ impl Render for SearchPanel {
                                         Tooltip::view("Toggle Replace (Ctrl+Shift+R)", window, cx)
                                     })
                                     .child(chevron)
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.toggle_replace(cx)),
-                                    ),
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_replace(cx)))
+                                    .pin("toggle-replace")
+                                    .label("Toggle Replace"),
                             )
-                            .child(div().flex_1().child(input(&self.query, "Search", cx)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(input(&self.query, "Search", cx))
+                                    .pin("query")
+                                    .label("Search"),
+                            )
                             .child(self.render_toggle(
                                 Toggle::CaseSensitive,
                                 "Aa",
@@ -1038,15 +1069,21 @@ impl Render for SearchPanel {
                                 .items_center()
                                 .gap_1()
                                 .pl(px(18.))
-                                .child(div().flex_1().child(input(
-                                    &self.replacement,
-                                    if self.regex {
-                                        "Replace ($1, ${name})"
-                                    } else {
-                                        "Replace"
-                                    },
-                                    cx,
-                                )))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .child(input(
+                                            &self.replacement,
+                                            if self.regex {
+                                                "Replace ($1, ${name})"
+                                            } else {
+                                                "Replace"
+                                            },
+                                            cx,
+                                        ))
+                                        .pin("replacement")
+                                        .label("Replace"),
+                                )
                                 .child(
                                     div()
                                         .id("search-replace-all")
@@ -1076,27 +1113,34 @@ impl Render for SearchPanel {
                                                 cx,
                                             )
                                         })
-                                        .child("Replace All"),
+                                        .child("Replace All")
+                                        .pin("replace-all"),
                                 ),
                         )
                     })
-                    .child(input(
-                        &self.include,
-                        "Files to include (e.g. *.py, src/**)",
-                        cx,
-                    ))
-                    .child(input(&self.exclude, "Files to exclude", cx))
+                    .child(
+                        input(&self.include, "Files to include (e.g. *.py, src/**)", cx)
+                            .pin("include")
+                            .label("Files to include"),
+                    )
+                    .child(
+                        input(&self.exclude, "Files to exclude", cx)
+                            .pin("exclude")
+                            .label("Files to exclude"),
+                    )
                     .children(self.status_text().map(|(status, color)| {
                         div()
                             .text_xs()
                             .text_color(color())
                             .child(selectable("status", status))
+                            .pin("status")
                     }))
                     .children(self.notice.clone().map(|(notice, color)| {
                         div()
                             .text_xs()
                             .text_color(color())
                             .child(selectable("replace-notice", notice))
+                            .pin("notice")
                     })),
             )
             .child(
@@ -1107,7 +1151,9 @@ impl Render for SearchPanel {
                         range.map(|index| this.render_row(index, cx)).collect()
                     }),
                 )
-                .flex_1(),
+                .flex_1()
+                .pin("results")
+                .interactive(false),
             )
     }
 }

@@ -5,7 +5,7 @@ use git::{Ref, RefKind};
 use gpui::{ClickEvent, Context, div, prelude::*, px};
 
 use super::GitLogPanel;
-use crate::{selectable::selectable, theme};
+use crate::{pinpoint::Pin, selectable::selectable, theme};
 
 pub(super) const LOCAL: &str = "local";
 pub(super) const REMOTE: &str = "remote";
@@ -192,6 +192,21 @@ impl GitLogPanel {
                 .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                     this.click_branch(index, event, cx)
                 }));
+            let (key, text) = match row {
+                BranchRow::Head { label } => ("head".to_owned(), label),
+                BranchRow::Group { key, label, .. } => (format!("group:{key}"), label),
+                BranchRow::Ref {
+                    name, label, kind, ..
+                } => {
+                    let kind = if *kind == RefKind::Tag {
+                        "tag"
+                    } else {
+                        "branch"
+                    };
+                    (format!("{kind}:{name}"), label)
+                }
+            };
+            let text = text.clone();
             match row {
                 BranchRow::Head { label } => base
                     .pl(px(8.))
@@ -237,6 +252,8 @@ impl GitLogPanel {
                         )
                 }
             }
+            .pin(key)
+            .label(text)
         });
         div()
             .size_full()
@@ -262,7 +279,8 @@ impl GitLogPanel {
                     .min_h_0()
                     .overflow_y_scroll()
                     .py_1()
-                    .children(rows),
+                    .children(rows)
+                    .pin("branches"),
             )
     }
 }

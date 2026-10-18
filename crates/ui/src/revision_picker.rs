@@ -9,6 +9,7 @@ use gpui::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    pinpoint::Pin,
     project_picker,
     selectable::selectable,
     theme,
@@ -220,7 +221,9 @@ impl Render for RevisionPicker {
                     .py_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(self.query.clone()),
+                    .child(self.query.clone())
+                    .pin("input")
+                    .label("Revision"),
             )
             .children(
                 self.rows
@@ -229,6 +232,8 @@ impl Render for RevisionPicker {
                     .enumerate()
                     .map(|(index, choice)| {
                         let (name, detail) = Self::label(choice);
+                        let pin = format!("item:{name}");
+                        let label = name.clone();
                         div()
                             .id(index)
                             .h(px(ROW_HEIGHT))
@@ -254,6 +259,8 @@ impl Render for RevisionPicker {
                                     .text_color(theme::muted())
                                     .child(selectable("detail", detail)),
                             )
+                            .pin(pin)
+                            .label(label)
                     }),
             )
             .children(self.error.clone().map(|error| {
@@ -263,7 +270,11 @@ impl Render for RevisionPicker {
                     .text_xs()
                     .text_color(theme::error())
                     .child(selectable("error", error))
+                    .pin("error")
+                    .interactive(false)
             }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .pin("revision-picker")
+            .label(self.title)
     }
 }

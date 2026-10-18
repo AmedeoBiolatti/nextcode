@@ -15,7 +15,7 @@ use super::{
     session::{Children, DebugSession, SessionState, WatchValue},
     store::DebugStore,
 };
-use crate::{editor::Editor, selectable::selectable, theme};
+use crate::{editor::Editor, pinpoint::Pin, selectable::selectable, theme};
 
 const ROW_HEIGHT: f32 = 22.;
 const INDENT: f32 = 14.;
@@ -249,21 +249,21 @@ impl DebugPanel {
                 )
             })
             .child(tool_button(
-                "debug-over",
+                "debug-step-over",
                 "↷",
                 "Step Over (F10)",
                 paused,
                 StepOver.boxed_clone(),
             ))
             .child(tool_button(
-                "debug-into",
+                "debug-step-into",
                 "↓",
                 "Step Into (F11)",
                 paused,
                 StepInto.boxed_clone(),
             ))
             .child(tool_button(
-                "debug-out",
+                "debug-step-out",
                 "↑",
                 "Step Out (Shift+F11)",
                 paused,
@@ -329,6 +329,12 @@ impl DebugPanel {
                     .child(selectable("title", section.title().to_uppercase())),
             )
             .children(extra)
+            .pin(format!(
+                "section:{}",
+                crate::pinpoint::kebab(section.title())
+            ))
+            .label(section.title())
+            .interactive(true)
     }
 
     fn render_call_stack(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -370,6 +376,8 @@ impl DebugPanel {
                         })
                         .child(if is_current { "▾" } else { "▸" })
                         .child(selectable("name", thread.name.clone()))
+                        .pin(format!("thread:{id}"))
+                        .label(thread.name.clone())
                         .into_any_element(),
                 );
             }
@@ -415,6 +423,8 @@ impl DebugPanel {
                                 .text_color(theme::muted())
                                 .child(selectable("location", location)),
                         )
+                        .pin(format!("frame:{}", index + 1))
+                        .label(frame.name.clone())
                         .into_any_element(),
                 );
             }
@@ -532,6 +542,12 @@ impl DebugPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = SharedString::from(format!("{prefix}-{index}"));
+        let pin_id = match row.kind {
+            RowKind::Variable => format!("variable:{}", row.path),
+            RowKind::More(reference) => format!("more:{reference}"),
+            RowKind::Loading => format!("loading:{}", row.parent),
+            RowKind::Message(_) => format!("message:{}", row.parent),
+        };
         let element = div()
             .id(id)
             .h(px(ROW_HEIGHT))
@@ -544,7 +560,7 @@ impl DebugPanel {
             .overflow_hidden()
             .whitespace_nowrap()
             .text_sm();
-        match row.kind {
+        let rendered = match row.kind {
             RowKind::Loading => element
                 .child(
                     div()
@@ -668,7 +684,8 @@ impl DebugPanel {
                     }))
                     .into_any_element()
             }
-        }
+        };
+        rendered.pin(pin_id).into_any_element()
     }
 
     fn render_variables(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -742,8 +759,9 @@ impl DebugPanel {
                         .child(
                             div()
                                 .text_color(theme::text())
-                                .child(selectable("name", row.name)),
+                                .child(selectable("name", row.name.clone())),
                         )
+                        .pin(format!("scope:{}", row.name))
                         .into_any_element()
                 } else {
                     self.render_variable_row(&session_entity, index, row, "var", cx)
@@ -842,8 +860,12 @@ impl DebugPanel {
                                 cx.stop_propagation();
                                 store.update(cx, |store, cx| store.remove_watch(index, cx));
                             })
-                            .child("×"),
+                            .child("×")
+                            .pin("remove")
+                            .label("Remove Watch"),
                     )
+                    .pin(format!("watch:{expression}"))
+                    .interactive(true)
                     .into_any_element(),
             );
             if expanded && let Some(session_entity) = &session {
@@ -875,6 +897,8 @@ impl DebugPanel {
                 .font_family(theme::MONO_FONT)
                 .text_sm()
                 .child(self.watch_input.clone())
+                .pin("watch-input")
+                .label("Add Watch Expression")
                 .into_any_element(),
         );
         elements.push(message("watch-hint", "Enter adds an expression").into_any_element());
@@ -914,6 +938,8 @@ impl DebugPanel {
                             .text_color(theme::text())
                             .child(selectable("label", filter.label.clone())),
                     )
+                    .pin(format!("exception-filter:{}", filter.filter))
+                    .label(filter.label.clone())
                     .into_any_element(),
             );
         }
@@ -957,6 +983,12 @@ impl DebugPanel {
                 let (toggle_path, remove_path, open_path) =
                     (path.clone(), path.clone(), path.clone());
                 let key = format!("{}:{line}", path.display());
+                let pin_id = format!(
+                    "breakpoint:{}:{}",
+                    path.to_string_lossy().replace('\\', "/"),
+                    line + 1
+                );
+                let pin_label = format!("{name}:{}", line + 1);
                 elements.push(
                     row(SharedString::from(format!("bp-{key}")), 0)
                         .on_click(cx.listener(move |_, _, _, cx| {
@@ -974,7 +1006,9 @@ impl DebugPanel {
                                         store.set_enabled(&toggle_path, line, !enabled, cx)
                                     });
                                 })
-                                .child(checkbox(enabled)),
+                                .child(checkbox(enabled))
+                                .pin("enabled")
+                                .label("Enable/Disable"),
                         )
                         .child(dot(enabled, verified.as_ref().is_some_and(|(ok, _)| !ok)))
                         .child(
@@ -1005,8 +1039,13 @@ impl DebugPanel {
                                         store.remove(&remove_path, line, cx)
                                     });
                                 })
-                                .child("×"),
+                                .child("×")
+                                .pin("remove")
+                                .label("Remove Breakpoint"),
                         )
+                        .pin(pin_id)
+                        .label(pin_label)
+                        .interactive(true)
                         .into_any_element(),
                 );
             }
@@ -1124,6 +1163,9 @@ fn tool_button(
         })
         .tooltip(move |window, cx| crate::debugger::panel::Tooltip::view(title, window, cx))
         .child(glyph)
+        // The id without its `debug-` prefix: `continue`, `step-over`, …
+        .pin(id.trim_start_matches("debug-"))
+        .label(title)
 }
 
 /// A one-line tooltip.
@@ -1188,6 +1230,8 @@ impl Render for DebugPanel {
                         this.store.update(cx, |store, cx| store.remove_all(cx));
                     }))
                     .child("Remove all")
+                    .pin("remove-all")
+                    .label("Remove all breakpoints")
                     .into_any_element()
             });
             body = body.child(self.section_header(section, extra, cx));
@@ -1209,7 +1253,7 @@ impl Render for DebugPanel {
             .size_full()
             .flex()
             .flex_col()
-            .child(self.render_toolbar(cx))
+            .child(self.render_toolbar(cx).pin("toolbar"))
             .child(body)
     }
 }

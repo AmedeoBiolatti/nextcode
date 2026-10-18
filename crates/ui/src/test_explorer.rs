@@ -20,6 +20,7 @@ use run::{NodeKind, Status, TestResult, TestTree, Tool};
 
 use crate::{
     editor::{Editor, EditorEvent},
+    pinpoint::Pin,
     project::Project,
     selectable::selectable,
     settings, theme,
@@ -408,6 +409,12 @@ impl TestsPanel {
     fn render_row(&self, row: Row, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let index = row.index;
         let (icon, color) = status_icon(row.status);
+        let key = self
+            .tree
+            .as_ref()
+            .and_then(|tree| tree.nodes.get(index))
+            .map_or_else(|| index.to_string(), |node| node.id.clone());
+        let label = row.label.clone();
         let button = |id: &'static str, label: &'static str, color: Hsla| {
             div()
                 .id((id, index))
@@ -442,21 +449,26 @@ impl TestsPanel {
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                 this.click(index, event.click_count(), cx)
             }))
-            .child(
-                div()
+            .child({
+                let chevron = div()
                     .id(("test-chevron", index))
                     .w(px(12.))
                     .flex_none()
                     .text_xs()
                     .text_color(theme::muted())
-                    .children(row.chevron)
-                    .when(row.chevron.is_some(), |chevron| {
-                        chevron.on_click(cx.listener(move |this, _, _, cx| {
+                    .children(row.chevron);
+                match row.chevron {
+                    Some(_) => chevron
+                        .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.toggle(index, cx);
                         }))
-                    }),
-            )
+                        .pin("toggle")
+                        .label("Expand/Collapse")
+                        .into_any_element(),
+                    None => chevron.into_any_element(),
+                }
+            })
             .child(div().w(px(14.)).flex_none().text_color(color).child(icon))
             .child(
                 div()
@@ -473,25 +485,30 @@ impl TestsPanel {
                     .child(selectable("counts", counts).double_click_through())
             }))
             .child(
-                button("test-run", "▶", theme::run_marker()).on_click(cx.listener(
-                    move |this, _, _, cx| {
+                button("test-run", "▶", theme::run_marker())
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         if let Some(tree) = &this.tree {
                             let id = tree.nodes[index].id.clone();
                             this.selected = Some(id.clone());
                             this.run(RunTarget::Ids(vec![id]), cx);
                         }
-                    },
-                )),
+                    }))
+                    .pin("run")
+                    .label("Run"),
             )
             .child(
-                button("test-debug", "Debug", theme::accent_text()).on_click(cx.listener(
-                    move |this, _, _, cx| {
+                button("test-debug", "Debug", theme::accent_text())
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.debug(index, cx);
-                    },
-                )),
+                    }))
+                    .pin("debug")
+                    .label("Debug"),
             )
+            .pin(format!("row:{key}"))
+            .label(label)
+            .interactive(true)
     }
 
     /// The selected node's result, else the last run's output.
@@ -598,27 +615,35 @@ impl Render for TestsPanel {
                     .gap_1()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(Self::toolbar_button(
-                        "tests-run-all",
-                        "▶ Run All",
-                        !busy,
-                        cx,
-                        |this, cx| this.run(RunTarget::All, cx),
-                    ))
-                    .child(Self::toolbar_button(
-                        "tests-run-failed",
-                        "Run Failed",
-                        !busy,
-                        cx,
-                        |this, cx| this.run(RunTarget::Failed, cx),
-                    ))
-                    .child(Self::toolbar_button(
-                        "tests-discover",
-                        "⟳",
-                        !busy,
-                        cx,
-                        |this, cx| this.discover(cx),
-                    ))
+                    .child(
+                        Self::toolbar_button(
+                            "tests-run-all",
+                            "▶ Run All",
+                            !busy,
+                            cx,
+                            |this, cx| this.run(RunTarget::All, cx),
+                        )
+                        .pin("run-all")
+                        .label("Run All"),
+                    )
+                    .child(
+                        Self::toolbar_button(
+                            "tests-run-failed",
+                            "Run Failed",
+                            !busy,
+                            cx,
+                            |this, cx| this.run(RunTarget::Failed, cx),
+                        )
+                        .pin("run-failed")
+                        .label("Run Failed"),
+                    )
+                    .child(
+                        Self::toolbar_button("tests-discover", "⟳", !busy, cx, |this, cx| {
+                            this.discover(cx)
+                        })
+                        .pin("discover")
+                        .label("Discover Tests"),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -631,7 +656,8 @@ impl Render for TestsPanel {
                                     .clone()
                                     .map(|status| selectable("status", status)),
                             ),
-                    ),
+                    )
+                    .pin("toolbar"),
             )
             .child(
                 div()
@@ -644,7 +670,9 @@ impl Render for TestsPanel {
                     .border_1()
                     .border_color(theme::border())
                     .rounded_sm()
-                    .child(self.filter.clone()),
+                    .child(self.filter.clone())
+                    .pin("filter")
+                    .label("Filter Tests"),
             )
             .children(self.errors.iter().enumerate().map(|(index, error)| {
                 div()
@@ -669,7 +697,8 @@ impl Render for TestsPanel {
                 )
                 .track_scroll(self.scroll.clone())
                 .flex_1()
-                .min_h_0(),
+                .min_h_0()
+                .pin("tree"),
             )
             .children(details.map(|(title, message, output)| {
                 div()
@@ -708,6 +737,7 @@ impl Render for TestsPanel {
                                     .join("\n"),
                             )),
                     )
+                    .pin("details")
             }))
     }
 }

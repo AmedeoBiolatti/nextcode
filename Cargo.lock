@@ -3737,6 +3737,7 @@ dependencies = [
  "notebook",
  "nucleo-matcher",
  "parking_lot",
+ "pinpoint_cli",
  "pulldown-cmark",
  "python",
  "regex",
@@ -3768,8 +3769,10 @@ dependencies = [
  "futures",
  "libc",
  "parking_lot",
+ "pinpoint_cli",
  "proto",
  "search",
+ "serde_json",
  "watcher",
  "worktree",
 ]
@@ -4343,6 +4346,13 @@ name = "pin-utils"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13bee6c73da26345c729282832b60b0363cf3dd9f4bfd81d8551b7a1c889a113"
+
+[[package]]
+name = "pinpoint_cli"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "piper"
@@ -5013,6 +5023,7 @@ dependencies = [
  "next_code_agent",
  "parking_lot",
  "proto",
+ "serde_json",
  "terminal",
  "windows-sys 0.61.2",
 ]

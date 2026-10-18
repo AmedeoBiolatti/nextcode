@@ -651,6 +651,8 @@ impl Editor {
                     row.child(div().text_color(theme::text()).child(pending))
                 })
                 .children(recording.map(|text| div().text_color(theme::warning()).child(text)))
+                .pin("vim-mode")
+                .label(format!("Vim {label}"))
                 .into_any_element(),
         )
     }

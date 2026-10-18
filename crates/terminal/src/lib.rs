@@ -25,6 +25,7 @@ use alacritty_terminal::{
     event::{Event, EventListener, WindowSize},
     event_loop::{EventLoop, EventLoopSender, Msg},
     grid::{Dimensions, Scroll},
+    index::{Column, Line},
     sync::FairMutex,
     term::{Config, Term, TermMode, cell::Flags, color::Colors},
     tty::{self, EventedPty, EventedReadWrite, Shell},
@@ -707,6 +708,31 @@ impl Terminal {
 
     pub fn scroll_to_bottom(&self) {
         self.term.lock().scroll_display(Scroll::Bottom);
+    }
+
+    /// Scrolls the view so the lowest line holding `text` (on screen or in
+    /// the history) sits mid-screen; false when no line holds it.
+    pub fn scroll_to_text(&self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let mut term = self.term.lock();
+        let (rows, columns) = (term.screen_lines() as i32, term.columns());
+        let history = term.grid().history_size() as i32;
+        // Grid lines run from -history (oldest) to rows - 1; with display
+        // offset d, line l shows on screen row l + d.
+        let found = (-history..rows).rev().find(|&line| {
+            let row = &term.grid()[Line(line)];
+            let text_of_row: String = (0..columns).map(|column| row[Column(column)].c).collect();
+            text_of_row.contains(text)
+        });
+        let Some(line) = found else {
+            return false;
+        };
+        let offset = (rows / 2 - line).clamp(0, history);
+        term.scroll_display(Scroll::Bottom);
+        term.scroll_display(Scroll::Delta(offset));
+        true
     }
 
     pub fn snapshot(&self) -> Snapshot {

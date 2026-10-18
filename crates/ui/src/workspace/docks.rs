@@ -10,7 +10,17 @@ use super::*;
 use crate::{
     layout::{DockPosition, MIN_DOCK_SIZE, PanelId},
     lsp_store::RunningServer,
+    pinpoint::Pin,
 };
+
+/// The dock's pinpoint id.
+fn dock_pin(position: DockPosition) -> &'static str {
+    match position {
+        DockPosition::Left => "left-dock",
+        DockPosition::Right => "right-dock",
+        DockPosition::Bottom => "bottom-dock",
+    }
+}
 
 actions!(
     workspace,
@@ -439,8 +449,12 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.layout.dock_mut(position).open = false;
                         this.layout_changed(cx);
-                    })),
-            );
+                    }))
+                    .pin("collapse")
+                    .label("Hide dock"),
+            )
+            .pin("dock-tabs");
+        let active = dock.active;
         let body = div().flex_1().min_h_0().min_w_0().children(
             match dock.active.and_then(|panel| self.panel_view(panel)) {
                 Some(view) => Some(view.into_any_element()),
@@ -457,6 +471,14 @@ impl Workspace {
                 ),
             },
         );
+        // The panel's owner pins its content inside this wrapper.
+        let body = match active {
+            Some(panel) => body
+                .pin(format!("panel:{}", panel.key()))
+                .label(panel.title())
+                .interactive(false),
+            None => body.pin("panel").interactive(false),
+        };
         let size = px(dock.size);
         let content = div()
             .flex()
@@ -486,7 +508,7 @@ impl Workspace {
                 .child(handle)
                 .child(content),
         };
-        Some(dock.flex_none().into_any_element())
+        Some(dock.flex_none().pin(dock_pin(position)).into_any_element())
     }
 
     fn render_panel_tab(
@@ -538,6 +560,8 @@ impl Workspace {
             .on_drop(cx.listener(move |this, dragged: &DraggedPanel, _, cx| {
                 this.move_panel(dragged.0, position, Some(index), cx);
             }))
+            .pin(format!("tab:{}", panel.key()))
+            .label(panel.title())
     }
 
     /// A collapsed dock: one button per panel; also a drop target.
@@ -571,6 +595,8 @@ impl Workspace {
                         cx.notify();
                     }),
                 )
+                .pin(format!("tab:{}", panel.key()))
+                .label(panel.title())
         });
         let strip = div()
             .flex_none()
@@ -599,6 +625,8 @@ impl Workspace {
                 .border_l_1(),
             DockPosition::Bottom => strip.h(px(STRIP_SIZE)).w_full().px_2().border_t_1(),
         }
+        .pin("dock-tabs")
+        .pin(dock_pin(position))
         .into_any_element()
     }
 
@@ -635,6 +663,8 @@ impl Workspace {
                 .w_full()
                 .cursor(CursorStyle::ResizeUpDown),
         }
+        .pin("resize-handle")
+        .label("Resize dock")
     }
 
     /// The right-click menu of a panel tab or strip button.
@@ -666,6 +696,8 @@ impl Workspace {
                 .on_click(
                     cx.listener(move |this, _, _, cx| this.move_panel(panel, position, None, cx)),
                 )
+                .pin(format!("item:move-to-{}", position.label().to_lowercase()))
+                .label(format!("Move to {}", position.label()))
             });
         Some(deferred(
             anchored().position(menu.position).child(
@@ -690,17 +722,23 @@ impl Workspace {
                     .children(moves)
                     .child(div().my_1().h(px(1.)).bg(theme::border()))
                     .child(
-                        item("save-default".into(), "Save layout as default".into()).on_click(
-                            cx.listener(|this, _, window, cx| {
+                        item("save-default".into(), "Save layout as default".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.save_layout_as_default(&SaveLayoutAsDefault, window, cx)
-                            }),
-                        ),
+                            }))
+                            .pin("item:save-layout-as-default")
+                            .label("Save layout as default"),
                     )
-                    .child(item("reset-layout".into(), "Reset layout".into()).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.reset_layout(&ResetLayout, window, cx)
-                        }),
-                    )),
+                    .child(
+                        item("reset-layout".into(), "Reset layout".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_layout(&ResetLayout, window, cx)
+                            }))
+                            .pin("item:reset-layout")
+                            .label("Reset layout"),
+                    )
+                    .pin("panel-menu")
+                    .label(format!("{} tab menu", panel.title())),
             ),
         ))
     }

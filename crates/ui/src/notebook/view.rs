@@ -31,6 +31,7 @@ use super::{
 };
 use crate::{
     editor::{CompletionProvider, Editor, EditorEvent},
+    pinpoint::Pin,
     selectable::selectable,
     theme,
 };
@@ -497,6 +498,20 @@ impl NotebookView {
                 offset_in_item: px(0.),
             });
         }
+    }
+
+    /// Pinpoint: scrolls cell `cell` (1-based, as in `cell:<n>`) into view
+    /// without touching selection or mode; false when there is no such cell.
+    pub fn reveal_pinned_cell(&mut self, cell: usize, cx: &mut Context<Self>) -> bool {
+        let Some(index) = cell
+            .checked_sub(1)
+            .filter(|index| *index < self.order.len())
+        else {
+            return false;
+        };
+        self.reveal_cell(index);
+        cx.notify();
+        true
     }
 
     /// The list measures the cell again (its height may have changed).
@@ -1389,13 +1404,29 @@ impl NotebookView {
                                     cx.stop_propagation();
                                     this.select(id, false, cx);
                                     this.run_cell(&RunCell, window, cx);
-                                })),
+                                }))
+                                .pin("run")
+                                .label("Run Cell"),
                         )
                     })
-                    .child(label),
+                    .child(label.clone().pin("prompt").text(label).interactive(false)),
             )
-            .children(elapsed.map(|(text, color)| div().text_color(color).child(text)))
-            .children(marker.map(|(text, color)| div().text_color(color).child(text)));
+            .children(elapsed.map(|(text, color)| {
+                div()
+                    .text_color(color)
+                    .child(text.clone())
+                    .pin("elapsed")
+                    .text(text)
+                    .interactive(false)
+            }))
+            .children(marker.map(|(text, color)| {
+                div()
+                    .text_color(color)
+                    .child(text)
+                    .pin("marker")
+                    .text(text)
+                    .interactive(false)
+            }));
 
         // The cell's text: its editor, or rendered Markdown (or a line
         // standing for a collapsed source).
@@ -1426,6 +1457,8 @@ impl NotebookView {
                     this.document
                         .update(cx, |document, cx| document.set_source_hidden(id, false, cx));
                 }))
+                .pin("show-source")
+                .label("Show Source")
                 .into_any_element(),
             Some(editor) => div()
                 .w_full()
@@ -1444,6 +1477,7 @@ impl NotebookView {
                     theme::background()
                 })
                 .child(editor)
+                .pin("editor")
                 .into_any_element(),
             None => {
                 let base_dir = document.path().parent();
@@ -1479,6 +1513,7 @@ impl NotebookView {
                             cx,
                         )
                     })
+                    .pin("markdown")
                     .into_any_element()
             }
         };
@@ -1490,6 +1525,7 @@ impl NotebookView {
                 .text_sm()
                 .text_color(theme::error())
                 .child(selectable(("cell-error", id), error))
+                .pin("error")
         });
 
         let help = self
@@ -1529,8 +1565,11 @@ impl NotebookView {
                                     state.help = None;
                                 }
                                 cx.notify();
-                            })),
+                            }))
+                            .pin("close-help")
+                            .label("Close Help"),
                     )
+                    .pin("help")
             });
 
         let outputs = &cell.cell.outputs;
@@ -1545,7 +1584,9 @@ impl NotebookView {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.toggle_collapsed(id, cx);
-                }));
+                }))
+                .pin("collapse")
+                .label("Toggle Outputs");
             let body = if collapsed {
                 div()
                     .id(("outputs-hidden", id))
@@ -1559,6 +1600,8 @@ impl NotebookView {
                         if outputs.len() == 1 { "" } else { "s" }
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(id, cx)))
+                    .pin("show-outputs")
+                    .label("Show Outputs")
                     .into_any_element()
             } else {
                 div()
@@ -1631,6 +1674,8 @@ impl NotebookView {
                             },
                             cx,
                         )
+                        .pin(format!("output:{}", position + 1))
+                        .interactive(false)
                     }))
                     .into_any_element()
             };
@@ -1661,7 +1706,7 @@ impl NotebookView {
                     .rounded_sm()
                     .when_some(bar, |bar_div, color| bar_div.bg(color)),
             )
-            .child(gutter)
+            .child(gutter.pin("gutter"))
             .child(
                 div()
                     .flex_1()
@@ -1673,6 +1718,7 @@ impl NotebookView {
                     .children(error)
                     .children(outputs),
             )
+            .pin(format!("cell:{}", index + 1))
             .into_any_element()
     }
 
@@ -1700,53 +1746,80 @@ impl NotebookView {
             .text_xs()
             .child(
                 tool_button("nb-run-all", "▶▶ Run All")
-                    .on_click(cx.listener(|this, _, window, cx| this.run_all(&RunAll, window, cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.run_all(&RunAll, window, cx)))
+                    .pin("run-all")
+                    .label("Run All"),
             )
             .child(
-                tool_button("nb-run-above", "Run Above").on_click(
-                    cx.listener(|this, _, window, cx| this.run_above(&RunAbove, window, cx)),
-                ),
+                tool_button("nb-run-above", "Run Above")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.run_above(&RunAbove, window, cx)),
+                    )
+                    .pin("run-above")
+                    .label("Run Above"),
             )
             .child(
-                tool_button("nb-run-below", "Run Below").on_click(
-                    cx.listener(|this, _, window, cx| this.run_below(&RunBelow, window, cx)),
-                ),
+                tool_button("nb-run-below", "Run Below")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.run_below(&RunBelow, window, cx)),
+                    )
+                    .pin("run-below")
+                    .label("Run Below"),
             )
             .child(
                 tool_button("nb-interrupt", "■ Interrupt")
                     .when(!busy, |button| button.text_color(theme::muted()))
                     .on_click(
                         cx.listener(|this, _, window, cx| this.interrupt(&Interrupt, window, cx)),
-                    ),
+                    )
+                    .pin("interrupt")
+                    .label("Interrupt"),
             )
             .child(
-                tool_button("nb-restart", "↻ Restart").on_click(
-                    cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)),
-                ),
+                tool_button("nb-restart", "↻ Restart")
+                    .on_click(cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)))
+                    .pin("restart")
+                    .label("Restart"),
             )
             .child(
-                tool_button("nb-restart-run", "Restart & Run All").on_click(cx.listener(
-                    |this, _, window, cx| this.restart_and_run_all(&RestartAndRunAll, window, cx),
-                )),
+                tool_button("nb-restart-run", "Restart & Run All")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.restart_and_run_all(&RestartAndRunAll, window, cx)
+                    }))
+                    .pin("restart-run-all")
+                    .label("Restart & Run All"),
             )
-            .child(tool_button("nb-clear", "Clear Outputs").on_click(
-                cx.listener(|this, _, window, cx| this.clear_outputs(&ClearOutputs, window, cx)),
-            ))
+            .child(
+                tool_button("nb-clear", "Clear Outputs")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.clear_outputs(&ClearOutputs, window, cx)
+                    }))
+                    .pin("clear-outputs")
+                    .label("Clear Outputs"),
+            )
             .child(
                 tool_button("nb-save", "Save")
-                    .on_click(cx.listener(|this, _, window, cx| this.save(&Save, window, cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.save(&Save, window, cx)))
+                    .pin("save")
+                    .label("Save"),
             )
             .when(marimo, |toolbar| {
                 toolbar
                     .child(
-                        tool_button("nb-marimo", "Open in marimo").on_click(cx.listener(
-                            |this, _, window, cx| this.open_in_marimo(&OpenInMarimo, window, cx),
-                        )),
+                        tool_button("nb-marimo", "Open in marimo")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_in_marimo(&OpenInMarimo, window, cx)
+                            }))
+                            .pin("open-in-marimo")
+                            .label("Open in marimo"),
                     )
                     .child(
-                        tool_button("nb-as-text", "Open as Text").on_click(cx.listener(
-                            |this, _, window, cx| this.open_as_text(&OpenAsText, window, cx),
-                        )),
+                        tool_button("nb-as-text", "Open as Text")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_as_text(&OpenAsText, window, cx)
+                            }))
+                            .pin("open-as-text")
+                            .label("Open as Text"),
                     )
             })
             .child(div().flex_1())
@@ -1765,7 +1838,9 @@ impl NotebookView {
                     }))
                     .child(div().size(px(8.)).rounded_full().bg(dot))
                     .child(div().text_color(theme::text()).child(status_text))
-                    .child(div().text_color(theme::muted()).child(interpreter)),
+                    .child(div().text_color(theme::muted()).child(interpreter))
+                    .pin("kernel")
+                    .label("Choose Interpreter"),
             )
     }
 
@@ -1794,13 +1869,18 @@ impl NotebookView {
                 )
         };
         let choose = || {
-            tool_button("nb-banner-choose", "Choose Interpreter").on_click(cx.listener(
-                |this, _, window, cx| this.choose_interpreter(&ChooseInterpreter, window, cx),
-            ))
+            tool_button("nb-banner-choose", "Choose Interpreter")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.choose_interpreter(&ChooseInterpreter, window, cx)
+                }))
+                .pin("choose-interpreter")
+                .label("Choose Interpreter")
         };
         let restart = || {
             tool_button("nb-banner-restart", "Restart Kernel")
                 .on_click(cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)))
+                .pin("restart-kernel")
+                .label("Restart Kernel")
         };
         match document.kernel_status() {
             KernelStatus::Missing { python, modules } => {
@@ -1817,11 +1897,17 @@ impl NotebookView {
                         theme::warning(),
                     )
                     .child(
-                        tool_button("nb-banner-install", "Install ipykernel").on_click(
-                            cx.listener(|_, _, _, cx| cx.emit(NotebookViewEvent::InstallKernel)),
-                        ),
+                        tool_button("nb-banner-install", "Install ipykernel")
+                            .on_click(
+                                cx.listener(|_, _, _, cx| {
+                                    cx.emit(NotebookViewEvent::InstallKernel)
+                                }),
+                            )
+                            .pin("install-kernel")
+                            .label("Install ipykernel"),
                     )
                     .child(choose())
+                    .pin("banner:missing")
                     .into_any_element(),
                 );
             }
@@ -1832,6 +1918,7 @@ impl NotebookView {
                     theme::error(),
                 )
                 .child(restart())
+                .pin("banner:dead")
                 .into_any_element(),
             ),
             KernelStatus::Failed(why) => banners.push(
@@ -1842,6 +1929,7 @@ impl NotebookView {
                 )
                 .child(restart())
                 .child(choose())
+                .pin("banner:failed")
                 .into_any_element(),
             ),
             _ => {}
@@ -1855,6 +1943,7 @@ impl NotebookView {
                         .into(),
                     theme::muted(),
                 )
+                .pin("banner:marimo")
                 .into_any_element(),
             );
         }
@@ -1865,7 +1954,11 @@ impl NotebookView {
                 } else {
                     theme::text()
                 };
-                banners.push(banner(id, notice.text.clone(), color).into_any_element());
+                banners.push(
+                    banner(id, notice.text.clone(), color)
+                        .pin(format!("banner:{}", &id[3..]))
+                        .into_any_element(),
+                );
             }
         }
         banners
@@ -1997,7 +2090,7 @@ impl Render for NotebookView {
             .flex_col()
             .bg(theme::background())
             .text_color(theme::text())
-            .child(toolbar)
+            .child(toolbar.pin("toolbar"))
             .children(banners)
             .child(div().flex_1().min_h_0().py_2().child(cells))
             .children(self.picker.as_ref().map(|(picker, _)| {

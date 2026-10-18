@@ -29,6 +29,8 @@ mod outline_panel;
 mod notebook;
 mod ports;
 mod problems;
+mod pinpoint;
+mod pinpoint_text;
 mod project;
 mod project_picker;
 mod python_panel;
@@ -60,7 +62,7 @@ use gpui::{App, Application};
 
 use crate::project::Location;
 
-const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code [--headless] --workspace <FILE>\n       next_code --automation [--port PORT] [--width PX] [--height PX] [--state-dir DIR] -- [PROJECT_DIR]\n\nWithout a project, the windows open when next_code last closed reopen (else the welcome screen;\n\"restore_windows\": false in settings.json always shows it). PROJECT_DIR . is the current directory,\nwhich --headless and --devcontainer also use when no project is given.\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).\n--workspace opens a multi-root workspace file (local, or <DISTRO>:/path in WSL); PROJECT_DIR\nnaming a *.next_code-workspace or VS Code *.code-workspace file opens it too.";
+const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code [--headless] --workspace <FILE>\n       next_code --automation [--port PORT] [--width PX] [--height PX] [--state-dir DIR] -- [PROJECT_DIR]\n       next_code pinpoint <COMMAND> [OPTIONS]\n\nWithout a project, the windows open when next_code last closed reopen (else the welcome screen;\n\"restore_windows\": false in settings.json always shows it). PROJECT_DIR . is the current directory,\nwhich --headless and --devcontainer also use when no project is given.\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).\n--workspace opens a multi-root workspace file (local, or <DISTRO>:/path in WSL); PROJECT_DIR\nnaming a *.next_code-workspace or VS Code *.code-workspace file opens it too.\npinpoint lists and highlights parts of the running editor for agents (next_code pinpoint --help).";
 
 /// Reads the command line: a local directory (`.` is the current one), a
 /// `\\wsl.localhost\<distro>\...` path, or `--wsl <distro> <linux path>`,
@@ -164,6 +166,15 @@ enum Launch {
 
 fn run() -> anyhow::Result<()> {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "pinpoint") {
+        // A one-shot client of the running editor: no GUI here.
+        startup::attach_console();
+        let args: Vec<String> = args[1..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        std::process::exit(pinpoint::server::run_cli(&args));
+    }
     if args.first().is_some_and(|arg| arg == "--automation") {
         startup::attach_console();
         let status = std::process::Command::new("python3")
@@ -231,6 +242,7 @@ fn run() -> anyhow::Result<()> {
         notebook::picker::bind_keys(cx);
         theme::refresh(cx);
         app_state::init(cx);
+        pinpoint::init(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();

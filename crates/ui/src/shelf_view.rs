@@ -18,6 +18,7 @@ use crate::{
     debugger::panel::Tooltip,
     diff_view::DiffSource,
     git_log::relative_time,
+    pinpoint::{Pin, kebab},
     project::Project,
     selectable::selectable,
     theme,
@@ -436,35 +437,41 @@ impl ShelfView {
             .border_color(theme::border())
             .child(
                 button("shelf-refresh", "⟳", "Refresh", true)
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
+                    .pin("refresh")
+                    .label("Refresh"),
             )
             .child(
-                button("shelf-unshelve", "⇪", "Unshelve…", has_shelf).on_click(cx.listener(
-                    |this, _, window, cx| {
+                button("shelf-unshelve", "⇪", "Unshelve…", has_shelf)
+                    .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(shelf) = this.selected_shelf() {
                             this.unshelve(shelf, window, cx)
                         }
-                    },
-                )),
+                    }))
+                    .pin("unshelve")
+                    .label("Unshelve…"),
             )
             .child(
-                button("shelf-show-diff", "⇄", "Show Diff", selected_file).on_click(cx.listener(
-                    |this, _, _, cx| {
+                button("shelf-show-diff", "⇄", "Show Diff", selected_file)
+                    .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(row) = this.selected {
                             this.show_diff(row, cx)
                         }
-                    },
-                )),
+                    }))
+                    .pin("show-diff")
+                    .label("Show Diff"),
             )
             .child(
-                button("shelf-delete", "✕", "Delete…", has_shelf).on_click(cx.listener(
-                    |this, _, window, cx| {
+                button("shelf-delete", "✕", "Delete…", has_shelf)
+                    .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(shelf) = this.selected_shelf() {
                             this.delete(shelf, window, cx)
                         }
-                    },
-                )),
+                    }))
+                    .pin("delete")
+                    .label("Delete…"),
             )
+            .pin("toolbar")
     }
 
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -517,7 +524,9 @@ impl ShelfView {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.toggle_expanded(shelf_index, cx)
-                        })),
+                        }))
+                        .pin("expand")
+                        .label(if expanded { "Collapse" } else { "Expand" }),
                 )
                 .child(
                     div()
@@ -539,6 +548,8 @@ impl ShelfView {
                             format!("{count} · {}", relative_time(shelf.date)),
                         )),
                 )
+                .pin(format!("shelf:{}", shelf.id))
+                .label(shelf.message.clone())
                 .into_any_element()
             }
             ShelfRow::File {
@@ -547,7 +558,9 @@ impl ShelfView {
                 name,
                 dir,
             } => {
-                let change = self.shelves[*shelf].files[*file].change;
+                let shelved = &self.shelves[*shelf];
+                let change = shelved.files[*file].change;
+                let key = format!("file:{}@{}", shelved.files[*file].path, shelved.id);
                 base.child(
                     div()
                         .flex_none()
@@ -563,6 +576,7 @@ impl ShelfView {
                         .text_color(theme::muted())
                         .child(row_text("detail", dir.clone())),
                 )
+                .pin(key)
                 .into_any_element()
             }
         }
@@ -605,6 +619,7 @@ impl ShelfView {
                         handler(this, window, cx);
                         cx.notify();
                     }))
+                    .pin(format!("item:{}", kebab(label)))
             });
         Some(deferred(
             anchored().position(position).child(
@@ -626,7 +641,8 @@ impl ShelfView {
                         this.menu = None;
                         cx.notify();
                     }))
-                    .children(rows),
+                    .children(rows)
+                    .pin("menu"),
             ),
         ))
     }
@@ -675,6 +691,7 @@ impl Render for ShelfView {
             )
             .flex_1()
             .w_full()
+            .pin("rows")
             .into_any_element()
         };
         div()

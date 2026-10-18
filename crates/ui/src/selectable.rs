@@ -93,6 +93,7 @@ pub fn selectable(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Se
         right_click_through: false,
         double_click_through: false,
         links: None,
+        pin_path: SharedString::default(),
     }
 }
 
@@ -103,6 +104,8 @@ pub struct SelectableText {
     right_click_through: bool,
     double_click_through: bool,
     links: Option<Links>,
+    /// The enclosing pin, whose text this is part of (pinpoint).
+    pin_path: SharedString,
 }
 
 /// What a click on a link does, given the link's index.
@@ -307,6 +310,7 @@ impl Element for SelectableText {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, ()) {
+        self.pin_path = crate::pinpoint::current_path().unwrap_or_default();
         self.styled.request_layout(None, inspector_id, window, cx)
     }
 
@@ -321,6 +325,12 @@ impl Element for SelectableText {
     ) -> Prepainted {
         self.styled
             .prepaint(None, inspector_id, bounds, request_layout, window, cx);
+        crate::pinpoint_text::record_layout_text(
+            window,
+            &self.pin_path,
+            &self.text,
+            self.styled.layout(),
+        );
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let owner = Owner::new(window, global_id);
         // The selection's focus handle lives in this element's dispatch

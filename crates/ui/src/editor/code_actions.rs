@@ -547,7 +547,7 @@ impl Editor {
 
     /// The lightbulb's line and whether it offers a quick fix: the
     /// server's, else an unknown word at the cursor.
-    fn lightbulb(&self) -> Option<(usize, bool)> {
+    pub(super) fn lightbulb(&self) -> Option<(usize, bool)> {
         self.code_actions.lightbulb.or_else(|| {
             let word = self.spell_target()?;
             Some((self.buffer.line_of(word.start), true))
@@ -694,7 +694,9 @@ impl Editor {
                     .cursor_default()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_mouse_move(|_, _, cx| cx.stop_propagation())
-                    .child(list),
+                    .child(list)
+                    .pin("code-actions")
+                    .label("Code Actions"),
             ),
         ))
     }
@@ -729,6 +731,8 @@ fn code_action_row(
             (badge, color, title(action).to_owned(), is_preferred(action))
         }
     };
+    let pin_id = format!("item:{label}");
+    let pin_label = SharedString::from(label.clone());
     div()
         .id(row)
         .h(px(ROW_HEIGHT))
@@ -763,6 +767,8 @@ fn code_action_row(
                 .when(preferred, |title| title.font_weight(FontWeight::BOLD))
                 .child(SharedString::from(label)),
         )
+        .pin(pin_id)
+        .label(pin_label)
 }
 
 #[cfg(test)]

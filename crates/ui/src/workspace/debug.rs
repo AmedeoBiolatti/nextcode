@@ -629,7 +629,9 @@ impl Workspace {
         let button = |id: &'static str,
                       label: &'static str,
                       enabled: bool,
-                      action: Box<dyn gpui::Action>| {
+                      action: Box<dyn gpui::Action>,
+                      pin: &'static str,
+                      name: &'static str| {
             div()
                 .id(id)
                 .px_2()
@@ -649,6 +651,8 @@ impl Workspace {
                         })
                 })
                 .child(label)
+                .pin(pin)
+                .label(name)
         };
         let running = state == SessionState::Running;
         Some(
@@ -673,15 +677,65 @@ impl Workspace {
                 )))
                 .child(div().flex_1())
                 .child(if paused {
-                    button("bar-continue", "▶ Continue F5", true, Box::new(Continue))
+                    button(
+                        "bar-continue",
+                        "▶ Continue F5",
+                        true,
+                        Box::new(Continue),
+                        "continue",
+                        "Continue",
+                    )
                 } else {
-                    button("bar-pause", "‖ Pause F6", running, Box::new(Pause))
+                    button(
+                        "bar-pause",
+                        "‖ Pause F6",
+                        running,
+                        Box::new(Pause),
+                        "pause",
+                        "Pause",
+                    )
                 })
-                .child(button("bar-over", "↷ Over F10", paused, Box::new(StepOver)))
-                .child(button("bar-into", "↓ Into F11", paused, Box::new(StepInto)))
-                .child(button("bar-out", "↑ Out ⇧F11", paused, Box::new(StepOut)))
-                .child(button("bar-restart", "↻ Restart", true, Box::new(Restart)))
-                .child(button("bar-stop", "■ Stop ⇧F5", true, Box::new(Stop))),
+                .child(button(
+                    "bar-over",
+                    "↷ Over F10",
+                    paused,
+                    Box::new(StepOver),
+                    "step-over",
+                    "Step Over",
+                ))
+                .child(button(
+                    "bar-into",
+                    "↓ Into F11",
+                    paused,
+                    Box::new(StepInto),
+                    "step-into",
+                    "Step Into",
+                ))
+                .child(button(
+                    "bar-out",
+                    "↑ Out ⇧F11",
+                    paused,
+                    Box::new(StepOut),
+                    "step-out",
+                    "Step Out",
+                ))
+                .child(button(
+                    "bar-restart",
+                    "↻ Restart",
+                    true,
+                    Box::new(Restart),
+                    "restart",
+                    "Restart",
+                ))
+                .child(button(
+                    "bar-stop",
+                    "■ Stop ⇧F5",
+                    true,
+                    Box::new(Stop),
+                    "stop",
+                    "Stop",
+                ))
+                .pin("debug-bar"),
         )
     }
 

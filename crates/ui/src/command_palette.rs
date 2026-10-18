@@ -10,6 +10,7 @@ use gpui::{
 use crate::{
     commands,
     editor::{self, Editor, EditorEvent},
+    pinpoint::{self, Pin},
     selectable::selectable,
     theme,
 };
@@ -29,6 +30,8 @@ pub struct Command {
     pub label: SharedString,
     pub category: SharedString,
     pub keys: Option<SharedString>,
+    /// Its pinpoint id, `item:<command id>`.
+    pin: SharedString,
     /// Lowercase `category label name`, for matching.
     haystack: String,
 }
@@ -40,6 +43,7 @@ impl Command {
         let category = commands::category(name);
         let haystack = format!("{category} {label} {name}").to_lowercase();
         Self {
+            pin: format!("item:{name}").into(),
             action,
             label: label.into(),
             category: category.into(),
@@ -52,6 +56,8 @@ impl Command {
     pub fn labeled(action: Box<dyn Action>, label: String, category: &str) -> Self {
         let haystack = format!("{category} {label}").to_lowercase();
         Self {
+            // One action for several commands: the label tells them apart.
+            pin: format!("item:{}:{}", action.name(), pinpoint::kebab(&label)).into(),
             action,
             label: label.into(),
             category: category.to_owned().into(),
@@ -182,6 +188,8 @@ impl Render for CommandPalette {
                 .items_center()
                 .text_color(theme::muted())
                 .child(selectable("empty", "No matching commands"))
+                .pin("empty")
+                .interactive(false)
                 .into_any_element()
         } else {
             uniform_list(
@@ -227,6 +235,8 @@ impl Render for CommandPalette {
                                         .text_color(theme::muted())
                                         .child(keys)
                                 }))
+                                .pin(command.pin.clone())
+                                .label(format!("{}: {}", command.category, command.label))
                         })
                         .collect()
                 }),
@@ -260,10 +270,14 @@ impl Render for CommandPalette {
                     .py_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(self.query.clone()),
+                    .child(self.query.clone())
+                    .pin("input")
+                    .label("Type a command"),
             )
             .child(list)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .pin("command-palette")
+            .label("Command Palette")
     }
 }
 

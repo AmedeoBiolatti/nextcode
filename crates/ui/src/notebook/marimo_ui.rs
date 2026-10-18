@@ -17,6 +17,7 @@ use super::{
     output::{OnAction, OutputAction, OutputOptions, note},
     widgets::{self, InputKind, InputSpec, Slider},
 };
+use crate::pinpoint::Pin;
 
 /// Width of a label column and of controls.
 const LABEL_WIDTH: f32 = 96.;
@@ -83,7 +84,14 @@ pub fn render(
         .gap_2()
         .children(parts.iter().enumerate().map(|(index, part)| {
             if let Some(element) = part.get("element") {
+                let key = match element["label"].as_str() {
+                    Some(label) if !label.is_empty() => label,
+                    _ => element["id"].as_str().unwrap_or_default(),
+                };
+                let key = format!("widget:{key}");
                 render_element(element, options, on_action)
+                    .pin(key)
+                    .into_any_element()
             } else if let Some(text) = part["markdown"].as_str() {
                 markdown(("marimo-md", index), text, MarkdownImages::default(), cx)
             } else {

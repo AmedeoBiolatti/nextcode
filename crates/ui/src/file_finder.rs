@@ -18,6 +18,7 @@ use nucleo_matcher::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    pinpoint::Pin,
     project::{Project, root_label},
     selectable::selectable,
     theme,
@@ -231,6 +232,14 @@ impl FileFinder {
         };
         let name = SharedString::from(path[name_start..].to_owned());
         let dir = SharedString::from(path[..name_start].to_owned());
+        // As `pinpoint::file_key` names the file.
+        let relative = path[file.relative..].replace('\\', "/");
+        let key = if self.project.is_multi_root() {
+            let roots = self.project.roots();
+            format!("{}/{relative}", roots[file.root].name)
+        } else {
+            relative
+        };
 
         div()
             .id(index)
@@ -255,6 +264,8 @@ impl FileFinder {
                     .text_color(theme::muted())
                     .child(selectable("dir", dir).with_highlights(highlights(0..name_start))),
             )
+            .pin(format!("item:{key}"))
+            .label(path.clone())
     }
 }
 
@@ -357,7 +368,9 @@ impl Render for FileFinder {
                     .py_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(self.query.clone()),
+                    .child(self.query.clone())
+                    .pin("input")
+                    .label("File name"),
             )
             .child(
                 uniform_list(
@@ -378,10 +391,14 @@ impl Render for FileFinder {
                     .border_color(theme::border())
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(selectable("status", status)),
+                    .child(selectable("status", status))
+                    .pin("status")
+                    .interactive(false),
             )
             // Keep clicks inside the modal from reaching the editor below.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .pin("file-finder")
+            .label("Go to File")
     }
 }
 

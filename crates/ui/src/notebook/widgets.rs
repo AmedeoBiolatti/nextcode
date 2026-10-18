@@ -38,6 +38,7 @@ use super::{
 };
 use crate::{
     editor::{Editor, EditorEvent},
+    pinpoint::Pin,
     selectable::selectable,
     theme,
 };
@@ -772,12 +773,13 @@ pub fn dropdown(
                 .cursor_pointer()
                 .when(Some(index) == selected, |row| row.bg(theme::active_row()))
                 .hover(|style| style.bg(theme::hover_row()))
-                .child(option)
+                .child(option.clone())
                 .on_click(move |_, window, cx| {
                     OPEN.with(|open| *open.borrow_mut() = None);
                     on_select(index, window, cx);
                     window.refresh();
                 })
+                .pin(format!("option:{option}"))
         });
         deferred(
             anchored().child(
@@ -798,7 +800,8 @@ pub fn dropdown(
                     .on_mouse_down_out(|_, window, _| {
                         OPEN.with(|open| *open.borrow_mut() = None);
                         window.refresh();
-                    }),
+                    })
+                    .pin("menu"),
             ),
         )
         .with_priority(1)
@@ -806,7 +809,7 @@ pub fn dropdown(
     div()
         .flex()
         .flex_col()
-        .child(field)
+        .child(field.pin("field"))
         .children(menu)
         .into_any_element()
 }
@@ -851,11 +854,12 @@ pub fn radio(
                             dot.child(div().size(px(8.)).rounded_full().bg(theme::accent()))
                         }),
                 )
-                .child(option)
+                .child(option.clone())
                 .when(!disabled, |row| {
                     row.cursor_pointer()
                         .on_click(move |_, window, cx| on_select(index, window, cx))
                 })
+                .pin(format!("option:{option}"))
         }))
         .into_any_element()
 }
@@ -1310,6 +1314,7 @@ fn render_model(
                             disabled,
                             Rc::new(move |window, cx| on_change(json!(position), true, window, cx)),
                         )
+                        .pin(format!("option:{label}"))
                     }),
                 ),
             )
@@ -1415,7 +1420,8 @@ fn render_model(
                                                 on_change(value, true, window, cx)
                                             })
                                     })
-                                    .child(label)
+                                    .child(label.clone())
+                                    .pin(format!("option:{label}"))
                             }),
                     ),
             )
@@ -1590,7 +1596,8 @@ fn render_model(
                                                 if open { Value::Null } else { json!(position) };
                                             on_change(next, true, window, cx)
                                         })
-                                    }),
+                                    })
+                                    .pin(format!("section:{}", title(position))),
                             )
                             .when(open, |section| {
                                 section.child(div().p_2().child(render_model(
@@ -1639,6 +1646,7 @@ fn render_model(
                                                 )
                                             })
                                             .child(title(position))
+                                            .pin(format!("tab:{}", title(position)))
                                     })),
                             )
                         })
@@ -1684,6 +1692,11 @@ fn render_model(
         .when_some(width, |frame, width| frame.w(width))
         .when(disabled && model.live, |frame| frame.opacity(0.6))
         .child(element)
+        .pin(if description.is_empty() {
+            format!("widget:{id}")
+        } else {
+            format!("widget:{description}")
+        })
         .into_any_element()
 }
 

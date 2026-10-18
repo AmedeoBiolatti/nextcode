@@ -9,6 +9,7 @@ use gpui::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    pinpoint::Pin,
     project::Location,
     recent,
     selectable::selectable,
@@ -144,14 +145,16 @@ impl Render for ProjectPicker {
                     .py_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(self.query.clone()),
+                    .child(self.query.clone())
+                    .pin("input")
+                    .label("Project location"),
             )
             .children(
                 self.rows
                     .iter()
                     .enumerate()
                     .take(14)
-                    .map(|(index, (_, label))| {
+                    .map(|(index, (location, label))| {
                         div()
                             .id(index)
                             .h(px(ROW_HEIGHT))
@@ -166,6 +169,8 @@ impl Render for ProjectPicker {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| this.open(index, cx)))
                             .child(selectable("label", label.clone()))
+                            .pin(format!("item:{location}"))
+                            .label(label.clone())
                     }),
             )
             .child(
@@ -176,8 +181,12 @@ impl Render for ProjectPicker {
                     .border_color(theme::border())
                     .text_xs()
                     .text_color(theme::muted())
-                    .child(selectable("hint", hint)),
+                    .child(selectable("hint", hint))
+                    .pin("hint")
+                    .interactive(false),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .pin("project-picker")
+            .label("Open Recent")
     }
 }

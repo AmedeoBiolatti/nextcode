@@ -614,6 +614,8 @@ impl Editor {
                 .shadow_md()
                 .text_sm()
                 .children(super::navigation::markdown_blocks("doc", &docs).collect::<Vec<_>>())
+                .pin("docs")
+                .label("Documentation")
         });
         Some(
             div()
@@ -628,7 +630,9 @@ impl Editor {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_move(|_, _, cx| cx.stop_propagation())
                 .child(list)
-                .children(docs_panel),
+                .children(docs_panel)
+                .pin("completion")
+                .label("Completions"),
         )
     }
 }
@@ -641,6 +645,16 @@ fn completion_row(
 ) -> impl IntoElement + use<> {
     let candidate = &menu.candidates[row];
     let item = &menu.items[candidate.index];
+    // Overloads share a label: later ones get `#2`, `#3`… to stay unique.
+    let same_before = menu.candidates[..row]
+        .iter()
+        .filter(|c| menu.items[c.index].label == item.label)
+        .count();
+    let pin_id = match same_before {
+        0 => format!("item:{}", item.label),
+        n => format!("item:{}#{}", item.label, n + 1),
+    };
+    let pin_label = item.label.clone();
     let (badge, badge_color) = kind_badge(item.kind, language);
     let highlight = HighlightStyle {
         color: Some(theme::accent_text()),
@@ -734,6 +748,8 @@ fn completion_row(
                 .text_color(theme::muted())
                 .child(detail)
         }))
+        .pin(pin_id)
+        .label(pin_label)
 }
 
 /// Documentation for the docs pane: the detail line as code, then docs.

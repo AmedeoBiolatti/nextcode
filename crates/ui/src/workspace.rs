@@ -35,6 +35,7 @@ use crate::{
     lsp_store::{LspStore, LspStoreEvent, ServerStatus},
     notebook::view::{NotebookView, NotebookViewEvent, OpenAsNotebook},
     outline_panel::OutlinePanel,
+    pinpoint::{self, Pin},
     ports::{Ports, PortsEvent, panel::PortsPanel},
     problems::{ProblemsEvent, ProblemsPanel},
     project::{self, Project},
@@ -60,6 +61,7 @@ mod git_gutter;
 mod log_window;
 mod notebooks;
 mod panes;
+mod pinpoint_text;
 mod runs;
 mod session;
 mod stash_flows;
@@ -250,6 +252,37 @@ impl Tab {
             TabContent::Diff(_) | TabContent::Compare(_) => false,
         }
     }
+
+    /// The stable pinpoint key of the tab (`tab:<key>`) and of its
+    /// content's wrapper: the file as `pinpoint::file_key` names it; a
+    /// diff adds which versions it compares.
+    fn pin_key(&self, project: &Project, cx: &App) -> String {
+        match &self.content {
+            TabContent::Editor(_) | TabContent::Notebook(_) => {
+                pinpoint::file_key(project, &self.path)
+            }
+            TabContent::Diff(diff) => format!(
+                "{}@{}",
+                pinpoint::file_key(project, &self.path),
+                pinpoint::kebab(&diff.read(cx).source().sides())
+            ),
+            TabContent::Compare(_) => format!(
+                "compare:{}",
+                pinpoint::kebab(self.title.trim_start_matches("Compare "))
+            ),
+        }
+    }
+
+    /// The pinpoint id of the wrapper its owner pins the content inside.
+    fn content_pin(&self, key: &str) -> String {
+        match &self.content {
+            TabContent::Editor(_) => format!("editor:{key}"),
+            TabContent::Notebook(_) => format!("notebook:{key}"),
+            TabContent::Diff(_) => format!("diff:{key}"),
+            // Already `compare:…`.
+            TabContent::Compare(_) => key.to_owned(),
+        }
+    }
 }
 
 /// A suggestion above the editor, with an action button and "Not now".
@@ -280,6 +313,17 @@ impl OfferKind {
             Self::DownloadCodeLldb => "Download CodeLLDB",
             Self::PortAvailable { .. } => "Open in Browser",
             Self::OpenAsNotebook { .. } => "Open as Notebook",
+        }
+    }
+
+    /// Its pinpoint id, `offer:<key>`.
+    fn pin_id(&self) -> String {
+        match self {
+            Self::ReopenInContainer { .. } => "offer:reopen-in-container".into(),
+            Self::PythonSync => "offer:python-sync".into(),
+            Self::DownloadCodeLldb => "offer:download-codelldb".into(),
+            Self::PortAvailable { port, .. } => format!("offer:port-{port}"),
+            Self::OpenAsNotebook { .. } => "offer:open-as-notebook".into(),
         }
     }
 }
@@ -1766,15 +1810,23 @@ impl Workspace {
                             .child(selectable(("offer", index), offer.message.clone())),
                     )
                     .child(
-                        button("offer-accept", offer.kind.action()).on_click(cx.listener(
-                            move |this, _, window, cx| {
+                        button("offer-accept", offer.kind.action())
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.accept_offer(accept_kind.clone(), window, cx)
-                            },
-                        )),
+                            }))
+                            .pin("accept")
+                            .label(offer.kind.action()),
                     )
-                    .child(button("offer-dismiss", "Not now").on_click(
-                        cx.listener(move |this, _, _, cx| this.withdraw_offer(&dismiss_kind, cx)),
-                    ))
+                    .child(
+                        button("offer-dismiss", "Not now")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.withdraw_offer(&dismiss_kind, cx)
+                            }))
+                            .pin("dismiss")
+                            .label("Not now"),
+                    )
+                    .pin(offer.kind.pin_id())
+                    .label(offer.message.clone())
                     .into_any_element()
             })
             .collect()
@@ -1996,16 +2048,18 @@ impl Render for Workspace {
                     .children(
                         self.connection_error
                             .iter()
-                            .chain(&self.notice)
-                            .cloned()
+                            .map(|notice| ("connection-error", notice))
+                            .chain(self.notice.iter().map(|notice| ("notice", notice)))
                             .enumerate()
-                            .map(|(index, notice)| {
+                            .map(|(index, (pin, notice))| {
                                 div()
                                     .px_3()
                                     .py_1()
                                     .text_sm()
                                     .text_color(theme::error())
-                                    .child(selectable(("notice", index), notice))
+                                    .child(selectable(("notice", index), notice.clone()))
+                                    .pin(pin)
+                                    .interactive(false)
                             }),
                     )
                     .children(self.render_offers(cx))
@@ -2067,5 +2121,6 @@ impl Render for Workspace {
             }))
             .children(self.render_branches_popup(cx))
             .children(self.render_configuration_picker())
+            .pin("workspace")
     }
 }

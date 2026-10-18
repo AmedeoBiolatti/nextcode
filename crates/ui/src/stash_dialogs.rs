@@ -14,6 +14,7 @@ use crate::{
     diff_view::DiffSource,
     git_dialogs::{Confirm, button, frame},
     git_log::relative_time,
+    pinpoint::Pin,
     project_picker,
     selectable::selectable,
     theme,
@@ -347,7 +348,10 @@ impl StashListDialog {
                             )),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.select(row, cx)))
+                    .pin(format!("stash:{}", stash.id))
+                    .label(format!("stash@{{{}}} {}", stash.index, stash.message))
             }))
+            .pin("stashes")
     }
 
     fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -401,7 +405,9 @@ impl StashListDialog {
                         }
                         cx.notify();
                     }))
+                    .pin(format!("file:{path}"))
             }))
+            .pin("files")
     }
 }
 
@@ -466,7 +472,9 @@ impl Render for StashListDialog {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.reinstate_index = !this.reinstate_index;
                         cx.notify();
-                    })),
+                    }))
+                    .pin("reinstate-index")
+                    .label("Reinstate index"),
             )
             .children(self.error.clone().map(|error| {
                 div()
@@ -480,22 +488,29 @@ impl Render for StashListDialog {
                     .gap_2()
                     .child(
                         action("stash-view", "View Diff", false)
-                            .on_click(cx.listener(|this, _, _, cx| this.view_diff(None, cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.view_diff(None, cx)))
+                            .pin("view-diff"),
                     )
-                    .child(action("stash-drop", "Drop…", false).on_click(
-                        cx.listener(|this, _, window, cx| this.drop_selected(window, cx)),
-                    ))
+                    .child(
+                        action("stash-drop", "Drop…", false)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.drop_selected(window, cx)),
+                            )
+                            .pin("drop")
+                            .label("Drop…"),
+                    )
                     .child(div().flex_1())
                     .child(
-                        button("stash-cancel", "Cancel".into(), false).on_click(cx.listener(
-                            |this, _, window, cx| {
+                        button("stash-cancel", "Cancel".into(), false)
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.dismiss(&project_picker::Dismiss, window, cx)
-                            },
-                        )),
+                            }))
+                            .pin("cancel"),
                     )
                     .child(
                         action("stash-pop", "Pop", false)
-                            .on_click(cx.listener(|this, _, _, cx| this.apply(true, cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.apply(true, cx)))
+                            .pin("pop"),
                     )
                     .child(
                         action(
@@ -503,8 +518,11 @@ impl Render for StashListDialog {
                             if self.busy { "Applying…" } else { "Apply" },
                             true,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| this.apply(false, cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.apply(false, cx)))
+                        .pin("apply"),
                     ),
             )
+            .pin("stash-dialog")
+            .label("Unstash Changes")
     }
 }

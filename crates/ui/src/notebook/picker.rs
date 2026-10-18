@@ -16,6 +16,7 @@ use super::{
 };
 use crate::{
     editor::{self, Editor, EditorEvent},
+    pinpoint::Pin,
     project::Project,
     selectable::selectable,
     theme,
@@ -289,7 +290,7 @@ impl Focusable for InterpreterPicker {
 impl Render for InterpreterPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let first = (self.selected + 1).saturating_sub(VISIBLE_ROWS);
-        let rows: Vec<(SharedString, SharedString, bool)> = self
+        let rows: Vec<(SharedString, SharedString, bool, String)> = self
             .typed
             .iter()
             .map(|typed| {
@@ -297,6 +298,7 @@ impl Render for InterpreterPicker {
                     format!("Use {}", typed.python.join(" ")).into(),
                     SharedString::from("the interpreter at this path"),
                     false,
+                    "item:typed".to_owned(),
                 )
             })
             .chain(self.rows.iter().map(|&index| {
@@ -305,6 +307,9 @@ impl Render for InterpreterPicker {
                     entry.label.clone(),
                     entry.detail.clone(),
                     self.current.as_ref() == Some(&entry.launch),
+                    // Labels repeat (two venvs of one Python): the detail
+                    // (its path) tells them apart.
+                    format!("item:{}@{}", entry.label, entry.detail),
                 )
             }))
             .collect();
@@ -348,14 +353,17 @@ impl Render for InterpreterPicker {
                     .py_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(self.query.clone()),
+                    .child(self.query.clone())
+                    .pin("input")
+                    .label("Interpreter"),
             )
             .children(
                 rows.into_iter()
                     .enumerate()
                     .skip(first)
                     .take(VISIBLE_ROWS)
-                    .map(|(index, (label, detail, current))| {
+                    .map(|(index, (label, detail, current, pin))| {
+                        let name = label.clone();
                         div()
                             .id(index)
                             .h(px(ROW_HEIGHT))
@@ -390,6 +398,8 @@ impl Render for InterpreterPicker {
                                     .truncate()
                                     .child(detail),
                             )
+                            .pin(pin)
+                            .label(name)
                     }),
             )
             .children(status.map(|status| {
@@ -399,6 +409,8 @@ impl Render for InterpreterPicker {
                     .text_xs()
                     .text_color(theme::muted())
                     .child(status)
+                    .pin("status")
+                    .interactive(false)
             }))
             .children(self.errors.iter().enumerate().map(|(index, error)| {
                 div()
@@ -409,5 +421,7 @@ impl Render for InterpreterPicker {
                     .child(selectable(("picker-error", index), error.clone()))
             }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .pin("interpreter-picker")
+            .label("Notebook interpreter")
     }
 }

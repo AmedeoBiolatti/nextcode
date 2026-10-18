@@ -5,6 +5,7 @@
 //! tab holds a [`WorkflowView`] (the file and its graph).
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     rc::Rc,
     sync::{Arc, LazyLock},
@@ -24,6 +25,7 @@ use crate::{
     commands,
     connecting::{Connecting, ConnectingEvent},
     menus::{self, Item, List, MenuBar, SEPARATOR},
+    pinpoint::{self, Pin},
     project::{Location, Project},
     project_picker::{ProjectPicker, ProjectPickerEvent},
     recent,
@@ -161,6 +163,18 @@ impl Tab {
             (_, Content::Workflow(view)) => view.read(cx).name(),
             (TabTarget::Project(location), _) => tab_title(location),
             (TabTarget::Workflow { workflow, .. }, _) => workflows::file_stem(workflow),
+        }
+    }
+
+    /// Its stable pinpoint key (`tab:<key>`): the project's name, or the
+    /// workflow's file name (also its content's `workflow:<key>`).
+    fn pin_key(&self) -> String {
+        match &self.target {
+            TabTarget::Project(location) => tab_title(location),
+            TabTarget::Workflow { workflow, .. } => workflow
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         }
     }
 
@@ -1403,6 +1417,14 @@ impl Shell {
         }
     }
 
+    /// The shown project tab's workspace (pinpoint reveals code there).
+    pub(crate) fn active_workspace(&self) -> Option<Entity<Workspace>> {
+        match &self.tabs.get(self.active)?.content {
+            Content::Workspace(workspace) => Some(workspace.clone()),
+            _ => None,
+        }
+    }
+
     /// Starts a workflow step's command in a terminal tab of the project at
     /// `location`.
     #[allow(clippy::too_many_arguments)]
@@ -1618,13 +1640,16 @@ impl Shell {
                     )
                     .child(div().text_xs().child("⌕"))
                     .child(div().flex_1().truncate().child("Search commands"))
-                    .child(div().text_xs().child(palette_keys)),
+                    .child(div().text_xs().child(palette_keys))
+                    .pin("search-commands")
+                    .label("Search commands"),
             )
             .child(drag_area("title-drag-right"))
             .children(self.render_run_selector(cx))
             .when(CUSTOM_TITLE_BAR, |bar| {
                 bar.child(self.render_caption_buttons(window))
             })
+            .pin("menu-bar")
     }
 
     /// PyCharm's branch widget: `⎇ main ▾` for the active project; a click
@@ -1693,7 +1718,9 @@ impl Shell {
                         .text_xs()
                         .text_color(theme::muted())
                         .child("▾"),
-                ),
+                )
+                .pin("branch")
+                .label("Git branch"),
         )
     }
 
@@ -1750,7 +1777,9 @@ impl Shell {
                                 .truncate()
                                 .child(name.unwrap_or_else(|| "Add Configuration…".into())),
                         )
-                        .child(div().text_xs().text_color(theme::muted()).child("▾")),
+                        .child(div().text_xs().text_color(theme::muted()).child("▾"))
+                        .pin("run-config")
+                        .label("Run configuration"),
                 )
                 .child(
                     button("run-config-run")
@@ -1762,7 +1791,9 @@ impl Shell {
                                 run.update(cx, |workspace, cx| workspace.run_selected(window, cx));
                             }),
                         )
-                        .child("▶"),
+                        .child("▶")
+                        .pin("run")
+                        .label("Run"),
                 )
                 .child(
                     button("run-config-debug")
@@ -1777,7 +1808,9 @@ impl Shell {
                                 });
                             }),
                         )
-                        .child("Debug"),
+                        .child("Debug")
+                        .pin("debug")
+                        .label("Debug"),
                 ),
         )
     }
@@ -1805,7 +1838,9 @@ impl Shell {
             .flex_none()
             .child(
                 button("caption-min", WindowControlArea::Min, "\u{E921}")
-                    .hover(|style| style.bg(theme::hover_row())),
+                    .hover(|style| style.bg(theme::hover_row()))
+                    .pin("minimize")
+                    .label("Minimize"),
             )
             .child(
                 button(
@@ -1817,11 +1852,19 @@ impl Shell {
                         "\u{E922}"
                     },
                 )
-                .hover(|style| style.bg(theme::hover_row())),
+                .hover(|style| style.bg(theme::hover_row()))
+                .pin("maximize")
+                .label(if window.is_maximized() {
+                    "Restore"
+                } else {
+                    "Maximize"
+                }),
             )
             .child(
                 button("caption-close", WindowControlArea::Close, "\u{E8BB}")
-                    .hover(|style| style.bg(theme::error()).text_color(theme::on_accent())),
+                    .hover(|style| style.bg(theme::error()).text_color(theme::on_accent()))
+                    .pin("close-window")
+                    .label("Close window"),
             )
     }
 
@@ -1832,6 +1875,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let open = self.menu.as_ref().filter(|menu| menu.menu == index);
+        let pin = format!("menu:{}", pinpoint::kebab(&label));
         div()
             .id(("menu", index))
             .relative()
@@ -1861,7 +1905,7 @@ impl Shell {
                     this.open_menu(index, window, cx);
                 }
             }))
-            .child(label)
+            .child(label.clone())
             .children(open.map(|menu| {
                 div()
                     .absolute()
@@ -1872,6 +1916,9 @@ impl Shell {
                             .with_priority(1),
                     )
             }))
+            .pin(pin)
+            .label(label)
+            .interactive(true)
     }
 
     /// One menu panel: `rows` at submenu `depth`, with `path` naming the
@@ -1937,6 +1984,8 @@ impl Shell {
                                     this.run_menu_command(action.boxed_clone(), window, cx)
                                 }))
                             })
+                            .pin(format!("item:{}", pinpoint::kebab(label)))
+                            .label(label.clone())
                             .into_any_element()
                     }
                     Row::Submenu { label, rows } => {
@@ -1963,6 +2012,9 @@ impl Shell {
                                         ))),
                                 )
                             })
+                            .pin(format!("item:{}", pinpoint::kebab(label)))
+                            .label(label.clone())
+                            .interactive(true)
                             .into_any_element()
                     }
                 }
@@ -1971,6 +2023,7 @@ impl Shell {
     }
 
     fn render_project_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut keys = HashSet::new();
         div()
             .flex()
             .flex_none()
@@ -1981,6 +2034,14 @@ impl Shell {
             .text_sm()
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                 let active = index == self.active;
+                // Two projects with the same folder name.
+                let mut key = tab.pin_key();
+                let mut copy = 1;
+                while !keys.insert(key.clone()) {
+                    copy += 1;
+                    key = format!("{}#{copy}", tab.pin_key());
+                }
+                let title = tab.title(cx);
                 div()
                     .id(("project-tab", index))
                     .flex()
@@ -2035,8 +2096,13 @@ impl Shell {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_tab(index, window, cx);
-                            })),
+                            }))
+                            .pin("close")
+                            .label(format!("Close {title}")),
                     )
+                    .pin(format!("tab:{key}"))
+                    .label(title)
+                    .interactive(true)
             }))
             .child(
                 div()
@@ -2048,10 +2114,15 @@ impl Shell {
                     .text_color(theme::muted())
                     .hover(|style| style.text_color(theme::text()))
                     .child("+")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.prompt_for_project(false, window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.prompt_for_project(false, window, cx)
+                        }),
+                    )
+                    .pin("new-project-tab")
+                    .label("Open Project…"),
             )
+            .pin("project-tabs")
     }
 
     /// The window without projects: how to open one.
@@ -2089,14 +2160,24 @@ impl Shell {
                     .child(selectable("welcome-title", "No project open")),
             )
             .child(
-                link("welcome-open", with_keys("Open Project…", &OpenProject)).on_click(
-                    cx.listener(|this, _, window, cx| this.prompt_for_project(false, window, cx)),
-                ),
+                link("welcome-open", with_keys("Open Project…", &OpenProject))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.prompt_for_project(false, window, cx)
+                        }),
+                    )
+                    .pin("open-project")
+                    .label("Open Project…"),
             )
             .child(
-                link("welcome-recent", with_keys("Open Recent…", &OpenRecent)).on_click(
-                    cx.listener(|this, _, window, cx| this.open_recent(&OpenRecent, window, cx)),
-                ),
+                link("welcome-recent", with_keys("Open Recent…", &OpenRecent))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.open_recent(&OpenRecent, window, cx)
+                        }),
+                    )
+                    .pin("open-recent")
+                    .label("Open Recent…"),
             )
             .when(!recents.is_empty(), |this| {
                 this.child(
@@ -2114,6 +2195,7 @@ impl Shell {
                     .enumerate()
                     .map(|(index, location)| {
                         let label = location.to_string();
+                        let pin = format!("recent:{label}");
                         div()
                             .id(("welcome-recent-project", index))
                             .px_2()
@@ -2121,12 +2203,15 @@ impl Shell {
                             .text_sm()
                             .cursor_pointer()
                             .hover(|style| style.bg(theme::hover_row()))
-                            .child(selectable("label", label))
+                            .child(selectable("label", label.clone()))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open(location.clone(), window, cx)
                             }))
+                            .pin(pin)
+                            .label(label)
                     }),
             )
+            .pin("welcome")
     }
 }
 
@@ -2246,6 +2331,11 @@ impl Render for Shell {
             // The active tab is loaded (see `activate`), or a workflow tab
             // waits for its project.
             Some(tab) => match tab.content.view() {
+                // The workflow view pins its content inside this wrapper.
+                Some(view) if matches!(tab.content, Content::Workflow(_)) => view
+                    .pin(format!("workflow:{}", tab.pin_key()))
+                    .label(tab.title(cx))
+                    .into_any_element(),
                 Some(view) => view.into_any_element(),
                 None => div()
                     .size_full()
@@ -2321,6 +2411,8 @@ impl Render for Shell {
                         this.notice = None;
                         cx.notify();
                     }))
+                    .pin("notice")
+                    .label("Notice (click to dismiss)")
             }))
             .children(self.theme_notice.clone().map(|notice| {
                 div()
@@ -2335,6 +2427,8 @@ impl Render for Shell {
                         this.theme_notice = None;
                         cx.notify();
                     }))
+                    .pin("theme-notice")
+                    .label("Theme problem (click to dismiss)")
             }))
             // A flex container: in a block one, panels in the right dock
             // left the workspace's inputs (finder, go to line, rename)
@@ -2384,6 +2478,7 @@ impl Render for Shell {
                     .map(|(picker, _)| modal(picker.clone().into())),
             )
             .children(selectable::context_menu(window, cx))
+            .child(crate::pinpoint::layer())
     }
 }
 

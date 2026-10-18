@@ -26,6 +26,7 @@ use syntax::Language;
 use crate::{
     editor::{self, Editor, EditorEvent, SymbolsStatus, symbol_kind_badge},
     lsp_store::{RunningServer, request_retrying},
+    pinpoint::Pin,
     project::Project,
     selectable::selectable,
     theme,
@@ -579,6 +580,13 @@ impl SymbolPicker {
                 (pos..pos + len, highlight)
             })
             .collect();
+        // Names repeat (overloads, files in folders): the hint (line,
+        // path) tells them apart.
+        let key = if item.hint.is_empty() {
+            item.name.clone()
+        } else {
+            format!("{}@{}", item.name, item.hint)
+        };
         div()
             .id(row)
             .h(px(ROW_HEIGHT))
@@ -631,6 +639,8 @@ impl SymbolPicker {
                     .text_color(theme::muted())
                     .child(selectable("hint", item.hint.clone())),
             )
+            .pin(format!("item:{key}"))
+            .label(item.name.clone())
     }
 }
 
@@ -780,7 +790,9 @@ impl Render for SymbolPicker {
                     .py_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(self.query.clone()),
+                    .child(self.query.clone())
+                    .pin("input")
+                    .label("Symbol name"),
             )
             .child(
                 uniform_list(
@@ -809,10 +821,14 @@ impl Render for SymbolPicker {
                             .truncate()
                             .child(selectable("title", self.title.clone())),
                     )
-                    .child(div().flex_none().child(selectable("status", status))),
+                    .child(div().flex_none().child(selectable("status", status)))
+                    .pin("status")
+                    .interactive(false),
             )
             // Keep clicks inside the modal from reaching the editor below.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .pin("symbol-picker")
+            .label(self.title.clone())
     }
 }
 

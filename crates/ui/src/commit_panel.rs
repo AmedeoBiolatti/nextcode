@@ -32,6 +32,7 @@ use crate::{
     debugger::panel::Tooltip,
     diff_view::DiffSource,
     editor::{self, Editor},
+    pinpoint::{self, Pin},
     project::Project,
     selectable::{SelectableText, selectable},
     settings,
@@ -130,6 +131,17 @@ impl Group {
             Self::Staged => "Staged",
             Self::Unstaged => "Unstaged",
             Self::Unversioned => "Unversioned Files",
+        }
+    }
+
+    /// The group's id in pinpoint paths.
+    fn pin_key(self) -> &'static str {
+        match self {
+            Self::Conflicts => "conflicts",
+            Self::Changes => "changes",
+            Self::Staged => "staged",
+            Self::Unstaged => "unstaged",
+            Self::Unversioned => "unversioned",
         }
     }
 
@@ -1942,6 +1954,11 @@ impl CommitPanel {
     /// Changes | Shelf, as PyCharm's Commit window tabs.
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = |id: &'static str, label: &'static str, tab: Tab, active: bool| {
+            let pin = if tab == Tab::Changes {
+                "tab:changes"
+            } else {
+                "tab:shelf"
+            };
             div()
                 .id(id)
                 .h_full()
@@ -1964,6 +1981,8 @@ impl CommitPanel {
                 .hover(|style| style.text_color(theme::text()))
                 .child(label)
                 .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
+                .pin(pin)
+                .label(label)
         };
         div()
             .h(px(26.))
@@ -1985,6 +2004,7 @@ impl CommitPanel {
                 Tab::Shelf,
                 self.tab == Tab::Shelf,
             ))
+            .pin("tabs")
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2020,12 +2040,17 @@ impl CommitPanel {
             .border_color(theme::border())
             .child(
                 button("commit-refresh", "⟳", "Refresh", false)
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
+                    .pin("refresh")
+                    .label("Refresh"),
             )
             .child(
-                button("commit-rollback", "↶", "Rollback…", false).on_click(
-                    cx.listener(|this, _, window, cx| this.rollback_selection(window, cx)),
-                ),
+                button("commit-rollback", "↶", "Rollback…", false)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.rollback_selection(window, cx)),
+                    )
+                    .pin("rollback")
+                    .label("Rollback…"),
             )
             .child(
                 button("commit-show-diff", "⇄", "Show Diff (Ctrl+D)", false)
@@ -2034,16 +2059,22 @@ impl CommitPanel {
                         if let Some(row) = this.selected {
                             this.show_diff(row, cx)
                         }
-                    })),
+                    }))
+                    .pin("show-diff")
+                    .label("Show Diff"),
             )
             .child(div().w(px(1.)).h(px(16.)).mx_1().bg(theme::border()))
             .child(
                 button("commit-expand-all", "⊞", "Expand All", false)
-                    .on_click(cx.listener(|this, _, _, cx| this.expand_all(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.expand_all(cx)))
+                    .pin("expand-all")
+                    .label("Expand All"),
             )
             .child(
                 button("commit-collapse-all", "⊟", "Collapse All", false)
-                    .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx)))
+                    .pin("collapse-all")
+                    .label("Collapse All"),
             )
             .child(
                 button(
@@ -2056,8 +2087,11 @@ impl CommitPanel {
                     this.by_directory = !this.by_directory;
                     this.rebuild_rows();
                     cx.notify();
-                })),
+                }))
+                .pin("group-by-directory")
+                .label("Group By Directory"),
             )
+            .pin("toolbar")
     }
 
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2076,6 +2110,31 @@ impl CommitPanel {
         };
         let selected = self.selected == Some(index);
         let actions = group.and_then(|group| self.row_actions(index, group, cx));
+        // Keyed by repository-relative path within the group; several
+        // repositories prefix their name.
+        let scope = if nested == 1 {
+            format!("{}/", repo.name())
+        } else {
+            String::new()
+        };
+        let (pin, pin_label) = match row {
+            Row::Repo { .. } => (format!("repo:{}", repo.name()), repo.name().to_owned()),
+            Row::Group { group, .. } => (
+                format!("group:{scope}{}", group.pin_key()),
+                group.title().to_owned(),
+            ),
+            Row::Dir { group, path, .. } => (
+                format!("dir:{scope}{}/{path}", group.pin_key()),
+                path.clone(),
+            ),
+            Row::File { group, entry, .. } => {
+                let path = &status.entries[*entry].path;
+                (
+                    format!("file:{scope}{}/{path}", group.pin_key()),
+                    path.clone(),
+                )
+            }
+        };
         let checkbox = (!self.staging && group.is_none_or(Group::checkable)).then(|| {
             checkbox(self.check_state(index))
                 .id(("commit-check", index))
@@ -2084,6 +2143,8 @@ impl CommitPanel {
                     cx.stop_propagation();
                     this.toggle_checked(index, cx)
                 }))
+                .pin("check")
+                .label("Include in Commit")
         });
         let files = |count: usize| match count {
             1 => "1 file".to_owned(),
@@ -2101,6 +2162,8 @@ impl CommitPanel {
                     cx.stop_propagation();
                     this.toggle_collapsed(index, cx)
                 }))
+                .pin("expand")
+                .label(if collapsed { "Expand" } else { "Collapse" })
         };
         let base = div()
             .id(("commit-row", index))
@@ -2152,6 +2215,9 @@ impl CommitPanel {
                             format!("{} · {}", branch_label(status), files(*count)),
                         )),
                 )
+                .pin(pin)
+                .label(pin_label)
+                .interactive(true)
                 .into_any_element();
         };
         match row {
@@ -2182,6 +2248,9 @@ impl CommitPanel {
                         .child(row_text("count", files(*count))),
                 )
                 .children(actions)
+                .pin(pin)
+                .label(pin_label)
+                .interactive(true)
                 .into_any_element(),
             Row::Dir {
                 label, collapsed, ..
@@ -2198,6 +2267,9 @@ impl CommitPanel {
                         .child(row_text("label", label.clone())),
                 )
                 .children(actions)
+                .pin(pin)
+                .label(pin_label)
+                .interactive(true)
                 .into_any_element(),
             Row::File {
                 entry, change, dir, ..
@@ -2237,6 +2309,9 @@ impl CommitPanel {
                             ),
                     )
                     .children(actions)
+                    .pin(pin)
+                    .label(pin_label)
+                    .interactive(true)
                     .into_any_element()
             }
         }
@@ -2250,13 +2325,14 @@ impl CommitPanel {
         group: Group,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement + use<>> {
-        let (glyph, title, stage): (&'static str, &'static str, bool) = match group {
-            Group::Staged => ("−", "Unstage", false),
-            Group::Unstaged => ("+", "Stage", true),
-            Group::Unversioned if self.staging => ("+", "Stage", true),
-            Group::Conflicts => ("✓", "Mark Resolved", true),
-            _ => return None,
-        };
+        let (glyph, title, pin, stage): (&'static str, &'static str, &'static str, bool) =
+            match group {
+                Group::Staged => ("−", "Unstage", "unstage", false),
+                Group::Unstaged => ("+", "Stage", "stage", true),
+                Group::Unversioned if self.staging => ("+", "Stage", "stage", true),
+                Group::Conflicts => ("✓", "Mark Resolved", "mark-resolved", true),
+                _ => return None,
+            };
         Some(
             div()
                 .id(("commit-row-action", index))
@@ -2283,7 +2359,9 @@ impl CommitPanel {
                     } else {
                         this.unstage(repo, entries, cx)
                     }
-                })),
+                }))
+                .pin(pin)
+                .label(title),
         )
     }
 
@@ -2403,6 +2481,8 @@ impl CommitPanel {
                         handler(this, repo, entries.clone(), window, cx);
                         cx.notify();
                     }))
+                    .pin(format!("item:{}", pinpoint::kebab(label)))
+                    .label(label)
             });
         Some(deferred(
             anchored().position(menu.position).child(
@@ -2424,7 +2504,8 @@ impl CommitPanel {
                         this.menu = None;
                         cx.notify();
                     }))
-                    .children(rows),
+                    .children(rows)
+                    .pin("menu"),
             ),
         ))
     }
@@ -2468,15 +2549,22 @@ impl CommitPanel {
                             .child(selectable(("operation", index), text)),
                     )
                     .when(rebasing, |banner| {
-                        banner.child(button(("operation-continue", index), "Continue").on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.finish_operation(index, false, cx)
-                            }),
-                        ))
+                        banner.child(
+                            button(("operation-continue", index), "Continue")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.finish_operation(index, false, cx)
+                                }))
+                                .pin("continue"),
+                        )
                     })
-                    .child(button(("operation-abort", index), "Abort").on_click(
-                        cx.listener(move |this, _, _, cx| this.finish_operation(index, true, cx)),
-                    ))
+                    .child(
+                        button(("operation-abort", index), "Abort")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.finish_operation(index, true, cx)
+                            }))
+                            .pin("abort"),
+                    )
+                    .pin(format!("operation:{}", repo.name()))
                     .into_any_element(),
             );
         }
@@ -2515,8 +2603,11 @@ impl CommitPanel {
                             .child("Trust This Folder")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.trust(trusted.to_string(), cx)
-                            })),
+                            }))
+                            .pin("trust")
+                            .label("Trust This Folder"),
                     )
+                    .pin(format!("untrusted:{path}"))
                     .into_any_element(),
             );
         }
@@ -2529,6 +2620,7 @@ impl CommitPanel {
                             .text_color(theme::error())
                             .child(selectable(("repository-error", index), error.clone())),
                     )
+                    .pin(format!("error:{}", index + 1))
                     .into_any_element(),
             );
         }
@@ -2572,7 +2664,9 @@ impl CommitPanel {
                         .on_click(
                             cx.listener(move |this, _, _, cx| this.select_shelf_repo(index, cx)),
                         )
-                })),
+                        .pin(format!("repo:{}", repo.name()))
+                }))
+                .pin("shelf-repos"),
         )
     }
 
@@ -2613,7 +2707,9 @@ impl CommitPanel {
                         Check::Unchecked
                     }))
                     .child(selectable("amend", "Amend"))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_amend(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_amend(cx)))
+                    .pin("amend")
+                    .label("Amend"),
             )
             .child(
                 div()
@@ -2637,7 +2733,9 @@ impl CommitPanel {
                                 .text_color(theme::muted())
                                 .child("Commit Message"),
                         )
-                    }),
+                    })
+                    .pin("message")
+                    .label("Commit Message"),
             )
             .child(
                 div()
@@ -2661,7 +2759,9 @@ impl CommitPanel {
                             .cursor_pointer()
                             .tooltip(|window, cx| Tooltip::view("Commit (Ctrl+Enter)", window, cx))
                             .child(commit_label)
-                            .on_click(cx.listener(|this, _, _, cx| this.commit(false, cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.commit(false, cx)))
+                            .pin("commit")
+                            .label(commit_label),
                     )
                     .child(
                         div()
@@ -2676,7 +2776,9 @@ impl CommitPanel {
                             .cursor_pointer()
                             .hover(|style| style.bg(theme::hover_row()))
                             .child(push_label)
-                            .on_click(cx.listener(|this, _, _, cx| this.commit(true, cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.commit(true, cx)))
+                            .pin("commit-and-push")
+                            .label(push_label),
                     ),
             )
             .children(self.feedback.clone().map(|(text, color)| {
@@ -2684,7 +2786,9 @@ impl CommitPanel {
                     .text_xs()
                     .text_color(color())
                     .child(selectable("feedback", text))
+                    .pin("feedback")
             }))
+            .pin("commit-area")
     }
 }
 
@@ -2711,6 +2815,7 @@ impl Render for CommitPanel {
                 .text_sm()
                 .text_color(color)
                 .child(selectable("message", text))
+                .pin("notice")
                 .into_any_element()
         };
         let ready = !self.repos.is_empty();
@@ -2737,6 +2842,7 @@ impl Render for CommitPanel {
                         "Everything is committed"
                     },
                 )))
+                .pin("empty")
                 .into_any_element()
         } else if ready {
             uniform_list(
@@ -2748,6 +2854,7 @@ impl Render for CommitPanel {
             )
             .flex_1()
             .w_full()
+            .pin("changes")
             .into_any_element()
         } else if !self.untrusted.is_empty() {
             div()
@@ -2787,8 +2894,11 @@ impl Render for CommitPanel {
                                 .child("Trust This Folder")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.trust(trusted.to_string(), cx)
-                                })),
+                                }))
+                                .pin("trust")
+                                .label("Trust This Folder"),
                         )
+                        .pin(format!("untrusted:{path}"))
                 }))
                 .into_any_element()
         } else if !self.errors.is_empty() {
@@ -2817,6 +2927,7 @@ impl Render for CommitPanel {
                     .text_xs()
                     .text_color(color())
                     .child(selectable("feedback", text))
+                    .pin("feedback")
             });
         div()
             .key_context("CommitPanel")
@@ -2848,7 +2959,8 @@ impl Render for CommitPanel {
                         .min_h_0()
                         .flex()
                         .flex_col()
-                        .child(self.shelf.clone()),
+                        .child(self.shelf.clone())
+                        .pin("shelf"),
                 )
             })
             .when(ready && changes, |panel| {

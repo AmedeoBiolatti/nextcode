@@ -10,6 +10,7 @@ use gpui::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    pinpoint::Pin,
     project_picker,
     selectable::selectable,
     theme,
@@ -204,7 +205,8 @@ impl Render for InputDialog {
                     .border_color(theme::accent())
                     .rounded_sm()
                     .bg(theme::background())
-                    .child(self.input.clone()),
+                    .child(self.input.clone())
+                    .pin("input"),
             )
             .children(self.checkbox.map(|(label, checked)| {
                 div()
@@ -238,6 +240,8 @@ impl Render for InputDialog {
                         }
                         cx.notify();
                     }))
+                    .pin("checkbox")
+                    .label(label)
             }))
             .children(self.error.clone().map(|error| {
                 div()
@@ -251,17 +255,21 @@ impl Render for InputDialog {
                     .justify_end()
                     .gap_2()
                     .child(
-                        button("dialog-cancel", "Cancel".into(), false).on_click(cx.listener(
-                            |this, _, window, cx| {
+                        button("dialog-cancel", "Cancel".into(), false)
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.dismiss(&project_picker::Dismiss, window, cx)
-                            },
-                        )),
+                            }))
+                            .pin("cancel"),
                     )
                     .child(
                         button("dialog-confirm", self.confirm_label.into(), true)
-                            .on_click(cx.listener(|this, _, _, cx| this.confirm(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm(cx)))
+                            .pin("confirm")
+                            .label(self.confirm_label),
                     ),
             )
+            .pin("input-dialog")
+            .label(self.title.clone())
     }
 }
 
@@ -431,6 +439,8 @@ impl Render for PushDialog {
                             .truncate()
                             .child(selectable(("subject", index), subject.to_owned())),
                     )
+                    .pin(format!("commit:{hash}"))
+                    .label(subject.to_owned())
             }));
         let can_push = matches!(&self.state, PushState::Ready { .. });
         frame()
@@ -456,7 +466,7 @@ impl Render for PushDialog {
                         .child(selectable("loading", "Reading outgoing commits…")),
                 )
             })
-            .when(target.is_some(), |dialog| dialog.child(list))
+            .when(target.is_some(), |dialog| dialog.child(list.pin("commits")))
             .children(match &self.state {
                 PushState::Failed(error) => Some(
                     div()
@@ -472,11 +482,11 @@ impl Render for PushDialog {
                     .justify_end()
                     .gap_2()
                     .child(
-                        button("push-cancel", "Cancel".into(), false).on_click(cx.listener(
-                            |this, _, window, cx| {
+                        button("push-cancel", "Cancel".into(), false)
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.dismiss(&project_picker::Dismiss, window, cx)
-                            },
-                        )),
+                            }))
+                            .pin("cancel"),
                     )
                     .child(
                         button(
@@ -484,8 +494,10 @@ impl Render for PushDialog {
                             if pushing { "Pushing…" } else { "Push" }.into(),
                             can_push,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| this.push(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.push(cx)))
+                        .pin("push"),
                     ),
             )
+            .pin("push-dialog")
     }
 }

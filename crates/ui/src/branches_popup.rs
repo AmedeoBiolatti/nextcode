@@ -14,6 +14,7 @@ use gpui::{
 use crate::{
     commit_panel::repository_name,
     editor::{self, Editor, EditorEvent},
+    pinpoint::{Pin, kebab},
     project_picker,
     selectable::selectable,
     theme,
@@ -466,8 +467,10 @@ impl BranchesPopup {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.select_repository(index, cx)
                                 }))
+                                .pin(format!("repository:{}", repository_name(repository)))
                         }),
-                ),
+                )
+                .pin("repositories"),
         )
     }
 
@@ -476,6 +479,7 @@ impl BranchesPopup {
         index: usize,
         branch: &Ref,
         tracking: Option<&BranchTracking>,
+        kind: &str,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let selected = self.selected == index;
@@ -556,6 +560,8 @@ impl BranchesPopup {
                     .text_color(theme::muted())
                     .child("›"),
             )
+            .pin(format!("{kind}:{}", branch.name))
+            .label(branch.name.clone())
             .into_any_element()
     }
 
@@ -589,6 +595,7 @@ impl BranchesPopup {
                             .bg(theme::border())
                             .into_any_element();
                     };
+                    let id = format!("item:{}", kebab(&label));
                     div()
                         .id(("branch-command", entry))
                         .h(px(ROW_HEIGHT))
@@ -603,8 +610,10 @@ impl BranchesPopup {
                         .hover(|style| style.bg(theme::hover_row()))
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| this.run(command.clone(), cx)))
+                        .pin(id)
                         .into_any_element()
-                })),
+                }))
+                .pin("submenu"),
         )
     }
 }
@@ -617,22 +626,26 @@ impl Focusable for BranchesPopup {
 
 impl Render for BranchesPopup {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut section = String::new();
         let rows: Vec<gpui::AnyElement> = self
             .items
             .clone()
             .iter()
             .enumerate()
             .map(|(index, item)| match item {
-                Item::Header(title) => div()
-                    .h(px(ROW_HEIGHT))
-                    .px_2()
-                    .flex()
-                    .items_end()
-                    .pb_0p5()
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child(selectable(("header", index), *title))
-                    .into_any_element(),
+                Item::Header(title) => {
+                    section = kebab(title);
+                    div()
+                        .h(px(ROW_HEIGHT))
+                        .px_2()
+                        .flex()
+                        .items_end()
+                        .pb_0p5()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(selectable(("header", index), *title))
+                        .into_any_element()
+                }
                 Item::Action(label, command) => {
                     let command = command.clone();
                     div()
@@ -654,10 +667,18 @@ impl Render for BranchesPopup {
                         }))
                         .child(*label)
                         .on_click(cx.listener(move |this, _, _, cx| this.run(command.clone(), cx)))
+                        .pin(format!("action:{}", kebab(label)))
+                        .label(*label)
                         .into_any_element()
                 }
                 Item::Branch { branch, tracking } => {
-                    self.render_branch_row(index, branch, tracking.as_ref(), cx)
+                    // A branch may be listed twice (recent and local).
+                    let kind = if section.starts_with("recent") {
+                        "recent"
+                    } else {
+                        "branch"
+                    };
+                    self.render_branch_row(index, branch, tracking.as_ref(), kind, cx)
                 }
             })
             .collect();
@@ -690,7 +711,7 @@ impl Render for BranchesPopup {
                             .text_color(theme::muted())
                             .child("⌕"),
                     )
-                    .child(self.query.clone()),
+                    .child(self.query.clone().pin("input").label("Search branches")),
             )
             .child(
                 div()
@@ -701,7 +722,8 @@ impl Render for BranchesPopup {
                     .p_1()
                     .flex()
                     .flex_col()
-                    .children(rows),
+                    .children(rows)
+                    .pin("rows"),
             )
             .children(self.error.clone().map(|error| {
                 div()
@@ -728,6 +750,8 @@ impl Render for BranchesPopup {
             .text_color(theme::text())
             .child(main)
             .children(self.render_submenu(cx))
+            .pin("branches-popup")
+            .label("Branches")
     }
 }
 

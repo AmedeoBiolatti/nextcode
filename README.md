@@ -79,7 +79,10 @@ to `~/.local/share/next_code/` in the distro (reinstalled when the build
 changes) and started through a login shell, so language servers come from the
 user's `PATH` there (`rustup component add rust-analyzer`,
 `uv tool install basedpyright`). `NEXT_CODE_WSL_AGENT` overrides the agent
-binary's location.
+binary's location. Each agent that starts points the stable link
+`~/.local/share/next_code/next_code_agent` at its build, so CLI agents working
+in the distro or container can call `next_code_agent pinpoint …` (see
+[docs/pinpoint-for-agents.md](docs/pinpoint-for-agents.md#from-inside-wsl-or-a-dev-container)).
 
 The real-WSL tests are ignored by default:
 
@@ -1857,6 +1860,40 @@ touches are dropped. `"semantic_highlighting": false` in `settings.json`
 turns this off (default `true`); the change applies live like a theme
 change.
 
+## Pinpoint
+
+Every part of the interface has a stable path (`menu-bar/run`,
+`workspace/left-dock/panel:commit/commit-area/commit`,
+`workspace/editor-area/pane:1/editor:src/main.rs/gutter/line:12`) that a
+person and an agent can both name, and text is addressable down to single
+characters (`src/main.rs:12:5-12:18`). An agent asked "how do I …?" can show
+the answer in the running window: outlines with a soft glow, numbered badges
+and short notes next to buttons, tints on code; the highlights follow their
+targets as panels scroll and resize, and go away with `clear`, Escape (when
+no popup uses it) or a note's ×.
+
+```sh
+next_code pinpoint list workspace/left-dock --depth 2
+next_code pinpoint highlight --clear workspace/left-dock/dock-tabs/tab:commit --step 1 \
+  --note "Open the Commit panel" src/main.rs:12 --reveal --note "Here"
+next_code pinpoint wait-pin --pick
+```
+
+`next_code pinpoint` is a client of the editor already running (it never
+opens a window): the editor serves JSON lines on a random loopback port with
+a token, announced in `<data dir>/next_code/pinpoint/<pid>.json`; the client
+picks the editor whose project holds the current directory. Agents inside
+WSL or a dev container use `next_code_agent pinpoint …`, and `--automation`
+has a `pinpoint` passthrough. The commands, targets and conventions are in
+[docs/pinpoint-for-agents.md](docs/pinpoint-for-agents.md).
+
+The other way round, **Pinpoint: Pick Element** (`Ctrl+Alt+Shift+P`) outlines
+the element under the pointer with its path; a click copies a reference
+(`nextcode://ui/<path>`, or the characters under the pointer in code and
+text) and adds it to the pins agents read (`pins`, `wait_pin`); Shift+click
+keeps picking, Escape leaves. **Pinpoint: Clear Highlights** removes the
+window's highlights.
+
 ## Headless mode
 
 ### UI automation (Linux / WSL)
@@ -1912,6 +1949,12 @@ Nothing the editor opens leaves the session: there is no D-Bus session bus
 `powershell.exe` launch used on WSL are stand-ins that only record the target.
 `{"cmd":"opened"}` returns the URLs and files the editor asked to open, in
 order.
+
+`{"cmd":"pinpoint","request":{…}}` forwards a [Pinpoint](#pinpoint) request
+(`list`, `find`, `highlight`, `clear`, `pick`, `pins`, `wait_pin`, `windows`)
+to the editor and returns its JSON reply as `result`: the paths and bounds of
+what is on screen (aim clicks with them) and highlights to check on
+screenshots.
 
 Requests execute serially. Input acknowledgements mean the platform operation
 finished, not that asynchronous application work or a rendered frame completed.

@@ -259,6 +259,12 @@ impl Editor {
             .border_color(theme::border())
             .text_xs()
             .text_color(theme::muted());
+        // `crumb:<n>`: 1-based position in the bar.
+        let mut crumb = 0;
+        let mut next_crumb = || {
+            crumb += 1;
+            format!("crumb:{crumb}")
+        };
         if let Some(folder) = folder {
             let dir = folder.path.clone();
             bar = bar
@@ -276,7 +282,9 @@ impl Editor {
                                 dir: dir.clone(),
                                 selected: None,
                             }));
-                        })),
+                        }))
+                        .pin(next_crumb())
+                        .label(folder.name.clone()),
                 )
                 .child(separator());
         }
@@ -310,7 +318,9 @@ impl Editor {
                                 selected: selected.clone(),
                             }));
                         }))
-                    }),
+                    })
+                    .pin(next_crumb())
+                    .label(name.clone()),
             );
         }
         for index in self.symbol_path() {
@@ -333,10 +343,12 @@ impl Editor {
                         cx.emit(EditorEvent::Pick(PickRequest::Symbols {
                             siblings_of: Some(index),
                         }));
-                    })),
+                    }))
+                    .pin(next_crumb())
+                    .label(symbol.name.clone()),
             );
         }
-        Some(bar)
+        Some(bar.pin("breadcrumbs"))
     }
 
     /// The project directory `root/segments…`.

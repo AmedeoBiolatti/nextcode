@@ -157,14 +157,18 @@ impl Editor {
                                 .border_color(theme::accent())
                                 .rounded_sm()
                                 .text_sm()
-                                .child(go_to.input.clone()),
+                                .child(go_to.input.clone())
+                                .pin("input")
+                                .label("Line[:column]"),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(theme::muted())
                                 .child(selectable("hint", hint)),
-                        ),
+                        )
+                        .pin("go-to-line")
+                        .label("Go to Line"),
                 ),
         )
     }

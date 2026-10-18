@@ -23,6 +23,7 @@ use text::{Bias, Buffer, Change, Encoding};
 use crate::{
     lsp_store::RunningServer,
     notebook::lsp::CellLink,
+    pinpoint::Pin,
     project::Project,
     selectable::selectable,
     theme::{self, SyntaxStyle},
@@ -47,6 +48,8 @@ mod inlay_hints;
 mod lines;
 mod minimap;
 mod navigation;
+mod pin_text;
+mod pins;
 mod project_settings;
 mod rename;
 mod scrollbar;
@@ -280,6 +283,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-shift-down", NextChange, ctx),
         KeyBinding::new("ctrl-alt-shift-up", PreviousChange, ctx),
         KeyBinding::new("ctrl-alt-z", RollbackLines, ctx),
+        // PyCharm's Copy Reference.
+        KeyBinding::new("ctrl-alt-shift-c", pin_text::CopyReference, ctx),
     ]);
     vim::init(cx);
     cx.bind_keys([KeyBinding::new(
@@ -541,6 +546,14 @@ pub struct Editor {
     notice: Option<SharedString>,
     /// Scroll the cursor to the middle of the view on the next layout.
     center_cursor: bool,
+    /// Pinpoint reveal: bring these bytes to the middle of the view on the
+    /// next layout, without moving the cursor.
+    pin_reveal: Option<Range<usize>>,
+    /// The enclosing pins' path in the last frame (a notebook cell's
+    /// reference names its notebook and cell from it).
+    pin_prefix: SharedString,
+    /// The text area's right-click menu, where it opened.
+    text_menu: Option<Point<Pixels>>,
     find: Option<FindBar>,
     go_to_line: Option<GoToLineInput>,
     rename: Option<rename::RenameInput>,
@@ -831,6 +844,9 @@ impl Editor {
             _navigation_task: None,
             notice: None,
             center_cursor: false,
+            pin_reveal: None,
+            pin_prefix: SharedString::default(),
+            text_menu: None,
             find: None,
             go_to_line: None,
             rename: None,
@@ -2110,6 +2126,10 @@ impl Editor {
             self.autoscroll = false;
             self.scroll.y = line_height * cursor_row as f32 - viewport.height / 2.;
         }
+        if let Some(range) = self.pin_reveal.take() {
+            self.autoscroll = false;
+            self.scroll = self.reveal_scroll(range, line_height, em_width, viewport, columns);
+        }
         if self.autoscroll {
             let top = line_height * cursor_row as f32;
             if top < self.scroll.y {
@@ -2833,6 +2853,8 @@ impl EntityInputHandler for Editor {
 
 struct EditorElement {
     editor: Entity<Editor>,
+    /// Pinpoint path of the enclosing pins, for the painted parts' nodes.
+    pin_prefix: SharedString,
 }
 
 impl IntoElement for EditorElement {
@@ -2863,6 +2885,7 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, ()) {
+        self.pin_prefix = crate::pinpoint::current_path().unwrap_or_default();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         if !self.editor.read(cx).notebook_cell {
@@ -2908,6 +2931,8 @@ impl Element for EditorElement {
     ) -> Vec<(Hitbox, CursorStyle)> {
         self.editor.update(cx, |editor, _| {
             editor.layout(bounds, window);
+            editor.record_pins(&self.pin_prefix, window);
+            editor.record_text_pins(&self.pin_prefix, window);
             let Some(layout) = editor.layout.as_ref() else {
                 return Vec::new();
             };
@@ -3157,6 +3182,7 @@ impl Render for Editor {
             })
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::copy_reference))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::undo))
@@ -3216,6 +3242,7 @@ impl Render for Editor {
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_mouse_down))
                     .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
+                    .on_mouse_down(MouseButton::Right, cx.listener(Self::on_text_right_mouse_down))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
@@ -3225,6 +3252,7 @@ impl Render for Editor {
                     .on_hover(cx.listener(Self::clear_hover))
                     .child(EditorElement {
                         editor: cx.entity(),
+                        pin_prefix: SharedString::default(),
                     })
                     .when(focused, |text| {
                         text.children(self.render_hover().map(|p| self.popover(p)))
@@ -3261,7 +3289,8 @@ impl Render for Editor {
                                 .min_w_0()
                                 .truncate()
                                 .text_color(message_color)
-                                .child(selectable("status-message", message)),
+                                .child(selectable("status-message", message))
+                                .pin("message"),
                         )
                         .child(
                             div()
@@ -3275,14 +3304,21 @@ impl Render for Editor {
                                             .truncate()
                                             .text_color(color())
                                             .child(selectable("server-status", status))
+                                            .pin("server-status")
+                                            .label("Language server")
                                     }),
                                 )
-                                .child(div().flex_none().child(selectable(
-                                    "position",
-                                    format!(
-                                        "{selection_count}Ln {line}, Col {column}   {indent}   {line_ending}   UTF-8   {language}"
-                                    ),
-                                )))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .child(selectable(
+                                            "position",
+                                            format!(
+                                                "{selection_count}Ln {line}, Col {column}   {indent}   {line_ending}   UTF-8   {language}"
+                                            ),
+                                        ))
+                                        .pin("position"),
+                                )
                                 .when(errors + warnings > 0, |row| {
                                     row.child(
                                         div()
@@ -3291,7 +3327,9 @@ impl Render for Editor {
                                             .child(
                                                 div()
                                                     .text_color(theme::error())
-                                                    .child(selectable("errors", format!("✕ {errors}"))),
+                                                    .child(selectable("errors", format!("✕ {errors}")))
+                                                    .pin("errors")
+                                                    .label(format!("{errors} errors")),
                                             )
                                             .child(
                                                 div()
@@ -3299,11 +3337,14 @@ impl Render for Editor {
                                                     .child(selectable(
                                                         "warnings",
                                                         format!("⚠ {warnings}"),
-                                                    )),
+                                                    ))
+                                                    .pin("warnings")
+                                                    .label(format!("{warnings} warnings")),
                                             ),
                                     )
                                 }),
-                        ),
+                        )
+                        .pin("status"),
                 )
             });
         if self.notebook_cell && self.rename.is_some() {
@@ -3360,6 +3401,7 @@ impl Render for Editor {
             .children(self.render_breakpoint_editor(cx))
             .children(self.render_hunk_popup(cx))
             .children(self.render_gutter_menu(cx))
+            .children(self.render_text_menu(cx))
             .into_any_element()
     }
 }

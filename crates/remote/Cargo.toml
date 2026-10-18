@@ -13,6 +13,7 @@ terminal.workspace = true
 
 [dev-dependencies]
 next_code_agent = { path = "../agent" }
+serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

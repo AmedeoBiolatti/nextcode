@@ -69,10 +69,10 @@ pub type DebugEvaluator = Rc<dyn Fn(String, &mut App) -> Task<Option<String>>>;
 #[derive(Default)]
 pub(super) struct DebugGutterState {
     /// In the order given; each with its line start offset.
-    breakpoints: Vec<(usize, GutterBreakpoint)>,
-    markers: Vec<(usize, GutterMarker)>,
+    pub(super) breakpoints: Vec<(usize, GutterBreakpoint)>,
+    pub(super) markers: Vec<(usize, GutterMarker)>,
     /// Line start offset and kind.
-    debug_line: Option<(usize, DebugLine)>,
+    pub(super) debug_line: Option<(usize, DebugLine)>,
     pub evaluator: Option<DebugEvaluator>,
     editing: Option<BreakpointEditor>,
 }
@@ -441,6 +441,11 @@ impl Editor {
                         .line_height(layout.line_height)
                         .child(field.clone()),
                 )
+                .pin(format!(
+                    "field:{}",
+                    FIELD_LABELS[index].to_lowercase().replace(' ', "-")
+                ))
+                .label(FIELD_LABELS[index])
         };
         let button = |id: &'static str, label: &'static str| {
             div()
@@ -510,22 +515,27 @@ impl Editor {
                                             "breakpoint-enabled",
                                             if enabled { "Disable" } else { "Enable" },
                                         )
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                if let Some(editing) = &mut this.debug.editing {
-                                                    editing.enabled = !editing.enabled;
-                                                    cx.notify();
-                                                }
-                                            }),
-                                        ),
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(editing) = &mut this.debug.editing {
+                                                editing.enabled = !editing.enabled;
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .pin("enabled")
+                                        .label(if enabled { "Disable" } else { "Enable" }),
                                     )
-                                    .child(button("breakpoint-remove", "Remove").on_click(
-                                        cx.listener(|this, _, window, cx| {
-                                            this.remove_edited_breakpoint(window, cx)
-                                        }),
-                                    )),
+                                    .child(
+                                        button("breakpoint-remove", "Remove")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.remove_edited_breakpoint(window, cx)
+                                            }))
+                                            .pin("remove")
+                                            .label("Remove"),
+                                    ),
                             ),
-                    ),
+                    )
+                    .pin("breakpoint-editor")
+                    .label("Edit Breakpoint"),
             ),
         ))
     }

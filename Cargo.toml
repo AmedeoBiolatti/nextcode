@@ -35,6 +35,7 @@ notify = "8"
 python = { path = "crates/python" }
 parking_lot = "0.12"
 percent-encoding = "2"
+pinpoint_cli = { path = "crates/pinpoint_cli" }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 proto = { path = "crates/proto" }
 # Already in the tree via grep-regex: find/replace in the editor.

@@ -10,6 +10,7 @@ use gpui::{
 use super::{Origin, Ports};
 use crate::{
     editor::{Editor, EditorEvent},
+    pinpoint::Pin,
     selectable::selectable,
     theme,
 };
@@ -171,7 +172,7 @@ impl PortsPanel {
             .child(
                 div()
                     .text_color(theme::muted())
-                    .child(selectable("prompt", prompt)),
+                    .child(selectable("prompt", prompt.clone())),
             )
             .child(
                 div()
@@ -183,15 +184,25 @@ impl PortsPanel {
                     .border_color(theme::accent())
                     .rounded_sm()
                     .bg(theme::background())
-                    .child(self.input.clone()),
+                    .child(self.input.clone())
+                    .pin("input")
+                    .label(prompt),
             )
-            .child(Self::button("port-input-ok", "Forward").on_click(
-                cx.listener(|this, _, window, cx| this.confirm(&ConfirmInput, window, cx)),
-            ))
             .child(
-                Self::button("port-input-cancel", "Cancel").on_click(
-                    cx.listener(|this, _, window, cx| this.cancel(&CancelInput, window, cx)),
-                ),
+                Self::button("port-input-ok", "Forward")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.confirm(&ConfirmInput, window, cx)),
+                    )
+                    .pin("ok")
+                    .label("Forward"),
+            )
+            .child(
+                Self::button("port-input-cancel", "Cancel")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.cancel(&CancelInput, window, cx)),
+                    )
+                    .pin("cancel")
+                    .label("Cancel"),
             )
     }
 }
@@ -232,7 +243,9 @@ impl Render for PortsPanel {
             .gap_2()
             .child(
                 Self::button("forward-port", "Forward a Port…")
-                    .on_click(cx.listener(|this, _, window, cx| this.start_forward(window, cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.start_forward(window, cx)))
+                    .pin("forward-port")
+                    .label("Forward a Port…"),
             )
             .children(
                 self.message
@@ -293,6 +306,7 @@ impl Render for PortsPanel {
                 let (url, address) = (forwarded.url(), forwarded.address());
                 let (open_url, copy, stop, change) =
                     (url.clone(), address.clone(), target.clone(), target.clone());
+                let row_key = format!("row:{target}");
                 div()
                     .id(("port-row", index))
                     .h(px(24.))
@@ -308,7 +322,8 @@ impl Render for PortsPanel {
                                 .cursor_pointer()
                                 .hover(|style| style.underline())
                                 .child(selectable("address", address))
-                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                                .on_click(move |_, _, cx| cx.open_url(&url))
+                                .pin("address"),
                         ),
                     )
                     .child(
@@ -333,40 +348,57 @@ impl Render for PortsPanel {
                             .gap_1()
                             .child(
                                 Self::button(("port-open", index), "Open")
-                                    .on_click(move |_, _, cx| cx.open_url(&open_url)),
+                                    .on_click(move |_, _, cx| cx.open_url(&open_url))
+                                    .pin("open")
+                                    .label("Open"),
                             )
-                            .child(Self::button(("port-copy", index), "Copy").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
-                                    this.message = Some((format!("Copied {copy}").into(), false));
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(Self::button(("port-local", index), "Port…").on_click(
-                                cx.listener(move |this, _, window, cx| {
-                                    let current = this
-                                        .ports
-                                        .read(cx)
-                                        .find(&change)
-                                        .map(|f| f.local_port().to_string())
-                                        .unwrap_or_default();
-                                    this.edit(
-                                        Editing::LocalPort(change.clone()),
-                                        &current,
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                            ))
-                            .child(Self::button(("port-stop", index), "Stop").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.ports.update(cx, |ports, cx| ports.stop(&stop, cx));
-                                    this.message =
-                                        Some((format!("Stopped forwarding {stop}").into(), false));
-                                    cx.notify();
-                                }),
-                            )),
+                            .child(
+                                Self::button(("port-copy", index), "Copy")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy.clone(),
+                                        ));
+                                        this.message =
+                                            Some((format!("Copied {copy}").into(), false));
+                                        cx.notify();
+                                    }))
+                                    .pin("copy")
+                                    .label("Copy"),
+                            )
+                            .child(
+                                Self::button(("port-local", index), "Port…")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let current = this
+                                            .ports
+                                            .read(cx)
+                                            .find(&change)
+                                            .map(|f| f.local_port().to_string())
+                                            .unwrap_or_default();
+                                        this.edit(
+                                            Editing::LocalPort(change.clone()),
+                                            &current,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                                    .pin("local-port")
+                                    .label("Port…"),
+                            )
+                            .child(
+                                Self::button(("port-stop", index), "Stop")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.ports.update(cx, |ports, cx| ports.stop(&stop, cx));
+                                        this.message = Some((
+                                            format!("Stopped forwarding {stop}").into(),
+                                            false,
+                                        ));
+                                        cx.notify();
+                                    }))
+                                    .pin("stop")
+                                    .label("Stop"),
+                            ),
                     )
+                    .pin(row_key)
                     .into_any_element()
             })
             .collect();
@@ -378,8 +410,8 @@ impl Render for PortsPanel {
             ))
         });
         let editing = self.editing.clone();
-        base.child(toolbar)
-            .children(editing.map(|editing| self.render_input(&editing, cx)))
+        base.child(toolbar.pin("toolbar"))
+            .children(editing.map(|editing| self.render_input(&editing, cx).pin("forward-input")))
             .child(header)
             .children(rows)
             .children(empty)

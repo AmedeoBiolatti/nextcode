@@ -23,6 +23,7 @@ use crate::{
     commit_panel::{Check, checkbox},
     editor::{Editor, EditorEvent},
     git_dialogs::button,
+    pinpoint::Pin,
     selectable::selectable,
     theme,
 };
@@ -544,6 +545,7 @@ impl InputForm {
                         this.choose(index, at, cx);
                         window.focus(&this.handles[index]);
                     }))
+                    .pin(format!("option:{}", option.label()))
             });
             div().absolute().top(px(FIELD_HEIGHT)).left_0().child(
                 deferred(
@@ -571,7 +573,8 @@ impl InputForm {
                                     cx.notify();
                                 },
                             ))
-                            .children(items),
+                            .children(items)
+                            .pin("options"),
                     ),
                 )
                 .with_priority(1),
@@ -658,6 +661,8 @@ impl InputForm {
                         .child(selectable(("input-error", index), sentence(&error))),
                 )
             })
+            .pin(format!("field:{}", input.id))
+            .label(input.label().to_owned())
             .into_any_element()
     }
 }
@@ -760,12 +765,21 @@ impl Render for InputForm {
                                     .cursor_pointer()
                                     .hover(|style| style.underline())
                                     .child("Reset to defaults")
-                                    .on_click(cx.listener(|this, _, _, cx| this.reset(cx))),
+                                    .on_click(cx.listener(|this, _, _, cx| this.reset(cx)))
+                                    .pin("reset")
+                                    .label("Reset to defaults"),
                             )
                             .child(div().flex_1())
-                            .child(button("inputs-cancel", "Cancel".into(), false).on_click(
-                                cx.listener(|_, _, _, cx| cx.emit(InputFormEvent::Cancelled)),
-                            ))
+                            .child(
+                                button("inputs-cancel", "Cancel".into(), false)
+                                    .on_click(
+                                        cx.listener(|_, _, _, cx| {
+                                            cx.emit(InputFormEvent::Cancelled)
+                                        }),
+                                    )
+                                    .pin("cancel")
+                                    .label("Cancel"),
+                            )
                             .child(
                                 button("inputs-run", "Run".into(), valid)
                                     .when(!valid, |run| {
@@ -776,9 +790,12 @@ impl Render for InputForm {
                                     })
                                     .when(valid, |run| {
                                         run.on_click(cx.listener(|this, _, _, cx| this.submit(cx)))
-                                    }),
+                                    })
+                                    .pin("run")
+                                    .label("Run"),
                             ),
-                    ),
+                    )
+                    .pin("inputs-form"),
             )
     }
 }

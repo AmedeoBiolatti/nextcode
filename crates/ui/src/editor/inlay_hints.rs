@@ -266,6 +266,13 @@ impl RowInlays {
             .iter()
             .any(|inlay| (inlay.start..inlay.start + inlay.len).contains(&index))
     }
+
+    /// Each inlay's byte range in the shaped text, in order.
+    pub fn spans(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.0
+            .iter()
+            .map(|inlay| inlay.start..inlay.start + inlay.len)
+    }
 }
 
 /// Inserts `inlays` (sorted; offsets relative to the row) into a row's

@@ -9,6 +9,7 @@ use gpui::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    pinpoint::Pin,
     project_picker,
     selectable::selectable,
     theme,
@@ -287,7 +288,9 @@ impl Render for WorktreePicker {
                     .py_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(self.query.clone()),
+                    .child(self.query.clone())
+                    .pin("input")
+                    .label("Worktree or branch"),
             )
             .children(
                 self.rows
@@ -295,6 +298,10 @@ impl Render for WorktreePicker {
                     .take(SHOWN)
                     .enumerate()
                     .map(|(index, choice)| {
+                        let pin = match choice {
+                            Choice::Add { branch, .. } => format!("item:add:{branch}"),
+                            Choice::Open(worktree) => format!("item:{}", worktree.path),
+                        };
                         let (name, detail, removable) = match choice {
                             Choice::Add {
                                 branch,
@@ -331,6 +338,7 @@ impl Render for WorktreePicker {
                                 (worktree.path.clone(), detail, removable)
                             }
                         };
+                        let label = name.clone();
                         div()
                             .id(index)
                             .h(px(ROW_HEIGHT))
@@ -371,7 +379,11 @@ impl Render for WorktreePicker {
                                         cx.stop_propagation();
                                         this.remove(worktree.clone(), window, cx)
                                     }))
+                                    .pin("remove")
+                                    .label("Remove worktree")
                             }))
+                            .pin(pin)
+                            .label(label)
                     }),
             )
             .when(self.busy, |picker| {
@@ -391,7 +403,11 @@ impl Render for WorktreePicker {
                     .text_xs()
                     .text_color(theme::error())
                     .child(selectable("error", error))
+                    .pin("error")
+                    .interactive(false)
             }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .pin("worktree-picker")
+            .label("Worktrees")
     }
 }

@@ -7,6 +7,7 @@ use gpui::{
 
 use crate::{
     editor::{self, Editor, EditorEvent},
+    pinpoint::{self, Pin},
     selectable::selectable,
     theme,
 };
@@ -136,7 +137,9 @@ impl Render for ThemePicker {
                     .py_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(self.query.clone()),
+                    .child(self.query.clone())
+                    .pin("input")
+                    .label("Theme name"),
             )
             .children(
                 self.rows
@@ -165,6 +168,8 @@ impl Render for ThemePicker {
                                     div().text_xs().text_color(theme::muted()).child("current"),
                                 )
                             })
+                            .pin(format!("item:{}", pinpoint::kebab(name)))
+                            .label(name.clone())
                     }),
             )
             .when(self.rows.is_empty(), |picker| {
@@ -174,9 +179,13 @@ impl Render for ThemePicker {
                         .py_1()
                         .text_xs()
                         .text_color(theme::muted())
-                        .child(selectable("empty", "No matching themes")),
+                        .child(selectable("empty", "No matching themes"))
+                        .pin("empty")
+                        .interactive(false),
                 )
             })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .pin("theme-picker")
+            .label("Select Theme")
     }
 }

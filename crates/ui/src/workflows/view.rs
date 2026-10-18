@@ -58,6 +58,7 @@ use super::{
 use crate::{
     debugger::panel::Tooltip,
     editor::{Editor, EditorEvent},
+    pinpoint::Pin,
     project::Project,
     selectable::selectable,
     shell::tab_title,
@@ -1093,6 +1094,7 @@ impl WorkflowView {
                     .text_xs()
                     .tooltip(move |window, cx| Tooltip::view(tooltip.clone(), window, cx))
                     .child(selectable("workflow-inputs-text", full))
+                    .pin("inputs-summary")
             }))
             .children(self.notice.clone().map(|notice| {
                 div()
@@ -1113,22 +1115,30 @@ impl WorkflowView {
                     .text_color(outcome_color(outcome))
                     .border_1()
                     .border_color(outcome_color(outcome))
-                    .child(selectable("text", outcome_text(outcome))),
+                    .child(selectable("text", outcome_text(outcome)))
+                    .pin("outcome")
+                    .interactive(false),
             )
             .child(
                 button("workflow-run-all", "Run All")
-                    .on_click(cx.listener(|this, _, _, cx| this.run_all(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.run_all(cx)))
+                    .pin("run-all")
+                    .label("Run All"),
             )
             .when(running, |toolbar| {
                 toolbar.child(
                     button("workflow-stop-all", "Stop All")
-                        .on_click(cx.listener(|this, _, _, cx| this.stop_all(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.stop_all(cx)))
+                        .pin("stop-all")
+                        .label("Stop All"),
                 )
             })
             .when(any_failed, |toolbar| {
                 toolbar.child(
                     button("workflow-retry-failed", "Retry Failed")
-                        .on_click(cx.listener(|this, _, _, cx| this.retry_failed(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_failed(cx)))
+                        .pin("retry-failed")
+                        .label("Retry Failed"),
                 )
             })
     }
@@ -1176,9 +1186,12 @@ impl WorkflowView {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.convert(cx);
-                            })),
+                            }))
+                            .pin("convert")
+                            .label("Convert to YAML"),
                     )
                 })
+                .pin("problems")
                 .into_any_element(),
         )
     }
@@ -1210,6 +1223,8 @@ impl WorkflowView {
         let size = |base: f32| px(base * scale);
         let path = node.path.clone();
         let group = node.is_group();
+        let pin_id = format!("{}:{}", if group { "group" } else { "card" }, node.path);
+        let pin_label = node.step.label().to_owned();
         let face = if self.under_cursor(index) {
             theme::active_row()
         } else {
@@ -1275,6 +1290,9 @@ impl WorkflowView {
                     .bg(face)
                     .child(content),
             )
+            .pin(pin_id)
+            .label(pin_label)
+            .interactive(true)
             .into_any_element()
     }
 
@@ -1390,7 +1408,9 @@ impl WorkflowView {
                                 .child(person_icon(size(12.), gate_color()))
                                 .tooltip(move |window, cx| {
                                     Tooltip::view(tooltip.clone(), window, cx)
-                                }),
+                                })
+                                .pin("gate")
+                                .label("Waits for you"),
                         )
                     })
                     .child(
@@ -1479,6 +1499,8 @@ impl WorkflowView {
                     });
                 }),
             )
+            .pin("continue")
+            .label("Continue")
             .into_any_element()
     }
 
@@ -1634,6 +1656,8 @@ impl WorkflowView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let path = self.graph.nodes[index].path.clone();
+        let pin_id = format!("group:{path}");
+        let pin_label = self.graph.nodes[index].step.label().to_owned();
         let scale = placement.scale;
         let size = |base: f32| px(base * scale);
         div()
@@ -1661,6 +1685,9 @@ impl WorkflowView {
                 }),
             )
             .child(self.group_title(index, status, active, scale, now))
+            .pin(pin_id)
+            .label(pin_label)
+            .interactive(true)
             .into_any_element()
     }
 
@@ -1921,47 +1948,60 @@ impl WorkflowView {
             .gap_1()
             .when(has_terminal, |actions| {
                 let step_id = step_id.clone();
-                actions.child(button("step-terminal", "Terminal").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        if on_host {
-                            this.host_terminal = match this.host_terminal.take() {
-                                Some(shown) if shown == step_id => None,
-                                _ => Some(step_id.clone()),
-                            };
-                            cx.notify();
-                        } else if let Some(at) = run_index {
-                            let id = this.id.clone();
-                            this.workflows
-                                .update(cx, |workflows, cx| workflows.show_terminal(&id, at, cx));
-                        }
-                    },
-                )))
+                actions.child(
+                    button("step-terminal", "Terminal")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if on_host {
+                                this.host_terminal = match this.host_terminal.take() {
+                                    Some(shown) if shown == step_id => None,
+                                    _ => Some(step_id.clone()),
+                                };
+                                cx.notify();
+                            } else if let Some(at) = run_index {
+                                let id = this.id.clone();
+                                this.workflows.update(cx, |workflows, cx| {
+                                    workflows.show_terminal(&id, at, cx)
+                                });
+                            }
+                        }))
+                        .pin("terminal")
+                        .label("Terminal"),
+                )
             })
             .when_some(run_index.filter(|_| waiting_manual), |actions, at| {
-                actions.child(button("step-continue", "Continue").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        let id = this.id.clone();
-                        this.workflows.update(cx, |workflows, cx| {
-                            workflows.continue_step(&id, at, cx);
-                        });
-                    },
-                )))
+                actions.child(
+                    button("step-continue", "Continue")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let id = this.id.clone();
+                            this.workflows.update(cx, |workflows, cx| {
+                                workflows.continue_step(&id, at, cx);
+                            });
+                        }))
+                        .pin("continue")
+                        .label("Continue"),
+                )
             })
             .when_some(run_index, |actions, at| {
                 let label = if failed { "Retry" } else { "Restart" };
-                actions.child(button("step-restart", label).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        let id = this.id.clone();
-                        this.workflows
-                            .update(cx, |workflows, cx| workflows.restart_step(&id, at, cx));
-                    },
-                )))
+                actions.child(
+                    button("step-restart", label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let id = this.id.clone();
+                            this.workflows
+                                .update(cx, |workflows, cx| workflows.restart_step(&id, at, cx));
+                        }))
+                        .pin(if failed { "retry" } else { "restart" })
+                        .label(label),
+                )
             })
             .child(
-                button("step-details-close", "×").on_click(cx.listener(|this, _, _, cx| {
-                    this.selected = None;
-                    cx.notify();
-                })),
+                button("step-details-close", "×")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.selected = None;
+                        cx.notify();
+                    }))
+                    .pin("close")
+                    .label("Close Details"),
             );
         let terminal = self
             .host_terminal
@@ -2061,7 +2101,8 @@ impl WorkflowView {
                             .whitespace_nowrap()
                             .overflow_y_scroll()
                             .track_scroll(&self.output_scroll)
-                            .child(selectable("step-output-text", lines.join("\n"))),
+                            .child(selectable("step-output-text", lines.join("\n")))
+                            .pin("output"),
                     )
                 })
                 .children(terminal.map(|view| {
@@ -2072,6 +2113,7 @@ impl WorkflowView {
                         .border_t_1()
                         .border_color(theme::border())
                         .child(div().flex_1().min_w_0().child(view))
+                        .pin("terminal-view")
                 }))
                 .into_any_element(),
             resizable,
@@ -2136,35 +2178,45 @@ impl WorkflowView {
             .flex_none()
             .gap_1()
             .when_some(run_index, |actions, at| {
-                actions.child(button("group-restart", "Restart").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        let id = this.id.clone();
-                        this.workflows
-                            .update(cx, |workflows, cx| workflows.restart_step(&id, at, cx));
-                    },
-                )))
+                actions.child(
+                    button("group-restart", "Restart")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let id = this.id.clone();
+                            this.workflows
+                                .update(cx, |workflows, cx| workflows.restart_step(&id, at, cx));
+                        }))
+                        .pin("restart")
+                        .label("Restart"),
+                )
             })
             .when_some(run_index.filter(|_| any_failed), |actions, at| {
-                actions.child(button("group-retry", "Retry Failed").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        let id = this.id.clone();
-                        this.workflows
-                            .update(cx, |workflows, cx| workflows.retry_step(&id, at, cx));
-                    },
-                )))
+                actions.child(
+                    button("group-retry", "Retry Failed")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let id = this.id.clone();
+                            this.workflows
+                                .update(cx, |workflows, cx| workflows.retry_step(&id, at, cx));
+                        }))
+                        .pin("retry-failed")
+                        .label("Retry Failed"),
+                )
             })
             .child(
-                button("group-toggle", if expanded { "Collapse" } else { "Expand" }).on_click(
-                    cx.listener(move |this, _, window, cx| {
+                button("group-toggle", if expanded { "Collapse" } else { "Expand" })
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.toggle_group(&path, window, cx);
-                    }),
-                ),
+                    }))
+                    .pin("toggle")
+                    .label(if expanded { "Collapse" } else { "Expand" }),
             )
             .child(
-                button("step-details-close", "×").on_click(cx.listener(|this, _, _, cx| {
-                    this.selected = None;
-                    cx.notify();
-                })),
+                button("step-details-close", "×")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.selected = None;
+                        cx.notify();
+                    }))
+                    .pin("close")
+                    .label("Close Details"),
             );
         div()
             .flex_none()
@@ -2271,6 +2323,8 @@ impl WorkflowView {
                 || artifact.target.text().to_owned(),
                 |found| found.resolved.clone(),
             );
+            let pin_id = format!("artifact:{}", artifact.name());
+            let pin_label = name.clone();
             div()
                 .id(("step-artifact", index))
                 .flex()
@@ -2316,6 +2370,8 @@ impl WorkflowView {
                             });
                         }))
                 })
+                .pin(pin_id)
+                .label(pin_label)
         });
         Some(
             div()
@@ -2335,14 +2391,17 @@ impl WorkflowView {
                                 .child(selectable("step-artifacts-heading", "Artifacts")),
                         )
                         .when_some(run_index.filter(|_| checkable), |header, at| {
-                            header.child(button("step-artifacts-check", "Check again").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    let id = this.id.clone();
-                                    this.workflows.update(cx, |workflows, cx| {
-                                        workflows.check_artifacts(&id, at, cx);
-                                    });
-                                }),
-                            ))
+                            header.child(
+                                button("step-artifacts-check", "Check again")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let id = this.id.clone();
+                                        this.workflows.update(cx, |workflows, cx| {
+                                            workflows.check_artifacts(&id, at, cx);
+                                        });
+                                    }))
+                                    .pin("check-artifacts")
+                                    .label("Check again"),
+                            )
                         })
                         .children(error.map(|error| {
                             div()
@@ -2354,6 +2413,7 @@ impl WorkflowView {
                         })),
                 )
                 .children(rows)
+                .pin("artifacts")
                 .into_any_element(),
         )
     }
@@ -2480,7 +2540,9 @@ impl WorkflowView {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
                     button("workflow-zoom-out", "−")
-                        .on_click(cx.listener(|this, _, _, cx| this.zoom_centered(1. / 1.2, cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.zoom_centered(1. / 1.2, cx)))
+                        .pin("zoom-out")
+                        .label("Zoom Out"),
                 )
                 .child(
                     div()
@@ -2493,13 +2555,18 @@ impl WorkflowView {
                 )
                 .child(
                     button("workflow-zoom-in", "+")
-                        .on_click(cx.listener(|this, _, _, cx| this.zoom_centered(1.2, cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.zoom_centered(1.2, cx)))
+                        .pin("zoom-in")
+                        .label("Zoom In"),
                 )
                 .child(
                     button("workflow-zoom-fit", "Fit")
                         .when(self.auto_fit, |fit| fit.border_color(theme::accent()))
-                        .on_click(cx.listener(|this, _, _, cx| this.fit(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.fit(cx)))
+                        .pin("zoom-fit")
+                        .label("Fit"),
                 )
+                .pin("zoom")
                 .into_any_element(),
         )
     }
@@ -2566,7 +2633,7 @@ impl Render for WorkflowView {
             .h_full()
             .flex()
             .overflow_hidden()
-            .child(self.editor.clone());
+            .child(self.editor.clone().pin("editor"));
         let handle = div()
             .id("workflow-split")
             .flex_none()
@@ -2586,7 +2653,9 @@ impl Render for WorkflowView {
                     cx.stop_propagation();
                     cx.notify();
                 }),
-            );
+            )
+            .pin("split")
+            .label("Resize Editor and Graph");
         let graph_area = div()
             .id("workflow-graph")
             .relative()
@@ -2616,7 +2685,7 @@ impl Render for WorkflowView {
                 .absolute()
                 .size_full(),
             )
-            .child(graph)
+            .child(graph.pin("graph"))
             .children(self.render_banner(cx))
             .children(self.render_zoom(cx))
             .children(self.form.as_ref().map(|(form, _)| form.clone()));
@@ -2672,7 +2741,9 @@ impl Render for WorkflowView {
                                 }
                                 cx.notify();
                             }),
-                        ),
+                        )
+                        .pin("details-split")
+                        .label("Resize Graph and Details"),
                 )
                 .child(
                     div()
@@ -2682,10 +2753,10 @@ impl Render for WorkflowView {
                         .flex()
                         .flex_col()
                         .overflow_hidden()
-                        .child(details),
+                        .child(details.pin("details")),
                 )
             }
-            Some((details, false)) => side.child(details),
+            Some((details, false)) => side.child(details.pin("details")),
             None => side,
         };
         div()
@@ -2703,7 +2774,7 @@ impl Render for WorkflowView {
             .flex_col()
             .bg(theme::background())
             .text_color(theme::text())
-            .child(self.render_toolbar(cx))
+            .child(self.render_toolbar(cx).pin("toolbar"))
             .child(
                 div()
                     .relative()

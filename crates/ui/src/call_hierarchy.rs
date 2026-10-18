@@ -18,6 +18,7 @@ use lsp::types::{
 use crate::{
     editor::symbol_kind_badge,
     lsp_store::{RunningServer, request_retrying},
+    pinpoint::Pin,
     selectable::selectable,
     theme,
 };
@@ -534,6 +535,7 @@ impl CallHierarchyPanel {
                     .pl(px(INDENT * (node.depth + 1) as f32 + 22.))
                     .text_color(theme::muted())
                     .child(div().truncate().child(selectable("message", text)))
+                    .pin(format!("{}>message", Self::item_key(tree, id)))
                     .into_any_element();
             }
             Row::Node(_) => {}
@@ -575,7 +577,9 @@ impl CallHierarchyPanel {
                             tree.selected = id;
                         }
                         this.toggle(id, cx);
-                    })),
+                    }))
+                    .pin("toggle")
+                    .label(if node.expanded { "Collapse" } else { "Expand" }),
             )
             .child(div().w(px(14.)).flex_none().text_color(color).child(badge))
             .child(
@@ -600,7 +604,33 @@ impl CallHierarchyPanel {
                     .text_color(theme::muted())
                     .child(selectable("place", place).double_click_through()),
             )
+            .pin(Self::item_key(tree, id))
+            .label(node.item.name.clone())
+            .interactive(true)
             .into_any_element()
+    }
+
+    /// `item:` and the node's `name@file:line` after its ancestors' (one
+    /// function can show up under several callers).
+    fn item_key(tree: &Tree, id: usize) -> String {
+        let mut parts = Vec::new();
+        let mut at = Some(id);
+        while let Some(id) = at {
+            let item = &tree.nodes[id].item;
+            let file = lsp::uri_to_path(&item.uri)
+                .as_deref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| item.uri.as_str().to_owned());
+            parts.push(format!(
+                "{}@{file}:{}",
+                item.name,
+                item.selection_range.start.line + 1
+            ));
+            at = tree.nodes[id].parent;
+        }
+        parts.reverse();
+        format!("item:{}", parts.join(">"))
     }
 
     fn direction_button(
@@ -629,6 +659,7 @@ impl CallHierarchyPanel {
             })
             .on_click(cx.listener(move |this, _, _, cx| this.set_direction(direction, cx)))
             .child(label)
+            .pin(label.to_lowercase())
     }
 }
 
@@ -703,7 +734,8 @@ impl Render for CallHierarchyPanel {
                             .child(selectable("title", title)),
                     )
                     .child(self.direction_button(Direction::Incoming, "Incoming", cx))
-                    .child(self.direction_button(Direction::Outgoing, "Outgoing", cx)),
+                    .child(self.direction_button(Direction::Outgoing, "Outgoing", cx))
+                    .pin("toolbar"),
             )
             .when(stopped, |panel| {
                 panel.child(
@@ -734,7 +766,8 @@ impl Render for CallHierarchyPanel {
                     }),
                 )
                 .track_scroll(self.scroll.clone())
-                .flex_1(),
+                .flex_1()
+                .pin("calls"),
             )
             .into_any_element()
     }

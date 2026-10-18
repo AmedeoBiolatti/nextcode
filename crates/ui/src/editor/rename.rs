@@ -260,7 +260,9 @@ impl Editor {
                             .font_family(theme::MONO_FONT)
                             .text_size(px(theme::EDITOR_FONT_SIZE))
                             .line_height(layout.line_height)
-                            .child(rename.input.clone()),
+                            .child(rename.input.clone())
+                            .pin("input")
+                            .label("New name"),
                     )
                     .child(
                         div()
@@ -268,7 +270,9 @@ impl Editor {
                             .text_xs()
                             .text_color(theme::muted())
                             .child(selectable("hint", "Enter to rename, Escape to cancel")),
-                    ),
+                    )
+                    .pin("rename")
+                    .label("Rename Symbol"),
             ),
         )
     }

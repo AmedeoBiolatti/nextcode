@@ -40,6 +40,7 @@ use crate::{
     editor::{self, Editor, EditorEvent},
     file_icons,
     file_ops::{self, NewKind},
+    pinpoint::{self, Pin},
     project::Project,
     selectable::selectable,
     theme,
@@ -1406,10 +1407,13 @@ impl FileTree {
                             .bg(theme::panel())
                             .border_1()
                             .border_color(theme::error())
-                            .child(selectable("file-tree-input-error", error)),
+                            .child(selectable("file-tree-input-error", error))
+                            .pin("error"),
                     ),
                 ))
             }))
+            .pin("name-input")
+            .label("Name")
     }
 
     /// The menu's items (`None`: a separator) with their actions and
@@ -1499,6 +1503,7 @@ impl FileTree {
                     .into_any_element();
             };
             let keys = commands::key_text(window, action.as_ref(), Some(&focus));
+            let id = format!("item:{}", pinpoint::kebab(label));
             div()
                 .id(("file-tree-menu-item", index))
                 .px_3()
@@ -1521,6 +1526,8 @@ impl FileTree {
                 })
                 .child(label)
                 .children(keys.map(|keys| div().text_color(theme::muted()).child(keys)))
+                .pin(id)
+                .label(label)
                 .into_any_element()
         });
         Some(deferred(
@@ -1543,7 +1550,8 @@ impl FileTree {
                         this.menu = None;
                         cx.notify();
                     }))
-                    .children(rows),
+                    .children(rows)
+                    .pin("menu"),
             ),
         ))
     }
@@ -1693,7 +1701,9 @@ impl Render for FileTree {
                         cx.listener(move |this, dragged: &DraggedPaths, window, cx| {
                             this.drop_paths(dragged.paths.clone(), header_drop.clone(), window, cx)
                         }),
-                    ),
+                    )
+                    .pin("header")
+                    .label(self.header.clone()),
             )
             .child(
                 div()
@@ -1732,7 +1742,8 @@ impl Render for FileTree {
                         )
                         .track_scroll(self.scroll.clone())
                         .size_full(),
-                    ),
+                    )
+                    .pin("tree"),
             )
             .children(self.render_menu(window, cx))
     }
@@ -1771,6 +1782,7 @@ impl FileTree {
                         .as_ref()
                         .map(|editing| self.render_input(editing)),
                 )
+                .pin("new-entry")
                 .into_any_element();
         }
         let selected = self.selection.contains(&row.path);
@@ -1899,6 +1911,12 @@ impl FileTree {
                     this.drop_paths(dragged.paths.clone(), drop_dir.clone(), window, cx)
                 }),
             )
+            .pin(format!(
+                "row:{}",
+                pinpoint::file_key(&self.project, &row.path)
+            ))
+            .label(row.name.clone())
+            .interactive(true)
             .into_any_element()
     }
 

@@ -160,6 +160,7 @@ const LABELS: &[(&str, &str)] = &[
     ("debugger::DownloadCodeLldb", "Download CodeLLDB"),
     ("debugger::ClearConsole", "Clear Debug Console"),
     ("editor::SelectAll", "Select All"),
+    ("editor::CopyReference", "Copy Reference"),
     ("editor::GoToDefinition", "Go to Definition"),
     ("editor::GoToDeclaration", "Go to Declaration"),
     ("editor::GoToTypeDefinition", "Go to Type Definition"),

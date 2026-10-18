@@ -800,14 +800,21 @@ impl Workspace {
 
     /// The editor area: the pane tree.
     pub(super) fn render_panes(&self, cx: &mut Context<Self>) -> AnyElement {
-        self.render_node(&self.pane_tree, cx)
+        // Panes are numbered in reading order (`pane:1` is top left): ids
+        // are internal and change between sessions.
+        let mut order = Vec::new();
+        self.pane_tree.leaves(&mut order);
+        self.render_node(&self.pane_tree, &order, cx)
+            .pin("editor-area")
+            .into_any_element()
     }
 
-    fn render_node(&self, node: &PaneNode, cx: &mut Context<Self>) -> AnyElement {
+    fn render_node(&self, node: &PaneNode, order: &[PaneId], cx: &mut Context<Self>) -> AnyElement {
         let split = match node {
             PaneNode::Leaf(id) => {
+                let number = order.iter().position(|leaf| leaf == id).unwrap_or(0) + 1;
                 return match self.pane(*id) {
-                    Some(pane) => self.render_pane(pane, cx),
+                    Some(pane) => self.render_pane(pane, number, cx),
                     None => div().into_any_element(),
                 };
             }
@@ -821,7 +828,7 @@ impl Workspace {
             .flex_none()
             .flex()
             .overflow_hidden()
-            .child(self.render_node(&split.first, cx));
+            .child(self.render_node(&split.first, order, cx));
         let first = if horizontal {
             first.w(relative(split.ratio)).h_full()
         } else {
@@ -833,7 +840,7 @@ impl Workspace {
             .min_h_0()
             .flex()
             .overflow_hidden()
-            .child(self.render_node(&split.second, cx));
+            .child(self.render_node(&split.second, order, cx));
         let handle = div()
             .flex_none()
             .bg(if self.pane_resize == Some(id) {
@@ -872,22 +879,45 @@ impl Workspace {
                     .size_full(),
             )
             .child(first)
-            .child(handle)
+            .child({
+                // Each gap between neighbouring panes belongs to one split:
+                // named after the pane before it.
+                let mut after = Vec::new();
+                split.second.leaves(&mut after);
+                let before = after
+                    .first()
+                    .and_then(|first| order.iter().position(|leaf| leaf == first))
+                    .unwrap_or(0);
+                handle
+                    .pin(format!("split-handle:{before}"))
+                    .label("Resize panes")
+            })
             .child(second)
             .into_any_element()
     }
 
-    fn render_pane(&self, pane: &Pane, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pane(&self, pane: &Pane, number: usize, cx: &mut Context<Self>) -> AnyElement {
         let id = pane.id;
         let content = match pane.active_tab() {
-            Some(tab) => div().size_full().flex().child(tab.view()),
+            Some(tab) => {
+                let key = tab.pin_key(&self.project, cx);
+                div()
+                    .size_full()
+                    .flex()
+                    .child(tab.view())
+                    .pin(tab.content_pin(&key))
+                    .label(tab.title.clone())
+                    .interactive(false)
+                    .into_any_element()
+            }
             None => div()
                 .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
                 .text_color(theme::muted())
-                .child("Open a file from the project tree, or press Ctrl+P"),
+                .child("Open a file from the project tree, or press Ctrl+P")
+                .into_any_element(),
         };
         div()
             .id(("pane", id.0))
@@ -911,12 +941,15 @@ impl Workspace {
                         area.child(self.render_drop_zones(id, cx))
                     }),
             )
+            .pin(format!("pane:{number}"))
+            .interactive(false)
             .into_any_element()
     }
 
     fn render_tab_bar(&self, pane: &Pane, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let pane_id = pane.id;
         let focused = pane_id == self.active_pane;
+        let mut keys = HashSet::new();
         div()
             .flex()
             .flex_none()
@@ -932,6 +965,13 @@ impl Workspace {
                     view: tab.entity_id(),
                     title: tab.title.clone(),
                 };
+                // A file open as text and as a notebook in one pane.
+                let mut key = tab.pin_key(&self.project, cx);
+                let mut copy = 1;
+                while !keys.insert(key.clone()) {
+                    copy += 1;
+                    key = format!("{}#{copy}", tab.pin_key(&self.project, cx));
+                }
                 div()
                     .id(("tab", index))
                     .relative()
@@ -1002,8 +1042,17 @@ impl Workspace {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_tab(pane_id, index, window, cx);
-                            })),
+                            }))
+                            .pin("close")
+                            .label(if dirty {
+                                "Close (unsaved changes)"
+                            } else {
+                                "Close"
+                            }),
                     )
+                    .pin(format!("tab:{key}"))
+                    .label(tab.title.clone())
+                    .interactive(true)
             }))
             // Empty space: drop to append.
             .child(
@@ -1019,6 +1068,7 @@ impl Workspace {
                         this.drop_tab(dragged, target, window, cx);
                     })),
             )
+            .pin("tab-bar")
     }
 
     /// While a tab is dragged: the pane's edges split it, its middle takes

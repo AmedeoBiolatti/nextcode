@@ -304,7 +304,9 @@ impl Editor {
                         div()
                             .text_color(theme::muted())
                             .child(selectable("blame-id", commit.id.clone())),
-                    ),
+                    )
+                    .pin("blame-hover")
+                    .label("Commit details"),
             ),
         ))
     }

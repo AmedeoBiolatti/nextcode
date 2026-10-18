@@ -32,6 +32,8 @@ use crate::{
     workspace_file::{self, Folder},
 };
 
+mod pinpoint;
+
 /// What the user asked to open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Location {
@@ -327,6 +329,8 @@ struct Inner {
     /// Settings layered per folder (see [`Project::settings_for`]).
     folder_settings: Mutex<Vec<Option<FolderSettings>>>,
     backend: Backend,
+    /// Serves `next_code_agent pinpoint` on a remote project's machine.
+    _pinpoint: Option<StreamHandle>,
 }
 
 /// A folder of the project.
@@ -507,12 +511,21 @@ impl Project {
     }
 
     fn build(roots: Vec<Root>, workspace: Option<WorkspaceInfo>, backend: Backend) -> Self {
+        let pinpoint = match &backend {
+            Backend::Local => None,
+            // Without it the project still works; only CLI agents on the
+            // remote machine can't reach this window.
+            Backend::Remote { client, .. } => pinpoint::serve(client, &roots)
+                .inspect_err(|err| eprintln!("next_code: remote pinpoint unavailable: {err}"))
+                .ok(),
+        };
         Self(Arc::new(Inner {
             root: roots[0].path.clone(),
             folder_settings: Mutex::new((0..roots.len()).map(|_| None).collect()),
             roots,
             workspace,
             backend,
+            _pinpoint: pinpoint,
         }))
     }
 
