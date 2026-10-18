@@ -35,6 +35,8 @@ fn properties(place: &Place) -> Option<&'static str> {
             "/definitions/dependsOn/anyOf/2/additionalProperties/anyOf/2/properties"
         }
         Place::Option(_) => "/definitions/input/properties/options/items/anyOf/1/properties",
+        Place::Healthcheck(_) => "/definitions/healthcheck/properties",
+        Place::Restart(_) => "/definitions/restart/anyOf/1/properties",
         _ => return None,
     })
 }

@@ -105,6 +105,17 @@ fn keys_of(
         Place::Dependency(_) => vec!["condition"],
         Place::Artifact(_) => vec!["label", "path", "url"],
         Place::Option(_) => vec!["value", "label"],
+        Place::Healthcheck(_) => {
+            // One probe: `test`, `http` or `port`.
+            let probes = ["test", "http", "port"];
+            let has_probe = present.iter().any(|key| probes.contains(&key.as_str()));
+            workflow::policy::HEALTHCHECK_KEYS
+                .iter()
+                .copied()
+                .filter(|key| !(has_probe && probes.contains(key)))
+                .collect()
+        }
+        Place::Restart(_) => vec!["policy", "max", "backoff"],
         Place::Input(id) => {
             let kind = analysis
                 .input_node(id)
@@ -270,12 +281,60 @@ pub fn complete(text: &str, offset: usize) -> Vec<Item> {
             "depends_on" => step_items(siblings(chain), ""),
             "open_urls" => booleans(),
             "timeout" | "stop_grace_period" => durations(),
+            "restart" => {
+                let mut items = values(&[
+                    (
+                        "on_failure",
+                        "Start it again when its command fails: an exit code, a crash after it was ready, a timeout, unhealthy.",
+                    ),
+                    (
+                        "always",
+                        "Also after a clean exit (a job that runs again and again).",
+                    ),
+                    ("no", "Never (the default)."),
+                ]);
+                items.extend(snippets(
+                    &[(
+                        "{policy: …, max: …, backoff: …}",
+                        "{policy: ${1|on_failure,always|}, max: ${2:5}, backoff: ${3:5s}}",
+                        "A policy with a limit and a wait before each restart.",
+                    )],
+                    &replace,
+                ));
+                items
+            }
+            "healthcheck" => snippets(
+                &[
+                    (
+                        "{test: …, interval: …}",
+                        "{test: ${1:curl -fs localhost:8000/health}, interval: ${2:30s}}",
+                        "A command every interval: exit code 0 is healthy.",
+                    ),
+                    (
+                        "{http: …}",
+                        "{http: '${1:http://localhost:8000/health}', interval: ${2:30s}}",
+                        "A URL answers with 200–399.",
+                    ),
+                    (
+                        "{port: …}",
+                        "{port: ${1:8000}, interval: ${2:30s}}",
+                        "Something listens on this port.",
+                    ),
+                ],
+                &replace,
+            ),
+            "if" => condition_items(&analysis, chain, &replace),
             "ready" => snippets(
                 &[
                     (
                         "{port: …}",
                         "{port: ${1:8000}}",
                         "Something listens on this port.",
+                    ),
+                    (
+                        "{http: …}",
+                        "{http: '${1:http://localhost:8000/health}'}",
+                        "A URL answers with 200–399.",
                     ),
                     (
                         "{output: …}",
@@ -323,6 +382,15 @@ pub fn complete(text: &str, offset: usize) -> Vec<Item> {
             _ => Vec::new(),
         },
         (At::Value(_), Place::DependsOn(_)) => conditions(),
+        (At::Value(key), Place::Healthcheck(_)) => match key.as_str() {
+            "interval" | "timeout" | "start_period" => durations(),
+            _ => Vec::new(),
+        },
+        (At::Value(key), Place::Restart(_)) => match key.as_str() {
+            "policy" => values(&[("on_failure", ""), ("always", ""), ("no", "")]),
+            "backoff" => durations(),
+            _ => Vec::new(),
+        },
         (At::Value(key), Place::Dependency(_)) if key == "condition" => conditions(),
         (At::Value(key), Place::Ready(_)) => match key.as_str() {
             "exit" => values(&[("true", "")]),
@@ -367,6 +435,45 @@ pub fn complete(text: &str, offset: usize) -> Vec<Item> {
         (At::Variable(typed), _) => variables(&analysis, text, offset, typed, &replace),
         _ => Vec::new(),
     }
+}
+
+/// What an `if` may read: the functions, the steps in scope and the
+/// inputs.
+fn condition_items(analysis: &Analysis, chain: &[String], replace: &Range<usize>) -> Vec<Item> {
+    let mut items: Vec<Item> = [
+        (
+            "success()",
+            "Every step it waits for is ready (or skipped).",
+        ),
+        (
+            "failure()",
+            "A step it waits for failed (wait for it `completed`).",
+        ),
+        ("always()", "Always true."),
+    ]
+    .iter()
+    .map(|(label, doc)| Item {
+        documentation: Some((*doc).to_owned()),
+        ..item(label, Kind::Value, (*label).to_owned(), replace)
+    })
+    .collect();
+    for (id, target) in analysis.scope(chain) {
+        for field in ["status", "exit_code"] {
+            let label = format!("steps.{id}.{field}");
+            items.push(Item {
+                documentation: Some(step_summary(analysis, &target)),
+                ..item(&label, Kind::Variable, label.clone(), replace)
+            });
+        }
+    }
+    for span in &analysis.inputs {
+        let label = format!("inputs.{}", span.id);
+        items.push(Item {
+            documentation: Some(input_summary(analysis, &span.id)),
+            ..item(&label, Kind::Input, label.clone(), replace)
+        });
+    }
+    items
 }
 
 fn snippets(choices: &[(&str, &str, &str)], replace: &Range<usize>) -> Vec<Item> {

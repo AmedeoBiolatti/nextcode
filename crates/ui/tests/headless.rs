@@ -54,7 +54,7 @@ impl Headless {
 
     /// `next_code --headless <args>`.
     fn launch(args: &[&std::ffi::OsStr], env: &[(&str, &std::path::Path)]) -> Self {
-        let mut child = background_command(env!("CARGO_BIN_EXE_next_code"))
+        let mut child = background_command(env!("CARGO_BIN_EXE_next_code_editor"))
             .arg("--headless")
             .args(args)
             .envs(env.iter().copied())
@@ -4380,6 +4380,97 @@ fn headless_mode_serves_workflow_files_with_the_built_in_server() {
         fs::read_to_string(&file).unwrap(),
         "steps:\n  postgres: {run: d}\n  api: {depends_on: [postgres, zz], run: 'a ${steps.postgres.status}'}\n"
     );
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Restart policies, HTTP readiness, health checks, `if` and env files
+/// with real processes: a flaky command restarts until it gives up, a
+/// step gets ready once a URL answers, a health check makes a step
+/// unhealthy, a false `if` skips a step and what needs it, and a `.env`
+/// reaches a command.
+#[test]
+fn headless_mode_restarts_probes_skips_and_reads_env_files() {
+    let root = std::env::temp_dir().join(format!("next_code_wf_policies_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join(".next_code/workflows")).unwrap();
+    let root = if cfg!(windows) {
+        root
+    } else {
+        root.canonicalize().unwrap()
+    };
+    fs::write(root.join(".env"), "GREETING=hello-from-file\n").unwrap();
+    // A server answering every request with 200.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut request = [0; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let greet = if cfg!(windows) {
+        "echo $env:GREETING"
+    } else {
+        "echo $GREETING"
+    };
+    let text = format!(
+        r#"name: Policies
+inputs:
+  mode: {{type: choice, options: [quick, full], default: quick}}
+steps:
+  flaky:
+    run: exit 3
+    restart: {{policy: on_failure, max: 2, backoff: 200ms}}
+  web:
+    ready: {{http: 'http://127.0.0.1:{port}/health'}}
+  sick:
+    check: exit 0
+    healthcheck: {{test: exit 1, interval: 300ms, retries: 2}}
+  full:
+    if: inputs.mode == 'full'
+    run: echo full
+  after_full: {{depends_on: [full], run: echo never}}
+  greet:
+    project: {{local: {root}}}
+    env_file: .env
+    run: {greet}
+"#,
+        root = serde_json::to_string(&root).unwrap(),
+    );
+    fs::write(root.join(".next_code/workflows/policies.yaml"), text).unwrap();
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let list = headless.call(json!({ "cmd": "workflows_list" }));
+    let listed = &list["result"][0];
+    assert_eq!(listed["error"], Value::Null, "{listed}");
+    assert_eq!(listed["steps"][0]["policies"]["restart"]["policy"], "on_failure");
+    assert_eq!(listed["steps"][2]["policies"]["healthcheck"]["probe"]["test"], "exit 1");
+    assert_eq!(listed["steps"][1]["ready"]["http"]["url"], format!("http://127.0.0.1:{port}/health"));
+    let run = headless.call(json!({ "cmd": "workflow_run", "name": "Policies" }));
+    assert_eq!(run["ok"], true, "{run}");
+    let status = status_until(&mut headless, "policies.yaml", |status| {
+        let steps = &status["steps"];
+        steps[0]["status"] == "failed"
+            && steps[1]["status"] == "ready"
+            && steps[2]["status"] == "failed"
+            && steps[5]["status"] == "ready"
+    });
+    let steps = status["steps"].as_array().unwrap();
+    assert_eq!(steps[0]["reason"], "failed (exit code 3) (gave up after 2 restarts)", "{status}");
+    assert_eq!(steps[0]["restarts"], 2);
+    assert_eq!(steps[2]["reason"], "unhealthy: exit code 1", "{status}");
+    assert_eq!(steps[3]["status"], "skipped");
+    assert_eq!(steps[3]["reason"], "if inputs.mode == 'full'");
+    assert_eq!(steps[4]["status"], "skipped");
+    assert_eq!(steps[4]["reason"], "full was skipped");
+    assert_eq!(steps[5]["last_line"], "hello-from-file", "{status}");
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
     assert!(headless.child.wait().unwrap().success());
     fs::remove_dir_all(&root).ok();

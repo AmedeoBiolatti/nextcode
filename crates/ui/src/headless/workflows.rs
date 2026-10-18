@@ -137,7 +137,7 @@ pub(super) fn forward(out: &Out, event: &WorkflowsEvent) {
                 "step": step,
                 "status": status.name(),
                 "reason": match status {
-                    Status::Failed(reason) => Some(reason.as_str()),
+                    Status::Failed(reason) | Status::Skipped(reason) => Some(reason.as_str()),
                     _ => None,
                 },
                 "detail": detail,
@@ -171,7 +171,41 @@ fn ready_json(ready: &Ready) -> Value {
         Ready::Port(port) => json!({ "port": port }),
         Ready::Manual(prompt) => json!({ "manual": prompt }),
         Ready::Delay(delay) => json!({ "delay": workflow::format_duration(*delay) }),
+        Ready::Http(http) => json!({ "http": http_json(http) }),
     }
+}
+
+/// `{url, status}` (`status`: the accepted codes, `[]` for 200–399).
+fn http_json(http: &workflow::HttpProbe) -> Value {
+    json!({ "url": http.url, "status": http.status })
+}
+
+/// A step's `restart`, `healthcheck`, `if` and `env_file` as declared.
+fn policies_json(step: &workflow::Step) -> Value {
+    let format = workflow::format_duration;
+    json!({
+        "restart": {
+            "policy": step.restart.policy.name(),
+            "max": step.restart.max,
+            "backoff": format(step.restart.backoff),
+        },
+        "healthcheck": step.healthcheck.as_ref().map(|check| {
+            let probe = match &check.probe {
+                workflow::Probe::Command(command) => json!({ "test": command }),
+                workflow::Probe::Http(http) => json!({ "http": http_json(http) }),
+                workflow::Probe::Port(port) => json!({ "port": port }),
+            };
+            json!({
+                "probe": probe,
+                "interval": format(check.interval),
+                "timeout": format(check.timeout),
+                "retries": check.retries,
+                "start_period": format(check.start_period),
+            })
+        }),
+        "if": step.condition,
+        "env_file": step.env_file.iter().map(|file| json!({ "path": file.path, "required": file.required })).collect::<Vec<_>>(),
+    })
 }
 
 /// `{"<id>": "ready" | "completed"}`, in the order written.
@@ -238,6 +272,7 @@ fn node_json(nodes: &[StepNode], at: usize) -> Value {
             "kind": "group",
             "title": step.title,
             "depends_on": depends_json(step),
+            "if": step.condition,
             "project": project,
             "steps": node.children.iter().map(|&child| node_json(nodes, child)).collect::<Vec<_>>(),
         });
@@ -255,6 +290,7 @@ fn node_json(nodes: &[StepNode], at: usize) -> Value {
         "timeout": step.timeout.map(workflow::format_duration),
         "stop_grace_period": workflow::format_duration(step.stop_grace()),
         "artifacts": step.artifacts.iter().map(artifact_json).collect::<Vec<_>>(),
+        "policies": policies_json(step),
     })
 }
 
@@ -308,7 +344,7 @@ fn status_json(workflows: &Workflows, id: &str, cx: &App) -> Result<Value, Strin
             let step = &node.step;
             let parent = node.parent.map(|parent| nodes[parent].path.as_str());
             let reason = match &state.status {
-                Status::Failed(reason) => Some(reason.as_str()),
+                Status::Failed(reason) | Status::Skipped(reason) => Some(reason.as_str()),
                 _ => None,
             };
             let elapsed_ms = state
@@ -357,6 +393,8 @@ fn status_json(workflows: &Workflows, id: &str, cx: &App) -> Result<Value, Strin
                 "check_output": state.check_output,
                 "exit_code": state.exit.flatten(),
                 "exited": state.exit.is_some(),
+                "restarts": state.restarts,
+                "health_failures": state.health_failures,
                 "elapsed_ms": elapsed_ms,
                 "location": active.location(index).map(ToString::to_string),
                 "terminal": active.terminal(index).map(|view| view.read(cx).run_name().map(str::to_owned)),

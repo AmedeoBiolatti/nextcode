@@ -92,8 +92,7 @@ fn independent_steps_start_together_and_needs_wait() {
 #[test]
 fn projects_open_and_checks_run_before_the_command() {
     let t = Instant::now();
-    let mut run =
-        run(r#"
+    let mut run = run(r#"
 steps:
   a: {project: {local: /p}, check: c, run: r}
 "#);
@@ -135,11 +134,12 @@ steps:
     );
     assert_eq!(statuses(&run), ["running"]);
 
-    let mut failing =
-        self::run(r#"
+    let mut failing = self::run(
+        r#"
 steps:
   a: {project: {local: /p}, run: r}
-"#);
+"#,
+    );
     failing.start(t);
     failing.project_failed(0, generation(&failing, 0), "no such folder", t);
     assert_eq!(
@@ -253,12 +253,15 @@ steps:
     assert_eq!(run.steps()[0].status, Status::Ready);
     assert_eq!(run.steps()[0].last_line(), "Listening on 8080");
 
-    assert_eq!(run.port_watches(), [(1, generation(&run, 1), 8000)]);
-    run.port_state(1, generation(&run, 1), false, t);
+    assert_eq!(
+        run.ready_probes(),
+        [(1, generation(&run, 1), Probe::Port(8000))]
+    );
+    run.probe_result(1, generation(&run, 1), false, t);
     assert_eq!(run.steps()[1].status, Status::Running);
-    run.port_state(1, generation(&run, 1), true, t);
+    run.probe_result(1, generation(&run, 1), true, t);
     assert_eq!(run.steps()[1].status, Status::Ready);
-    assert!(run.port_watches().is_empty());
+    assert!(run.ready_probes().is_empty());
 
     assert_eq!(run.next_deadline(), Some(t + Duration::from_millis(500)));
     run.tick(t + Duration::from_millis(499));
@@ -281,9 +284,13 @@ steps:
         Status::Failed("failed (exit code 2)".into())
     );
     assert_eq!(run.outcome(), Outcome::Failed, "finished with a failure");
-    // Exiting before readiness fails; exiting after it is only noted.
+    // Exiting before readiness fails; exiting with an error after it is
+    // a crash.
     run.exited(0, generation(&run, 0), Some(1), t);
-    assert_eq!(run.steps()[0].status, Status::Ready);
+    assert_eq!(
+        run.steps()[0].status,
+        Status::Failed("exited after it was ready (exit code 1)".into())
+    );
     assert_eq!(run.steps()[0].exit, Some(Some(1)));
     // Restarting the port step: its server is stopped first.
     let old = generation(&run, 1);
@@ -379,7 +386,7 @@ steps:
     let mut effects = run.take_effects();
     let server = started(&effects, 0);
     let deaf = started(&effects, 3);
-    run.port_state(0, server, true, t);
+    run.probe_result(0, server, true, t);
     run.exited(1, generation(&run, 1), Some(0), t);
     effects = run.take_effects();
     let eval = started(&effects, 2);
@@ -1003,4 +1010,250 @@ steps:
         ["failed", "running", "running", "starting"],
         "groups run while a step in them starts"
     );
+}
+
+/// The run's statuses with each step's detail, for steps that have one.
+fn details(run: &Run) -> Vec<String> {
+    run.steps()
+        .iter()
+        .map(|state| match (&state.status, state.detail.as_str()) {
+            (Status::Failed(reason), _) => format!("failed: {reason}"),
+            (Status::Skipped(reason), _) => format!("skipped: {reason}"),
+            (status, "") => status.name().to_owned(),
+            (status, detail) => format!("{}: {detail}", status.name()),
+        })
+        .collect()
+}
+
+#[test]
+fn on_failure_restarts_after_the_backoff_until_max() {
+    let t = Instant::now();
+    let mut run = run(r#"
+steps:
+  api:
+    run: serve
+    ready: {port: 8000}
+    restart: {policy: on_failure, max: 2, backoff: 5s}
+  web: {depends_on: [api], run: w}
+"#);
+    run.start(t);
+    let first = started(&run.take_effects(), 0);
+    run.exited(0, first, Some(1), t);
+    assert_eq!(
+        details(&run),
+        [
+            "waiting: restart 1 in 5s: exited before it was ready (exit code 1)",
+            "waiting: needs api"
+        ]
+    );
+    assert_eq!(run.outcome(), Outcome::Running, "it will try again");
+    assert_eq!(run.next_deadline(), Some(t + secs(5)));
+    run.tick(t + secs(4));
+    assert!(run.take_effects().is_empty(), "not before the backoff");
+    run.tick(t + secs(5));
+    let second = started(&run.take_effects(), 0);
+    assert_eq!(statuses(&run), ["running", "waiting"]);
+    assert_eq!(run.steps()[0].restarts, 1);
+    run.exited(0, second, Some(1), t + secs(6));
+    run.tick(t + secs(11));
+    let third = started(&run.take_effects(), 0);
+    run.exited(0, third, Some(2), t + secs(12));
+    assert_eq!(
+        details(&run)[0],
+        "failed: exited before it was ready (exit code 2) (gave up after 2 restarts)"
+    );
+    assert_eq!(run.outcome(), Outcome::Failed);
+    // Retry counts from 0 again.
+    run.retry_failed(t + secs(13));
+    assert_eq!(run.steps()[0].restarts, 0);
+    assert_eq!(statuses(&run)[0], "running");
+}
+
+#[test]
+fn a_ready_command_that_exits_crashed_and_always_restarts_after_clean_exits() {
+    let t = Instant::now();
+    let mut plain = run("steps:\n  api: {run: serve, ready: {port: 8000}}\n");
+    plain.start(t);
+    let g = started(&plain.take_effects(), 0);
+    plain.probe_result(0, g, true, t);
+    assert_eq!(plain.outcome(), Outcome::Ready);
+    plain.exited(0, g, Some(137), t);
+    assert_eq!(
+        details(&plain),
+        ["failed: exited after it was ready (exit code 137)"]
+    );
+    assert_eq!(plain.outcome(), Outcome::Failed, "no longer all ready");
+    // A clean exit after ready is done, without `always`.
+    let mut done = run("steps:\n  job: {run: j, ready: {output: started}}\n");
+    done.start(t);
+    let g = started(&done.take_effects(), 0);
+    done.output(0, g, b"started\n", t);
+    done.exited(0, g, Some(0), t);
+    assert_eq!(statuses(&done), ["ready"]);
+    // `always`: a one-shot job runs again after each clean exit; its
+    // dependents start after its first.
+    let mut cron = run(
+        "steps:\n  sync: {run: s, restart: {policy: always, backoff: 1m}}\n  after: {depends_on: [sync], run: a}\n",
+    );
+    cron.start(t);
+    let g = started(&cron.take_effects(), 0);
+    cron.exited(0, g, Some(0), t);
+    assert_eq!(
+        details(&cron),
+        [
+            "waiting: restart 1 in 1m: exited (exit code 0)",
+            "running: running"
+        ]
+    );
+    cron.tick(t + secs(60));
+    assert!(
+        cron.take_effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartCommand { step: 0, .. }))
+    );
+}
+
+#[test]
+fn health_checks_fail_an_unhealthy_step_and_its_policy_restarts_it() {
+    let t = Instant::now();
+    let mut run = run(r#"
+steps:
+  api:
+    run: serve
+    ready: {http: 'http://localhost:8000/health'}
+    healthcheck: {test: curl -f localhost:8000, interval: 10s, retries: 2, start_period: 15s}
+    restart: on_failure
+"#);
+    run.start(t);
+    let g = started(&run.take_effects(), 0);
+    let probes = run.ready_probes();
+    assert!(
+        matches!(&probes[0].2, Probe::Http(http) if http.url == "http://localhost:8000/health")
+    );
+    assert_eq!(
+        run.steps()[0].detail,
+        "waiting for http://localhost:8000/health to answer"
+    );
+    run.probe_result(0, g, true, t);
+    assert_eq!(statuses(&run), ["ready"]);
+    assert_eq!(run.next_deadline(), Some(t + secs(10)));
+    // A probe every interval; failures within the start period do not count.
+    run.tick(t + secs(10));
+    let probe = |run: &mut Run| -> u64 {
+        run.take_effects()
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::RunHealthcheck {
+                    step: 0,
+                    generation,
+                } => Some(generation),
+                _ => None,
+            })
+            .expect("a health probe")
+    };
+    let h = probe(&mut run);
+    run.health_checked(0, h, Err("exit code 7".into()), t + secs(10));
+    assert_eq!(run.steps()[0].health_failures, 0);
+    assert!(run.steps()[0].detail.starts_with("starting up"));
+    run.tick(t + secs(20));
+    let h = probe(&mut run);
+    run.health_checked(0, h, Err("exit code 7".into()), t + secs(20));
+    assert_eq!(
+        details(&run),
+        ["ready: health check failed (1 of 2): exit code 7"]
+    );
+    run.tick(t + secs(30));
+    let h = probe(&mut run);
+    run.health_checked(0, h, Ok(()), t + secs(30));
+    assert_eq!(run.steps()[0].health_failures, 0, "a pass resets the count");
+    for at in [40, 50] {
+        run.tick(t + secs(at));
+        let h = probe(&mut run);
+        run.health_checked(0, h, Err("exit code 7".into()), t + secs(at));
+    }
+    // Unhealthy: its command is stopped, then it restarts.
+    assert_eq!(statuses(&run), ["stopping"]);
+    assert!(
+        run.take_effects()
+            .contains(&Effect::InterruptCommand { step: 0 })
+    );
+    run.exited(0, g, None, t + secs(51));
+    assert_eq!(
+        details(&run),
+        ["waiting: restart 1 in 2s: unhealthy: exit code 7"]
+    );
+}
+
+#[test]
+fn if_conditions_skip_steps_and_skips_reach_what_needs_them() {
+    let t = Instant::now();
+    let workflow = crate::file::parse(
+        r#"
+inputs:
+  env: {type: choice, options: [dev, prod], default: dev}
+steps:
+  deploy: {run: d, if: "inputs.env == 'prod'"}
+  smoke: {depends_on: [deploy], run: s}
+  notes: {depends_on: {deploy: completed}, run: 'n ${steps.deploy.status}'}
+  eval: {run: e}
+  alert: {depends_on: {eval: completed}, if: failure(), run: a}
+  report: {depends_on: {eval: completed}, if: steps.eval.status == 'ready', run: r}
+"#,
+        "f",
+    )
+    .unwrap();
+    let values = crate::inputs::defaults(&workflow.inputs);
+    let mut run = Run::new(workflow.with_inputs(&values));
+    run.start(t);
+    let effects = run.take_effects();
+    assert_eq!(
+        details(&run)[..3],
+        [
+            "skipped: if inputs.env == 'prod'",
+            "skipped: deploy was skipped",
+            "running: running"
+        ]
+    );
+    assert_eq!(run.definition(2).run.as_deref(), Some("n skipped"));
+    let eval = started(&effects, 3);
+    run.exited(3, eval, Some(1), t);
+    assert_eq!(
+        statuses(&run)[4..],
+        ["running", "skipped"],
+        "alert runs, report is skipped"
+    );
+    let alert = started(&run.take_effects(), 4);
+    run.exited(4, alert, Some(0), t);
+    let notes = started(&effects, 2);
+    run.exited(2, notes, Some(0), t);
+    assert_eq!(run.outcome(), Outcome::Failed, "eval failed");
+    // With prod, deploy and smoke run.
+    let workflow = crate::file::parse(
+        "inputs: {env: {default: prod}}\nsteps:\n  deploy: {run: d, if: inputs.env == 'prod'}\n  smoke: {depends_on: [deploy], run: s}\n",
+        "f",
+    )
+    .unwrap();
+    let values = crate::inputs::defaults(&workflow.inputs);
+    let mut run = Run::new(workflow.with_inputs(&values));
+    run.start(t);
+    assert_eq!(statuses(&run), ["running", "waiting"]);
+}
+
+#[test]
+fn a_group_whose_if_is_false_skips_its_steps() {
+    let t = Instant::now();
+    let mut run = run(r#"
+steps:
+  gpu:
+    if: false
+    steps:
+      a: {run: a}
+      b: {depends_on: [a], run: b}
+  web: {run: w}
+"#);
+    run.start(t);
+    assert_eq!(statuses(&run), ["skipped", "skipped", "skipped", "running"]);
+    let web = started(&run.take_effects(), 3);
+    run.exited(3, web, Some(0), t);
+    assert_eq!(run.outcome(), Outcome::Ready, "skipped steps count as done");
 }

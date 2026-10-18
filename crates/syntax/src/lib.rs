@@ -1,4 +1,11 @@
 //! Incremental tree-sitter parsing and highlight spans for a `text::Buffer`.
+//!
+//! Grammars are not linked in: each lives in a library next to the editor
+//! (`nc_grammar_<crate>.dll`/`.so`, see `crates/grammar_abi`) loaded the
+//! first time its language is used, which keeps ~14 MB of parse tables out
+//! of the executable (`grammars`).
+
+mod grammars;
 
 use std::{ops::Range, path::Path, sync::LazyLock};
 
@@ -174,12 +181,62 @@ impl Language {
         matches!(self, Self::Bash | Self::Dockerfile | Self::Sql | Self::Yaml)
     }
 
-    fn config(self) -> &'static LanguageConfig {
+    /// The grammar library holding this language (`nc_grammar_<name>`) and
+    /// the entry's name in it.
+    fn grammar(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Bash => ("bash", "bash"),
+            Self::C => ("c", "c"),
+            Self::Cpp => ("cpp", "cpp"),
+            Self::Css => ("css", "css"),
+            Self::Dockerfile => ("containerfile", "containerfile"),
+            Self::Go => ("go", "go"),
+            Self::Html => ("html", "html"),
+            Self::JavaScript => ("javascript", "javascript"),
+            Self::Json => ("json", "json"),
+            Self::Markdown => ("md", "markdown"),
+            Self::Python => ("python", "python"),
+            Self::Rust => ("rust", "rust"),
+            Self::Sql => ("sequel", "sql"),
+            Self::Toml => ("toml", "toml"),
+            Self::Tsx => ("typescript", "tsx"),
+            Self::TypeScript => ("typescript", "typescript"),
+            Self::Yaml => ("yaml", "yaml"),
+        }
+    }
+
+    /// Our refinements of the upstream highlight query (`queries/`), in
+    /// order; for the same node a later pattern wins.
+    fn refinements(self) -> &'static [&'static str] {
+        match self {
+            Self::Bash => &[BASH],
+            Self::C => &[C],
+            // The C++ queries extend the C ones, like the grammar does.
+            Self::Cpp => &[C, CPP],
+            Self::Css => &[CSS],
+            Self::Dockerfile | Self::Sql => &[],
+            Self::Go => &[GO],
+            Self::Html => &[HTML],
+            Self::JavaScript => &[ECMA, JAVASCRIPT],
+            Self::Json => &[JSON],
+            Self::Markdown => &[MARKDOWN],
+            Self::Python => &[PYTHON],
+            Self::Rust => &[RUST],
+            Self::Toml => &[TOML],
+            Self::Tsx | Self::TypeScript => &[ECMA, TYPESCRIPT],
+            Self::Yaml => &[YAML],
+        }
+    }
+
+    /// The grammar and compiled highlight query, loaded on first use;
+    /// `None` when the grammar library is missing or broken (see
+    /// [`problems`]).
+    fn config(self) -> Option<&'static LanguageConfig> {
         macro_rules! config {
             ($language:ident) => {{
-                static CONFIG: LazyLock<LanguageConfig> =
-                    LazyLock::new(|| LanguageConfig::new(Language::$language));
-                &CONFIG
+                static CONFIG: LazyLock<Option<LanguageConfig>> =
+                    LazyLock::new(|| LanguageConfig::load(Language::$language));
+                CONFIG.as_ref()
             }};
         }
         match self {
@@ -373,150 +430,77 @@ struct LanguageConfig {
 }
 
 impl LanguageConfig {
-    fn new(language: Language) -> Self {
-        // Upstream queries first, then ours (`queries/`), which refine them:
-        // for the same node the later pattern wins (see `Syntax::highlights`).
-        let (grammar, query): (Grammar, String) = match language {
-            Language::Bash => (
-                tree_sitter_bash::LANGUAGE.into(),
-                [tree_sitter_bash::HIGHLIGHT_QUERY, BASH].join("\n"),
-            ),
-            Language::C => (
-                tree_sitter_c::LANGUAGE.into(),
-                [tree_sitter_c::HIGHLIGHT_QUERY, C].join("\n"),
-            ),
-            // The C++ queries extend the C ones, like the grammar does.
-            Language::Cpp => (
-                tree_sitter_cpp::LANGUAGE.into(),
-                [
-                    tree_sitter_c::HIGHLIGHT_QUERY,
-                    tree_sitter_cpp::HIGHLIGHT_QUERY,
-                    C,
-                    CPP,
-                ]
-                .join("\n"),
-            ),
-            Language::Css => (
-                tree_sitter_css::LANGUAGE.into(),
-                [tree_sitter_css::HIGHLIGHTS_QUERY, CSS].join("\n"),
-            ),
-            Language::Dockerfile => (
-                tree_sitter_containerfile::LANGUAGE.into(),
-                tree_sitter_containerfile::HIGHLIGHTS_QUERY.into(),
-            ),
-            Language::Go => (
-                tree_sitter_go::LANGUAGE.into(),
-                [tree_sitter_go::HIGHLIGHTS_QUERY, GO].join("\n"),
-            ),
-            Language::Html => (
-                tree_sitter_html::LANGUAGE.into(),
-                [tree_sitter_html::HIGHLIGHTS_QUERY, HTML].join("\n"),
-            ),
-            Language::JavaScript => (
-                tree_sitter_javascript::LANGUAGE.into(),
-                [
-                    tree_sitter_javascript::HIGHLIGHT_QUERY,
-                    tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-                    ECMA,
-                    JAVASCRIPT,
-                ]
-                .join("\n"),
-            ),
-            Language::Json => (
-                tree_sitter_json::LANGUAGE.into(),
-                [tree_sitter_json::HIGHLIGHTS_QUERY, JSON].join("\n"),
-            ),
-            // The block grammar only: inline markup needs a second parse.
-            Language::Markdown => (
-                tree_sitter_md::LANGUAGE.into(),
-                [tree_sitter_md::HIGHLIGHT_QUERY_BLOCK, MARKDOWN].join("\n"),
-            ),
-            Language::Python => (
-                tree_sitter_python::LANGUAGE.into(),
-                [tree_sitter_python::HIGHLIGHTS_QUERY, PYTHON].join("\n"),
-            ),
-            Language::Rust => (
-                tree_sitter_rust::LANGUAGE.into(),
-                [tree_sitter_rust::HIGHLIGHTS_QUERY, RUST].join("\n"),
-            ),
-            // Written for Neovim: `#match?` uses Lua's `%d`, which Rust regex reads literally.
-            Language::Sql => (
-                tree_sitter_sequel::LANGUAGE.into(),
-                tree_sitter_sequel::HIGHLIGHTS_QUERY.replace("%d", "\\\\d"),
-            ),
-            // Upstream captures the whole `key = value` pair as `@property`,
-            // coloring the whitespace in it; capture the key instead.
-            Language::Toml => (
-                tree_sitter_toml_ng::LANGUAGE.into(),
-                format!(
-                    "{}\n{TOML}",
-                    tree_sitter_toml_ng::HIGHLIGHTS_QUERY.replace(
-                        "(pair\n  (bare_key)) @property",
-                        "(pair\n  (bare_key) @property)"
-                    )
-                ),
-            ),
-            // The TypeScript queries extend the JavaScript ones, like the grammars do.
-            Language::Tsx => (
-                tree_sitter_typescript::LANGUAGE_TSX.into(),
-                [
-                    tree_sitter_javascript::HIGHLIGHT_QUERY,
-                    tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-                    tree_sitter_typescript::HIGHLIGHTS_QUERY,
-                    ECMA,
-                    TYPESCRIPT,
-                ]
-                .join("\n"),
-            ),
-            Language::TypeScript => (
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                [
-                    tree_sitter_javascript::HIGHLIGHT_QUERY,
-                    tree_sitter_typescript::HIGHLIGHTS_QUERY,
-                    ECMA,
-                    TYPESCRIPT,
-                ]
-                .join("\n"),
-            ),
-            Language::Yaml => (
-                tree_sitter_yaml::LANGUAGE.into(),
-                [tree_sitter_yaml::HIGHLIGHTS_QUERY, YAML].join("\n"),
-            ),
-        };
-        let query = Query::new(&grammar, &query)
-            .unwrap_or_else(|err| panic!("{} highlight query: {err}", language.name()));
-        let highlights = query
-            .capture_names()
-            .iter()
-            .map(|name| Highlight::from_capture(name))
-            .collect();
-        Self {
-            grammar,
-            query,
-            highlights,
+    fn load(language: Language) -> Option<Self> {
+        let (library, entry) = language.grammar();
+        let result = grammars::entries(library)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|loaded| loaded.name == entry)
+                    .ok_or_else(|| format!("the {library} grammar library has no {entry} grammar"))
+            })
+            .and_then(|loaded| {
+                let grammar: Grammar = loaded.language.into();
+                // Upstream queries first, then ours (`queries/`), which
+                // refine them: for the same node the later pattern wins
+                // (see `Syntax::highlights`).
+                let query = std::iter::once(loaded.query.as_str())
+                    .chain(language.refinements().iter().copied())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let query = Query::new(&grammar, &query)
+                    .map_err(|err| format!("{} highlight query: {err}", language.name()))?;
+                let highlights = query
+                    .capture_names()
+                    .iter()
+                    .map(|name| Highlight::from_capture(name))
+                    .collect();
+                Ok(Self {
+                    grammar,
+                    query,
+                    highlights,
+                })
+            });
+        match result {
+            Ok(config) => Some(config),
+            Err(error) => {
+                grammars::report(language, error);
+                None
+            }
         }
     }
 }
 
+/// Languages whose grammar could not be loaded so far, with the reason
+/// (no highlighting, folding or structure for them).
+pub fn problems() -> Vec<(Language, String)> {
+    grammars::problems()
+}
+
 pub struct Syntax {
     language: Language,
+    config: &'static LanguageConfig,
     parser: Parser,
     tree: Option<Tree>,
 }
 
 impl Syntax {
-    pub fn new(language: Language, buffer: &Buffer) -> Self {
+    /// `None` when the language's grammar library is unavailable (see
+    /// [`problems`]): the file is then plain text.
+    pub fn new(language: Language, buffer: &Buffer) -> Option<Self> {
+        let config = language.config()?;
         let mut parser = Parser::new();
         parser
-            .set_language(&language.config().grammar)
+            .set_language(&config.grammar)
             .expect("grammar ABI is supported by the tree-sitter runtime");
         let mut syntax = Self {
             language,
+            config,
             parser,
             tree: None,
         };
         syntax.reparse(buffer);
-        syntax
+        Some(syntax)
     }
 
     pub fn language(&self) -> Language {
@@ -555,7 +539,7 @@ impl Syntax {
         let Some(tree) = &self.tree else {
             return Vec::new();
         };
-        let config = self.language.config();
+        let config = self.config;
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(range.clone());
         let text = |node: tree_sitter::Node| buffer.chunks(node.byte_range()).map(str::as_bytes);
@@ -825,7 +809,9 @@ mod tests {
 
     fn assert_highlights(language: Language, source: &str, expected: &[(&str, &str)]) {
         let buffer = Buffer::new(source);
-        let spans = highlighted(&Syntax::new(language, &buffer), &buffer);
+        let syntax = Syntax::new(language, &buffer)
+            .unwrap_or_else(|| panic!("{}: {:?}", language.name(), problems()));
+        let spans = highlighted(&syntax, &buffer);
         for &(text, scope) in expected {
             h(scope);
             assert!(
@@ -839,15 +825,19 @@ mod tests {
     #[test]
     fn every_language_query_compiles_and_parses() {
         for language in Language::ALL {
-            let syntax = Syntax::new(language, &Buffer::new("x"));
+            let syntax = Syntax::new(language, &Buffer::new("x"))
+                .unwrap_or_else(|| panic!("{}: {:?}", language.name(), problems()));
             assert!(syntax.tree.is_some(), "{}", language.name());
         }
+        assert!(problems().is_empty(), "{:?}", problems());
     }
 
     #[test]
     fn every_capture_maps_to_a_scope_or_is_deliberately_unstyled() {
         for language in Language::ALL {
-            let config = language.config();
+            let config = language
+                .config()
+                .unwrap_or_else(|| panic!("{}: {:?}", language.name(), problems()));
             for (name, highlight) in config.query.capture_names().iter().zip(&config.highlights) {
                 assert!(
                     highlight.is_some() || UNSTYLED_CAPTURES.contains(name),
@@ -1201,7 +1191,7 @@ mod tests {
     #[test]
     fn spans_are_clipped_to_the_requested_range() {
         let buffer = Buffer::new("fn main() {}\n");
-        let syntax = Syntax::new(Language::Rust, &buffer);
+        let syntax = Syntax::new(Language::Rust, &buffer).expect("rust grammar");
         let spans = syntax.highlights(&buffer, 1..buffer.len());
         assert_eq!(
             spans.first(),
@@ -1215,7 +1205,7 @@ mod tests {
     #[test]
     fn incremental_reparse_matches_a_fresh_parse() {
         let mut buffer = Buffer::new("fn a() {}\nfn b() {}\n");
-        let mut syntax = Syntax::new(Language::Rust, &buffer);
+        let mut syntax = Syntax::new(Language::Rust, &buffer).expect("rust grammar");
         buffer.drain_changes();
 
         // Turn `b` into a struct and add a comment on the first line, across lines.
@@ -1226,7 +1216,7 @@ mod tests {
         }
         syntax.reparse(&buffer);
 
-        let fresh = Syntax::new(Language::Rust, &buffer);
+        let fresh = Syntax::new(Language::Rust, &buffer).expect("rust grammar");
         assert_eq!(
             syntax.tree.as_ref().unwrap().root_node().to_sexp(),
             fresh.tree.as_ref().unwrap().root_node().to_sexp()
@@ -1252,7 +1242,7 @@ mod tests {
     fn bracket_partners_come_from_the_tree_and_skip_strings() {
         let source = "fn f(a: [u8; 2]) { g(\"(\", (1)); }";
         let buffer = Buffer::new(source);
-        let syntax = Syntax::new(Language::Rust, &buffer);
+        let syntax = Syntax::new(Language::Rust, &buffer).expect("rust grammar");
         let at = |pattern: &str, nth: usize| source.match_indices(pattern).nth(nth).unwrap().0;
         // `f(` ↔ the `)` before ` {`.
         assert_eq!(syntax.bracket_partner(at("(", 0)), Some(Some(at(")", 0))));
@@ -1278,7 +1268,9 @@ mod tests {
 
     fn folds(language: Language, source: &str) -> Vec<(usize, usize)> {
         let buffer = Buffer::new(source);
-        Syntax::new(language, &buffer).fold_ranges(0..buffer.line_count())
+        Syntax::new(language, &buffer)
+            .expect("grammar")
+            .fold_ranges(0..buffer.line_count())
     }
 
     #[test]
@@ -1303,7 +1295,7 @@ y = 2
         );
         // Asked for the `def f` line only: its body starts on the next line.
         let buffer = Buffer::new(source);
-        let syntax = Syntax::new(Language::Python, &buffer);
+        let syntax = Syntax::new(Language::Python, &buffer).expect("python grammar");
         assert_eq!(syntax.fold_ranges(1..2), [(0, 9), (1, 3)]);
         assert_eq!(
             folds(Language::Python, "def f():\n    pass\nx = 1\n"),
@@ -1337,6 +1329,7 @@ class Inventory:
     fn openings(language: Language, source: &str) -> Vec<(usize, usize, usize)> {
         let buffer = Buffer::new(source);
         let mut scopes: Vec<_> = Syntax::new(language, &buffer)
+            .expect("grammar")
             .scopes(0..buffer.line_count())
             .into_iter()
             .map(|s| (s.opening, s.header, s.last))
@@ -1423,7 +1416,7 @@ fn h() { 1 }
         let source = "{\n  \"a\": {\n    \"b\": [\n      1,\n      2\n    ]\n  }\n}\n";
         assert_eq!(folds(Language::Json, source), [(0, 6), (1, 5), (2, 4)]);
         let buffer = Buffer::new(source);
-        let syntax = Syntax::new(Language::Json, &buffer);
+        let syntax = Syntax::new(Language::Json, &buffer).expect("json grammar");
         // Only ranges touching the requested lines.
         assert_eq!(syntax.fold_ranges(4..5), [(0, 6), (1, 5), (2, 4)]);
         assert_eq!(syntax.fold_ranges(7..8), []);

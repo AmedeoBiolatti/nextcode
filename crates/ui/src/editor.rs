@@ -788,7 +788,7 @@ const INDENT_SAMPLE_LINES: usize = 2000;
 impl Editor {
     pub fn new(mut buffer: Buffer, cx: &mut Context<Self>) -> Self {
         let language = buffer.path().and_then(Language::from_path);
-        let syntax = language.map(|language| Syntax::new(language, &buffer));
+        let syntax = language.and_then(|language| Syntax::new(language, &buffer));
         buffer.drain_changes();
         let sample: Vec<String> = (0..buffer.line_count().min(INDENT_SAMPLE_LINES))
             .map(|line| buffer.line_text(line))
@@ -1064,7 +1064,7 @@ impl Editor {
     /// `CellBoundary` like Up/Down.
     pub fn notebook_cell(text: &str, language: Option<Language>, cx: &mut Context<Self>) -> Self {
         let mut buffer = Buffer::new(text);
-        let syntax = language.map(|language| Syntax::new(language, &buffer));
+        let syntax = language.and_then(|language| Syntax::new(language, &buffer));
         buffer.drain_changes();
         let sample: Vec<String> = (0..buffer.line_count().min(INDENT_SAMPLE_LINES))
             .map(|line| buffer.line_text(line))

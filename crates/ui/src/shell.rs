@@ -414,9 +414,13 @@ fn window_title(subject: Option<&str>) -> String {
 
 /// Brings forward the project tab showing `location` in a window other
 /// than `except`; false when there is none.
-fn activate_elsewhere(location: &Location, except: gpui::AnyWindowHandle, cx: &mut App) -> bool {
+pub fn activate_existing(
+    location: &Location,
+    except: Option<gpui::AnyWindowHandle>,
+    cx: &mut App,
+) -> bool {
     for handle in cx.windows() {
-        if handle == except {
+        if Some(handle) == except {
             continue;
         }
         let Some(shell) = handle.downcast::<Shell>() else {
@@ -436,6 +440,20 @@ fn activate_elsewhere(location: &Location, except: gpui::AnyWindowHandle, cx: &m
         }
     }
     false
+}
+
+/// Brings forward the window that had focus last (the first, when none is
+/// known); nothing when no window is open.
+pub fn activate_focused(cx: &mut App) {
+    let windows = cx.windows();
+    let handle = app_state::focused_window(cx)
+        .filter(|focused| windows.contains(focused))
+        .or_else(|| windows.first().copied());
+    if let Some(handle) = handle {
+        handle
+            .update(cx, |_, window, _| window.activate_window())
+            .ok();
+    }
 }
 
 impl Shell {
@@ -540,7 +558,7 @@ impl Shell {
         if let Some(index) = self.position_of(&location) {
             return self.activate(index, window, cx);
         }
-        if !activate_elsewhere(&location, window.window_handle(), cx) {
+        if !activate_existing(&location, Some(window.window_handle()), cx) {
             self.add_tab(location, None, window, cx);
         }
     }
@@ -936,7 +954,7 @@ impl Shell {
             this.update_in(cx, |this, window, cx| {
                 if new_window {
                     let location = location.absolute();
-                    if !activate_elsewhere(&location, window.window_handle(), cx) {
+                    if !activate_existing(&location, Some(window.window_handle()), cx) {
                         match this.position_of(&location) {
                             Some(index) => this.activate(index, window, cx),
                             None => open_window(location, None, cx),

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "grammars/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,10 +24,14 @@ grep-matcher = "0.1.9"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4"
+instance = { path = "crates/instance" }
 git = { path = "crates/git" }
+grammar_abi = { path = "crates/grammar_abi" }
 language = { path = "crates/language" }
 lsp = { path = "crates/lsp" }
 libc = "0.2"
+# Already in the tree (gpui): the grammar libraries, loaded on first use.
+libloading = "0.8"
 lsp-types = "0.97"
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 nucleo-matcher = "0.3"
@@ -85,3 +89,89 @@ watcher = { path = "crates/watcher" }
 workflow = { path = "crates/workflow" }
 workflow_lsp = { path = "crates/workflow_lsp" }
 worktree = { path = "crates/worktree" }
+
+# gpui 0.2.2 with startup changes (see vendor/gpui/NEXT_CODE_PATCHES.md).
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
+
+[profile.release]
+# A smaller executable starts faster: on machines whose endpoint security
+# scans every image load, each MB costs milliseconds per launch.
+panic = "abort"
+lto = "thin"
+
+# The installed build (`scripts/install.ps1 -Profile dist`): ~8 % smaller
+# again with fat LTO and one codegen unit, at four times the build time
+# (~20 min for a full build here).
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+# Cold code (loaded once, run rarely) optimized for size, ~1.1 MB less;
+# the editor's hot paths (text, layout, rendering, parsing, search) keep
+# opt-level 3.
+[profile.release.package."lsp-types"]
+opt-level = "s"
+[profile.release.package.windows]
+opt-level = "s"
+[profile.release.package."windows-core"]
+opt-level = "s"
+[profile.release.package.notebook]
+opt-level = "s"
+[profile.release.package.workflow]
+opt-level = "s"
+[profile.release.package.workflow_lsp]
+opt-level = "s"
+[profile.release.package.dap]
+opt-level = "s"
+[profile.release.package.devcontainer]
+opt-level = "s"
+[profile.release.package.python]
+opt-level = "s"
+[profile.release.package.run]
+opt-level = "s"
+[profile.release.package.git]
+opt-level = "s"
+[profile.release.package.remote]
+opt-level = "s"
+[profile.release.package.proto]
+opt-level = "s"
+[profile.release.package.usvg]
+opt-level = "s"
+[profile.release.package.resvg]
+opt-level = "s"
+[profile.release.package."tiny-skia"]
+opt-level = "s"
+[profile.release.package."tiny-skia-path"]
+opt-level = "s"
+[profile.release.package.image]
+opt-level = "s"
+[profile.release.package.png]
+opt-level = "s"
+[profile.release.package."zune-jpeg"]
+opt-level = "s"
+[profile.release.package.gif]
+opt-level = "s"
+[profile.release.package."image-webp"]
+opt-level = "s"
+[profile.release.package."regex-syntax"]
+opt-level = "s"
+[profile.release.package."saphyr-parser"]
+opt-level = "s"
+[profile.release.package."pulldown-cmark"]
+opt-level = "s"
+[profile.release.package.toml]
+opt-level = "s"
+[profile.release.package.toml_edit]
+opt-level = "s"
+[profile.release.package.toml_parser]
+opt-level = "s"
+[profile.release.package.url]
+opt-level = "s"
+[profile.release.package.notify]
+opt-level = "s"
+[profile.release.package.rand]
+opt-level = "s"
+[profile.release.package.serde_json_lenient]
+opt-level = "s"

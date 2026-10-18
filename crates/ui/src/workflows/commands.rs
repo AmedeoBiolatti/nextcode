@@ -1,20 +1,23 @@
 //! The processes a workflow step starts: its `run` command in a terminal
 //! (PowerShell on Windows, the user's login shell elsewhere) and its
-//! `check` as a plain process, with `${…}` variables, `env` and `cwd`
-//! applied as run configurations do; and where its artifacts are.
+//! `check` as a plain process, with `${…}` variables, `env_file`s, `env`
+//! and `cwd` applied as run configurations do; where its artifacts are;
+//! and its probes (a health check's command, an HTTP(S) URL, a port),
+//! answered where the step runs.
 
 use std::{
     collections::HashMap,
-    net::TcpStream,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use run::{
     CommandLine,
     shell::{self, Shell},
 };
-use workflow::{ArtifactState, ArtifactTarget, CheckResult, Step};
+use workflow::{ArtifactState, ArtifactTarget, CheckResult, Probe, Step};
 
 use crate::project::Project;
 
@@ -35,6 +38,9 @@ pub(crate) struct Place {
     separator: char,
     env: HashMap<String, String>,
     home: Option<String>,
+    /// The step's `env_file` variables ([`Place::read_env_files`]): in its
+    /// commands' environment (its `env` wins) and for `${env:…}`.
+    files: Vec<(String, String)>,
 }
 
 impl Place {
@@ -54,6 +60,7 @@ impl Place {
                     separator: '/',
                     home: env.get("HOME").cloned(),
                     env,
+                    files: Vec::new(),
                 })
             }
             _ => Ok(Self {
@@ -69,13 +76,58 @@ impl Place {
                 separator: if cfg!(windows) { '\\' } else { '/' },
                 env: std::env::vars().collect(),
                 home,
+                files: Vec::new(),
             }),
         }
     }
 
-    /// Expands `${…}` variables as they read where the step runs.
+    /// Reads the step's `env_file`s where it runs (relative to its `cwd`),
+    /// in order: a later file's variable wins. A missing required file is
+    /// an error. Blocks.
+    pub(crate) fn read_env_files(
+        &mut self,
+        step: &Step,
+        project: Option<&Project>,
+    ) -> Result<(), String> {
+        if step.env_file.is_empty() {
+            return Ok(());
+        }
+        let cwd = self.cwd(step)?;
+        let host = Project::local(PathBuf::from(&self.root));
+        let project = project.unwrap_or(&host);
+        let mut files = Vec::new();
+        for file in &step.env_file {
+            let path = self.with_context(|context| {
+                let base = run::Context {
+                    workspace_folder: &cwd,
+                    ..*context
+                };
+                Ok::<_, String>(base.absolute(&context.substitute(&file.path)?))
+            })?;
+            match project.read_text(Path::new(&path)) {
+                Ok(text) => files.extend(
+                    workflow::dotenv::parse(&text)
+                        .map_err(|err| format!("env_file {path}: {err}"))?,
+                ),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound && !file.required => {}
+                Err(err) => return Err(format!("env_file {path}: {err}")),
+            }
+        }
+        self.files = files;
+        Ok(())
+    }
+
+    /// Expands `${…}` variables as they read where the step runs (its
+    /// `env_file` variables first).
     fn with_context<R>(&self, then: impl FnOnce(&run::Context) -> R) -> R {
-        let lookup = |name: &str| self.env.get(name).cloned();
+        let lookup = |name: &str| {
+            self.files
+                .iter()
+                .rev()
+                .find(|(known, _)| known == name)
+                .map(|(_, value)| value.clone())
+                .or_else(|| self.env.get(name).cloned())
+        };
         then(&run::Context {
             workspace_folder: &self.root,
             file: None,
@@ -98,11 +150,12 @@ impl Place {
     pub(crate) fn line(&self, step: &Step, command: &str) -> Result<String, String> {
         let cwd = self.cwd(step)?;
         self.with_context(|context| {
-            let env = step
-                .env
-                .iter()
-                .map(|(name, value)| Ok((name.clone(), context.substitute(value)?)))
-                .collect::<Result<_, String>>()?;
+            // The env files' variables, then `env` (which wins).
+            let mut env: std::collections::BTreeMap<String, String> =
+                self.files.iter().cloned().collect();
+            for (name, value) in &step.env {
+                env.insert(name.clone(), context.substitute(value)?);
+            }
             let command = run::Command {
                 line: CommandLine::Shell(context.substitute(command)?),
                 cwd,
@@ -189,7 +242,8 @@ pub(crate) fn run_program(
     project: Option<&Project>,
 ) -> Result<(String, Vec<String>), String> {
     let command = step.run.as_deref().ok_or("the step has no `run`")?;
-    let place = Place::of(project)?;
+    let mut place = Place::of(project)?;
+    place.read_env_files(step, project)?;
     let line = place.line(step, command)?;
     Ok(place.terminal_program(line))
 }
@@ -199,7 +253,8 @@ pub(crate) fn run_check(step: &Step, project: Option<&Project>) -> CheckResult {
     let Some(check) = step.check.as_deref() else {
         return CheckResult::Error("the step has no `check`".into());
     };
-    let result = Place::of(project).and_then(|place| {
+    let result = Place::of(project).and_then(|mut place| {
+        place.read_env_files(step, project)?;
         let line = place.line(step, check)?;
         let (program, args) = place.check_program(line);
         let timeout = step.timeout.unwrap_or(CHECK_TIMEOUT);
@@ -244,6 +299,251 @@ pub(crate) fn check_artifacts(
             resolved,
         })
         .collect())
+}
+
+/// Probes a step where it runs: a command (in its shell, `cwd`, env files
+/// and `env`; exit code 0 passes), an HTTP(S) URL (an accepted status) or
+/// a port; `Err` says why it failed. Blocks up to about `timeout`.
+pub(crate) fn probe(
+    step: &Step,
+    probe: &Probe,
+    project: Option<&Project>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match probe {
+        Probe::Port(port) => {
+            if port_listening(project, *port) {
+                Ok(())
+            } else {
+                Err(format!("nothing listens on port {port}"))
+            }
+        }
+        Probe::Command(command) => {
+            let mut place = Place::of(project)?;
+            place.read_env_files(step, project)?;
+            let line = place.line(step, command)?;
+            let (program, args) = place.check_program(line);
+            let host = Project::local(PathBuf::from(&place.root));
+            let output = project
+                .unwrap_or(&host)
+                .run_program(&program, &args, &[], None, timeout)
+                .map_err(|err| err.to_string())?;
+            if output.code == Some(0) {
+                return Ok(());
+            }
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let last = text
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default()
+                .to_owned();
+            let code = output
+                .code
+                .map_or("killed".to_owned(), |code| format!("exit code {code}"));
+            Err(if last.is_empty() {
+                code
+            } else {
+                format!("{code}: {last}")
+            })
+        }
+        Probe::Http(http) => {
+            let place = Place::of(project)?;
+            let url = place.with_context(|context| context.substitute(&http.url))?;
+            let status = http_status(project, &place, &url, timeout)?;
+            if http.accepts(status) {
+                Ok(())
+            } else {
+                Err(format!("{url} answered {status}"))
+            }
+        }
+    }
+}
+
+/// `scheme`, `host`, `port` and the path (with its query) of an http(s)
+/// URL.
+fn split_url(url: &str) -> Result<(&str, String, u16, String), String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .filter(|(scheme, _)| matches!(*scheme, "http" | "https"))
+        .ok_or_else(|| format!("`{url}` is not an http(s) URL"))?;
+    let (authority, path) = match rest.find(['/', '?', '#']) {
+        Some(at) if rest[at..].starts_with('/') => (&rest[..at], rest[at..].to_owned()),
+        Some(at) => (&rest[..at], format!("/{}", &rest[at..])),
+        None => (rest, "/".to_owned()),
+    };
+    let path = path.split('#').next().unwrap_or("/").to_owned();
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, port) = match authority.strip_prefix('[') {
+        // [::1]:8000
+        Some(rest) => {
+            let (host, after) = rest
+                .split_once(']')
+                .ok_or_else(|| format!("`{url}`: unclosed `[`"))?;
+            (host.to_owned(), after.strip_prefix(':'))
+        }
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) => (host.to_owned(), Some(port)),
+            None => (authority.to_owned(), None),
+        },
+    };
+    let port = match port {
+        Some(port) => port
+            .parse()
+            .map_err(|_| format!("`{url}`: `{port}` is not a port"))?,
+        None if scheme == "https" => 443,
+        None => 80,
+    };
+    Ok((scheme, host, port, path))
+}
+
+/// The status of a `GET` on `url` where the step runs: plain HTTP
+/// directly (through the agent's tunnel for a remote project); HTTPS with
+/// `curl` there (PowerShell on this Windows machine). Blocks up to about
+/// `timeout`.
+pub(crate) fn http_status(
+    project: Option<&Project>,
+    place: &Place,
+    url: &str,
+    timeout: Duration,
+) -> Result<u16, String> {
+    let (scheme, host, port, path) = split_url(url)?;
+    if scheme == "https" {
+        return https_status(project, place, url, timeout);
+    }
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: next_code\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
+    let deadline = Instant::now() + timeout;
+    let mut stream = match project.and_then(Project::agent) {
+        // From inside WSL or the container: a tunnel from the agent.
+        Some(agent) => {
+            let listener = TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
+            let client = TcpStream::connect(listener.local_addr().map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())?;
+            let (relayed, _) = listener.accept().map_err(|err| err.to_string())?;
+            let handle = agent
+                .tunnel(&host, port, relayed, |_| {})
+                .map_err(|err| format!("{host}:{port}: {err}"))?;
+            return exchange(client, &request, deadline, Some(handle));
+        }
+        None => {
+            let addresses: Vec<_> = (host.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|err| format!("{host}: {err}"))?
+                .collect();
+            let mut connected = None;
+            let mut last_error = format!("{host}:{port}: no address");
+            for address in addresses {
+                match TcpStream::connect_timeout(&address, timeout.min(Duration::from_secs(3))) {
+                    Ok(stream) => {
+                        connected = Some(stream);
+                        break;
+                    }
+                    Err(err) => last_error = format!("{host}:{port}: {err}"),
+                }
+            }
+            connected.ok_or(last_error)?
+        }
+    };
+    stream.set_nodelay(true).ok();
+    exchange_stream(&mut stream, &request, deadline)
+}
+
+/// Sends `request` on `stream` and reads the status line; `_tunnel` stays
+/// open until then.
+fn exchange(
+    mut stream: TcpStream,
+    request: &str,
+    deadline: Instant,
+    _tunnel: Option<remote::TunnelHandle>,
+) -> Result<u16, String> {
+    exchange_stream(&mut stream, request, deadline)
+}
+
+fn exchange_stream(
+    stream: &mut TcpStream,
+    request: &str,
+    deadline: Instant,
+) -> Result<u16, String> {
+    let left = || {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(50))
+    };
+    stream.set_write_timeout(Some(left())).ok();
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("could not send the request: {err}"))?;
+    let mut head = Vec::new();
+    let mut buffer = [0; 1024];
+    while !head.windows(2).any(|pair| pair == b"\r\n") {
+        stream.set_read_timeout(Some(left())).ok();
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => head.extend_from_slice(&buffer[..read]),
+            Err(err) => return Err(format!("no answer: {err}")),
+        }
+        if head.len() > 8192 || Instant::now() >= deadline {
+            break;
+        }
+    }
+    let line = String::from_utf8_lossy(&head);
+    let status = line
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok());
+    status.ok_or_else(|| {
+        if head.is_empty() {
+            "the connection closed without an answer".into()
+        } else {
+            "not an HTTP answer".into()
+        }
+    })
+}
+
+/// HTTPS: `curl` where the step runs (PowerShell's `Invoke-WebRequest`
+/// on this Windows machine).
+fn https_status(
+    project: Option<&Project>,
+    place: &Place,
+    url: &str,
+    timeout: Duration,
+) -> Result<u16, String> {
+    let seconds = timeout.as_secs().max(1);
+    let line = match place.shell {
+        Shell::PowerShell => format!(
+            "try {{ (Invoke-WebRequest -UseBasicParsing -TimeoutSec {seconds} -Uri '{}').StatusCode }} \
+             catch {{ if ($_.Exception.Response) {{ [int]$_.Exception.Response.StatusCode }} else {{ 0 }} }}",
+            url.replace('\'', "''")
+        ),
+        Shell::Posix => format!(
+            "curl -sk -o /dev/null -w '%{{http_code}}' --max-time {seconds} '{}'",
+            url.replace('\'', "'\\''")
+        ),
+    };
+    let (program, args) = place.check_program(line);
+    let host = Project::local(PathBuf::from(&place.root));
+    let output = project
+        .unwrap_or(&host)
+        .run_program(&program, &args, &[], None, timeout + Duration::from_secs(5))
+        .map_err(|err| err.to_string())?;
+    if output.code == Some(127) {
+        return Err("https checks need curl where the step runs".into());
+    }
+    match String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u16>()
+    {
+        Ok(0) | Err(_) => Err(format!("{url}: no answer")),
+        Ok(status) => Ok(status),
+    }
 }
 
 /// Whether something accepts TCP connections on `port` here (local
@@ -293,6 +593,10 @@ mod tests {
             cwd: cwd.map(Into::into),
             stop_grace: workflow::DEFAULT_STOP_GRACE,
             artifacts: Vec::new(),
+            env_file: Vec::new(),
+            restart: workflow::Restart::default(),
+            healthcheck: None,
+            condition: None,
             steps: Vec::new(),
         }
     }
@@ -315,6 +619,7 @@ mod tests {
                 }
                 .into(),
             ),
+            files: Vec::new(),
         }
     }
 
@@ -461,5 +766,133 @@ mod tests {
         assert!(port_open_locally(port));
         drop(listener);
         assert!(!port_open_locally(port));
+    }
+
+    #[test]
+    fn urls_split_into_scheme_host_port_and_path() {
+        assert_eq!(
+            split_url("http://localhost:8000/health?full=1#top").unwrap(),
+            ("http", "localhost".into(), 8000, "/health?full=1".into())
+        );
+        assert_eq!(
+            split_url("https://example.com").unwrap(),
+            ("https", "example.com".into(), 443, "/".into())
+        );
+        assert_eq!(
+            split_url("http://[::1]:9000/x").unwrap(),
+            ("http", "::1".into(), 9000, "/x".into())
+        );
+        assert_eq!(split_url("http://u:p@host/a").unwrap().1, "host");
+        assert!(split_url("ftp://x").is_err());
+        assert!(split_url("http://x:port/").is_err());
+    }
+
+    /// A one-request HTTP server answering `status`; returns its port.
+    fn serve_once(status: u16) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            assert!(request.starts_with("GET /health HTTP/1.1\r\n"), "{request}");
+            write!(
+                stream,
+                "HTTP/1.1 {status} Whatever\r\nContent-Length: 0\r\n\r\n"
+            )
+            .unwrap();
+        });
+        port
+    }
+
+    #[test]
+    fn http_probes_read_the_status_where_the_step_runs() {
+        let mut step = step(None, &[]);
+        let place = Place::of(None).unwrap();
+        let port = serve_once(204);
+        let url = format!("http://127.0.0.1:{port}/health");
+        assert_eq!(
+            http_status(None, &place, &url, Duration::from_secs(5)),
+            Ok(204)
+        );
+        let port = serve_once(503);
+        let probe = Probe::Http(workflow::HttpProbe {
+            url: format!("http://127.0.0.1:{port}/health"),
+            status: Vec::new(),
+        });
+        let failed = super::probe(&step, &probe, None, Duration::from_secs(5)).unwrap_err();
+        assert!(failed.ends_with("answered 503"), "{failed}");
+        // Nothing listening: why.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let probe = Probe::Http(workflow::HttpProbe {
+            url: format!("http://127.0.0.1:{closed}/health"),
+            status: Vec::new(),
+        });
+        assert!(super::probe(&step, &probe, None, Duration::from_secs(2)).is_err());
+        step.run = None;
+        assert!(super::probe(&step, &Probe::Port(closed), None, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn env_files_are_read_relative_to_the_cwd_and_env_wins() {
+        let dir = std::env::temp_dir().join(format!("nc-envfile-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(
+            dir.join("sub/.env"),
+            "A=from-file\nB='kept # this'\nTOKEN=file\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sub/more.env"), "A=later\n").unwrap();
+        let mut step = step(Some("sub"), &[("TOKEN", "own ${env:B}")]);
+        step.env_file = vec![
+            workflow::EnvFile {
+                path: ".env".into(),
+                required: true,
+            },
+            workflow::EnvFile {
+                path: "more.env".into(),
+                required: true,
+            },
+            workflow::EnvFile {
+                path: "missing.env".into(),
+                required: false,
+            },
+        ];
+        let mut place = Place {
+            root: dir.to_string_lossy().into_owned(),
+            separator: std::path::MAIN_SEPARATOR,
+            ..place(Shell::Posix)
+        };
+        place.read_env_files(&step, None).unwrap();
+        assert_eq!(
+            place.files,
+            [
+                ("A".to_owned(), "from-file".to_owned()),
+                ("B".to_owned(), "kept # this".to_owned()),
+                ("TOKEN".to_owned(), "file".to_owned()),
+                ("A".to_owned(), "later".to_owned()),
+            ]
+        );
+        let line = place.line(&step, "run").unwrap();
+        assert!(
+            line.contains("A=later") && !line.contains("A=from-file"),
+            "{line}"
+        );
+        assert!(
+            line.contains("TOKEN='own kept # this'"),
+            "env wins and reads the files: {line}"
+        );
+        step.env_file.push(workflow::EnvFile {
+            path: "nope.env".into(),
+            required: true,
+        });
+        let error = place.read_env_files(&step, None).unwrap_err();
+        assert!(error.contains("nope.env"), "{error}");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

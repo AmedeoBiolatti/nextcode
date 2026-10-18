@@ -360,7 +360,7 @@ pub fn check_document(
         return Ok(Vec::new());
     };
     let buffer = Buffer::new(text);
-    let syntax = language.map(|language| Syntax::new(language, &buffer));
+    let syntax = language.and_then(|language| Syntax::new(language, &buffer));
     let folder = project.zip(path).map(|(project, path)| {
         let file = folder_words_file(project, path);
         (project, file)
@@ -554,7 +554,7 @@ impl Editor {
             let problems = cx
                 .background_spawn(async move {
                     let buffer = Buffer::new(&text);
-                    let syntax = language.map(|language| Syntax::new(language, &buffer));
+                    let syntax = language.and_then(|language| Syntax::new(language, &buffer));
                     let folder = folder
                         .as_ref()
                         .map(|(project, file)| (project, file.as_path()));

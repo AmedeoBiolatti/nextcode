@@ -5,9 +5,11 @@
 //!
 //! Every window reports itself (`update`) when its tabs, active tab or
 //! bounds change; the file follows 500 ms later. Closing a window while
-//! others remain drops it; closing the last one (which quits) and quitting
-//! keep every window open at that moment. A window without tabs is kept
-//! only when it is the only one.
+//! others remain drops it; closing the last one and quitting keep every
+//! window open at that moment. A window without tabs is kept only when it
+//! is the only one. An editor that stays running after its last window
+//! (`instance::stays_resident`) starts tracking afresh: the next launch
+//! reopens what was saved.
 
 use std::{
     path::{Path, PathBuf},
@@ -355,8 +357,18 @@ fn window_closed(cx: &mut App) {
         .map(|handle| handle.window_id())
         .collect();
     if open.is_empty() {
-        // The last window: closing it quits, and it reopens next time.
-        return quit(cx);
+        // The last window: it reopens next time. The editor quits, or stays
+        // for the next launch with nothing tracked (that launch restores
+        // the saved windows, which report themselves again).
+        if crate::instance::stays_resident() {
+            let tracker = cx.default_global::<Tracker>();
+            tracker.save();
+            tracker.windows.clear();
+            tracker.focused = None;
+        } else {
+            quit(cx);
+        }
+        return;
     }
     let tracker = cx.default_global::<Tracker>();
     tracker.windows.retain(|(id, _)| open.contains(id));
@@ -364,6 +376,14 @@ fn window_closed(cx: &mut App) {
         tracker.focused = None;
     }
     tracker.save();
+}
+
+/// The window that reported focus last, if it is still open.
+pub fn focused_window(cx: &mut App) -> Option<gpui::AnyWindowHandle> {
+    let focused = cx.default_global::<Tracker>().focused?;
+    cx.windows()
+        .into_iter()
+        .find(|handle| handle.window_id() == focused)
 }
 
 /// The state as the next save would write it.

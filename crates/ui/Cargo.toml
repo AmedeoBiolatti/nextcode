@@ -4,8 +4,15 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+# The editor. Users run `next_code` (`crates/launcher`), which starts this
+# or hands its command line to the running one.
+[[bin]]
+name = "next_code_editor"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
+instance.workspace = true
 dap.workspace = true
 dirs.workspace = true
 futures.workspace = true
@@ -27,6 +34,24 @@ similar.workspace = true
 spell.workspace = true
 syntax.workspace = true
 terminal.workspace = true
+# The grammar libraries the editor loads on demand (`grammars/`): depended
+# on so they are built with it (into `deps`), never linked.
+grammar_bash = { path = "../../grammars/bash" }
+grammar_c = { path = "../../grammars/c" }
+grammar_containerfile = { path = "../../grammars/containerfile" }
+grammar_cpp = { path = "../../grammars/cpp" }
+grammar_css = { path = "../../grammars/css" }
+grammar_go = { path = "../../grammars/go" }
+grammar_html = { path = "../../grammars/html" }
+grammar_javascript = { path = "../../grammars/javascript" }
+grammar_json = { path = "../../grammars/json" }
+grammar_md = { path = "../../grammars/md" }
+grammar_python = { path = "../../grammars/python" }
+grammar_rust = { path = "../../grammars/rust" }
+grammar_sequel = { path = "../../grammars/sequel" }
+grammar_toml = { path = "../../grammars/toml" }
+grammar_typescript = { path = "../../grammars/typescript" }
+grammar_yaml = { path = "../../grammars/yaml" }
 text.workspace = true
 unicode-width.workspace = true
 watcher.workspace = true
@@ -53,13 +78,10 @@ next_code_agent = { path = "../agent" }
 embed-resource = "3.0"
 
 [target.'cfg(windows)'.dependencies]
-# The version gpui uses (no second copy): startup warm-up (`startup::prewarm`),
-# Recycle Bin deletes (`project::trash_local`).
+# The version gpui uses (no second copy): the taskbar identity
+# (`startup::set_app_id`), Recycle Bin deletes (`project::trash_local`).
 windows = { version = "0.61", features = [
     "Win32_Foundation",
-    "Win32_Graphics_DirectWrite",
-    "Win32_System_Com",
-    "Win32_System_Ole",
     "Win32_UI_Shell",
 ] }
 windows-sys = { version = "0.61", features = [

@@ -40,6 +40,9 @@
       "description": "Environment every step gets (a group's and the step's own `env` win).",
       "$ref": "#/definitions/env"
     },
+    "env_file": {
+      "$ref": "#/definitions/envFile"
+    },
     "steps": {
       "description": "The steps, keyed by id, in the order they show (independent steps run in parallel).",
       "$ref": "#/definitions/steps"
@@ -330,8 +333,8 @@
           "$ref": "#/definitions/duration"
         },
         "http": {
-          "description": "Planned, not supported yet: an HTTP URL that answers.",
-          "not": {}
+          "description": "An http(s) URL answers where the step runs (default: a status 200–399), or `{url, status}`.",
+          "$ref": "#/definitions/httpProbe"
         },
         "delay_ms": {
           "description": "The old JSON format's; now `delay` (a duration: 500ms).",
@@ -389,10 +392,6 @@
       "description": "Names the artifact in ${steps.<id>.artifacts.<label>}: not a number (numbers address artifacts by position), no `}`.",
       "type": "string",
       "pattern": "^(?![0-9]+$)[^}]*\\S[^}]*$"
-    },
-    "planned": {
-      "description": "Planned, not supported yet (see the workflows manual).",
-      "not": {}
     },
     "step": {
       "description": "A step: a check, a command and when it is ready; or a group of steps (`steps`).",
@@ -453,6 +452,18 @@
             "$ref": "#/definitions/artifact"
           }
         },
+        "env_file": {
+          "$ref": "#/definitions/envFile"
+        },
+        "restart": {
+          "$ref": "#/definitions/restart"
+        },
+        "healthcheck": {
+          "$ref": "#/definitions/healthcheck"
+        },
+        "if": {
+          "$ref": "#/definitions/condition_if"
+        },
         "steps": {
           "description": "Makes this step a group of these steps: its depends_on gates them; they inherit its project, cwd and env.",
           "type": "object",
@@ -463,18 +474,6 @@
           "additionalProperties": {
             "$ref": "#/definitions/step"
           }
-        },
-        "restart": {
-          "$ref": "#/definitions/planned"
-        },
-        "healthcheck": {
-          "$ref": "#/definitions/planned"
-        },
-        "if": {
-          "$ref": "#/definitions/planned"
-        },
-        "env_file": {
-          "$ref": "#/definitions/planned"
         },
         "id": {
           "description": "The old JSON format's; the id is now the step's key in `steps`.",
@@ -550,9 +549,11 @@
                   "enum": [
                     "title",
                     "depends_on",
+                    "if",
                     "steps",
                     "project",
                     "env",
+                    "env_file",
                     "cwd"
                   ]
                 },
@@ -574,6 +575,9 @@
                 "run"
               ],
               "stop_grace_period": [
+                "run"
+              ],
+              "restart": [
                 "run"
               ]
             },
@@ -797,6 +801,184 @@
           }
         ]
       }
+    },
+    "httpProbe": {
+      "description": "An http(s) URL that answers with an accepted status (default 200–399), probed where the step runs.",
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^https?://"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "pattern": "^https?://"
+            },
+            "status": {
+              "description": "Accepted status codes (default: 200–399).",
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 599
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 599
+                  },
+                  "minItems": 1
+                }
+              ]
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "restart": {
+      "description": "When the step starts again by itself: `on_failure` (its command failed: an exit code, a crash after it was ready, a timeout, unhealthy), `always` (also after a clean exit), `no` (the default); or `{policy, max, backoff}`.",
+      "anyOf": [
+        {
+          "enum": [
+            "no",
+            "on_failure",
+            "always"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "policy": {
+              "enum": [
+                "no",
+                "on_failure",
+                "always"
+              ]
+            },
+            "max": {
+              "description": "Restarts before giving up (default: no limit).",
+              "type": "integer",
+              "minimum": 1
+            },
+            "backoff": {
+              "description": "Wait before each restart (default 2s).",
+              "$ref": "#/definitions/duration"
+            }
+          },
+          "required": [
+            "policy"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "healthcheck": {
+      "description": "Probed every `interval` while the step is ready: `retries` failures in a row (not within `start_period` of getting ready) make it unhealthy, and it fails (and restarts with a `restart` policy). One of `test` (a command), `http`, `port`.",
+      "type": "object",
+      "properties": {
+        "test": {
+          "description": "A command where the step runs (its shell, cwd and env); exit code 0 is healthy. Any check every `interval`.",
+          "$ref": "#/definitions/text"
+        },
+        "http": {
+          "$ref": "#/definitions/httpProbe"
+        },
+        "port": {
+          "description": "Something listens on this TCP port where the step runs.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "interval": {
+          "description": "How often it is probed (default 30s).",
+          "$ref": "#/definitions/duration"
+        },
+        "timeout": {
+          "description": "How long one probe may take (default 10s).",
+          "$ref": "#/definitions/duration"
+        },
+        "retries": {
+          "description": "Failures in a row that make it unhealthy (default 3).",
+          "type": "integer",
+          "minimum": 1
+        },
+        "start_period": {
+          "description": "After it got ready, failures do not count for this long (default 0s).",
+          "$ref": "#/definitions/duration"
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "test"
+          ]
+        },
+        {
+          "required": [
+            "http"
+          ]
+        },
+        {
+          "required": [
+            "port"
+          ]
+        }
+      ]
+    },
+    "envFile": {
+      "description": "Dotenv files (`NAME=value` lines) the step's commands read, relative to its cwd (else its project) where it runs; `env` wins over them. A string, or a list of paths and `{path, required: false}`.",
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "\\S"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "required": {
+                    "description": "A missing required file fails the step (default true).",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "path"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "condition_if": {
+      "description": "Whether the step runs once what it depends on is done; false: skipped (and steps that need it ready are skipped too). An expression: `inputs.env == 'prod'`, `steps.db.status == 'failed'`, `steps.db.exit_code != 0`, `success()`, `failure()`, `always()`, with `==`, `!=`, `<`, `>`, `&&`, `||`, `!`.",
+      "type": [
+        "string",
+        "boolean"
+      ]
     }
   }
 }

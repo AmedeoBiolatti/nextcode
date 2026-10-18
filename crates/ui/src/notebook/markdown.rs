@@ -572,9 +572,9 @@ fn code_language(info: &str) -> Option<Language> {
 fn code_block(info: &str, text: String) -> Block {
     let language = code_language(info);
     let highlights = language
-        .map(|language| {
+        .and_then(|language| {
             let buffer = text::Buffer::new(&text);
-            Syntax::new(language, &buffer).highlights(&buffer, 0..buffer.len())
+            Syntax::new(language, &buffer).map(|syntax| syntax.highlights(&buffer, 0..buffer.len()))
         })
         .unwrap_or_default();
     Block::Code {

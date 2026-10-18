@@ -81,10 +81,10 @@ fn log_panics() {
 }
 
 /// Closes every window (as their close buttons would, but without asking
-/// about unsaved files) on SIGTERM, SIGINT or SIGHUP, so dev containers
-/// and language servers are shut down as on a normal exit. Like a quit,
-/// every open window reopens next time. A second signal falls back to the
-/// default action.
+/// about unsaved files) and quits on SIGTERM, SIGINT or SIGHUP, so dev
+/// containers and language servers are shut down as on a normal exit.
+/// Like a quit, every open window reopens next time. A second signal falls
+/// back to the default action.
 #[cfg(unix)]
 pub fn close_on_termination(cx: &mut gpui::App) {
     use futures::StreamExt;
@@ -115,6 +115,8 @@ pub fn close_on_termination(cx: &mut gpui::App) {
                         .update(cx, |_, window, _| window.remove_window())
                         .ok();
                 }
+                // Also when the editor would stay for the next launch.
+                cx.quit();
             })
             .ok();
         }
@@ -244,116 +246,3 @@ pub fn set_app_id() {
 
 #[cfg(not(windows))]
 pub fn set_app_id() {}
-
-/// Warm-up threads started ahead of gpui; what they created stays alive
-/// until the first window is up.
-pub struct Prewarm {
-    release: Vec<std::sync::mpsc::Sender<()>>,
-}
-
-impl Prewarm {
-    /// Lets the warm-up threads drop what they created.
-    pub fn finish(self) {
-        drop(self.release);
-    }
-}
-
-/// Runs the slow parts of gpui's Windows setup that it would otherwise do
-/// one after another on the main thread, on threads of their own while the
-/// main thread creates the Direct3D devices:
-/// - DirectWrite's system font collection, cached by the shared factory
-///   gpui also uses (~100 ms cold);
-/// - the shell's drag-and-drop helper (loads its COM server, ~20 ms).
-///
-/// A warm-up Direct3D device was tried as well: it competes with gpui's
-/// own device creation and makes startup slower.
-#[cfg(windows)]
-pub fn prewarm() -> Prewarm {
-    let fonts = keep_until_released("prewarm-fonts", "prewarm: fonts", || {
-        use windows::Win32::Graphics::DirectWrite::{
-            DWRITE_FACTORY_TYPE_SHARED, DWriteCreateFactory, IDWriteFactory5,
-        };
-        // SAFETY: plain COM calls on objects owned by this thread.
-        unsafe {
-            DWriteCreateFactory::<IDWriteFactory5>(DWRITE_FACTORY_TYPE_SHARED).map(|factory| {
-                let mut collection = None;
-                // The same call as gpui's (no downloadable fonts, check
-                // for updates), so its result is the cached one.
-                factory
-                    .GetSystemFontCollection(false, &mut collection, true)
-                    .ok();
-                (factory, collection)
-            })
-        }
-    });
-    let shell = keep_until_released("prewarm-shell", "prewarm: shell", || {
-        use windows::Win32::{
-            System::{
-                Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
-                Ole::{OleInitialize, OleUninitialize},
-            },
-            UI::Shell::{CLSID_DragDropHelper, IDropTargetHelper},
-        };
-        /// Releases the helper, then leaves COM, on the creating thread.
-        struct Helper(Option<IDropTargetHelper>);
-        impl Drop for Helper {
-            fn drop(&mut self) {
-                if let Some(helper) = self.0.take() {
-                    drop(helper);
-                    // SAFETY: balances the successful `OleInitialize`.
-                    unsafe { OleUninitialize() };
-                }
-            }
-        }
-        // SAFETY: COM is initialized for this thread before creating the
-        // helper, and left only after releasing it (see `Helper`).
-        unsafe {
-            if OleInitialize(None).is_err() {
-                return Helper(None);
-            }
-            match CoCreateInstance::<_, IDropTargetHelper>(
-                &CLSID_DragDropHelper,
-                None,
-                CLSCTX_INPROC_SERVER,
-            ) {
-                Ok(helper) => Helper(Some(helper)),
-                Err(_) => {
-                    OleUninitialize();
-                    Helper(None)
-                }
-            }
-        }
-    });
-    Prewarm {
-        release: [fonts, shell].into_iter().flatten().collect(),
-    }
-}
-
-/// Runs `create` on a thread named `name` and keeps its result there until
-/// the returned sender is dropped (COM objects stay on their thread).
-#[cfg(windows)]
-fn keep_until_released<T>(
-    name: &str,
-    label: &'static str,
-    create: impl FnOnce() -> T + Send + 'static,
-) -> Option<std::sync::mpsc::Sender<()>> {
-    let (release, released) = std::sync::mpsc::channel::<()>();
-    std::thread::Builder::new()
-        .name(name.into())
-        .spawn(move || {
-            let warm = create();
-            mark(label);
-            // Returns once the sender is dropped.
-            released.recv().ok();
-            drop(warm);
-        })
-        .ok()?;
-    Some(release)
-}
-
-#[cfg(not(windows))]
-pub fn prewarm() -> Prewarm {
-    Prewarm {
-        release: Vec::new(),
-    }
-}

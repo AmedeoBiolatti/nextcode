@@ -78,7 +78,9 @@ fn highlight_lines<'a>(
         return HashMap::new();
     }
     let buffer = Buffer::new(&text);
-    let spans = Syntax::new(language, &buffer).highlights(&buffer, 0..text.len());
+    let spans = Syntax::new(language, &buffer)
+        .map(|syntax| syntax.highlights(&buffer, 0..text.len()))
+        .unwrap_or_default();
     let mut result = HashMap::with_capacity(starts.len());
     let mut first = 0;
     for (line, start, len) in starts {

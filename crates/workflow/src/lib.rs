@@ -13,11 +13,14 @@
 //! [`inputs`] the parameters a run asks for (`${inputs.…}`), and
 //! [`legacy`] converts files of the old JSON format.
 
+pub mod dotenv;
+pub mod expr;
 pub mod file;
 pub mod inputs;
 pub mod layout;
 pub mod legacy;
 pub mod output;
+pub mod policy;
 pub mod run;
 pub mod source;
 pub mod tree;
@@ -32,6 +35,7 @@ pub use file::{
 pub use inputs::{Choice, Input, InputKind, InputValue, InputValues};
 pub use layout::{GraphLayout, Metrics, View, layout_workflow};
 pub use output::{AnsiStripper, OutputWatcher, urls_in};
+pub use policy::{EnvFile, Healthcheck, HttpProbe, Probe, Restart, RestartPolicy};
 pub use run::{ArtifactState, Change, CheckResult, Effect, Outcome, Run, Status, StepState};
 pub use source::{
     InputSpan, Problem, StepSpan, input_spans, path_at, span_of, spans_of, step_at, step_spans,

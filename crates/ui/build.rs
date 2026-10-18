@@ -1,6 +1,7 @@
-//! Embeds the Windows icon and version information into next_code.exe.
-//! gpui loads icon resource 1 for its windows; Explorer and the taskbar
-//! show it too.
+//! Embeds the Windows icon and version information into
+//! next_code_editor.exe. gpui loads icon resource 1 for its windows; the
+//! taskbar shows it too (the launcher, `next_code.exe`, carries the same
+//! icon for Explorer and shortcuts).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -8,6 +9,9 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    // Fold identical functions at link time (rustc passes /OPT:NOICF by
+    // default): a smaller executable, which loads faster.
+    println!("cargo:rustc-link-arg-bins=/OPT:REF,ICF");
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let icon = manifest_dir.join("assets").join("next_code.ico");
     let version = std::env::var("CARGO_PKG_VERSION").unwrap();
@@ -41,7 +45,7 @@ BEGIN
       VALUE "ProductName", "next_code"
       VALUE "FileVersion", "{version}"
       VALUE "ProductVersion", "{version}"
-      VALUE "OriginalFilename", "next_code.exe"
+      VALUE "OriginalFilename", "next_code_editor.exe"
     END
   END
   BLOCK "VarFileInfo"

@@ -150,6 +150,7 @@ Top level, a mapping:
 | `description` | string; documentation only |
 | `inputs` | mapping of input ids to their settings (§3.5) |
 | `env` | mapping of names to values every step gets (a group's and the step's own `env` win) |
+| `env_file` | dotenv files every step reads (§3.8) |
 | `steps` | **required**: mapping of step ids to steps, in the order they run and show |
 | `x-…` | any key starting with `x-`: shared parts for YAML anchors (below); ignored |
 | `$schema` | ignored |
@@ -197,6 +198,10 @@ ignored. Allowed keys:
 | `open_urls` | bool | http(s) URLs printed by `run` open in the browser (once each) until ready + 3 s. Needs `run` |
 | `env` | mapping of string/number/bool | Extra environment for `run`/`check` |
 | `cwd` | string | Working directory, relative to the project root (home folder without a project) |
+| `restart` | `no`, `on_failure`, `always`, or `{policy, max, backoff}` | Starts its command again by itself when it fails (§3.6). Needs `run` |
+| `healthcheck` | mapping | Probed while it is ready; unhealthy fails it (§3.6) |
+| `if` | expression | Runs only when true once what it depends on is done; else `skipped` (§3.7) |
+| `env_file` | path or list | Dotenv files its commands read; its `env` wins (§3.8) |
 | `steps` | mapping, non-empty | Makes the step a **group** of these steps (§3.4) |
 
 **Durations** are Compose's: `90s`, `10m`, `1h30m`, `500ms`, `1.5s` (no
@@ -254,6 +259,7 @@ Exactly one condition:
 | `{output: <regex>}` | the regex matches the command's output (ANSI codes stripped, across chunks and lines; Rust regex syntax) | servers that print a "ready" line |
 | `{port: N}` | something listens on TCP port N where the step runs | servers with a known port (most robust) |
 | `{manual: <prompt>}` | someone sends Continue | approvals, browser confirmations, anything only a human can verify |
+| `{http: <url>}` or `{http: {url, status}}` | the URL answers where the step runs with an accepted status (default 200–399; `status: 200` or `[200, 204]`); tried every second | servers with a health endpoint (better than `port`: the app answers) |
 | `{delay: <duration>}` | that long after the command started (or the check passed) | last resort; avoid |
 
 ### 3.3 `artifacts` entries
@@ -299,11 +305,12 @@ api:
       env: {LOG_LEVEL: debug}
 ```
 
-- **Keys:** `title`, `depends_on`, `steps`, and the defaults `project`,
-  `cwd`, `env`. Anything else (`run`, `check`, `on_fail`, `ready`,
-  `timeout`, `open_urls`, `terminal`, `stop_grace_period`, `artifacts`) is
-  an error (`a group cannot have …`), as is an empty `steps`. Groups nest
-  to any depth.
+- **Keys:** `title`, `depends_on`, `if`, `steps`, and the defaults
+  `project`, `cwd`, `env`, `env_file`. Anything else (`run`, `check`,
+  `on_fail`, `ready`, `timeout`, `open_urls`, `terminal`,
+  `stop_grace_period`, `artifacts`, `restart`, `healthcheck`) is an error
+  (`a group cannot have …`), as is an empty `steps`. Groups nest to any
+  depth. A group's `if` that is false skips all its steps.
 - **Inheritance:** every step inside (at any depth) gets the nearest
   group's `project` and `cwd` unless it sets its own; `env` is merged
   (the workflow's, outer groups, then inner ones, then the step; the step
@@ -402,6 +409,103 @@ An input without settings (`note:` alone) is a string input.
   ones fail `workflow_run` with every problem:
   ``Deploy cannot run: unknown input `colour` (inputs: env, branch, workers, clean); input `env`: `qa` is not one of dev, staging, prod; input `branch`: required; input `workers`: must be ≤ 64``.
 
+### 3.6 Keeping services up: `restart` and `healthcheck`
+
+```yaml
+api:
+  run: uv run uvicorn app:app --port 8000
+  ready: {http: 'http://localhost:8000/health'}
+  restart: {policy: on_failure, max: 5, backoff: 5s}
+  healthcheck:
+    test: curl -fs localhost:8000/health   # or http: …, or port: 8000
+    interval: 30s                          # default 30s
+    timeout: 10s                           # one probe, default 10s
+    retries: 3                             # failures in a row, default 3
+    start_period: 1m                       # failures right after ready do not count
+```
+
+- A **ready** step whose command exits with a non-zero code **crashed**:
+  it fails (`exited after it was ready (exit code 1)`). A clean exit (0)
+  after ready leaves it ready.
+- `restart`: `no` (the default), `on_failure` or `always`, or
+  `{policy, max, backoff}` (`max`: restarts before giving up, default no
+  limit; `backoff`: the wait before each, default `2s`). `on_failure`
+  restarts after a failure of its **command**: a non-zero exit before or
+  after ready, a `timeout`, unhealthy. Not after a failed `check`, a
+  project that could not open or a variable that could not be read (they
+  need a human). `always` also restarts after a clean exit (a `ready:
+  exit` step then runs again and again: its dependents start after its
+  first run). While it waits the step is `waiting` with detail `restart 2
+  in 5s: <why>`; it then starts as usual (after its dependencies).
+  `restarts` (status rows) counts them; after `max` it fails with `… (gave
+  up after 5 restarts)`. Run All, Restart and Retry count from 0 again.
+- `healthcheck`: one of `test` (a command where the step runs, in its
+  shell, `cwd`, env files and `env`; exit code 0 is healthy: **any check
+  every N seconds**), `http` (a URL answers 200–399, or `{url, status}`)
+  or `port`. It is probed every `interval` while the step is ready (also
+  a step without `run`: watch a VPN, a tunnel, a remote service).
+  Failures within `start_period` of getting ready do not count; `retries`
+  failures in a row make it unhealthy: it fails (`unhealthy: exit code
+  7`), its command is stopped (with its grace), and with a `restart`
+  policy it starts again. While failures add up the detail says `health
+  check failed (1 of 3): …`.
+- HTTP probes (`ready.http`, `healthcheck.http`) run where the step runs:
+  plain `http://` directly (through the agent for WSL and dev containers),
+  `https://` with `curl` there (PowerShell on this Windows machine).
+- Steps that depend on a step that restarts are left alone; they waited
+  for it once.
+
+### 3.7 Conditions: `if` and `skipped`
+
+```yaml
+deploy: {run: ./deploy.sh, if: "inputs.env == 'prod'"}
+smoke: {depends_on: [deploy], run: pytest smoke}         # skipped with deploy
+notify:
+  depends_on: {eval: completed}
+  if: failure()                                          # only after eval failed
+  run: ./notify.sh '${steps.eval.exit_code}'
+```
+
+- Evaluated when the step could start (what it depends on is done). False
+  → `skipped` (reason `if inputs.env == 'prod'`); a group's `if` that is
+  false skips all its steps.
+- Reads `inputs.<id>`, `steps.<id>.status` (`ready`, `failed`, `stopped`,
+  `skipped`), `steps.<id>.exit_code` (steps in its `depends_on` or a
+  group's, as for variables), and `success()` (every step it waits for is
+  ready or skipped), `failure()` (one failed: wait for it `completed`),
+  `always()`. Strings in quotes, numbers, `true`/`false`/`null`; `==`,
+  `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, parentheses. `false`, `0`,
+  `''` and `null` are false. Quote the whole `if` when it starts with a
+  quote or holds `: ` or ` #` (`if: "inputs.env == 'prod'"`).
+- A step that needs a skipped step **ready** is skipped too (`deploy was
+  skipped`); one that waits for it `completed` runs (`${steps.deploy.status}`
+  is `skipped`). Skipped steps count as done: the outcome is `ready` when
+  every step is ready or skipped.
+- Unknown inputs, steps outside the scope, unknown fields and syntax
+  errors are validation errors at the place in the expression.
+
+### 3.8 `env_file`
+
+```yaml
+env_file: .env                                   # every step
+steps:
+  api:
+    env_file: [config/dev.env, {path: .env.local, required: false}]
+    env: {LOG_LEVEL: debug}                      # wins over the files
+```
+
+- Dotenv files: `NAME=value` lines, `export ` allowed, `#` comments,
+  values unquoted (` #` starts a comment), `'single'` (as written) or
+  `"double"` (`\n`, `\t`, `\"` escaped; may span lines).
+- Read **where the step runs** (inside WSL or the container), relative to
+  the step's `cwd` (else its project root, else the home folder), when
+  its check or command starts; `${…}` variables work in paths. The
+  workflow's files come first, then each group's, then the step's: a
+  later file's variable wins, and `env` wins over all of them. `${env:NAME}`
+  reads them too.
+- A missing file fails the step (`env_file /p/.env: No such file …`)
+  unless `required: false`.
+
 ---
 
 ## 4. How commands run
@@ -474,9 +578,11 @@ Step states (`status` in events and status replies):
 
 ```
 pending → waiting (for its depends_on) → starting (opening project / running check)
-        → running (command runs, or waiting for port/output/delay/Continue)
+        → running (command runs, or waiting for port/http/output/delay/Continue)
         → ready | failed | stopped
+waiting → skipped (its if, or a group's, is false; a step it needs ready was skipped)
 running/ready with a live command → stopping (Ctrl+C sent; grace running) → stopped | failed
+failed command with a restart policy → waiting (restart N in 5s: …) → starting …
 ```
 
 `stopping` lasts until the command exits (which ends it early) or its
@@ -484,7 +590,8 @@ running/ready with a live command → stopping (Ctrl+C sent; grace running) → 
 e.g. `stopping (12 s left)`, `restarting; stopping (2 s left)`, `timed
 out after 10m; stopping (3 s left)`.
 
-Workflow outcomes: `idle`, `running`, `ready` (every step ready),
+Workflow outcomes: `idle`, `running`, `ready` (every step ready or
+skipped; a step that crashes or restarts later puts it back to `running`),
 `failed`, `stopped`. **`failed`** means either a check without `on_fail`
 failed (everything was stopped), or the run **finished with failures**:
 nothing is pending, waiting (unblocked), starting, running or stopping
@@ -515,7 +622,10 @@ Failure rules:
 | `check` fails, step has `on_fail` | step `failed` with reason = the `on_fail` text; waits for Retry; others continue |
 | `check` fails, no `on_fail` | the **workflow fails**: everything it started is stopped (each with its grace) |
 | `run` exits non-zero (ready `exit`) | step `failed` (`failed (exit code N)`); `completed` dependents run |
-| command exits before ready (output/port/delay) | step `failed` (`exited before it was ready …`) |
+| command exits before ready (output/port/http/delay) | step `failed` (`exited before it was ready …`) |
+| a ready step's command exits non-zero | step `failed` (`exited after it was ready (exit code N)`) |
+| health check: `retries` failures in a row | step `failed` (`unhealthy: …`), its command stopped |
+| any of the four above, with `restart` | instead of failing: `waiting` (`restart N in 2s: …`), then it starts again; `… (gave up after N restarts)` after `max` |
 | `timeout` reached | step `stopping` (detail `timed out after 10m; stopping …`), then `failed` (`timed out after 10m`) once the command is gone |
 | a step failed | `ready` dependents are blocked (`blocked: <id> did not get ready`); `completed` dependents run; independent steps keep going; when nothing can progress the outcome is `failed` |
 
@@ -718,11 +828,11 @@ Workflows are named by `"name"`, `"path"` or `"id"` (from
 
 | Command | Params | Result |
 |---|---|---|
-| `workflows_list` | – | array of `{id, name, path, source, error, inputs, steps, outcome}`; `inputs` as declared: `{id, label, type, description, default, required, placeholder}` plus `options[{value, label}]` (choice) or `min`, `max`, `integer` (number); each step `{id, path, kind: "step", title, depends_on: {"<id>": "ready" or "completed"}, project, run, check, ready, timeout, stop_grace_period, artifacts[{label, path} or {label, url}]}`, each group `{id, path, kind: "group", title, depends_on, project, steps[…]}` (nested). `path` is the qualified id; `project` is where it runs (inherited from its groups); durations as in files (`10m`, `3s`; `ready.delay` too); `${inputs.…}` show unexpanded. Old-format files have an `error` saying to convert them |
+| `workflows_list` | – | array of `{id, name, path, source, error, inputs, steps, outcome}`; each step also has `policies: {restart: {policy, max, backoff}, healthcheck: {probe, interval, timeout, retries, start_period} or null, if, env_file: [{path, required}]}` and `ready: {http: {url, status}}` for HTTP readiness; groups have `if`; `inputs` as declared: `{id, label, type, description, default, required, placeholder}` plus `options[{value, label}]` (choice) or `min`, `max`, `integer` (number); each step `{id, path, kind: "step", title, depends_on: {"<id>": "ready" or "completed"}, project, run, check, ready, timeout, stop_grace_period, artifacts[{label, path} or {label, url}]}`, each group `{id, path, kind: "group", title, depends_on, project, steps[…]}` (nested). `path` is the qualified id; `project` is where it runs (inherited from its groups); durations as in files (`10m`, `3s`; `ready.delay` too); `${inputs.…}` show unexpanded. Old-format files have an `error` saying to convert them |
 | `workflow_schema` | – | `{schema, file, modeline}`: the format's JSON Schema (§2.2), the name of the copy in the user's workflows folder, and the line that points YAML editors at a copy beside a workflow |
 | `workflow_convert` | name/path/id of an old-format file | `{path, backup, problems}`: the YAML file written beside it (comments kept; an error if it exists), the old file renamed to `<name>.bak`, and the converted file's problems (as the old one had them; `[]` usually). Files are read again |
 | `workflow_run` | name/path/id, `inputs`? (`{"<id>": value}`) | `{run, id}`; starts afresh (a run of it still going is stopped first, each command with its grace). Inputs not given get their defaults; invalid ones are an error listing each (§3.5) |
-| `workflow_status` | name/path/id | `{run, workflow, outcome, inputs, steps[…]}` (error if it has not run); `inputs` the run's values by id (`{"env": "prod", "workers": 8}`). One row per step and group in file order, groups before their steps. Step rows: `{id, kind: "step", parent, title, status, reason, detail, blocked, last_line, check_output, exit_code, exited, elapsed_ms, location, terminal, artifacts[{label, name, path or url, resolved, exists}], artifacts_error}`; group rows: `{id, kind: "group", parent, title, status, reason, detail, blocked, elapsed_ms, steps[qualified ids]}`. `id`/`parent` are qualified ids (`parent` null at the top). `resolved`/`exists` are `null` until the artifacts were checked; `artifacts_error` says why they could not be |
+| `workflow_status` | name/path/id | `{run, workflow, outcome, inputs, steps[…]}` (error if it has not run); `inputs` the run's values by id (`{"env": "prod", "workers": 8}`). One row per step and group in file order, groups before their steps. Step rows: `{id, kind: "step", parent, title, status, reason, detail, blocked, last_line, check_output, exit_code, exited, restarts, health_failures, elapsed_ms, location, terminal, artifacts[{label, name, path or url, resolved, exists}], artifacts_error}`; group rows: `{id, kind: "group", parent, title, status, reason, detail, blocked, elapsed_ms, steps[qualified ids]}`. `id`/`parent` are qualified ids (`parent` null at the top). `resolved`/`exists` are `null` until the artifacts were checked; `artifacts_error` says why they could not be |
 | `workflow_continue` | name, `step` | `null`; error `the step is not waiting for Continue` unless it is a running `manual` step |
 | `workflow_restart` | name, `step` | bool (its old command is stopped with its grace first; a group: every step in it) |
 | `workflow_retry` | name, `step`? | bool: without `step` reruns every failed step; with it that step if it failed, or a group's failed steps (`false` if none had failed) |
@@ -881,6 +991,12 @@ Rules of thumb:
 | Step `stopping` for long, then `stopped`/`failed` | It ignores or slowly handles Ctrl+C; it is killed when `stop_grace_period` runs out. Lower it, or Stop again to kill now |
 | Checkpoint not written on Stop | Killed before it finished: raise `stop_grace_period`. The program itself must handle Ctrl+C (a `trap … INT` in a `sh` script, Python's `KeyboardInterrupt`, PowerShell `finally`); try Ctrl+C in a terminal of that project to see what it does |
 | Report step never runs | It depends on the evaluation `ready`; use `depends_on: {eval: completed}`. Or the evaluation was stopped / waits for Retry (`blocked: … was stopped` / `waits for Retry`) |
+| A server shows `failed: exited after it was ready` | Its command crashed after it got ready (before, such steps stayed "ready"). Read `last_line`; add `restart: on_failure` to bring it back by itself |
+| Step stays `waiting` with `restart N in …` | Its restart policy waits for the backoff; it gives up after `max` (then `failed … (gave up after N restarts)`). Stop All or Retry interrupts it |
+| `unhealthy: …` | The health check failed `retries` times in a row; the message is the probe's (exit code and last line, or `… answered 503`). Raise `start_period` for slow starts |
+| HTTP readiness never passes | The URL must answer where the step runs (inside the container for dev containers) with 200–399, or set `status`; `https://` needs `curl` there |
+| Step `skipped` unexpectedly | Its `if` was false (the reason quotes it) or a step it needs ready was skipped; wait for that one `completed` to run anyway |
+| `env_file …: No such file` | Paths are relative to the step's `cwd` (else its project root), where the step runs; `required: false` for optional files |
 | Outcome `failed` though the last step is ready | Finished with failures: some other step failed or is blocked. See each step's `reason`/`detail` |
 | Artifact `missing` | The path is relative to the step's `cwd` (else its project root), checked where the step runs; compare `resolved` with where the file was written; Check again after writing it later |
 | A step fails with `` `${steps.x.artifacts.y}`: the artifacts of `x` could not be resolved `` | `x`'s environment could not be read or its path uses an unknown variable (`artifacts_error` of `x`) |
@@ -909,19 +1025,13 @@ Rules of thumb:
 ## 12. Planned (designed, not supported yet)
 
 These are designed into the format so adding them will not change it
-again; until then a file using them is invalid (`` `restart` is planned
-but not supported yet ``). The shapes follow the tools they come from.
+again. The shapes follow the tools they come from.
 
 | Feature | Shape (planned) | From |
 |---|---|---|
-| Restart policy | `restart: on_failure` (or `always`, `no`), or `restart: {policy: on_failure, max: 5, backoff: 2s}` | Compose `restart`, process-compose `availability` |
-| Health after ready | `healthcheck: {test: <command>, interval: 10s, timeout: 5s, retries: 3, start_period: 30s}` (or `http`/`port` instead of `test`): a step that stops being healthy fails, and restarts with a `restart` policy | Compose `healthcheck`, process-compose `liveness_probe` |
-| HTTP readiness | `ready: {http: 'http://localhost:8000/health'}` or `{http: {url: …, status: 200}}` | process-compose `readiness_probe.http_get` |
 | Daemons | several conditions in `ready`, all of them: `ready: {exit: true, port: 5432}` for `docker compose up -d` (the command exits 0, then the port listens) | process-compose `is_daemon` |
 | Partial runs | headless `workflow_run` with `"steps": ["api"]` (and the GUI's Run Step With Dependencies): only those steps and what they depend on; per-step Stop | `docker compose up api` |
 | Step outputs | named groups in `ready.output` (`'listening on port (?<port>\d+)'`) read as `${steps.api.outputs.port}` | GitHub Actions step outputs |
-| Conditions | `if: inputs.env == 'prod'`, `if: steps.eval.status == 'failed'` (only after a failure): a step whose `if` is false is `skipped`; dependents of a skipped step are skipped too | GitHub Actions `if` |
-| Environment files | `env_file: .env` (or a list), on the workflow, a group or a step, read where the step runs; `env` wins over it | Compose `env_file`, Taskfile `dotenv` |
 
 ---
 
@@ -944,3 +1054,8 @@ but not supported yet ``). The shapes follow the tools they come from.
 | VS Code tasks `dependsOn`, `isBackground` + `endsPattern` | `depends_on`, `ready: {output: …}` |
 | VS Code `${workspaceFolder}`, `${env:NAME}`, `${input:x}` | `${workspaceFolder}`, `${env:NAME}`, `${inputs.x}` |
 | Taskfile `preconditions: [{sh, msg}]` | `check` + `on_fail` |
+| Compose `restart: on-failure` / process-compose `availability` | `restart: on_failure` or `{policy, max, backoff}` |
+| Compose `healthcheck: {test, interval, timeout, retries, start_period}` | `healthcheck` with the same keys (`test` a command line; or `http`, `port`) |
+| process-compose `readiness_probe.http_get` | `ready: {http: …}` |
+| Compose / Taskfile `env_file`, `dotenv` | `env_file` (string or list; `{path, required: false}`) |
+| GitHub Actions `if:` with `success()`, `failure()`, `always()` | `if:` (no `${{ }}`; `inputs.<id>`, `steps.<id>.status`) |

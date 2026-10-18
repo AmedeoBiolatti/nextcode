@@ -33,19 +33,28 @@ fn keys_for_where_the_cursor_is() {
     let top = labels("name: x\n|");
     assert_eq!(
         top,
-        ["description", "inputs", "env", "steps"],
+        ["description", "inputs", "env", "env_file", "steps"],
         "`name` is there"
     );
     let step = labels("steps:\n  a:\n    run: x\n    |");
     assert!(step.contains(&"depends_on".to_owned()) && step.contains(&"ready".to_owned()));
     assert!(!step.contains(&"run".to_owned()), "present already");
-    assert!(
-        !step.iter().any(|key| key == "needs" || key == "restart"),
-        "old and planned keys"
-    );
+    assert!(!step.iter().any(|key| key == "needs"), "old keys");
+    assert!(step.contains(&"restart".to_owned()) && step.contains(&"healthcheck".to_owned()));
     // A group takes only group keys.
     let group = labels("steps:\n  g:\n    steps:\n      a: {run: x}\n    |");
-    assert_eq!(group, ["title", "depends_on", "project", "env", "cwd"]);
+    assert_eq!(
+        group,
+        [
+            "title",
+            "depends_on",
+            "if",
+            "project",
+            "env",
+            "env_file",
+            "cwd"
+        ]
+    );
     assert_eq!(
         labels("steps:\n  a: {run: x, ready: {|"),
         ["exit", "output", "port", "manual", "delay"]
@@ -332,4 +341,48 @@ fn diagnostics_cover_the_token_they_are_about() {
     let found = diagnostics(text);
     assert_eq!(&text[found[0].0.clone()], "zz");
     assert!(diagnostics("steps:\n  a: {run: x}\n").is_empty());
+}
+
+#[test]
+fn the_service_keys_complete_too() {
+    let health = labels("steps:\n  a:\n    run: x\n    healthcheck:\n      test: y\n      |");
+    assert_eq!(
+        health,
+        ["interval", "timeout", "retries", "start_period"],
+        "one probe"
+    );
+    assert_eq!(
+        labels("steps:\n  a: {run: x, healthcheck: {|"),
+        workflow::policy::HEALTHCHECK_KEYS
+    );
+    assert_eq!(
+        labels("steps:\n  a: {run: x, restart: |}")[..3],
+        ["on_failure", "always", "no"]
+    );
+    assert_eq!(
+        labels("steps:\n  a: {run: x, restart: {policy: always, |"),
+        ["max", "backoff"]
+    );
+    assert!(labels("steps:\n  a:\n    run: x\n    ready: |").contains(&"{http: …}".to_owned()));
+    let conditions =
+        labels("inputs: {env: {}}\nsteps:\n  db: {run: d}\n  a: {depends_on: [db], run: x, if: |}");
+    assert_eq!(
+        conditions,
+        [
+            "success()",
+            "failure()",
+            "always()",
+            "steps.db.status",
+            "steps.db.exit_code",
+            "inputs.env"
+        ]
+    );
+    // Hovers come from the schema.
+    let (text, offset) = cursor("steps:\n  a:\n    run: x\n    heal|thcheck: {port: 1}\n");
+    assert!(
+        hover(&text, offset)
+            .unwrap()
+            .0
+            .contains("Probed every `interval`")
+    );
 }

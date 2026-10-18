@@ -36,6 +36,10 @@ pub enum Place {
     DependsOn(Vec<String>),
     /// One dependency's `{condition: …}`.
     Dependency(Vec<String>),
+    /// A step's `healthcheck`.
+    Healthcheck(Vec<String>),
+    /// A step's `restart` mapping.
+    Restart(Vec<String>),
     Artifacts(Vec<String>),
     Artifact(Vec<String>),
     Inputs,
@@ -69,6 +73,8 @@ impl Place {
                     "project" => Place::Project(chain),
                     "depends_on" => Place::DependsOn(chain),
                     "artifacts" => Place::Artifacts(chain),
+                    "healthcheck" => Place::Healthcheck(chain),
+                    "restart" => Place::Restart(chain),
                     "env" => Place::Env,
                     _ => Place::Other,
                 },

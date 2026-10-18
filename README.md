@@ -7,20 +7,25 @@ Native, AI-first IDE written in Rust on [gpui](https://crates.io/crates/gpui).
 | Crate | Purpose |
 |---|---|
 | `crates/text` | UI-agnostic rope buffer: edits, undo/redo, grapheme/word motion, UTF-16 mapping, line endings, change log |
-| `crates/syntax` | Incremental tree-sitter parsing and highlight spans for Bash, C, C++, CSS, Dockerfile, Go, HTML, JavaScript, JSON, Markdown, Python, Rust, SQL, TOML, TypeScript/TSX, YAML |
+| `crates/syntax` | Incremental tree-sitter parsing and highlight spans for Bash, C, C++, CSS, Dockerfile, Go, HTML, JavaScript, JSON, Markdown, Python, Rust, SQL, TOML, TypeScript/TSX, YAML; loads the grammars from `grammars/` libraries on first use |
+| `crates/grammar_abi` | The contract between the editor and its grammar libraries (entry table, ABI version, `export!`) |
+| `grammars/*` | One shared library per tree-sitter grammar (`nc_grammar_<name>.dll`/`.so`), built with the editor and loaded when a file of that language opens |
 | `crates/search` | Gitignore-aware project text search with regex, globs and streaming results |
 | `crates/watcher` | Debounced project file watching with `.gitignore` filtering |
 | `crates/terminal` | Shell process and terminal emulation, local or attached to a remote pty; links (URLs, file locations, OSC 8) in its output |
 | `crates/worktree` | Project file operations shared by the editor and the agent: listing, ignore rules, tool lookup |
 | `crates/proto` | Versioned editor ↔ agent wire protocol (framing, requests, events) |
 | `crates/agent` | `next_code_agent`: headless Linux process serving files, watching, search, language servers and shells |
+| `vendor/gpui` | gpui 0.2.2 with startup patches to its Windows platform (`NEXT_CODE_PATCHES.md` there) |
+| `crates/instance` | One editor process per user: the launch request channel (named pipe / Unix socket), its JSON protocol, client and server |
+| `crates/launcher` | `next_code`: the small launcher users run; hands the command line to the running editor or starts `next_code_editor` |
 | `crates/remote` | Agent client and the bootstraps that install and start it in WSL or a container (`docker exec`) |
 | `crates/devcontainer` | `devcontainer.json` (JSONC) and bringing dev containers up with the docker CLI |
 | `crates/python` | `pyproject.toml` / `uv.lock`, uv command lines, pytest node ids |
 | `crates/notebook` | Notebooks: `.ipynb` and marimo file formats (round-trip exact), marimo's static analysis and cell graph, kernel output folding, ANSI colours, the kernel bridge (`assets/bridge.py`) and its JSON-lines protocol |
 | `crates/git` | Git through its CLI: porcelain v2 status, stage/unstage/discard/commit, hunk patches, branches, worktrees, fetch/pull/push, history, diffs |
 | `crates/spell` | Spell checking: Hunspell dictionaries through `spellbook` (bundled en_US), word lists, word splitting, which parts of a document are prose |
-| `crates/ui` | `next_code` binary: editor, docks, LSP, terminal, search, problems, git and Python panels, diffs, fuzzy file finder (`Ctrl+P`) |
+| `crates/ui` | `next_code_editor` binary: editor, docks, LSP, terminal, search, problems, git and Python panels, diffs, fuzzy file finder (`Ctrl+P`) |
 
 ## Build and run
 
@@ -49,13 +54,62 @@ with it. Started from a terminal, it returns to the prompt right away;
 argument errors and `--headless` output still print to that terminal (or to
 redirected streams), and closing the terminal does not close the editor.
 
+### Startup
+
+The build makes two programs: `next_code` (`crates/launcher`), a small
+launcher without gpui, and `next_code_editor` (`crates/ui`), the editor.
+Run `next_code`. It hands its command line to the editor already running
+(over a named pipe on Windows, a Unix socket in the state directory
+elsewhere), which opens the window in a fraction of the time a process
+start takes, and starts `next_code_editor` next to it when none runs. Like
+VS Code, `next_code <dir>` from a second shell opens in the same process;
+a project already open comes forward. `cargo run -p next_code` runs the
+editor directly, which joins a running editor the same way.
+
+- `--new-instance` starts a separate editor process that neither joins
+  nor serves launches (tests and `--automation` use it).
+- `--quit` asks the running editor to exit.
+- `"keep_running"` in `settings.json`: `true` keeps the editor running
+  after its last window closes, ready for the next launch; `false` exits;
+  `"auto"` (the default) keeps it except for builds run from a cargo
+  `target` directory, which cargo must be able to rewrite. A resident
+  editor exits by itself when its executable has been replaced (the next
+  launch starts the new build), on `--quit`, and on **File > Exit**.
+- `scripts\install.ps1` copies the release build to
+  `%LOCALAPPDATA%\next_code\bin` (asking a resident editor to exit first),
+  where launches do not hold the cargo output; add that folder to `PATH`.
+- The tree-sitter grammars (about 14 MB of parse tables) are not in the
+  executable: each is a library, `nc_grammar_<name>.dll` on Windows
+  (`libnc_grammar_<name>.so` on Linux), built with the editor and loaded
+  the first time a file of its language opens. The editor looks in the
+  `NEXT_CODE_GRAMMARS` directory, next to its executable, then in its
+  `deps` directory (where cargo puts libraries built as dependencies, so
+  `cargo run` finds them). A missing or stale library (the ABI is checked)
+  leaves that language as plain text, with the reason on stderr;
+  `cargo build --release --workspace` puts the libraries next to the
+  executable, and `scripts\install.ps1` copies them.
+- Size, Windows release build: 55 MB at the start of this work, 38 MB
+  with `panic = "abort"`, thin LTO and gpui's `image` trimmed, 25 MB with
+  the grammars in libraries, 24 MB with cold dependencies (LSP types,
+  notebooks, workflows, git, SVG and image decoding, ...) at `opt-level =
+  "s"`. `cargo build --profile dist` (fat LTO, one codegen unit) takes
+  another 2 MB off at about four times the build time; `scripts\install.ps1
+  -Profile dist` installs it.
+
 Set `NEXT_CODE_TRACE_STARTUP=1` to print startup milestones (time since the
 process was created) to stderr, e.g. from PowerShell:
-`$env:NEXT_CODE_TRACE_STARTUP=1; .\next_code.exe C:\dev\p 2> trace.txt`.
+`$env:NEXT_CODE_TRACE_STARTUP=1; .\next_code_editor.exe C:\dev\p 2> trace.txt`.
 The WSL connection (or, for local projects, git status) starts on a thread
-before the window, alongside gpui's platform setup; DirectWrite's font list
-and the shell's drag-and-drop helper are loaded on threads of their own
-while gpui creates its Direct3D devices.
+before the window, alongside gpui's platform setup. gpui is a patched copy
+(`vendor/gpui`, see `NEXT_CODE_PATCHES.md` there): its Windows platform
+creates the Direct3D device once (upstream probed with a throwaway device
+first) and on a thread of its own, loads DirectWrite's font list on
+another, and creates the shell's drag-and-drop helper on the first drag
+instead of at startup. The release profile is `panic = "abort"` with thin
+LTO and gpui's `image` crate trimmed to the formats shown, for a smaller
+executable: on machines whose endpoint security scans every image load,
+each MB of executable costs milliseconds per launch, and a rebuilt
+executable's first launch pays a full scan.
 
 ## WSL projects
 
@@ -514,7 +568,8 @@ Top level: `name` (default: the file name), `description`, `inputs`,
 (`x-api: &api {project: …}`, then `<<: *api` in steps, as in Compose
 files). Step fields (the step's id is its key in `steps`): `title`,
 `depends_on`, `project`, `run`, `terminal`, `check`, `on_fail`, `ready`,
-`timeout`, `stop_grace_period`, `artifacts`, `open_urls`, `env`, `cwd`.
+`timeout`, `stop_grace_period`, `artifacts`, `open_urls`, `env`, `cwd`,
+`env_file`, `restart`, `healthcheck`, `if`.
 `depends_on` is an id, a list of ids (each must be ready; independent
 steps run in parallel), or a mapping of ids to a condition: `ready` (the
 default) or `completed` (finished, ready or failed), also as Compose's
@@ -523,8 +578,7 @@ default) or `completed` (finished, ready or failed), also as Compose's
 cycles and `${steps.…}` variables naming a step outside `depends_on` make
 the workflow invalid: it is listed with the error (located at the key or
 value it is about) and cannot run. Keys of the old JSON format say what
-they became; `restart`, `healthcheck`, `if`, `env_file` and `ready.http`
-are reserved for planned features (see the manual).
+they became.
 
 **Editing workflow files.** next_code has its own language server for
 workflow files (`crates/workflow_lsp`), built in and run in-process, so it
@@ -569,6 +623,22 @@ Zed, Neovim) complete keys, describe them on hover and flag mistakes. For
 project workflows copy the schema beside them or map it in `yaml.schemas`
 (see the manual §2.1). next_code's own validation still checks more
 (dependencies, cycles, variables, regexes).
+
+**Services, conditions and env files.** `ready: {http: <url>}` waits for
+a URL to answer (200–399, or `{url, status}`) where the step runs. A ready
+step whose command exits non-zero crashed and fails. `restart:
+on_failure` (or `always`, or `{policy, max, backoff}`) starts a failed
+command again after its backoff (exit codes, crashes, timeouts,
+unhealthy), up to `max`. `healthcheck: {test: <command> | http: <url> |
+port: N, interval, timeout, retries, start_period}` probes a ready step
+every `interval` (any command every N seconds); `retries` failures in a
+row make it unhealthy: it fails, and restarts with a policy. `if:
+inputs.env == 'prod'` (also `steps.<id>.status`, `.exit_code`,
+`success()`, `failure()`, `always()`, `==`, `&&`, `||`, …) skips a step
+when false; steps needing it ready are skipped too; skipped steps count
+as done. `env_file: .env` (or a list, `{path, required: false}`; on the
+workflow, groups and steps) reads dotenv files where the step runs,
+relative to its `cwd`; `env` wins. Details: the manual §3.6–§3.8.
 
 Files of the old JSON format (`.json`/`.jsonc` with a `steps` array) are
 listed with a problem and do not run; their tab has **Convert to YAML**
@@ -1105,7 +1175,11 @@ others remain, removes it; quitting (**File > Exit**, a termination
 signal on Linux, or closing the last window) keeps every window open at
 that moment. A window on the welcome screen is kept only when it is the
 only one. Naming a project on the command line (`next_code .`,
-`next_code <dir>`, `--wsl`, `--devcontainer`) opens just that project.
+`next_code <dir>`, `--wsl`, `--devcontainer`) opens just that project,
+in the editor already running if there is one (see
+[Startup](#startup)); a launch without a project while the editor runs
+brings its windows forward, or reopens the saved ones when it stayed
+running with none.
 The state is `windows.json` next to `recent.json`
 (`%LOCALAPPDATA%\next_code\` on Windows, `~/.local/share/next_code/` on
 Linux); `"restore_windows": false` in `settings.json` shows the welcome

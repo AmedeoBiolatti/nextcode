@@ -8,10 +8,18 @@
 //!
 //! Per step: Pending → Waiting (for its `depends_on`) → Starting
 //! (opening the project, running the check) → Running (the command runs;
-//! not ready yet) → Ready | Failed | Stopped. Stopping a live command
-//! (Stop All, Restart, Run All, `timeout`, the workflow failing) goes
-//! through Stopping: Ctrl+C, then a kill if it has not exited after the
-//! step's `stop_grace_period`.
+//! not ready yet) → Ready | Failed | Stopped, or Skipped when its `if` (or
+//! a group's) is false or a step it needs ready was skipped. Stopping a
+//! live command (Stop All, Restart, Run All, `timeout`, the workflow
+//! failing) goes through Stopping: Ctrl+C, then a kill if it has not
+//! exited after the step's `stop_grace_period`.
+//!
+//! A ready step whose command exits with a non-zero code crashed: it
+//! fails. With a `restart` policy, a failed command (an exit code, a
+//! crash, a timeout, an unhealthy `healthcheck`) waits for its backoff
+//! and starts again (`always`: after a clean exit too), up to `max`
+//! times; a `healthcheck` is probed every `interval` while the step is
+//! ready.
 //!
 //! Steps are indexed as [`tree::flatten`] lists them, groups included. A
 //! group's `depends_on` gates each of its steps; its state follows
@@ -22,8 +30,11 @@
 use std::time::{Duration, Instant};
 
 use crate::{
+    expr,
     file::{Ready, Step, Workflow, format_duration},
+    inputs::InputValue,
     output::OutputWatcher,
+    policy::{Probe, RestartPolicy},
     tree::{self, StepNode},
     vars::{self, StepField, StepRef},
 };
@@ -46,6 +57,9 @@ pub enum Status {
     Ready,
     Failed(String),
     Stopped,
+    /// Its `if` (or a group's) was false, or a step it needs ready was
+    /// skipped; the text says which.
+    Skipped(String),
 }
 
 impl Status {
@@ -59,7 +73,16 @@ impl Status {
             Self::Ready => "ready",
             Self::Failed(_) => "failed",
             Self::Stopped => "stopped",
+            Self::Skipped(_) => "skipped",
         }
+    }
+
+    /// Ready, failed, stopped or skipped.
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self,
+            Self::Ready | Self::Failed(_) | Self::Stopped | Self::Skipped(_)
+        )
     }
 
     /// Waiting, starting, running or stopping.
@@ -111,6 +134,12 @@ pub enum Effect {
     OpenUrl {
         step: usize,
         url: String,
+    },
+    /// Probe the step's `healthcheck` where it runs (its
+    /// [`Run::definition`]); answer with [`Run::health_checked`].
+    RunHealthcheck {
+        step: usize,
+        generation: u64,
     },
 }
 
@@ -174,7 +203,9 @@ enum Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Then {
     Stopped,
-    Fail(String),
+    /// Fails with this reason; `true`: its `restart` policy may start it
+    /// again.
+    Fail(String, bool),
     /// Waits for what it waits for again, then starts afresh.
     Restart,
 }
@@ -224,6 +255,17 @@ pub struct StepState {
     artifacts_pending: bool,
     /// Its definition with `${steps.…}` replaced, since it started.
     resolved: Option<Step>,
+    /// Times its `restart` policy started it again in a row (Run All,
+    /// Restart and Retry count from 0 again).
+    pub restarts: u32,
+    /// Waiting for its restart backoff until then.
+    restart_at: Option<Instant>,
+    /// Health check failures in a row.
+    pub health_failures: u32,
+    /// When its health check is probed next (while it is ready).
+    next_health: Option<Instant>,
+    /// A health probe is out.
+    health_busy: bool,
 }
 
 impl StepState {
@@ -248,6 +290,11 @@ impl StepState {
             placed: false,
             artifacts_pending: false,
             resolved: None,
+            restarts: 0,
+            restart_at: None,
+            health_failures: 0,
+            next_health: None,
+            health_busy: false,
         }
     }
 
@@ -288,6 +335,11 @@ impl StepState {
     /// When a stopping command gets killed.
     pub fn stop_deadline(&self) -> Option<Instant> {
         self.stop.as_ref().map(|stop| stop.deadline)
+    }
+
+    /// When its `restart` policy starts it again, while it waits for that.
+    pub fn restart_at(&self) -> Option<Instant> {
+        self.restart_at
     }
 }
 
@@ -416,20 +468,23 @@ impl Run {
         std::mem::take(&mut self.changes)
     }
 
-    /// Steps waiting for a port: `(step, generation, port)`.
-    pub fn port_watches(&self) -> Vec<(usize, u64, u16)> {
+    /// Steps waiting for a port or an HTTP answer to get ready:
+    /// `(step, generation, probe)` (the URL as [`Run::definition`] has
+    /// it); answer with [`Run::probe_result`].
+    pub fn ready_probes(&self) -> Vec<(usize, u64, Probe)> {
         self.leaves
             .iter()
             .filter_map(|&index| {
                 let state = &self.steps[index];
-                match self.nodes[index].step.ready {
-                    Ready::Port(port)
-                        if state.status == Status::Running && state.phase == Phase::Waiting =>
-                    {
-                        Some((index, state.generation, port))
-                    }
-                    _ => None,
+                if state.status != Status::Running || state.phase != Phase::Waiting {
+                    return None;
                 }
+                let probe = match &self.definition(index).ready {
+                    Ready::Port(port) => Probe::Port(*port),
+                    Ready::Http(http) => Probe::Http(http.clone()),
+                    _ => return None,
+                };
+                Some((index, state.generation, probe))
             })
             .collect()
     }
@@ -439,6 +494,7 @@ impl Run {
     pub fn start(&mut self, now: Instant) {
         for at in 0..self.leaves.len() {
             let index = self.leaves[at];
+            self.steps[index].restarts = 0;
             if self.steps[index].command.is_some() {
                 self.stop_command(index, Then::Restart, now);
             } else {
@@ -525,7 +581,7 @@ impl Run {
         state.detail.clear();
         match then {
             Then::Stopped => self.set_status(index, Status::Stopped, now),
-            Then::Fail(reason) => self.set_status(index, Status::Failed(reason), now),
+            Then::Fail(reason, restartable) => self.settle_failure(index, reason, restartable, now),
             Then::Restart => self.reset(index, now),
         }
     }
@@ -551,7 +607,7 @@ impl Run {
         let seconds = left.as_secs() + u64::from(left.subsec_nanos() > 0);
         let before = match &stop.then {
             Then::Stopped => String::new(),
-            Then::Fail(reason) => format!("{reason}; "),
+            Then::Fail(reason, _) => format!("{reason}; "),
             Then::Restart => "restarting; ".into(),
         };
         state.detail = format!("{before}stopping ({seconds} s left)");
@@ -568,6 +624,7 @@ impl Run {
             if self.nodes[index].is_group() {
                 continue;
             }
+            self.steps[index].restarts = 0;
             if self.steps[index].command.is_some() {
                 self.stop_command(index, Then::Restart, now);
             } else {
@@ -600,6 +657,7 @@ impl Run {
             })
             .collect();
         for &index in &failed {
+            self.steps[index].restarts = 0;
             self.reset(index, now);
         }
         if !failed.is_empty() {
@@ -612,9 +670,10 @@ impl Run {
     /// Whether step `index` is a manual gate waiting for the user's
     /// Continue (its command and check, if any, are done).
     pub fn awaits_user(&self, index: usize) -> bool {
-        self.steps.get(index).is_some_and(|state| {
-            state.status == Status::Running && state.phase == Phase::Waiting
-        }) && matches!(self.nodes[index].step.ready, Ready::Manual(_))
+        self.steps
+            .get(index)
+            .is_some_and(|state| state.status == Status::Running && state.phase == Phase::Waiting)
+            && matches!(self.nodes[index].step.ready, Ready::Manual(_))
             && !self.nodes[index].is_group()
     }
 
@@ -676,7 +735,52 @@ impl Run {
         state.placed = false;
         state.artifacts_pending = false;
         state.resolved = None;
+        state.restart_at = None;
+        state.health_failures = 0;
+        state.next_health = None;
+        state.health_busy = false;
         self.set_status(index, Status::Waiting, now);
+    }
+
+    /// A failure of step `index` (its command gone): with a `restart`
+    /// policy and `restartable`, it waits for its backoff and starts again
+    /// (unless it gave up after `max` restarts); else Failed.
+    fn settle_failure(&mut self, index: usize, reason: String, restartable: bool, now: Instant) {
+        // A step of a run that was all ready fails or restarts: the run
+        // goes on (and settles again).
+        if self.outcome == Outcome::Ready {
+            self.outcome = Outcome::Running;
+        }
+        let restart = &self.nodes[index].step.restart;
+        if restartable && restart.policy != RestartPolicy::No {
+            let used = self.steps[index].restarts;
+            match restart.max {
+                Some(max) if used >= max => {
+                    let reason = format!("{reason} (gave up after {used} restarts)");
+                    return self.set_status(index, Status::Failed(reason), now);
+                }
+                _ => return self.schedule_restart(index, &reason, now),
+            }
+        }
+        self.set_status(index, Status::Failed(reason), now);
+    }
+
+    /// Waiting again, until its backoff ends: then it starts as usual
+    /// (after what it waits for). Its command is gone.
+    fn schedule_restart(&mut self, index: usize, reason: &str, now: Instant) {
+        if self.outcome == Outcome::Ready {
+            self.outcome = Outcome::Running;
+        }
+        let backoff = self.nodes[index].step.restart.backoff;
+        let restarts = self.steps[index].restarts + 1;
+        self.reset(index, now);
+        let state = &mut self.steps[index];
+        state.restarts = restarts;
+        state.restart_at = Some(now + backoff);
+        state.detail = format!(
+            "restart {restarts} in {}: {reason}",
+            format_duration(backoff)
+        );
     }
 
     fn set_status(&mut self, index: usize, status: Status, now: Instant) {
@@ -684,7 +788,7 @@ impl Run {
         if state.status == status {
             return;
         }
-        let finished = matches!(status, Status::Ready | Status::Failed(_) | Status::Stopped);
+        let finished = status.is_finished();
         if finished {
             state.finished = Some(now);
         }
@@ -716,6 +820,8 @@ impl Run {
             let (id, state) = (self.nodes[need].step.id.as_str(), &self.steps[need]);
             match &state.status {
                 Status::Ready if !state.artifacts_pending => {}
+                // Skips this step too (see `skipped_needs`).
+                Status::Skipped(_) => {}
                 Status::Failed(_) | Status::Stopped => stuck.push((id, "did not get ready")),
                 Status::Waiting if state.blocked => stuck.push((id, "can never run")),
                 _ => needs.push(id),
@@ -726,6 +832,7 @@ impl Run {
             match &state.status {
                 Status::Failed(_) if state.awaiting_retry => stuck.push((id, "waits for Retry")),
                 Status::Ready | Status::Failed(_) if !state.artifacts_pending => {}
+                Status::Skipped(_) => {}
                 Status::Stopped => stuck.push((id, "was stopped")),
                 Status::Waiting if state.blocked => stuck.push((id, "can never run")),
                 _ => after.push(id),
@@ -758,9 +865,15 @@ impl Run {
                     state.blocked = false;
                     continue;
                 }
+                if self.steps[index].restart_at.is_some_and(|at| at > now) {
+                    continue;
+                }
                 let (waiting, stuck) = self.blockers(index);
                 if waiting.is_empty() && stuck.is_empty() {
-                    self.begin(index, now);
+                    match self.skip_reason(index) {
+                        Some(reason) => self.set_status(index, Status::Skipped(reason), now),
+                        None => self.begin(index, now),
+                    }
                     changed = true;
                     continue;
                 }
@@ -795,10 +908,7 @@ impl Run {
             state.artifacts_pending = derived.artifacts_pending;
             state.detail = derived.detail;
             state.started = derived.started;
-            if !matches!(
-                derived.status,
-                Status::Ready | Status::Failed(_) | Status::Stopped
-            ) {
+            if !derived.status.is_finished() {
                 state.finished = None;
             }
             if state.status != derived.status {
@@ -816,7 +926,8 @@ impl Run {
         let states = || children.iter().map(|&child| &self.steps[child]);
         let total = children.len();
         let count = |wanted: fn(&Status) -> bool| states().filter(|s| wanted(&s.status)).count();
-        let ready = count(|status| *status == Status::Ready);
+        let ready = count(|status| matches!(status, Status::Ready | Status::Skipped(_)));
+        let skipped = count(|status| matches!(status, Status::Skipped(_)));
         let mut derived = Derived {
             status: Status::Pending,
             detail: String::new(),
@@ -833,6 +944,8 @@ impl Run {
         });
         if count(|status| *status == Status::Pending) == total {
             derived.started = None;
+        } else if skipped == total {
+            derived.status = Status::Skipped(format!("its {total} steps were skipped"));
         } else if ready == total {
             derived.status = Status::Ready;
         } else if count(|status| matches!(status, Status::Starting | Status::Running)) > 0 {
@@ -881,18 +994,89 @@ impl Run {
             return;
         }
         let leaves = || self.leaves.iter().map(|&index| &self.steps[index]);
-        if leaves().all(|state| state.status == Status::Ready) {
+        if leaves().all(|state| matches!(state.status, Status::Ready | Status::Skipped(_))) {
             self.outcome = Outcome::Ready;
             return;
         }
         let progressing = leaves().any(|state| match state.status {
             Status::Pending | Status::Starting | Status::Running | Status::Stopping => true,
             Status::Waiting => !state.blocked,
-            Status::Ready | Status::Failed(_) | Status::Stopped => false,
+            Status::Ready | Status::Failed(_) | Status::Stopped | Status::Skipped(_) => false,
         });
         if !progressing {
             self.outcome = Outcome::Failed;
         }
+    }
+
+    /// Why step `index`, free to start, is skipped instead: a step it (or
+    /// a group it is in) needs ready was skipped, or its `if` or a
+    /// group's is false. `None`: it starts.
+    fn skip_reason(&self, index: usize) -> Option<String> {
+        let (gate_needs, _) = tree::gates(&self.nodes, index);
+        let skipped: Vec<&str> = gate_needs
+            .iter()
+            .filter(|&&need| matches!(self.steps[need].status, Status::Skipped(_)))
+            .map(|&need| self.nodes[need].step.id.as_str())
+            .collect();
+        if !skipped.is_empty() {
+            return Some(format!("{} was skipped", skipped.join(", ")));
+        }
+        let mut node = Some(index);
+        while let Some(at) = node {
+            if let Some(text) = &self.nodes[at].step.condition
+                && !self.condition_holds(at, text)
+            {
+                return Some(format!("if {text}"));
+            }
+            node = self.nodes[at].parent;
+        }
+        None
+    }
+
+    /// Whether node `at`'s `if` is true now: references read the run's
+    /// inputs and the states of the steps in its scope; `success()` holds
+    /// when every step it waits for is ready (or skipped), `failure()`
+    /// when one failed.
+    fn condition_holds(&self, at: usize, text: &str) -> bool {
+        let Ok(parsed) = expr::parse(text) else {
+            return false;
+        };
+        let scope = tree::scope(&self.nodes, at);
+        let lookup = |path: &[String]| -> expr::Value {
+            match path {
+                [root, id] if root == "inputs" => match self.workflow.values.get(id) {
+                    Some(InputValue::Text(text)) => expr::Value::String(text.clone()),
+                    Some(InputValue::Number(Some(number))) => expr::Value::Number(*number),
+                    Some(InputValue::Bool(flag)) => expr::Value::Bool(*flag),
+                    Some(InputValue::Number(None)) | None => expr::Value::Null,
+                },
+                [root, id, field] if root == "steps" => {
+                    let Some(&(_, target)) = scope.iter().find(|(scoped, _)| scoped == id) else {
+                        return expr::Value::Null;
+                    };
+                    let state = &self.steps[target];
+                    match field.as_str() {
+                        "status" => expr::Value::String(state.status.name().to_owned()),
+                        "exit_code" => state.exit.flatten().map_or(expr::Value::Null, |code| {
+                            expr::Value::Number(f64::from(code))
+                        }),
+                        _ => expr::Value::Null,
+                    }
+                }
+                _ => expr::Value::Null,
+            }
+        };
+        let upstream: Vec<&StepState> = scope.iter().map(|&(_, at)| &self.steps[at]).collect();
+        let call = |name: &str| match name {
+            "success" => upstream
+                .iter()
+                .all(|state| matches!(state.status, Status::Ready | Status::Skipped(_))),
+            "failure" => upstream
+                .iter()
+                .any(|state| matches!(state.status, Status::Failed(_))),
+            _ => true,
+        };
+        parsed.eval(&lookup, &call).truthy()
     }
 
     fn begin(&mut self, index: usize, now: Instant) {
@@ -1008,6 +1192,7 @@ impl Run {
             Ready::Port(port) => format!("waiting for port {port}"),
             Ready::Manual(prompt) => prompt.clone(),
             Ready::Delay(delay) => format!("waiting {}", format_duration(*delay)),
+            Ready::Http(http) => format!("waiting for {} to answer", http.url),
         };
         if let Ready::Delay(delay) = step.ready {
             state.ready_at = Some(now + delay);
@@ -1027,25 +1212,43 @@ impl Run {
     }
 
     fn mark_ready(&mut self, index: usize, now: Instant) {
+        let interval = self.nodes[index]
+            .step
+            .healthcheck
+            .as_ref()
+            .map(|check| check.interval);
         let state = &mut self.steps[index];
         state.phase = Phase::Idle;
         state.ready_at = None;
         state.detail.clear();
+        state.health_failures = 0;
+        state.next_health = interval.map(|interval| now + interval);
         self.set_status(index, Status::Ready, now);
     }
 
     /// Fails the step; a command that still runs is stopped first (the
     /// step is Stopping until it is gone).
     fn fail(&mut self, index: usize, reason: String, now: Instant) {
+        self.fail_with(index, reason, false, now);
+    }
+
+    /// [`Run::fail`] for a failure of its command (an exit code, a
+    /// timeout, unhealthy): its `restart` policy may start it again.
+    fn fail_command(&mut self, index: usize, reason: String, now: Instant) {
+        self.fail_with(index, reason, true, now);
+    }
+
+    fn fail_with(&mut self, index: usize, reason: String, restartable: bool, now: Instant) {
         if self.steps[index].command.is_some() {
-            return self.stop_command(index, Then::Fail(reason), now);
+            return self.stop_command(index, Then::Fail(reason, restartable), now);
         }
         let state = &mut self.steps[index];
         state.phase = Phase::Idle;
         state.ready_at = None;
+        state.next_health = None;
         state.detail.clear();
         state.generation += 1;
-        self.set_status(index, Status::Failed(reason), now);
+        self.settle_failure(index, reason, restartable, now);
     }
 
     fn current(&self, index: usize, generation: u64) -> bool {
@@ -1195,19 +1398,37 @@ impl Run {
             return;
         }
         let waiting = state.status == Status::Running && state.phase == Phase::Waiting;
-        if !waiting {
-            return;
-        }
         let code_text = code.map_or("unknown exit code".to_owned(), |code| {
             format!("exit code {code}")
         });
+        let always = self.nodes[index].step.restart.policy == RestartPolicy::Always;
+        if !waiting {
+            // A ready command that exits: crashed (non-zero), or done.
+            if self.steps[index].status == Status::Ready {
+                if code != Some(0) {
+                    let reason = format!("exited after it was ready ({code_text})");
+                    self.fail_command(index, reason, now);
+                } else if always {
+                    self.schedule_restart(index, &format!("exited ({code_text})"), now);
+                }
+                self.advance(now);
+            }
+            return;
+        }
         match (&self.nodes[index].step.ready, code) {
-            (Ready::Exit, Some(0)) => self.mark_ready(index, now),
-            (Ready::Exit, _) => self.fail(index, format!("failed ({code_text})"), now),
+            (Ready::Exit, Some(0)) => {
+                self.mark_ready(index, now);
+                if always {
+                    // Its dependents start first; then it runs again.
+                    self.advance(now);
+                    self.schedule_restart(index, &format!("exited ({code_text})"), now);
+                }
+            }
+            (Ready::Exit, _) => self.fail_command(index, format!("failed ({code_text})"), now),
             // A command that ends before its prompt is answered: the prompt
             // still decides.
             (Ready::Manual(_), _) => return,
-            _ => self.fail(
+            _ => self.fail_command(
                 index,
                 format!("exited before it was ready ({code_text})"),
                 now,
@@ -1216,16 +1437,69 @@ impl Run {
         self.advance(now);
     }
 
-    /// Whether the step's port listens where it runs.
-    pub fn port_state(&mut self, index: usize, generation: u64, listening: bool, now: Instant) {
+    /// Whether the step's readiness probe ([`Run::ready_probes`]: its
+    /// port listens, its URL answers) passed.
+    pub fn probe_result(&mut self, index: usize, generation: u64, passed: bool, now: Instant) {
         let waiting = self.current(index, generation)
             && self.steps[index].status == Status::Running
             && self.steps[index].phase == Phase::Waiting
-            && matches!(self.nodes[index].step.ready, Ready::Port(_));
-        if waiting && listening {
+            && matches!(
+                self.nodes[index].step.ready,
+                Ready::Port(_) | Ready::Http(_)
+            );
+        if waiting && passed {
             self.mark_ready(index, now);
             self.advance(now);
         }
+    }
+
+    /// A health probe's answer: `Err` says why it failed. `retries`
+    /// failures in a row (outside the `start_period` after it got ready)
+    /// make the step unhealthy: it fails (and restarts with a policy).
+    pub fn health_checked(
+        &mut self,
+        index: usize,
+        generation: u64,
+        result: Result<(), String>,
+        now: Instant,
+    ) {
+        if !self.current(index, generation) {
+            return;
+        }
+        let Some(check) = self.nodes[index].step.healthcheck.clone() else {
+            return;
+        };
+        let state = &mut self.steps[index];
+        state.health_busy = false;
+        if state.status != Status::Ready {
+            return;
+        }
+        state.next_health = Some(now + check.interval);
+        let failure = match result {
+            Ok(()) => {
+                state.health_failures = 0;
+                state.detail.clear();
+                return;
+            }
+            Err(failure) => failure,
+        };
+        let starting = state
+            .finished
+            .is_some_and(|ready| now.saturating_duration_since(ready) < check.start_period);
+        if starting {
+            state.detail = format!("starting up; health check failed: {failure}");
+            return;
+        }
+        state.health_failures += 1;
+        if state.health_failures < check.retries {
+            state.detail = format!(
+                "health check failed ({} of {}): {failure}",
+                state.health_failures, check.retries
+            );
+            return;
+        }
+        self.fail_command(index, format!("unhealthy: {failure}"), now);
+        self.advance(now);
     }
 
     /// The step's artifacts, resolved and checked where it runs (in file
@@ -1267,6 +1541,24 @@ impl Run {
         let mut changed = false;
         for at in 0..self.leaves.len() {
             let index = self.leaves[at];
+            let state = &mut self.steps[index];
+            if state.status == Status::Waiting && state.restart_at.is_some_and(|at| at <= now) {
+                state.restart_at = None;
+                changed = true;
+                continue;
+            }
+            if state.status == Status::Ready
+                && !state.health_busy
+                && state.next_health.is_some_and(|at| at <= now)
+            {
+                state.health_busy = true;
+                state.next_health = None;
+                self.effects.push(Effect::RunHealthcheck {
+                    step: index,
+                    generation: state.generation,
+                });
+                continue;
+            }
             let state = &self.steps[index];
             if state.status == Status::Stopping {
                 if state.stop.as_ref().is_some_and(|stop| stop.deadline <= now) {
@@ -1289,7 +1581,7 @@ impl Run {
             if let (Some(timeout), Some(started)) = (timeout, state.started)
                 && now.saturating_duration_since(started) >= timeout
             {
-                self.fail(
+                self.fail_command(
                     index,
                     format!("timed out after {}", format_duration(timeout)),
                     now,
@@ -1309,8 +1601,11 @@ impl Run {
             .enumerate()
             .flat_map(|(index, state)| {
                 let stop = state.stop_deadline();
-                if !matches!(state.status, Status::Starting | Status::Running) {
-                    return [stop, None, None];
+                match state.status {
+                    Status::Waiting => return [stop, state.restart_at, None],
+                    Status::Ready if !state.health_busy => return [stop, state.next_health, None],
+                    Status::Starting | Status::Running => {}
+                    _ => return [stop, None, None],
                 }
                 let timeout = self.nodes[index]
                     .step

@@ -10,6 +10,7 @@
 //!   "auto_close_brackets": true,
 //!   "restore_session": true,
 //!   "restore_windows": true,
+//!   "keep_running": "auto",
 //!   "word_wrap": false,
 //!   "inlay_hints": true,
 //!   "format_on_save": false,
@@ -64,6 +65,11 @@ pub struct Settings {
     /// A launch without a project reopens the windows and project tabs
     /// open when the editor last closed (else the welcome screen).
     pub restore_windows: bool,
+    /// Keep the editor process running after its last window closes, so
+    /// the next launch opens a window without starting a process. `"auto"`
+    /// (the default) does so except for builds run from a cargo `target`
+    /// directory, which cargo must be able to overwrite.
+    pub keep_running: KeepRunning,
     /// Wrap long lines at the editor's width (Alt+Z toggles per editor).
     pub word_wrap: bool,
     /// Show language servers' inlay hints (inferred types, parameter
@@ -89,6 +95,34 @@ pub struct Settings {
     pub raw: Arc<Value>,
 }
 
+/// `keep_running`: `true`, `false` or `"auto"` (see `instance`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeepRunning {
+    Always,
+    Never,
+    #[default]
+    Auto,
+}
+
+impl<'de> Deserialize<'de> for KeepRunning {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Flag(bool),
+            Name(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Flag(true) => Ok(Self::Always),
+            Raw::Flag(false) => Ok(Self::Never),
+            Raw::Name(name) if name == "auto" => Ok(Self::Auto),
+            Raw::Name(name) => Err(serde::de::Error::custom(format!(
+                "keep_running: expected true, false or \"auto\", not {name:?}"
+            ))),
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -97,6 +131,7 @@ impl Default for Settings {
             auto_close_brackets: true,
             restore_session: true,
             restore_windows: true,
+            keep_running: KeepRunning::Auto,
             word_wrap: false,
             inlay_hints: true,
             format_on_save: false,

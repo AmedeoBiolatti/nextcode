@@ -714,7 +714,7 @@ mod tests {
 
     fn blocks(text: &str, name: &str, max_columns: usize) -> Vec<Vec<(u32, u32, bool)>> {
         let buffer = Buffer::with_path(text, PathBuf::from(name));
-        let syntax = Language::from_path(name.as_ref()).map(|l| Syntax::new(l, &buffer));
+        let syntax = Language::from_path(name.as_ref()).and_then(|l| Syntax::new(l, &buffer));
         let plain = gpui::red();
         let color = |highlight: Option<Highlight>| match highlight {
             // One colour per highlight, so blocks split where tokens do.

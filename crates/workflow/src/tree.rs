@@ -2,13 +2,17 @@
 //! steps (pre-order), each with its qualified id (`group/step`), its
 //! parent and children, its `depends_on` resolved among its siblings
 //! (split by condition), and what it inherits from its groups and the
-//! workflow (`project`, `cwd`, and `env` merged, its own values winning).
+//! workflow (`project`, `cwd`, `env` merged with its own values winning,
+//! and `env_file`s, outer ones first).
 //! A run schedules the steps that do something (leaves); a group's state
 //! follows from its steps'.
 
 use std::{collections::BTreeMap, ops::Range};
 
-use crate::file::{Condition, Step, Workflow};
+use crate::{
+    file::{Condition, Step, Workflow},
+    policy::EnvFile,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepNode {
@@ -43,15 +47,19 @@ impl StepNode {
 
 /// The workflow's steps, flattened (see the module).
 pub fn flatten(workflow: &Workflow) -> Vec<StepNode> {
-    flatten_steps(&workflow.steps, &workflow.env)
+    flatten_steps(&workflow.steps, &workflow.env, &workflow.env_file)
 }
 
 /// [`flatten`] for a list of top-level steps and the workflow's `env`
-/// (ids not found among the siblings are left out of `needs` and `after`;
-/// validation reports them).
-pub fn flatten_steps(steps: &[Step], env: &BTreeMap<String, String>) -> Vec<StepNode> {
+/// and `env_file` (ids not found among the siblings are left out of
+/// `needs` and `after`; validation reports them).
+pub fn flatten_steps(
+    steps: &[Step],
+    env: &BTreeMap<String, String>,
+    env_file: &[EnvFile],
+) -> Vec<StepNode> {
     let mut nodes = Vec::new();
-    add(&mut nodes, steps, None, env);
+    add(&mut nodes, steps, None, env, env_file);
     nodes
 }
 
@@ -62,6 +70,7 @@ fn add(
     steps: &[Step],
     parent: Option<usize>,
     env: &BTreeMap<String, String>,
+    env_file: &[EnvFile],
 ) -> Vec<usize> {
     let mut indices = Vec::with_capacity(steps.len());
     for (index, step) in steps.iter().enumerate() {
@@ -81,6 +90,9 @@ fn add(
                         .entry(name.clone())
                         .or_insert_with(|| value.clone());
                 }
+                let mut files = from.step.env_file.clone();
+                files.append(&mut effective.env_file);
+                effective.env_file = files;
                 (format!("{}/{}", from.path, step.id), from.depth + 1)
             }
             None => {
@@ -90,6 +102,9 @@ fn add(
                         .entry(name.clone())
                         .or_insert_with(|| value.clone());
                 }
+                let mut files = env_file.to_vec();
+                files.append(&mut effective.env_file);
+                effective.env_file = files;
                 (step.id.clone(), 0)
             }
         };
@@ -106,7 +121,7 @@ fn add(
         });
         indices.push(at);
         if !step.steps.is_empty() {
-            nodes[at].children = add(nodes, &step.steps, Some(at), env);
+            nodes[at].children = add(nodes, &step.steps, Some(at), env, env_file);
         }
     }
     for &at in &indices {

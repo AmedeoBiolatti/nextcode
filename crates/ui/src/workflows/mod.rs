@@ -85,8 +85,10 @@ const PROJECT_DIR: &str = ".next_code/workflows";
 /// How often running workflows check timeouts, stop graces, ports and
 /// opening projects.
 const TICK: Duration = Duration::from_millis(250);
-/// How often a step's port is looked up.
+/// How often a step's readiness probe (its port, its URL) is tried.
 const PORT_POLL: Duration = Duration::from_secs(1);
+/// How long one readiness probe may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The user's workflows folder (next to `settings.json`).
 pub fn user_dir() -> Option<PathBuf> {
@@ -1103,6 +1105,35 @@ impl Workflows {
                 })
                 .detach();
             }
+            Effect::RunHealthcheck { step, generation } => {
+                let definition = self.runs[index].run.definition(step).clone();
+                let project = self.runs[index].steps[step].project.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            let Some(check) = definition.healthcheck.clone() else {
+                                return Ok(());
+                            };
+                            commands::probe(
+                                &definition,
+                                &check.probe,
+                                project.as_ref(),
+                                check.timeout,
+                            )
+                        })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        if let Some(active) = this.run_mut(run_id) {
+                            active
+                                .run
+                                .health_checked(step, generation, result, Instant::now());
+                        }
+                        this.pump(cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             Effect::OpenUrl { step, url } => {
                 self.host.open_url(&url, cx);
                 let active = &self.runs[index];
@@ -1261,7 +1292,8 @@ impl Workflows {
                 }
             }
             let run_id = self.runs[index].id;
-            for (step, generation, port) in self.runs[index].run.port_watches() {
+            for (step, generation, probe) in self.runs[index].run.ready_probes() {
+                let definition = self.runs[index].run.definition(step).clone();
                 let runtime = &mut self.runs[index].steps[step];
                 if runtime.port_busy
                     || runtime
@@ -1274,9 +1306,10 @@ impl Workflows {
                 runtime.last_port_poll = Some(now);
                 let project = runtime.project.clone();
                 cx.spawn(async move |this, cx| {
-                    let listening = cx
+                    let passed = cx
                         .background_spawn(async move {
-                            commands::port_listening(project.as_ref(), port)
+                            commands::probe(&definition, &probe, project.as_ref(), PROBE_TIMEOUT)
+                                .is_ok()
                         })
                         .await;
                     this.update(cx, |this, cx| {
@@ -1284,7 +1317,7 @@ impl Workflows {
                             active.steps[step].port_busy = false;
                             active
                                 .run
-                                .port_state(step, generation, listening, Instant::now());
+                                .probe_result(step, generation, passed, Instant::now());
                         }
                         this.pump(cx);
                     })

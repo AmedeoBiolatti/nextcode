@@ -169,7 +169,7 @@ mod tests {
     /// The misspelled words `scope` finds in `text`, in order.
     fn typos(language: Option<Language>, scope: Scope, text: &str) -> Vec<String> {
         let buffer = Buffer::new(text);
-        let syntax = language.map(|language| Syntax::new(language, &buffer));
+        let syntax = language.and_then(|language| Syntax::new(language, &buffer));
         let mut ranges = Vec::new();
         segments(
             &buffer,

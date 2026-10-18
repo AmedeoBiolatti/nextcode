@@ -5,21 +5,27 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+grammar_abi.workspace = true
+libloading.workspace = true
 text.workspace = true
 tree-sitter.workspace = true
-tree-sitter-bash.workspace = true
-tree-sitter-c.workspace = true
-tree-sitter-containerfile.workspace = true
-tree-sitter-cpp.workspace = true
-tree-sitter-css.workspace = true
-tree-sitter-go.workspace = true
-tree-sitter-html.workspace = true
-tree-sitter-javascript.workspace = true
-tree-sitter-json.workspace = true
-tree-sitter-md.workspace = true
-tree-sitter-python.workspace = true
-tree-sitter-rust.workspace = true
-tree-sitter-sequel.workspace = true
-tree-sitter-toml-ng.workspace = true
-tree-sitter-typescript.workspace = true
-tree-sitter-yaml.workspace = true
+
+# The grammar libraries (`grammars/`), built next to the test binary
+# so the tests can load them.
+[dev-dependencies]
+grammar_bash = { path = "../../grammars/bash" }
+grammar_c = { path = "../../grammars/c" }
+grammar_containerfile = { path = "../../grammars/containerfile" }
+grammar_cpp = { path = "../../grammars/cpp" }
+grammar_css = { path = "../../grammars/css" }
+grammar_go = { path = "../../grammars/go" }
+grammar_html = { path = "../../grammars/html" }
+grammar_javascript = { path = "../../grammars/javascript" }
+grammar_json = { path = "../../grammars/json" }
+grammar_md = { path = "../../grammars/md" }
+grammar_python = { path = "../../grammars/python" }
+grammar_rust = { path = "../../grammars/rust" }
+grammar_sequel = { path = "../../grammars/sequel" }
+grammar_toml = { path = "../../grammars/toml" }
+grammar_typescript = { path = "../../grammars/typescript" }
+grammar_yaml = { path = "../../grammars/yaml" }

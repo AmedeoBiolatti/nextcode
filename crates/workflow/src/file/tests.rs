@@ -302,7 +302,7 @@ fn rejects_invalid_steps() {
 }
 
 #[test]
-fn keys_of_the_old_format_and_planned_ones_say_so() {
+fn keys_of_the_old_format_say_what_they_became() {
     let one = |extra: &str| error(&format!("steps:\n  a: {{run: x, {extra}}}\n"));
     for (key, now) in [
         ("needs: [b]", "now `depends_on`"),
@@ -318,18 +318,6 @@ fn keys_of_the_old_format_and_planned_ones_say_so() {
         assert!(message.contains(now), "{message}");
     }
     assert!(one("ready: {delay_ms: 5}").contains("now `delay`"));
-    for key in [
-        "restart: on_failure",
-        "healthcheck: {}",
-        "if: x",
-        "env_file: .env",
-    ] {
-        assert!(
-            one(key).contains("is planned but not supported yet"),
-            "{key}"
-        );
-    }
-    assert!(one("ready: {http: 'http://x'}").contains("planned"));
 }
 
 #[test]
@@ -985,6 +973,10 @@ fn the_schema_and_the_parser_agree() {
             "steps:\n  g:\n    depends_on: [a]\n    project: {local: C:/p}\n    env: {A: x}\n    cwd: s\n    steps:\n      x: {run: x}\n  a: {run: a}\n",
             true,
         ),
+        (
+            "env_file: .env\nsteps:\n  a:\n    run: x\n    ready: {http: {url: 'http://localhost:8000/h', status: [200, 204]}}\n    restart: {policy: on_failure, max: 3, backoff: 5s}\n    healthcheck: {test: curl -f x, interval: 10s, retries: 2, start_period: 1m}\n    env_file: [.env, {path: .env.local, required: false}]\n    if: \"steps.b.status == 'ready'\"\n    depends_on: {b: completed}\n  b: {run: b, restart: always, healthcheck: {port: 80}}\n  g:\n    if: false\n    env_file: g.env\n    steps: {c: {check: c, healthcheck: {http: 'http://x'}}}\n",
+            true,
+        ),
         // Problems the schema sees too.
         ("name: x", false),
         ("steps: [a]", false),
@@ -992,7 +984,21 @@ fn the_schema_and_the_parser_agree() {
         ("steps:\n  a: {}\n", false),
         ("steps:\n  a: {rum: x}\n", false),
         ("steps:\n  a: {run: x, needs: [b]}\n", false),
-        ("steps:\n  a: {run: x, restart: always}\n", false),
+        ("steps:\n  a: {run: x, restart: sometimes}\n", false),
+        ("steps:\n  a: {check: x, restart: always}\n", false),
+        (
+            "steps:\n  a: {run: x, healthcheck: {interval: 5s}}\n",
+            false,
+        ),
+        (
+            "steps:\n  a: {run: x, healthcheck: {test: y, port: 1}}\n",
+            false,
+        ),
+        ("steps:\n  a: {run: x, ready: {http: 'ftp://x'}}\n", false),
+        (
+            "steps:\n  a: {run: x, env_file: [{required: false}]}\n",
+            false,
+        ),
         ("steps:\n  a: {run: x, timeout: soon}\n", false),
         (
             "steps:\n  a: {run: x, ready: {exit: true, port: 1}}\n",
@@ -1067,4 +1073,59 @@ fn files_the_converter_writes_fit_the_schema() {
         .map(|err| err.to_string())
         .collect();
     assert!(errors.is_empty(), "{converted}\n{errors:#?}");
+}
+
+#[test]
+fn conditions_are_checked_where_they_are_written() {
+    let text = "inputs: {env: {}}\nsteps:\n  db: {run: d}\n  api:\n    depends_on: [db]\n    run: a\n    if: inputs.env == 'prod' && steps.web.status == 'ready'\n  web: {run: w}\n";
+    assert_eq!(
+        located(text),
+        [(
+            "`api`: `if`: `steps.web.status`: `web` is not in the `depends_on` of this step or of its groups"
+                .to_owned(),
+            Some((7, 33))
+        )]
+    );
+    let one = |condition: &str| {
+        error(&format!(
+            "inputs: {{env: {{}}}}\nsteps:\n  db: {{run: d}}\n  api: {{depends_on: [db], run: a, if: \"{condition}\"}}\n"
+        ))
+    };
+    assert!(one("inputs.nope").contains("no input `nope` (inputs: env)"));
+    assert!(one("steps.db.output").contains("unknown field `output`"));
+    assert!(one("env.HOME == 'x'").contains("an `if` reads `inputs.<id>`"));
+    let syntax = "steps:\n  a: {run: x, if: \"inputs.env = 'prod'\"}\n";
+    assert_eq!(
+        located(syntax),
+        [(
+            "`a`: `if`: unexpected `=` (compare with `==`)".to_owned(),
+            Some((2, 31))
+        )]
+    );
+    assert!(steps("steps:\n  a: {run: x, if: true}\n  b: {depends_on: {a: completed}, run: y, if: failure() || steps.a.exit_code != 0}\n").is_ok());
+}
+
+#[test]
+fn env_files_inherit_outer_first() {
+    let workflow = parse(
+        "env_file: top.env\nsteps:\n  g:\n    env_file: [g.env, {path: opt.env, required: false}]\n    steps:\n      a: {run: x, env_file: own.env}\n",
+        "f",
+    )
+    .unwrap();
+    let nodes = tree::flatten(&workflow);
+    let paths: Vec<(&str, bool)> = nodes[1]
+        .step
+        .env_file
+        .iter()
+        .map(|file| (file.path.as_str(), file.required))
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            ("top.env", true),
+            ("g.env", true),
+            ("opt.env", false),
+            ("own.env", true)
+        ]
+    );
 }

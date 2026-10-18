@@ -16,7 +16,9 @@ use std::{
 use serde_json::Value;
 
 use crate::{
+    expr,
     inputs::{self, Input, InputValues},
+    policy::{self, EnvFile, Healthcheck, HttpProbe, Probe, Restart},
     source::{self, Problem, StepSpan},
     tree,
     vars::{self, ArtifactRef, StepField},
@@ -36,7 +38,12 @@ pub struct Workflow {
     pub inputs: Vec<Input>,
     /// Environment every step gets (its groups' and its own win).
     pub env: BTreeMap<String, String>,
+    /// Dotenv files every step reads (its `env` wins over them).
+    pub env_file: Vec<EnvFile>,
     pub steps: Vec<Step>,
+    /// The run's input values (set by [`Workflow::with_inputs`]), which
+    /// `if` reads.
+    pub values: InputValues,
 }
 
 impl Workflow {
@@ -52,10 +59,14 @@ impl Workflow {
                 }
             };
             resolved.env.values_mut().for_each(replace);
+            for file in &mut resolved.env_file {
+                replace(&mut file.path);
+            }
             for step in &mut resolved.steps {
                 step.map_texts(&replace);
             }
         }
+        resolved.values = values.clone();
         resolved
     }
 }
@@ -89,6 +100,15 @@ pub struct Step {
     pub stop_grace: Duration,
     /// Files and links it produces.
     pub artifacts: Vec<Artifact>,
+    /// Dotenv files its commands read (its `env` wins); a group's apply
+    /// to its steps.
+    pub env_file: Vec<EnvFile>,
+    /// When it starts again by itself.
+    pub restart: Restart,
+    /// Probed while it is ready.
+    pub healthcheck: Option<Healthcheck>,
+    /// Its `if` (see [`crate::expr`]); false when it would start: skipped.
+    pub condition: Option<String>,
     /// A group's steps (empty for a step that does something).
     pub steps: Vec<Step>,
 }
@@ -148,6 +168,10 @@ impl Step {
             cwd: self.cwd.clone(),
             stop_grace: self.stop_grace,
             artifacts: self.artifacts.clone(),
+            env_file: self.env_file.clone(),
+            restart: self.restart.clone(),
+            healthcheck: self.healthcheck.clone(),
+            condition: self.condition.clone(),
             steps: Vec::new(),
         }
     }
@@ -177,14 +201,30 @@ impl Step {
     }
 
     /// The texts `${…}` variables are expanded in: `run`, `check`, `cwd`,
-    /// `env` values and artifact paths/URLs.
+    /// `env` values, artifact paths/URLs, `env_file` paths, HTTP URLs and
+    /// the health check's command.
     pub fn texts(&self) -> impl Iterator<Item = &str> {
+        let ready_url = match &self.ready {
+            Ready::Http(probe) => Some(probe.url.as_str()),
+            _ => None,
+        };
+        let health = self
+            .healthcheck
+            .as_ref()
+            .and_then(|check| match &check.probe {
+                Probe::Command(command) => Some(command.as_str()),
+                Probe::Http(probe) => Some(probe.url.as_str()),
+                Probe::Port(_) => None,
+            });
         [&self.run, &self.check, &self.cwd]
             .into_iter()
             .flatten()
             .map(String::as_str)
             .chain(self.env.values().map(String::as_str))
             .chain(self.artifacts.iter().map(|artifact| artifact.target.text()))
+            .chain(self.env_file.iter().map(|file| file.path.as_str()))
+            .chain(ready_url)
+            .chain(health)
     }
 
     /// [`Step::texts`] and the `project`'s: where `${inputs.…}` works.
@@ -206,6 +246,18 @@ impl Step {
         for artifact in &mut self.artifacts {
             match &mut artifact.target {
                 ArtifactTarget::Path(text) | ArtifactTarget::Url(text) => change(text),
+            }
+        }
+        for file in &mut self.env_file {
+            change(&mut file.path);
+        }
+        if let Ready::Http(probe) = &mut self.ready {
+            change(&mut probe.url);
+        }
+        if let Some(check) = &mut self.healthcheck {
+            match &mut check.probe {
+                Probe::Command(text) | Probe::Http(HttpProbe { url: text, .. }) => change(text),
+                Probe::Port(_) => {}
             }
         }
         if let Some(project) = &mut self.project {
@@ -284,6 +336,9 @@ pub enum Ready {
     Manual(String),
     /// This long after the command started (or the check passed).
     Delay(Duration),
+    /// An HTTP(S) URL answers (where the step runs) with an accepted
+    /// status.
+    Http(HttpProbe),
 }
 
 /// Where a step runs. The editor maps it to a project location; the
@@ -337,7 +392,15 @@ impl ProjectSpec {
 
 /// The keys at the top of the file (and `x-…` ones, which hold shared
 /// parts for YAML anchors, as in Compose files).
-pub const TOP_KEYS: &[&str] = &["name", "description", "inputs", "env", "steps", "$schema"];
+pub const TOP_KEYS: &[&str] = &[
+    "name",
+    "description",
+    "inputs",
+    "env",
+    "env_file",
+    "steps",
+    "$schema",
+];
 
 /// The keys a step may have.
 pub const STEP_KEYS: &[&str] = &[
@@ -355,15 +418,28 @@ pub const STEP_KEYS: &[&str] = &[
     "env",
     "cwd",
     "artifacts",
+    "env_file",
+    "restart",
+    "healthcheck",
+    "if",
     "steps",
 ];
 
 /// The keys a group (a step with `steps`) may have.
-pub const GROUP_KEYS: &[&str] = &["title", "depends_on", "steps", "project", "env", "cwd"];
+pub const GROUP_KEYS: &[&str] = &[
+    "title",
+    "depends_on",
+    "if",
+    "steps",
+    "project",
+    "env",
+    "env_file",
+    "cwd",
+];
 
 /// Keys of the format that are designed but not supported yet (see the
 /// workflows manual): an error says so instead of "unknown key".
-const PLANNED_KEYS: &[&str] = &["restart", "healthcheck", "if", "env_file"];
+const PLANNED_KEYS: &[&str] = &[];
 
 /// The old JSON format's step keys, and what they became.
 const RENAMED_KEYS: &[(&str, &str)] = &[
@@ -448,7 +524,7 @@ pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> 
                 format!(
                     "unknown key `{}` (known: {}, and `x-…` keys for shared parts)",
                     entry.key,
-                    TOP_KEYS[..5].join(", ")
+                    TOP_KEYS[..6].join(", ")
                 ),
                 entry.key_start,
             ));
@@ -473,6 +549,13 @@ pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> 
         Some(node) => env(node, "`env`").unwrap_or_else(|err| {
             problems.push(err);
             BTreeMap::new()
+        }),
+    };
+    let env_file = match root.get("env_file") {
+        None => Vec::new(),
+        Some(node) => policy::env_files(node).unwrap_or_else(|(message, offset)| {
+            problems.push(problem(format!("`env_file`: {message}"), offset));
+            Vec::new()
         }),
     };
     let Some(steps_node) = root.get("steps") else {
@@ -504,6 +587,7 @@ pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> 
         let spans = source::spans_of(&root).0;
         let mut errors = validate(&steps, &env);
         errors.extend(validate_input_refs(&steps, &input_ids));
+        errors.extend(validate_conditions(&steps, &env, &input_ids));
         problems.extend(errors.into_iter().map(|(message, at)| Problem {
             offset: locate(text, &spans, at),
             message,
@@ -520,7 +604,9 @@ pub fn check(text: &str, fallback_name: &str) -> Result<Workflow, Vec<Problem>> 
             name,
             inputs,
             env,
+            env_file,
             steps,
+            values: InputValues::default(),
         })
     } else {
         Err(problems)
@@ -810,6 +896,42 @@ fn parse_step(entry: &Entry, path: &str, problems: &mut Vec<Problem>) -> Result<
         None => BTreeMap::new(),
         Some(field) => env(&field.value, &format!("`{path}`: `env`"))?,
     };
+    let env_file = match get("env_file") {
+        None => Vec::new(),
+        Some(field) => policy::env_files(&field.value)
+            .map_err(|(message, offset)| at(format!("`env_file`: {message}"), offset))?,
+    };
+    let restart = match get("restart") {
+        None => Restart::default(),
+        Some(field) => policy::restart(&field.value)
+            .map_err(|(message, offset)| at(format!("`restart`: {message}"), offset))?,
+    };
+    let healthcheck = match get("healthcheck") {
+        None => None,
+        Some(field) => Some(
+            policy::healthcheck(&field.value)
+                .map_err(|(message, offset)| at(format!("`healthcheck`: {message}"), offset))?,
+        ),
+    };
+    let condition = match get("if") {
+        None => None,
+        Some(field) => {
+            let Some(text) = field.value.text() else {
+                return Err(at(
+                    "`if` is an expression: `inputs.env == 'prod'`".into(),
+                    field.value.start,
+                ));
+            };
+            if let Err(error) = expr::parse(text) {
+                // Where the expression's text starts: after the quote of a
+                // quoted scalar (its span is longer than its text).
+                let quoted = field.value.end - field.value.start > text.len();
+                let start = field.value.start + usize::from(quoted);
+                return Err(at(format!("`if`: {}", error.message), start + error.offset));
+            }
+            Some(text.to_owned())
+        }
+    };
 
     let needs_run = |key: &str, message: &str| -> Result<(), Problem> {
         match get(key) {
@@ -831,6 +953,10 @@ fn parse_step(entry: &Entry, path: &str, problems: &mut Vec<Problem>) -> Result<
     needs_run("open_urls", "`open_urls` needs `run`")?;
     needs_run("terminal", "`terminal` needs `run`")?;
     needs_run("stop_grace_period", "`stop_grace_period` needs `run`")?;
+    needs_run(
+        "restart",
+        "`restart` needs `run` (it starts the command again)",
+    )?;
     if check.is_none()
         && let Some(field) = get("on_fail")
     {
@@ -853,6 +979,10 @@ fn parse_step(entry: &Entry, path: &str, problems: &mut Vec<Problem>) -> Result<
         cwd,
         stop_grace: stop_grace.unwrap_or(DEFAULT_STOP_GRACE),
         artifacts,
+        env_file,
+        restart,
+        healthcheck,
+        condition,
         steps,
     })
 }
@@ -1103,7 +1233,7 @@ fn artifact(node: &Node) -> Result<Artifact, String> {
 /// offset.
 fn ready(node: &Node) -> Result<Ready, (String, usize)> {
     const SHAPES: &str = "one of `exit: true`, `output: <regex>`, `port: <number>`, \
-                          `manual: <prompt>`, `delay: <duration>`";
+                          `http: <url>`, `manual: <prompt>`, `delay: <duration>`";
     let entries = match &node.data {
         Data::Map(entries) => entries,
         _ => return Err((format!("expected {SHAPES}"), node.start)),
@@ -1149,10 +1279,7 @@ fn ready(node: &Node) -> Result<Ready, (String, usize)> {
             Ok(delay) => Ok(Ready::Delay(delay)),
             Err(err) => wrong(&err),
         },
-        "http" => Err((
-            "`http` is planned but not supported yet".into(),
-            entry.key_start,
-        )),
+        "http" => policy::http_probe(value).map(Ready::Http),
         "delay_ms" => Err((
             "`delay_ms` is from the old JSON format; it is now `delay` (a duration: `500ms`)"
                 .into(),
@@ -1368,7 +1495,7 @@ fn check_cycles(
 /// artifact that step declares. Checked in each step that does something,
 /// with what it inherits from its groups and the workflow.
 fn validate_variables(steps: &[Step], env: &BTreeMap<String, String>) -> Vec<(String, At)> {
-    let nodes = tree::flatten_steps(steps, env);
+    let nodes = tree::flatten_steps(steps, env, &[]);
     let ids: Vec<&str> = nodes.iter().map(|node| node.step.id.as_str()).collect();
     let mut errors = Vec::new();
     for (at, node) in nodes.iter().enumerate() {
@@ -1481,6 +1608,72 @@ fn validate_input_refs(steps: &[Step], ids: &[String]) -> Vec<(String, At)> {
     errors
 }
 
+/// Each `if` names inputs that exist and steps its `depends_on` lists
+/// (or an enclosing group's), with a field they have (`status`, and
+/// `exit_code` for a step that does something).
+fn validate_conditions(
+    steps: &[Step],
+    env: &BTreeMap<String, String>,
+    input_ids: &[String],
+) -> Vec<(String, At)> {
+    let nodes = tree::flatten_steps(steps, env, &[]);
+    let mut errors = Vec::new();
+    for (at, node) in nodes.iter().enumerate() {
+        let Some(text) = &node.step.condition else {
+            continue;
+        };
+        let Ok(parsed) = expr::parse(text) else {
+            continue;
+        };
+        let scope = tree::scope(&nodes, at);
+        let mut position = Vec::new();
+        let mut current = Some(at);
+        while let Some(index) = current {
+            position.push(nodes[index].index);
+            current = nodes[index].parent;
+        }
+        position.reverse();
+        for (path, _) in parsed.refs() {
+            let written = path.join(".");
+            let problem = match path {
+                [root, id] if root == "inputs" => {
+                    (!input_ids.contains(id)).then(|| match input_ids {
+                        [] => format!("`{written}`: the workflow has no `inputs`"),
+                        ids => format!("`{written}`: no input `{id}` (inputs: {})", ids.join(", ")),
+                    })
+                }
+                [root, id, field] if root == "steps" => {
+                    match scope.iter().find(|(scoped, _)| scoped == id) {
+                        None => Some(format!(
+                            "`{written}`: `{id}` is not in the `depends_on` of this step or of its groups"
+                        )),
+                        Some(&(_, target)) => match field.as_str() {
+                            "status" => None,
+                            "exit_code" if !nodes[target].is_group() => None,
+                            "exit_code" => Some(format!(
+                                "`{written}`: `{id}` is a group (a group only has `status`)"
+                            )),
+                            other => Some(format!(
+                                "`{written}`: unknown field `{other}` (status, exit_code)"
+                            )),
+                        },
+                    }
+                }
+                _ => Some(format!(
+                    "`{written}`: an `if` reads `inputs.<id>`, `steps.<id>.status` or `steps.<id>.exit_code`"
+                )),
+            };
+            if let Some(problem) = problem {
+                errors.push((
+                    format!("`{}`: `if`: {problem}", node.path),
+                    At::Text(position.clone(), written),
+                ));
+            }
+        }
+    }
+    errors
+}
+
 /// The problems of the `${inputs.…}` variables in `text`, each with the
 /// text to point at.
 fn input_ref_problems(text: &str, ids: &[String]) -> Vec<(String, Option<String>)> {
@@ -1557,9 +1750,11 @@ inputs:
     placeholder: branch name
     required: true
 
-# Environment for every step (a group's and a step's own `env` win).
+# Environment for every step (a group's and a step's own `env` win), and
+# dotenv files they read (relative to each step's cwd; `env` wins).
 env:
   LOG_LEVEL: info
+env_file: [{path: .env, required: false}]
 
 # Shared parts: any `x-` key, reused with YAML anchors (&name, *name, <<).
 x-api: &api
@@ -1587,11 +1782,19 @@ steps:
     # elsewhere).
     run: uv run uvicorn app:app --port 8000
     terminal: API
-    # exit: true (default) | output: <regex> | port: N | manual: <prompt>
-    # | delay: <duration>.
-    ready: {port: 8000}
+    # exit: true (default) | output: <regex> | port: N | http: <url>
+    # | manual: <prompt> | delay: <duration>.
+    ready: {http: 'http://localhost:8000/health'}
     # Durations: 90s, 10m, 1h30m, 500ms.
     timeout: 5m
+    # Start it again when its command fails (an exit code, a crash after
+    # it was ready, a timeout, unhealthy): on_failure; also after a clean
+    # exit: always. Or {policy: on_failure, max: 5, backoff: 10s}.
+    restart: on_failure
+    # Probed every interval while it is ready: `test` (any command, exit
+    # 0 is healthy), `http` or `port`; `retries` failures in a row make it
+    # unhealthy (it fails, and restarts with the policy above).
+    healthcheck: {test: curl -fs localhost:8000/health, interval: 30s, retries: 3}
     env:
       LOG_LEVEL: debug
       PROFILE: ${inputs.profile}
@@ -1616,6 +1819,10 @@ steps:
   tests:
     <<: *api
     depends_on: [api]
+    # Runs only when this is true once what it depends on is done (else
+    # skipped): inputs.<id>, steps.<id>.status / .exit_code, success(),
+    # failure(), always(), ==, !=, <, >, &&, ||, !.
+    if: inputs.profile != 'prod'
     run: uv run pytest --junitxml=reports/tests.xml
     # Stop sends Ctrl+C, then kills after this long (default 3s).
     stop_grace_period: 30s

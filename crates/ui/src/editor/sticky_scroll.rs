@@ -435,7 +435,7 @@ mod tests {
     fn doc(name: &str, text: &str) -> Doc {
         let buffer = Buffer::with_path(text, PathBuf::from(name));
         let language = Language::from_path(name.as_ref()).unwrap();
-        let syntax = Syntax::new(language, &buffer);
+        let syntax = Syntax::new(language, &buffer).expect("grammar library");
         let regions = scope_regions(&buffer, Some(&syntax), 0..buffer.line_count());
         Doc {
             display: DisplayMap::new(&buffer),

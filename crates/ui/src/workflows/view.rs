@@ -230,6 +230,7 @@ fn status_look(status: &Status) -> (&'static str, Hsla) {
         Status::Ready => ("✓", theme::git_added()),
         Status::Failed(_) => ("✗", theme::error()),
         Status::Stopped => ("■", theme::muted()),
+        Status::Skipped(_) => ("⊘", theme::muted()),
     }
 }
 
@@ -285,9 +286,19 @@ fn kind_hint(step: &Step) -> String {
         Ready::Port(port) => parts.push(format!("port {port}")),
         Ready::Manual(_) => parts.push("manual".into()),
         Ready::Delay(delay) => parts.push(format!("delay {}", format_duration(*delay))),
+        Ready::Http(_) => parts.push("http".into()),
     }
     if step.depending(Condition::Completed).next().is_some() {
         parts.push("after".into());
+    }
+    if step.restart.policy != workflow::RestartPolicy::No {
+        parts.push("restarts".into());
+    }
+    if step.healthcheck.is_some() {
+        parts.push("health".into());
+    }
+    if step.condition.is_some() {
+        parts.push("if".into());
     }
     parts.join(" · ")
 }
@@ -1916,6 +1927,10 @@ impl WorkflowView {
                 Some(check) => format!("{reason} — {check}"),
                 None => reason.clone(),
             },
+            (Status::Skipped(reason), _, _) => format!("Skipped: {reason}"),
+            (Status::Ready, Some((_, state)), _) if state.restarts > 0 && state.detail.is_empty() => {
+                format!("Restarted {} times", state.restarts)
+            }
             (Status::Running, _, Ready::Manual(prompt)) => prompt.clone(),
             (_, Some((_, state)), _) => state.detail.clone(),
             (_, None, _) => "Not started: Run All runs the workflow.".into(),
@@ -2142,12 +2157,14 @@ impl WorkflowView {
             .unwrap_or_default();
         let reason = match (&status, state) {
             (Status::Failed(reason), _) => reason.clone(),
+            (Status::Skipped(reason), _) => format!("Skipped: {reason}"),
             (_, Some((_, state))) => state.detail.clone(),
             (_, None) => "Not started: Run All runs the workflow.".into(),
         };
         // Its steps by state, in a fixed order.
-        const ORDER: [&str; 8] = [
-            "ready", "running", "starting", "stopping", "waiting", "failed", "stopped", "pending",
+        const ORDER: [&str; 9] = [
+            "ready", "running", "starting", "stopping", "waiting", "failed", "stopped", "skipped",
+            "pending",
         ];
         let mut counts = [0usize; ORDER.len()];
         for &child in &node.children {
