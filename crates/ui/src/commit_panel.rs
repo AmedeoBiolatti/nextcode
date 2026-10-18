@@ -3027,7 +3027,8 @@ pub(crate) mod test_support {
         let dir = std::env::temp_dir().join(format!("next_code_{name}_{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let dir = dir.canonicalize().unwrap();
+        // Spelled like the project's roots (no `\\?\` on Windows).
+        let dir = crate::project::without_verbatim_prefix(dir.canonicalize().unwrap());
         repository(&dir.join("api"), "main");
         repository(&dir.join("web"), "dev");
         std::fs::create_dir_all(dir.join("docs")).unwrap();

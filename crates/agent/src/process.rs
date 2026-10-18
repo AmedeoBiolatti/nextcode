@@ -80,6 +80,7 @@ fn spawn_piped(request: SpawnRequest, sink: EventSink) -> io::Result<Arc<Piped>>
     command
         .args(&request.args)
         .current_dir(&request.cwd)
+        .envs(crate::process_env())
         .envs(request.env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

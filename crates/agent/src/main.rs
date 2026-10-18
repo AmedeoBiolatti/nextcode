@@ -5,6 +5,8 @@
 //! `next_code_agent pinpoint context …` (what the user is looking at).
 //! `next_code_agent notes <command> …`: reads and writes the project's
 //! sticky notes (the same commands as `next_code notes`).
+//! `next_code_agent git-credential <get|store|erase>`: git's credential
+//! helper, answered with the editor's machine's credentials.
 //! `next_code_agent --version`: prints the banner and exits.
 
 use std::process::ExitCode;
@@ -27,6 +29,8 @@ fn main() -> ExitCode {
         Some("pinpoint") => next_code_agent::pinpoint::cli(&args[1..]),
         #[cfg(unix)]
         Some("context") => next_code_agent::pinpoint::cli(&args),
+        #[cfg(unix)]
+        Some("git-credential") => next_code_agent::host::credential_cli(&args[1..]),
         Some("notes") => {
             ExitCode::from(notes::cli::run(&args[1..], "next_code_agent").clamp(0, 255) as u8)
         }
@@ -36,7 +40,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: next_code_agent serve | pinpoint <command> … | context … | notes <command> … | --version"
+                "usage: next_code_agent serve | pinpoint <command> … | context … | notes <command> … | git-credential <get|store|erase> | --version"
             );
             ExitCode::from(2)
         }

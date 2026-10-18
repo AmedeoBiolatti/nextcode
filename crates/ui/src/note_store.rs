@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use gpui::{AppContext, Context, EventEmitter, SharedString, Task};
+use gpui::{AppContext, Context, EntityId, EventEmitter, SharedString, Task};
 use notes::{AnchorState, Author, AuthorKind, NOTES_FILE, Note, Notes, NotesFs, Store};
 
 use crate::project::Project;
@@ -28,8 +28,8 @@ pub struct NoteStore {
     show_resolved: bool,
     error: Option<SharedString>,
     /// Where open editors show notes now (unsaved edits included), by
-    /// (folder, id): 1-based first line and state.
-    live: HashMap<(usize, String), (usize, AnchorState)>,
+    /// (folder, id): the publishing editor, 1-based first line and state.
+    live: HashMap<(usize, String), (EntityId, usize, AnchorState)>,
 }
 
 struct RootNotes {
@@ -131,21 +131,33 @@ impl NoteStore {
 
     /// Where an open editor shows note `id` of folder `root` now.
     pub fn live_position(&self, root: usize, id: &str) -> Option<(usize, AnchorState)> {
-        self.live.get(&(root, id.to_owned())).copied()
+        let (_, line, state) = self.live.get(&(root, id.to_owned()))?;
+        Some((*line, *state))
     }
 
-    /// An editor's current note positions (1-based first line, state).
+    /// Editor `editor`'s current note positions (1-based first line, state).
     pub fn set_live_positions(
         &mut self,
+        editor: EntityId,
         root: usize,
         positions: Vec<(String, usize, AnchorState)>,
         cx: &mut Context<Self>,
     ) {
         let mut changed = false;
         for (id, line, state) in positions {
-            changed |= self.live.insert((root, id), (line, state)) != Some((line, state));
+            let value = (editor, line, state);
+            changed |= self.live.insert((root, id), value) != Some(value);
         }
         if changed {
+            cx.notify();
+        }
+    }
+
+    /// Forgets what `editor` published (it closed): stored anchors apply again.
+    pub fn clear_live_positions(&mut self, editor: EntityId, cx: &mut Context<Self>) {
+        let before = self.live.len();
+        self.live.retain(|_, (owner, ..)| *owner != editor);
+        if self.live.len() != before {
             cx.notify();
         }
     }

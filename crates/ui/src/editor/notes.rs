@@ -56,7 +56,7 @@ const CODE_GAP: f32 = 24.;
 const ICON_WIDTH: f32 = 26.;
 const ICON_HEIGHT: f32 = 18.;
 const THREAD_WIDTH: f32 = 400.;
-/// Typing pauses this long before moved anchors are saved.
+/// Typing pauses this long before moved notes are published (written on save).
 const SAVE_DELAY: Duration = Duration::from_millis(700);
 
 /// Where one card goes, relative to the editor's top-left corner.
@@ -190,6 +190,27 @@ pub struct NoteFact {
     pub replies: usize,
 }
 
+impl NoteFact {
+    /// `note` at 1-based lines `start_line..=end_line`.
+    pub fn new(note: &Note, start_line: usize, end_line: usize, state: AnchorState) -> Self {
+        Self {
+            id: note.id.clone(),
+            start_line,
+            end_line,
+            state,
+            open: note.is_open(),
+            to: note.to.clone(),
+            author: note
+                .thread
+                .first()
+                .map(|message| message.author.name.clone())
+                .unwrap_or_default(),
+            text: note.text().to_owned(),
+            replies: note.thread.len().saturating_sub(1),
+        }
+    }
+}
+
 /// A note's card color: a name or `#rrggbb`.
 fn note_color(color: Option<&str>) -> Hsla {
     let hex = match color.unwrap_or("yellow") {
@@ -242,6 +263,32 @@ fn next_to(to: Option<&str>) -> Option<String> {
     }
 }
 
+/// The first `max` visual lines of `text`; `wrap` gives the byte offsets where a line wraps.
+/// The flag marks the last line when text was left out.
+fn clamp_lines(
+    text: &str,
+    max: usize,
+    mut wrap: impl FnMut(&str) -> Vec<usize>,
+) -> Vec<(String, bool)> {
+    let mut lines = Vec::new();
+    for paragraph in text.trim_end().split('\n') {
+        let paragraph = paragraph.trim_end_matches('\r');
+        let mut start = 0;
+        for end in wrap(paragraph).into_iter().chain([paragraph.len()]) {
+            lines.push((paragraph[start..end].trim_end().to_owned(), false));
+            start = end;
+            if lines.len() > max {
+                lines.truncate(max);
+                if let Some(last) = lines.last_mut() {
+                    last.1 = true;
+                }
+                return lines;
+            }
+        }
+    }
+    lines
+}
+
 impl Editor {
     /// Shows `store`'s notes on this editor's file (`cell`: a notebook
     /// cell's editor, 1-based) and lets the person add some.
@@ -273,6 +320,16 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let observe = cx.observe(&store, |this, _, cx| this.sync_notes(cx));
+        if self.notes.store.is_none() {
+            // A closed editor's positions would otherwise hide the stored anchors.
+            let editor = cx.entity_id();
+            cx.on_release(move |this: &mut Self, cx| {
+                if let Some(store) = this.notes.store.take() {
+                    store.update(cx, |store, cx| store.clear_live_positions(editor, cx));
+                }
+            })
+            .detach();
+        }
         self.notes = NotesState {
             store: Some(store),
             root,
@@ -291,22 +348,7 @@ impl Editor {
             .iter()
             .map(|tracked| {
                 let (start_line, end_line) = self.note_lines(tracked);
-                NoteFact {
-                    id: tracked.note.id.clone(),
-                    start_line: start_line + 1,
-                    end_line: end_line + 1,
-                    state: tracked.state,
-                    open: tracked.note.is_open(),
-                    to: tracked.note.to.clone(),
-                    author: tracked
-                        .note
-                        .thread
-                        .first()
-                        .map(|message| message.author.name.clone())
-                        .unwrap_or_default(),
-                    text: tracked.note.text().to_owned(),
-                    replies: tracked.note.thread.len().saturating_sub(1),
-                }
+                NoteFact::new(&tracked.note, start_line + 1, end_line + 1, tracked.state)
             })
             .collect()
     }
@@ -442,16 +484,16 @@ impl Editor {
         if (dirty || orphans) && self.notes.store.is_some() {
             self.notes._save = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(SAVE_DELAY).await;
-                this.update(cx, |this, cx| this.save_note_anchors(cx)).ok();
+                this.update(cx, |this, cx| this.refresh_note_positions(cx))
+                    .ok();
             }));
         }
     }
 
-    /// Saves the anchors of moved or edited notes; looks again for
-    /// orphaned ones (an undo brings their lines back).
-    fn save_note_anchors(&mut self, cx: &mut Context<Self>) {
+    /// Looks again for orphaned notes (an undo brings their lines back) and
+    /// publishes where notes are now; nothing is written before a save.
+    fn refresh_note_positions(&mut self, cx: &mut Context<Self>) {
         let text = self.text();
-        let mut anchors = Vec::new();
         for index in 0..self.notes.tracked.len() {
             let tracked = &self.notes.tracked[index];
             if tracked.state == AnchorState::Orphaned {
@@ -459,9 +501,22 @@ impl Editor {
                 if found.state != AnchorState::Orphaned {
                     self.notes.tracked[index] = found;
                 }
-                continue;
             }
-            if !tracked.dirty {
+        }
+        cx.notify();
+        self.publish_note_positions(cx);
+    }
+
+    /// The buffer was saved (or its notebook): writes the anchors of moved or
+    /// edited notes, so notes.json never points into unsaved text.
+    pub(crate) fn write_note_anchors(&mut self, cx: &mut Context<Self>) {
+        self.notes._save = None;
+        self.refresh_note_positions(cx);
+        let text = self.text();
+        let mut anchors = Vec::new();
+        for index in 0..self.notes.tracked.len() {
+            let tracked = &self.notes.tracked[index];
+            if tracked.state == AnchorState::Orphaned || !tracked.dirty {
                 continue;
             }
             let (start_line, end_line) = self.note_lines(tracked);
@@ -475,8 +530,6 @@ impl Editor {
                 anchors.push((tracked.note.id.clone(), anchor));
             }
         }
-        cx.notify();
-        self.publish_note_positions(cx);
         let Some(store) = self.notes.store.clone() else {
             return;
         };
@@ -507,6 +560,18 @@ impl Editor {
         self.notes.store.is_some()
     }
 
+    /// The buffer went back to the file (reload, discarded edits): notes
+    /// follow their stored anchors again.
+    pub(super) fn notes_reloaded(&mut self, cx: &mut Context<Self>) {
+        if self.notes.store.is_none() {
+            return;
+        }
+        self.notes._save = None;
+        self.notes.tracked.clear();
+        self.notes.generation = None;
+        self.sync_notes(cx);
+    }
+
     /// Tells the store where this editor shows its notes (the Notes panel
     /// lists open files' notes where they are now).
     fn publish_note_positions(&self, cx: &mut Context<Self>) {
@@ -519,9 +584,9 @@ impl Editor {
             .iter()
             .map(|t| (t.note.id.clone(), self.note_lines(t).0 + 1, t.state))
             .collect();
-        let root = self.notes.root;
+        let (editor, root) = (cx.entity_id(), self.notes.root);
         store.update(cx, |store, cx| {
-            store.set_live_positions(root, positions, cx)
+            store.set_live_positions(editor, root, positions, cx)
         });
     }
 
@@ -1061,17 +1126,39 @@ impl Editor {
                     )
                     .child(collapse),
             )
-            .child(
+            .child({
+                // gpui's line_clamp drops the ellipsis when wrapping wastes width; wrap here.
+                let width = px((placement.width - 18.).max(1.));
+                let mut wrapper = cx
+                    .text_system()
+                    .line_wrapper(gpui::font(theme::UI_FONT), px(12.));
+                let lines = clamp_lines(note.text(), 2, |line| {
+                    let fragments = [gpui::LineFragment::text(line)];
+                    wrapper.wrap_line(&fragments, width).map(|b| b.ix).collect()
+                });
+                let last = lines.len().saturating_sub(1);
                 div()
                     .flex_none()
                     .h(px(30.))
                     .overflow_hidden()
                     .text_xs()
                     .line_height(px(15.))
-                    .line_clamp(2)
-                    .text_ellipsis()
-                    .child(note.text().to_owned()),
-            )
+                    .children(lines.into_iter().enumerate().map(|(ix, (line, cut))| {
+                        let line = if cut && ix == last {
+                            wrapper
+                                .truncate_line(
+                                    format!("{line}…").into(),
+                                    width,
+                                    "…",
+                                    &mut Vec::new(),
+                                )
+                                .to_string()
+                        } else {
+                            line
+                        };
+                        div().whitespace_nowrap().overflow_hidden().child(line)
+                    }))
+            })
             .pin(format!("note:{id}"))
             .label(label)
             .into_any_element()
@@ -1457,6 +1544,41 @@ mod tests {
     };
 
     #[test]
+    fn card_text_keeps_two_lines_and_marks_the_cut() {
+        // Wraps after the last space within 10 bytes, like gpui's word wrap.
+        let wrap = |line: &str| {
+            let mut ends = Vec::new();
+            let mut start = 0;
+            while line.len() - start > 10 {
+                let end = line[start..start + 10]
+                    .rfind(' ')
+                    .map_or(start + 10, |i| start + i + 1);
+                ends.push(end);
+                start = end;
+            }
+            ends
+        };
+        let lines = |text| clamp_lines(text, 2, wrap);
+        assert_eq!(lines("short"), [("short".to_owned(), false)]);
+        assert_eq!(
+            lines("aaaa bbbb cccc dddd eeee"),
+            [
+                ("aaaa bbbb".to_owned(), false),
+                ("cccc dddd".to_owned(), true)
+            ]
+        );
+        // Exactly two lines: nothing cut.
+        assert_eq!(
+            lines("one\ntwo\n"),
+            [("one".to_owned(), false), ("two".to_owned(), false)]
+        );
+        assert_eq!(
+            lines("one\r\ntwo\nthree"),
+            [("one".to_owned(), false), ("two".to_owned(), true)]
+        );
+    }
+
+    #[test]
     fn cards_stack_downward_and_collapse_beside_long_code() {
         let short = |_: f32, _: f32| 100.;
         // Two notes on neighboring lines: the second goes under the first.
@@ -1580,11 +1702,11 @@ mod tests {
         // Orphaned notes are not drawn, nor followed further.
         type_text(window, "x", cx);
         assert_eq!(where_is(window, cx).2, AnchorState::Orphaned);
-        // Undo brings the lines back: the next save finds the note again.
+        // Undo brings the lines back: the next refresh finds the note again.
         update(window, cx, |editor, window, cx| {
             editor.undo(&Undo, window, cx);
             editor.undo(&Undo, window, cx);
-            editor.save_note_anchors(cx);
+            editor.refresh_note_positions(cx);
         });
         assert_eq!(where_is(window, cx), (2, 4, AnchorState::Exact, false));
     }
@@ -1600,5 +1722,76 @@ mod tests {
             editor.backspace(&Backspace, window, cx);
         });
         assert_eq!(where_is(window, cx), (2, 3, AnchorState::Exact, true));
+    }
+
+    /// Moved anchors reach notes.json only with a save; discarded edits and a
+    /// closed editor leave the stored anchor in charge.
+    #[gpui::test]
+    fn anchors_are_written_on_save_and_dropped_on_discard(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!("nc-notes-save-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.rs");
+        std::fs::write(&path, TEXT).unwrap();
+        let disk = ::notes::Store::open(root.clone());
+        let id = disk
+            .add(
+                "a.rs",
+                None,
+                ::notes::anchor_from(TEXT, 2, 4, None),
+                "check",
+                Author::user("me"),
+                None,
+            )
+            .unwrap()
+            .id;
+        let stored_line = || disk.load().unwrap().get(&id).unwrap().anchor.start_line;
+        let project = crate::project::Project::local(root.clone());
+        let store = cx.new(|cx| NoteStore::new(project.clone(), cx));
+        cx.run_until_parked();
+        let window = cx.add_window(|_, cx| {
+            Editor::for_file(Buffer::with_path(TEXT, path.clone()), project, cx)
+        });
+        update(window, cx, |editor, _, cx| {
+            editor.set_note_store(store.clone(), None, cx)
+        });
+        let live = |cx: &mut TestAppContext| store.read_with(cx, |s, _| s.live_position(0, &id));
+        assert_eq!(live(cx), Some((2, AnchorState::Exact)));
+
+        type_text(window, "// one\n", cx);
+        cx.executor().advance_clock(SAVE_DELAY * 2);
+        cx.run_until_parked();
+        assert_eq!(live(cx), Some((3, AnchorState::Exact)));
+        assert_eq!(stored_line(), 2, "unsaved edits are not written");
+
+        update(window, cx, |editor, _, cx| assert!(editor.save(cx)));
+        cx.run_until_parked();
+        assert_eq!(stored_line(), 3);
+
+        // Discarded: back to the file, and to its anchor.
+        type_text(window, "// two\n", cx);
+        cx.executor().advance_clock(SAVE_DELAY * 2);
+        cx.run_until_parked();
+        assert_eq!(live(cx), Some((4, AnchorState::Exact)));
+        update(window, cx, |editor, _, cx| {
+            editor.reload_from_disk(true, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(where_is(window, cx), (3, 5, AnchorState::Exact, false));
+        assert_eq!(live(cx), Some((3, AnchorState::Exact)));
+        assert_eq!(stored_line(), 3);
+
+        // Closing the editor forgets its positions.
+        type_text(window, "// three\n", cx);
+        cx.executor().advance_clock(SAVE_DELAY * 2);
+        cx.run_until_parked();
+        assert_eq!(live(cx), Some((4, AnchorState::Exact)));
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(live(cx), None);
+        assert_eq!(stored_line(), 3);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

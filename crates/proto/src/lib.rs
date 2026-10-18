@@ -46,8 +46,19 @@
 //! Both carry JSON text (the pinpoint control commands), opaque to the
 //! protocol.
 //!
+//! # Host services
+//!
+//! [`Request::HostServices`] is the other stream the agent drives: the
+//! agent's machine borrows the editor's git credentials and ssh-agent (as
+//! VS Code's dev containers do). Each use arrives as an [`Event::HostCall`]
+//! with an agent-chosen `call` number, answered with
+//! [`ClientMessage::HostReply`]; [`Event::SshAgentClosed`] tells that a
+//! forwarded ssh-agent connection ended.
+//!
 //! Shutdown is closing the agent's stdin: the agent stops its watchers and
 //! searches, terminates the processes it started, and exits.
+
+pub mod credential;
 
 use std::io::{self, Read, Write};
 
@@ -57,7 +68,7 @@ pub use watcher::Batch;
 pub use worktree::{DirEntry, FileKind};
 
 /// Bumped on every incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Bytes a tunnel's sender may have in flight in each direction before the
 /// receiver grants more (see the crate docs).
@@ -135,6 +146,14 @@ pub enum ClientMessage {
         call: u64,
         reply: String,
     },
+    /// The answer to the [`Event::HostCall`] numbered `call` of the
+    /// [`Request::HostServices`] stream `id`: the git credential text or the
+    /// ssh-agent reply message, or why there is none.
+    HostReply {
+        id: RequestId,
+        call: u64,
+        reply: Result<Vec<u8>, String>,
+    },
 }
 
 /// Paths are absolute POSIX paths on the agent's side.
@@ -202,6 +221,41 @@ pub enum Request {
     Pinpoint {
         roots: Vec<String>,
     },
+    /// Lends the editor's machine's git credentials and ssh-agent to the
+    /// agent's machine until cancelled (see the crate docs): sets up git
+    /// there, then streams [`Event::HostCall`] and
+    /// [`Event::SshAgentClosed`]; never ends by itself.
+    HostServices(HostServices),
+}
+
+/// What [`Request::HostServices`] lends. Everything off removes the git
+/// credential helper an earlier stream configured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostServices {
+    /// Answer git credential requests (`next_code_agent git-credential`,
+    /// configured as the user's `credential.helper` where none is set).
+    pub git_credentials: bool,
+    /// Serve an ssh-agent socket (`SSH_AUTH_SOCK` of the processes the
+    /// agent starts) relayed to the editor's machine's ssh-agent.
+    pub ssh_agent: bool,
+    /// The editor's machine's `user.name` / `user.email`, set in the
+    /// user's global git config where unset there.
+    pub git_user_name: Option<String>,
+    pub git_user_email: Option<String>,
+}
+
+/// Something the agent's machine asks of the editor's machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostRequest {
+    /// A git credential helper call: `credential` is the credential
+    /// protocol's text (see [`credential`]); `get` answers with one.
+    GitCredential {
+        operation: credential::Operation,
+        credential: String,
+    },
+    /// One ssh-agent request message (without its length prefix) on the
+    /// forwarded connection `connection`; answered with the reply message.
+    SshAgent { connection: u64, message: Vec<u8> },
 }
 
 /// A listening TCP socket.
@@ -290,6 +344,16 @@ pub enum Event {
     Pinpoint {
         call: u64,
         request: String,
+    },
+    /// A use of the editor's machine, answered with
+    /// [`ClientMessage::HostReply`] carrying the same `call`.
+    HostCall {
+        call: u64,
+        request: HostRequest,
+    },
+    /// The forwarded ssh-agent connection `connection` ended.
+    SshAgentClosed {
+        connection: u64,
     },
 }
 
@@ -467,6 +531,20 @@ mod tests {
                 id: 4,
                 call: 9,
                 reply: r#"{"ok":true}"#.into(),
+            },
+            ClientMessage::Request {
+                id: 5,
+                request: Request::HostServices(HostServices {
+                    git_credentials: true,
+                    ssh_agent: true,
+                    git_user_name: Some("Ada".into()),
+                    git_user_email: None,
+                }),
+            },
+            ClientMessage::HostReply {
+                id: 5,
+                call: 1,
+                reply: Err("no".into()),
             },
         ];
         let mut wire = Vec::new();

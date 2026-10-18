@@ -20,9 +20,9 @@ use futures::channel::mpsc as async_mpsc;
 use lsp::{Incoming, LanguageServer, LogKind, Logger};
 use parking_lot::{Condvar, Mutex};
 use proto::{
-    AgentMessage, Banner, Batch, ClientMessage, DirEntry, Event, FileKind, ListeningPort,
-    PROTOCOL_VERSION, PtySize, Request, RequestId, Response, SearchEvent, SearchLimits,
-    SearchQuery, SpawnRequest, TUNNEL_WINDOW,
+    AgentMessage, Banner, Batch, ClientMessage, DirEntry, Event, FileKind, HostRequest,
+    HostServices, ListeningPort, PROTOCOL_VERSION, PtySize, Request, RequestId, Response,
+    SearchEvent, SearchLimits, SearchQuery, SpawnRequest, TUNNEL_WINDOW,
 };
 use terminal::{OutputTap, Palette, PtyOutput, RemotePty, Terminal, TerminalEvent};
 
@@ -412,6 +412,35 @@ impl AgentClient {
                     };
                     handler(request, reply);
                 }
+            }
+        })
+    }
+
+    /// Lends this machine's git credentials and ssh-agent to the agent's
+    /// machine (see [`HostServices`]): `handler` gets each request on the
+    /// reader thread, so it must not block; it answers through the
+    /// [`HostReply`]. `closed` hears that a forwarded ssh-agent connection
+    /// ended. Dropping the handle stops serving.
+    pub fn serve_host(
+        self: &Arc<Self>,
+        services: HostServices,
+        handler: impl Fn(HostRequest, HostReply) + Send + 'static,
+        closed: impl Fn(u64) + Send + 'static,
+    ) -> io::Result<StreamHandle> {
+        let client = Arc::downgrade(self);
+        self.start_stream_with_id(Request::HostServices(services), move |id| {
+            move |event| match event {
+                Event::HostCall { call, request } => {
+                    let reply = HostReply {
+                        client: client.clone(),
+                        id,
+                        call,
+                        sent: false,
+                    };
+                    handler(request, reply);
+                }
+                Event::SshAgentClosed { connection } => closed(connection),
+                _ => {}
             }
         })
     }
@@ -886,6 +915,43 @@ impl Drop for PinpointReply {
     fn drop(&mut self) {
         if !self.sent {
             self.deliver(r#"{"ok":false,"error":"the editor dropped the request"}"#.into());
+        }
+    }
+}
+
+/// The answer to one host services call (see [`AgentClient::serve_host`]);
+/// dropped unanswered, it answers with an error so the caller never hangs.
+pub struct HostReply {
+    client: Weak<AgentClient>,
+    id: RequestId,
+    call: u64,
+    sent: bool,
+}
+
+impl HostReply {
+    /// Sends the credential text or ssh-agent message, or why there is none.
+    pub fn send(mut self, reply: Result<Vec<u8>, String>) {
+        self.sent = true;
+        self.deliver(reply);
+    }
+
+    fn deliver(&self, reply: Result<Vec<u8>, String>) {
+        if let Some(client) = self.client.upgrade() {
+            client
+                .send(&ClientMessage::HostReply {
+                    id: self.id,
+                    call: self.call,
+                    reply,
+                })
+                .ok();
+        }
+    }
+}
+
+impl Drop for HostReply {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.deliver(Err("the editor dropped the request".into()));
         }
     }
 }

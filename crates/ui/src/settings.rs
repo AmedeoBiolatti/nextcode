@@ -28,6 +28,7 @@
 //!   "tests": { "discover_on_save": true, "pytest_args": ["-p", "no:randomly"],
 //!     "cargo_test_args": ["--features", "slow-tests"] },
 //!   "ports": { "auto_forward": true },
+//!   "devcontainer": { "forward_git_credentials": true },
 //!   "git": { "staging_area": false, "update_method": "merge", "inline_blame": false },
 //!   "editor": { "minimap": { "enabled": true, "max_columns": 120, "side": "right" },
 //!     "sticky_scroll": { "enabled": true, "max_lines": 5 } },
@@ -81,6 +82,7 @@ pub struct Settings {
     pub debug: DebugSettings,
     pub tests: TestSettings,
     pub ports: PortSettings,
+    pub devcontainer: DevContainerSettings,
     pub git: GitSettings,
     pub spell: SpellSettings,
     pub editor: EditorSettings,
@@ -139,6 +141,7 @@ impl Default for Settings {
             debug: DebugSettings::default(),
             tests: TestSettings::default(),
             ports: PortSettings::default(),
+            devcontainer: DevContainerSettings::default(),
             git: GitSettings::default(),
             spell: SpellSettings::default(),
             editor: EditorSettings::default(),
@@ -291,6 +294,24 @@ pub struct PortSettings {
 impl Default for PortSettings {
     fn default() -> Self {
         Self { auto_forward: true }
+    }
+}
+
+/// `"devcontainer"`: dev container (and WSL) projects.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevContainerSettings {
+    /// Lend this machine's git credentials (`git credential`), ssh-agent
+    /// and `user.name`/`user.email` to the project's machine; off also
+    /// removes the git credential helper set there earlier.
+    pub forward_git_credentials: bool,
+}
+
+impl Default for DevContainerSettings {
+    fn default() -> Self {
+        Self {
+            forward_git_credentials: true,
+        }
     }
 }
 

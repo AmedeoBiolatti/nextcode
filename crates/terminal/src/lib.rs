@@ -5,6 +5,7 @@
 
 mod keys;
 mod links;
+mod shell_state;
 
 use std::{
     borrow::Cow,
@@ -35,6 +36,8 @@ use futures::channel::mpsc;
 pub use keys::{Key, Modifiers, encode_key, encode_paste};
 pub use links::{Link, LinkTarget, find_links};
 use parking_lot::Mutex;
+use shell_state::ShellScanner;
+pub use shell_state::ShellState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalEvent {
@@ -480,15 +483,17 @@ impl EventListener for Listener {
 struct TappedPty {
     pty: tty::Pty,
     tap: Option<OutputTap>,
+    shell: Arc<Mutex<ShellScanner>>,
 }
 
 impl Read for TappedPty {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let read = self.pty.reader().read(buffer)?;
-        if let Some(tap) = &self.tap
-            && read > 0
-        {
-            tap(Output::Data(&buffer[..read]));
+        if read > 0 {
+            self.shell.lock().feed(&buffer[..read]);
+            if let Some(tap) = &self.tap {
+                tap(Output::Data(&buffer[..read]));
+            }
         }
         Ok(read)
     }
@@ -548,6 +553,9 @@ pub struct Terminal {
     io: Io,
     window_size: Arc<Mutex<WindowSize>>,
     palette: Palette,
+    shell: Arc<Mutex<ShellScanner>>,
+    /// The local shell's process id (Unix), for its directory when it reports none.
+    pid: Option<u32>,
 }
 
 impl Terminal {
@@ -578,10 +586,16 @@ impl Terminal {
             env,
             ..tty::Options::default()
         };
+        let shell = Arc::new(Mutex::new(ShellScanner::default()));
         let pty = TappedPty {
             pty: tty::new(&pty_options, *listener.window_size.lock(), 0)?,
             tap,
+            shell: shell.clone(),
         };
+        #[cfg(unix)]
+        let pid = Some(pty.pty.child().id());
+        #[cfg(not(unix))]
+        let pid = None;
         let event_loop = EventLoop::new(term.clone(), listener.clone(), pty, true, false)?;
         let io = Io::Local(event_loop.channel());
         listener.writer.set(io.clone()).ok();
@@ -592,6 +606,8 @@ impl Terminal {
             io,
             window_size: listener.window_size.clone(),
             palette,
+            shell,
+            pid,
         };
         Ok((terminal, events))
     }
@@ -614,6 +630,8 @@ impl Terminal {
         listener.writer.set(io.clone()).ok();
         let reader_term = term.clone();
         let reader_listener = listener.clone();
+        let shell = Arc::new(Mutex::new(ShellScanner::default()));
+        let reader_shell = shell.clone();
         thread::Builder::new()
             .name("terminal-remote".into())
             .spawn(move || {
@@ -625,6 +643,7 @@ impl Terminal {
                             if let Some(tap) = &tap {
                                 tap(Output::Data(&data));
                             }
+                            reader_shell.lock().feed(&data);
                             parser.advance(&mut *reader_term.lock(), &data);
                             reader_listener.send_event(Event::Wakeup);
                         }
@@ -642,6 +661,8 @@ impl Terminal {
             io,
             window_size: listener.window_size.clone(),
             palette,
+            shell,
+            pid: None,
         };
         Ok((terminal, events))
     }
@@ -678,6 +699,17 @@ impl Terminal {
         };
         let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
         (term, listener, events_rx)
+    }
+
+    /// What the shell reported (OSC 7 etc.); without a reported directory, a
+    /// local Linux shell's is read from /proc (its foreground job's, else its own).
+    /// Read on request only.
+    pub fn shell_state(&self) -> ShellState {
+        let mut state = self.shell.lock().state.clone();
+        if state.cwd.is_none() {
+            state.cwd = self.pid.and_then(proc_cwd);
+        }
+        state
     }
 
     /// Sends input bytes to the shell.
@@ -853,6 +885,32 @@ fn color_at(colors: &Colors, palette: &Palette, index: usize) -> Rgb {
     colors[index].unwrap_or_else(|| palette.indexed(index))
 }
 
+/// The directory of `shell`'s foreground job (from /proc), else the shell's.
+#[cfg(target_os = "linux")]
+fn proc_cwd(shell: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{shell}/stat")).ok();
+    let foreground = stat.as_deref().and_then(foreground_group);
+    foreground
+        .into_iter()
+        .chain([shell])
+        .find_map(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_cwd(_shell: u32) -> Option<String> {
+    None
+}
+
+/// `tpgid` (the terminal's foreground process group) of a `/proc/<pid>/stat` line.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn foreground_group(stat: &str) -> Option<u32> {
+    // `pid (comm) state ppid pgrp session tty_nr tpgid …`; comm may hold spaces or `)`.
+    let fields = &stat[stat.rfind(')')? + 1..];
+    let tpgid: i64 = fields.split_whitespace().nth(5)?.parse().ok()?;
+    u32::try_from(tpgid).ok().filter(|pid| *pid > 0)
+}
+
 fn window_size(columns: u16, rows: u16) -> WindowSize {
     WindowSize {
         num_lines: rows,
@@ -899,6 +957,38 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn foreground_group_reads_tpgid_past_odd_names() {
+        let stat = "4242 (my (odd) sh) S 1 4242 4242 34816 5000 4194560 0 0";
+        assert_eq!(foreground_group(stat), Some(5000));
+        assert_eq!(foreground_group("1 (init) S 0 1 1 0 -1 4194560"), None);
+    }
+
+    /// The shell's directory follows `cd` (from /proc on Linux; OSC 7 when printed).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reports_the_shell_directory_and_last_exit() {
+        let dir = std::env::temp_dir().join(format!("nc-term-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (options, _) = test_shell();
+        let (terminal, mut events) = Terminal::spawn(options, Palette::default(), None).unwrap();
+        terminal.write(format!("cd '{}'\n", dir.display()).into_bytes());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while terminal.shell_state().cwd.as_deref() != Some(dir.to_str().unwrap()) {
+            assert!(Instant::now() < deadline, "{:?}", terminal.shell_state());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        terminal.write(&b"printf '\\033]7;file://h/elsewhere\\007\\033]133;D;4\\007'\n"[..]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while terminal.shell_state().last_exit != Some(4) {
+            assert!(Instant::now() < deadline, "{:?}", terminal.shell_state());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(terminal.shell_state().cwd.as_deref(), Some("/elsewhere"));
+        drop(events.try_recv());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -3,7 +3,11 @@
 //! TCP tunnels for port forwarding) on the machine it runs on. The editor
 //! starts it inside a WSL distro or dev container and talks to it over the
 //! process's stdin/stdout. It also relays `next_code_agent pinpoint` calls
-//! made on that machine to the editor ([`pinpoint`]).
+//! made on that machine to the editor ([`pinpoint`]), and lends that machine
+//! the editor's git credentials and ssh-agent ([`host`]).
+
+#[cfg(unix)]
+pub mod host;
 
 #[cfg(unix)]
 pub mod pinpoint;
@@ -109,6 +113,9 @@ enum Stream {
     /// Dropping the server stops listening.
     #[cfg(unix)]
     Pinpoint(Arc<pinpoint::Server>),
+    /// Dropping the services stops listening.
+    #[cfg(unix)]
+    Host(Arc<host::Services>),
 }
 
 impl Stream {
@@ -161,7 +168,17 @@ fn is_streaming(request: &Request) -> bool {
             | Request::Spawn(_)
             | Request::Tunnel { .. }
             | Request::Pinpoint { .. }
+            | Request::HostServices(_)
     )
+}
+
+/// Variables the agent adds to the processes it starts (before the
+/// request's own): the host services' sockets.
+pub(crate) fn process_env() -> Vec<(String, String)> {
+    #[cfg(unix)]
+    return host::process_env();
+    #[cfg(not(unix))]
+    Vec::new()
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -260,6 +277,20 @@ impl Agent {
                     };
                     if let Some(server) = server {
                         server.reply(call, reply);
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = (id, call, reply);
+            }
+            ClientMessage::HostReply { id, call, reply } => {
+                #[cfg(unix)]
+                {
+                    let services = match self.streams.lock().get(&id) {
+                        Some(Slot::Running(Stream::Host(services))) => Some(services.clone()),
+                        _ => None,
+                    };
+                    if let Some(services) = services {
+                        services.reply(call, reply);
                     }
                 }
                 #[cfg(not(unix))]
@@ -391,6 +422,25 @@ impl Agent {
             Request::Pinpoint { .. } => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "pinpoint needs Unix sockets",
+            )),
+            #[cfg(unix)]
+            Request::HostServices(services) => {
+                // `--global` honours `GIT_CONFIG_GLOBAL` (tests).
+                host::configure_git(&["--global".into()], &services, &host::helper_program());
+                let sink = self.sink(id);
+                let started = host::Services::start(
+                    &pinpoint::runtime_dir(),
+                    &pinpoint::unique_name(),
+                    &services,
+                    move |event| sink.send(event),
+                )?;
+                self.install(id, Stream::Host(Arc::new(started)));
+                Ok(Response::Done)
+            }
+            #[cfg(not(unix))]
+            Request::HostServices(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "host services need Unix sockets",
             )),
         }
     }

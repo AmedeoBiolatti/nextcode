@@ -300,6 +300,7 @@ impl TerminalView {
     /// The tab as `next_code context` reports it (read on request only:
     /// the screen snapshot copies the grid).
     pub(crate) fn context_facts(&self) -> crate::pinpoint::context::TerminalFacts {
+        let shell = self.terminal.shell_state();
         crate::pinpoint::context::TerminalFacts {
             // The shell's whole title (the tab cuts long ones); the run name
             // is reported apart.
@@ -311,6 +312,8 @@ impl TerminalView {
             run_name: self.run_name.as_ref().map(ToString::to_string),
             screen: self.terminal.snapshot().text(),
             exit: self.exit,
+            cwd: shell.cwd,
+            last_command_exit: shell.last_exit,
         }
     }
 
@@ -1020,7 +1023,10 @@ impl TerminalPanel {
 
     /// The shown tab's view and the number of tabs (`next_code context`).
     pub(crate) fn active_view(&self) -> (Option<&Entity<TerminalView>>, usize) {
-        (self.tabs.get(self.active).map(|(view, _)| view), self.tabs.len())
+        (
+            self.tabs.get(self.active).map(|(view, _)| view),
+            self.tabs.len(),
+        )
     }
 
     /// The tabs' views (tests).

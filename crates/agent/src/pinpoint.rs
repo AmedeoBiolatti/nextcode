@@ -47,7 +47,7 @@ pub fn runtime_dir() -> PathBuf {
 
 /// [`runtime_dir`] first, then the other place an agent started with
 /// another environment (`docker exec` sets no `XDG_RUNTIME_DIR`) used.
-fn runtime_dirs() -> Vec<PathBuf> {
+pub(crate) fn runtime_dirs() -> Vec<PathBuf> {
     if let Some(dir) = env::var_os(DIR_ENV) {
         return vec![PathBuf::from(dir)];
     }
@@ -68,7 +68,7 @@ pub(crate) fn unique_name() -> String {
     )
 }
 
-fn uid() -> u32 {
+pub(crate) fn uid() -> u32 {
     // SAFETY: getuid has no preconditions and cannot fail.
     unsafe { libc::getuid() }
 }
@@ -76,7 +76,7 @@ fn uid() -> u32 {
 /// Creates `dir` (mode 0700), or checks that an existing one is a real
 /// directory of the user's that nobody else may enter: in a shared `/tmp`
 /// someone else could have created it first.
-fn private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     match fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -94,7 +94,7 @@ fn private_dir(dir: &Path) -> io::Result<()> {
     check_private(dir)
 }
 
-fn check_private(dir: &Path) -> io::Result<()> {
+pub(crate) fn check_private(dir: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(dir)
         .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", dir.display())))?;
     if !meta.is_dir() || meta.uid() != uid() {
@@ -111,7 +111,7 @@ fn check_private(dir: &Path) -> io::Result<()> {
 
 /// The uid of the process at the other end, where the system tells it.
 #[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     // SAFETY: `ucred` is plain data; getsockopt writes at most `len` bytes.
     unsafe {
@@ -129,7 +129,7 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn peer_uid(_: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_uid(_: &UnixStream) -> Option<u32> {
     Some(uid())
 }
 

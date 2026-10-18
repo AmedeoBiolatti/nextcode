@@ -507,7 +507,8 @@ fn highlight_text(reply: &Value) -> String {
 /// A `context` reply as compact Markdown for an agent's prompt (the
 /// CLI's default output and what Copy Context for Agent copies).
 pub fn context_markdown(reply: &Value) -> String {
-    let str_of = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    let str_of =
+        |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     let num = |value: &Value, key: &str| value.get(key).and_then(Value::as_u64);
     let flag = |value: &Value, key: &str| value.get(key).and_then(Value::as_bool) == Some(true);
     let items = |value: &Value, key: &str| {
@@ -532,7 +533,11 @@ pub fn context_markdown(reply: &Value) -> String {
             .iter()
             .filter_map(|root| str_of(root, "path"))
             .collect();
-        let remote = if flag(project, "remote") { " (remote)" } else { "" };
+        let remote = if flag(project, "remote") {
+            " (remote)"
+        } else {
+            ""
+        };
         out.push_str(&format!("project: {}{remote}\n", roots.join(", ")));
     }
 
@@ -567,9 +572,17 @@ pub fn context_markdown(reply: &Value) -> String {
                 selection.get("start").map(point).unwrap_or_default(),
                 selection.get("end").map(point).unwrap_or_default()
             );
-            let cut = if flag(&selection, "truncated") { ", truncated" } else { "" };
+            let cut = if flag(&selection, "truncated") {
+                ", truncated"
+            } else {
+                ""
+            };
             out.push_str(&format!("\n### Selection {range}{cut}\n"));
-            fenced(&mut out, &fence_language, &str_of(&selection, "text").unwrap_or_default());
+            fenced(
+                &mut out,
+                &fence_language,
+                &str_of(&selection, "text").unwrap_or_default(),
+            );
         }
         if let Some(around) = editor.get("around") {
             let start = num(around, "start_line").unwrap_or(1);
@@ -598,7 +611,11 @@ pub fn context_markdown(reply: &Value) -> String {
                     (None, Some(code)) => format!(" [{code}]"),
                     (None, None) => String::new(),
                 };
-                let here = if flag(diagnostic, "at_cursor") { " ← at cursor" } else { "" };
+                let here = if flag(diagnostic, "at_cursor") {
+                    " ← at cursor"
+                } else {
+                    ""
+                };
                 out.push_str(&format!(
                     "- {}:{} {}{origin}: {}{here}\n",
                     num(diagnostic, "line").unwrap_or(0),
@@ -608,28 +625,16 @@ pub fn context_markdown(reply: &Value) -> String {
                 ));
             }
         }
-        let notes = items(editor, "notes");
-        if !notes.is_empty() {
-            out.push_str(&format!("\n### Notes in this file ({})\n", notes.len()));
-            for note in &notes {
-                let to = str_of(note, "to").map(|to| format!(" → {to}")).unwrap_or_default();
-                let replies = num(note, "replies").filter(|n| *n > 0);
-                let replies = replies.map(|n| format!(" (+{n} replies)")).unwrap_or_default();
-                out.push_str(&format!(
-                    "- {} line {} [{}{to}] {}: {}{replies}\n",
-                    str_of(note, "id").unwrap_or_default(),
-                    num(note, "line").unwrap_or(0),
-                    str_of(note, "status").unwrap_or_default(),
-                    str_of(note, "author").unwrap_or_default(),
-                    one_line(&str_of(note, "text").unwrap_or_default()),
-                ));
-            }
-        }
+        push_notes(&mut out, "file", &items(editor, "notes"));
     }
 
     if let Some(notebook) = reply.get("notebook") {
         let file = str_of(notebook, "file").unwrap_or_default();
-        let dirty = if flag(notebook, "dirty") { ", unsaved changes" } else { "" };
+        let dirty = if flag(notebook, "dirty") {
+            ", unsaved changes"
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "\n## Notebook: {file} ({} cells{dirty})\n",
             num(notebook, "cells").unwrap_or(0)
@@ -642,7 +647,11 @@ pub fn context_markdown(reply: &Value) -> String {
                 str_of(cell, "run").unwrap_or_default()
             ));
             let language = if kind == "code" { "python" } else { "" };
-            fenced(&mut out, language, &str_of(cell, "source").unwrap_or_default());
+            fenced(
+                &mut out,
+                language,
+                &str_of(cell, "source").unwrap_or_default(),
+            );
             if let Some(error) = str_of(cell, "error").or_else(|| str_of(cell, "marimo_error")) {
                 out.push_str(&format!("error: {}\n", one_line(&error)));
             }
@@ -654,25 +663,46 @@ pub fn context_markdown(reply: &Value) -> String {
                 fenced(&mut out, "", &str_of(&output, "text").unwrap_or_default());
             }
         }
+        push_notes(&mut out, "notebook", &items(notebook, "notes"));
     }
 
     if let Some(workflow) = reply.get("workflow") {
+        let dirty = if flag(workflow, "dirty") {
+            ", unsaved changes"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "\n## Workflow: {} ({}) — {}\n",
+            "\n## Workflow: {} ({}{dirty}) — {}\n",
             str_of(workflow, "name").unwrap_or_default(),
             str_of(workflow, "file").unwrap_or_default(),
             str_of(workflow, "outcome").unwrap_or_default()
         ));
+        for problem in items(workflow, "problems") {
+            let place = match (num(&problem, "line"), num(&problem, "column")) {
+                (Some(line), Some(column)) => format!(" (line {line}, column {column})"),
+                _ => String::new(),
+            };
+            out.push_str(&format!(
+                "- problem{place}: {}\n",
+                one_line(&str_of(&problem, "message").unwrap_or_default())
+            ));
+        }
         for step in items(workflow, "steps") {
-            let mut line = format!(
-                "- {}: {}",
-                str_of(&step, "id").unwrap_or_default(),
-                str_of(&step, "status").unwrap_or_default()
-            );
+            let status = str_of(&step, "status").unwrap_or_default();
+            let mut line = format!("- {}: ", str_of(&step, "id").unwrap_or_default());
             if let Some(error) = str_of(&step, "error").or_else(|| str_of(&step, "reason")) {
-                line.push_str(&format!(" — {}", one_line(&error)));
+                let error = one_line(&error);
+                // "failed (exit code 3)" already says the status.
+                if error.starts_with(&status) {
+                    line.push_str(&error);
+                } else {
+                    line.push_str(&format!("{status} — {error}"));
+                }
             } else if let Some(detail) = str_of(&step, "detail") {
-                line.push_str(&format!(" ({})", one_line(&detail)));
+                line.push_str(&format!("{status} ({})", one_line(&detail)));
+            } else {
+                line.push_str(&status);
             }
             out.push_str(&format!("{line}\n"));
             if let Some(lines) = str_of(&step, "last_lines") {
@@ -723,13 +753,30 @@ pub fn context_markdown(reply: &Value) -> String {
                 None => " (ended)".into(),
             },
         };
-        let cut = if flag(terminal, "truncated") { ", last lines" } else { "" };
+        let cut = if flag(terminal, "truncated") {
+            ", last lines"
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "\n## Terminal: {}{state}{cut}\n",
             str_of(terminal, "run_name")
                 .or_else(|| str_of(terminal, "title"))
                 .unwrap_or_default()
         ));
+        let mut facts = Vec::new();
+        if let Some(cwd) = str_of(terminal, "cwd") {
+            facts.push(format!("cwd: {cwd}"));
+        }
+        if let Some(code) = terminal
+            .get("last_command_exit_code")
+            .and_then(Value::as_i64)
+        {
+            facts.push(format!("last command exited {code}"));
+        }
+        if !facts.is_empty() {
+            out.push_str(&format!("{}\n", facts.join(" · ")));
+        }
         fenced(&mut out, "", &str_of(terminal, "lines").unwrap_or_default());
     }
 
@@ -761,7 +808,11 @@ pub fn context_markdown(reply: &Value) -> String {
     }
 
     if let Some(tests) = reply.get("tests") {
-        let running = if flag(tests, "running") { " (running)" } else { "" };
+        let running = if flag(tests, "running") {
+            " (running)"
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "\n## Tests{running}: {} passed, {} failed, {} skipped\n",
             num(tests, "passed").unwrap_or(0),
@@ -808,8 +859,18 @@ pub fn context_markdown(reply: &Value) -> String {
             ));
         }
         out.push_str(&format!("{title}\n"));
+        if let Some(code) = debugger.get("exit_code").and_then(Value::as_i64) {
+            out.push_str(&format!("exit code: {code}\n"));
+        }
+        if let Some(exception) = str_of(debugger, "exception") {
+            out.push_str(&format!("exception: {}\n", one_line(&exception)));
+        }
         if let Some(error) = str_of(debugger, "error") {
             out.push_str(&format!("error: {}\n", one_line(&error)));
+        }
+        if let Some(tail) = str_of(debugger, "output_tail") {
+            out.push_str("output (last lines):\n");
+            fenced(&mut out, "", &tail);
         }
         for frame in items(debugger, "frames") {
             let mark = if flag(&frame, "selected") { "▶ " } else { "" };
@@ -827,7 +888,8 @@ pub fn context_markdown(reply: &Value) -> String {
                 str_of(debugger, "scope").unwrap_or_else(|| "Locals".into())
             ));
             for local in &locals {
-                let kind = str_of(local, "type").map(|t| format!(": {t}")).unwrap_or_default();
+                let kind = str_of(local, "type").filter(|t| !t.is_empty());
+                let kind = kind.map(|t| format!(": {t}")).unwrap_or_default();
                 out.push_str(&format!(
                     "  - {}{kind} = {}\n",
                     str_of(local, "name").unwrap_or_default(),
@@ -837,6 +899,37 @@ pub fn context_markdown(reply: &Value) -> String {
         }
     }
     out.trim_end().to_owned()
+}
+
+/// A `notes` list as `### Notes in this <place>` lines (`cell` when set).
+fn push_notes(out: &mut String, place: &str, notes: &[Value]) {
+    if notes.is_empty() {
+        return;
+    }
+    fn text<'a>(note: &'a Value, key: &str) -> &'a str {
+        note.get(key).and_then(Value::as_str).unwrap_or_default()
+    }
+    let num = |note: &Value, key: &str| note.get(key).and_then(Value::as_u64);
+    out.push_str(&format!("\n### Notes in this {place} ({})\n", notes.len()));
+    for note in notes {
+        let to = note.get("to").and_then(Value::as_str);
+        let to = to.map(|to| format!(" → {to}")).unwrap_or_default();
+        let replies = num(note, "replies").filter(|n| *n > 0);
+        let replies = replies
+            .map(|n| format!(" (+{n} replies)"))
+            .unwrap_or_default();
+        let cell = num(note, "cell")
+            .map(|c| format!("cell {c} "))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "- {} {cell}line {} [{}{to}] {}: {}{replies}\n",
+            text(note, "id"),
+            num(note, "line").unwrap_or(0),
+            text(note, "status"),
+            text(note, "author"),
+            one_line(text(note, "text")),
+        ));
+    }
 }
 
 /// `{"line", "column"}` as `line:column`.
@@ -883,7 +976,11 @@ mod tests {
             parsed("context --max-lines 80 --around 0 --format json"),
             json!({"cmd": "context", "max_lines": 80, "around": 0, "output": "json"})
         );
-        assert!(parse(&args("context --frob")).unwrap_err().contains("unexpected"));
+        assert!(
+            parse(&args("context --frob"))
+                .unwrap_err()
+                .contains("unexpected")
+        );
     }
 
     #[test]
@@ -929,6 +1026,25 @@ mod tests {
         }
         let (rendered, code) = render(&json!({"cmd": "context"}), &reply);
         assert_eq!((rendered, code), (text, 0));
+    }
+
+    #[test]
+    fn context_markdown_shows_cell_notes_and_the_shell_directory() {
+        let reply = json!({
+            "focus": "notebook",
+            "notebook": {"file": "a.ipynb", "cells": 3, "notes": [
+                {"id": "n1", "cell": 2, "line": 1, "status": "open", "to": "agent",
+                 "author": "me", "text": "why\nslow?", "replies": 1}]},
+            "terminal": {"title": "bash", "lines": "$ false", "running": true,
+                         "cwd": "/work/sub", "last_command_exit_code": 1}
+        });
+        let text = context_markdown(&reply);
+        for expected in [
+            "### Notes in this notebook (1)\n- n1 cell 2 line 1 [open → agent] me: why slow? (+1 replies)",
+            "## Terminal: bash\ncwd: /work/sub · last command exited 1\n```\n$ false\n```",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
     }
 
     #[test]

@@ -218,6 +218,50 @@ fn texts_are_capped_by_lines_and_characters() {
     assert!(cut && tail.len() <= MAX_CHARS && tail.chars().all(|c| c == 'é'));
 }
 
+#[gpui::test]
+fn a_notebook_reports_the_notes_on_its_cells(cx: &mut TestAppContext) {
+    let root = project_dir("notebook");
+    let notebook = json!({
+        "cells": [
+            {"cell_type": "code", "metadata": {}, "outputs": [], "execution_count": null,
+             "source": ["import os\n"]},
+            {"cell_type": "code", "metadata": {}, "outputs": [], "execution_count": null,
+             "source": ["x = 1\n", "y = x / 0\n"]}
+        ],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5
+    });
+    std::fs::write(root.join("a.ipynb"), notebook.to_string()).unwrap();
+    let anchor = ::notes::anchor_from("x = 1\ny = x / 0\n", 2, 2, None);
+    let author = ::notes::Author::user("me");
+    let to = Some("agent".into());
+    let note = ::notes::Store::open(root.clone())
+        .add("a.ipynb", Some(2), anchor, "divides by zero", author, to)
+        .unwrap();
+    let window = open_workspace(&root, cx);
+    window
+        .update(cx, |workspace, window, cx| {
+            workspace.open(&root.join("a.ipynb"), window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let reply = context_of(window, json!({}), cx);
+    let notes = &reply["notebook"]["notes"];
+    assert_eq!(notes.as_array().map(Vec::len), Some(1), "{reply:#}");
+    let fact = &notes[0];
+    assert_eq!(fact["id"], note.id.as_str());
+    assert_eq!(fact["cell"], 2);
+    assert_eq!(
+        (fact["line"].clone(), fact["end_line"].clone()),
+        (json!(2), json!(2))
+    );
+    assert_eq!(fact["anchor"], "exact");
+    assert_eq!(fact["status"], "open");
+    assert_eq!(fact["to"], "agent");
+    assert_eq!(fact["author"], "me");
+    assert_eq!(fact["text"], "divides by zero");
+    cleanup(&root);
+}
+
 #[test]
 fn a_terminal_screen_keeps_its_tail() {
     let facts = TerminalFacts {
@@ -226,6 +270,8 @@ fn a_terminal_screen_keeps_its_tail() {
         run_name: None,
         screen: "$ pytest\nFAILED test_a.py::test_x\n$ \n\n\n".into(),
         exit: None,
+        cwd: Some("/work/sub".into()),
+        last_command_exit: Some(2),
     };
     let value = terminal_json(
         &facts,
@@ -238,4 +284,6 @@ fn a_terminal_screen_keeps_its_tail() {
     assert_eq!(value["truncated"], true);
     assert_eq!(value["running"], true);
     assert!(value.get("exit_code").is_none());
+    assert_eq!(value["cwd"], "/work/sub");
+    assert_eq!(value["last_command_exit_code"], 2);
 }

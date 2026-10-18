@@ -50,7 +50,10 @@ pub(crate) fn spawn(
             .map(|program| Shell::new(program, request.args)),
         working_directory: Some(PathBuf::from(&request.cwd)),
         drain_on_exit: true,
-        env: request.env.into_iter().collect(),
+        env: crate::process_env()
+            .into_iter()
+            .chain(request.env)
+            .collect(),
     };
     let pty = tty::new(&options, window_size(size), 0)?;
     let reader = pty.file().try_clone()?;

@@ -102,7 +102,7 @@ pub use lines::{
     MoveLineUp, Outdent, ToggleBlockComment, ToggleLineComment,
 };
 pub use navigation::{FindReferences, GoToDefinition, GoToImplementation, GoToTypeDefinition};
-pub use self::notes::AddNote;
+pub use self::notes::{AddNote, NoteFact};
 pub use rename::{CancelRename, ConfirmRename, RenameSymbol};
 pub use selections::{
     AddCursorAbove, AddCursorBelow, CollapseSelections, EditorState, SelectAllOccurrences,
@@ -1192,6 +1192,9 @@ impl Editor {
             // Same text as on disk (e.g. our own save): nothing to redraw
             // except a cleared dirty marker.
             self.finish_change(was_dirty, cx);
+            if was_dirty {
+                self.notes_reloaded(cx);
+            }
             return ReloadOutcome::Unchanged;
         }
         let before = self.selections.clone();
@@ -1199,6 +1202,13 @@ impl Editor {
         self.selections = before.clamped(&self.buffer);
         self.record_history(transaction, before);
         self.finish_change(was_dirty, cx);
+        if was_dirty {
+            // Unsaved edits discarded: their note positions go too.
+            self.notes_reloaded(cx);
+        } else {
+            // The file changed on disk and the notes followed: that is saved text.
+            self.write_note_anchors(cx);
+        }
         ReloadOutcome::Reloaded
     }
 
@@ -1225,6 +1235,7 @@ impl Editor {
                             text: doc.server.save_includes_text.then(|| self.text()),
                         });
                 }
+                self.write_note_anchors(cx);
                 cx.emit(EditorEvent::Saved);
                 // A saved `settings.json` or theme file applies at once.
                 theme::refresh(cx);

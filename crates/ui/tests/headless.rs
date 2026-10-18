@@ -34,6 +34,16 @@ fn remove_project_dir(root: &std::path::Path) {
     }
 }
 
+/// `canonicalize`, spelled as the editor spells a project root: without
+/// Windows' `\\?\` prefix.
+fn canonical(path: &std::path::Path) -> PathBuf {
+    let path = path.canonicalize().unwrap();
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(plain) if cfg!(windows) => PathBuf::from(plain),
+        _ => path,
+    }
+}
+
 struct Headless {
     child: Child,
     stdin: ChildStdin,
@@ -178,7 +188,7 @@ fn headless_mode_creates_renames_copies_and_deletes_files() {
     let root = std::env::temp_dir().join(format!("next_code_headless_ops_{}", std::process::id()));
     fs::remove_dir_all(&root).ok();
     fs::create_dir_all(&root).unwrap();
-    let root = root.canonicalize().unwrap();
+    let root = canonical(&root);
     let mut headless = Headless::start(&root);
     headless.next(|line| line["event"] == "ready");
     let mut ok = |request: Value| {
@@ -195,24 +205,19 @@ fn headless_mode_creates_renames_copies_and_deletes_files() {
     assert!(root.join("empty").is_dir());
     fs::write(&module, "x = 1\n").unwrap();
 
+    // Replies spell paths natively (`\` on Windows).
+    let native = |relative: &str| {
+        root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+            .to_string_lossy()
+            .into_owned()
+    };
     // Copies keep the name where it is free, else ` copy`, ` copy 2`.
     let copy = ok(json!({ "cmd": "copy_path", "path": "pkg/sub/mod.py" }));
-    assert_eq!(
-        copy["path"],
-        root.join("pkg/sub/mod copy.py").to_string_lossy().as_ref()
-    );
+    assert_eq!(copy["path"], native("pkg/sub/mod copy.py"));
     let copy = ok(json!({ "cmd": "copy_path", "path": "pkg/sub/mod.py" }));
-    assert_eq!(
-        copy["path"],
-        root.join("pkg/sub/mod copy 2.py")
-            .to_string_lossy()
-            .as_ref()
-    );
+    assert_eq!(copy["path"], native("pkg/sub/mod copy 2.py"));
     let copy = ok(json!({ "cmd": "copy_path", "path": "pkg", "dir": "empty" }));
-    assert_eq!(
-        copy["path"],
-        root.join("empty").join("pkg").to_string_lossy().as_ref()
-    );
+    assert_eq!(copy["path"], native("empty/pkg"));
     assert_eq!(
         fs::read_to_string(root.join("empty/pkg/sub/mod.py")).unwrap(),
         "x = 1\n"
@@ -222,10 +227,7 @@ fn headless_mode_creates_renames_copies_and_deletes_files() {
     let renamed = ok(
         json!({ "cmd": "rename_path", "path": "pkg/sub/mod.py", "new_path": "pkg/sub/main.py" }),
     );
-    assert_eq!(
-        renamed["path"],
-        root.join("pkg/sub/main.py").to_string_lossy().as_ref()
-    );
+    assert_eq!(renamed["path"], native("pkg/sub/main.py"));
     assert_eq!(renamed["edits"], json!([]));
     assert!(!module.exists());
     let mut fails = |request: Value| {
@@ -4338,6 +4340,7 @@ fn headless_mode_serves_workflow_files_with_the_built_in_server() {
     let root = std::env::temp_dir().join(format!("next_code_wf_lsp_{}", std::process::id()));
     fs::remove_dir_all(&root).ok();
     fs::create_dir_all(root.join(".next_code/workflows")).unwrap();
+    // `\\?\C:\…` on Windows: the server's `file:///C:/…` must still match.
     let root = root.canonicalize().unwrap();
     let file = root.join(".next_code/workflows/dev.yaml");
     fs::write(
@@ -4448,11 +4451,26 @@ steps:
     let mut headless = Headless::start(&root);
     headless.next(|line| line["event"] == "ready");
     let list = headless.call(json!({ "cmd": "workflows_list" }));
-    let listed = &list["result"][0];
+    // By name: on Windows the user's own workflows (in the real config
+    // dir, which `XDG_CONFIG_HOME` doesn't move) are listed too.
+    let listed = list["result"]
+        .as_array()
+        .and_then(|list| list.iter().find(|workflow| workflow["name"] == "Policies"))
+        .unwrap_or_else(|| panic!("{list}"));
     assert_eq!(listed["error"], Value::Null, "{listed}");
-    assert_eq!(listed["steps"][0]["policies"]["restart"]["policy"], "on_failure");
-    assert_eq!(listed["steps"][2]["policies"]["healthcheck"]["probe"]["test"], "exit 1");
-    assert_eq!(listed["steps"][1]["ready"]["http"]["url"], format!("http://127.0.0.1:{port}/health"));
+    assert_eq!(
+        listed["steps"][0]["policies"]["restart"]["policy"], "on_failure",
+        "{listed}"
+    );
+    assert_eq!(
+        listed["steps"][2]["policies"]["healthcheck"]["probe"]["test"], "exit 1",
+        "{listed}"
+    );
+    assert_eq!(
+        listed["steps"][1]["ready"]["http"]["url"],
+        format!("http://127.0.0.1:{port}/health"),
+        "{listed}"
+    );
     let run = headless.call(json!({ "cmd": "workflow_run", "name": "Policies" }));
     assert_eq!(run["ok"], true, "{run}");
     let status = status_until(&mut headless, "policies.yaml", |status| {

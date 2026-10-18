@@ -278,12 +278,35 @@ fn same_path(a: &str, b: &str, posix: bool) -> bool {
 
 /// A folder of the project, named by `name` or its last component.
 fn root_of_path(path: PathBuf, name: Option<String>, posix: bool) -> Root {
+    let path = if posix || !cfg!(windows) {
+        path
+    } else {
+        without_verbatim_prefix(path)
+    };
     Root {
         name: name
             .clone()
             .unwrap_or_else(|| workspace_file::folder_name(&path.to_string_lossy(), posix)),
         custom_name: name,
         path,
+    }
+}
+
+/// `\\?\C:\p` → `C:\p` and `\\?\UNC\host\share` → `\\host\share`, as
+/// `canonicalize` spells them on Windows: language servers' URIs
+/// (`file:///C:/p`), git and shells never spell them back, so files of
+/// the root would not match what they report.
+pub(crate) fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        // Other verbatim forms (`\\?\Volume{…}`) have no plain spelling.
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
     }
 }
 
@@ -331,6 +354,10 @@ struct Inner {
     backend: Backend,
     /// Serves `next_code_agent pinpoint` on a remote project's machine.
     _pinpoint: Option<StreamHandle>,
+    /// Lends this machine's git credentials and ssh-agent to a remote
+    /// project's machine (`remote::host`); filled by a thread, since finding
+    /// out what to lend runs git here.
+    _host: Arc<Mutex<Option<StreamHandle>>>,
 }
 
 /// A folder of the project.
@@ -487,6 +514,28 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Lends git credentials, the ssh-agent and the git identity to `client`'s
+/// machine (`devcontainer.forward_git_credentials`), or removes the helper
+/// set there earlier when that is off. The handle lands in `slot` unless the
+/// project closed meanwhile (dropping it stops serving).
+fn serve_host(client: Arc<AgentClient>, slot: std::sync::Weak<Mutex<Option<StreamHandle>>>) {
+    let enabled = crate::settings::current()
+        .devcontainer
+        .forward_git_credentials;
+    thread::Builder::new()
+        .name("host-services".into())
+        .spawn(move || match remote::host::serve(&client, enabled) {
+            Ok(handle) => {
+                if let Some(slot) = slot.upgrade() {
+                    *slot.lock() = Some(handle);
+                }
+            }
+            // The project works without; git there prompts by itself.
+            Err(err) => eprintln!("next_code: git credential forwarding unavailable: {err}"),
+        })
+        .ok();
+}
+
 impl Project {
     pub fn local(root: PathBuf) -> Self {
         Self::build(vec![root_of_path(root, None, false)], None, Backend::Local)
@@ -519,6 +568,10 @@ impl Project {
                 .inspect_err(|err| eprintln!("next_code: remote pinpoint unavailable: {err}"))
                 .ok(),
         };
+        let host = Arc::new(Mutex::new(None));
+        if let Backend::Remote { client, .. } = &backend {
+            serve_host(client.clone(), Arc::downgrade(&host));
+        }
         Self(Arc::new(Inner {
             root: roots[0].path.clone(),
             folder_settings: Mutex::new((0..roots.len()).map(|_| None).collect()),
@@ -526,6 +579,7 @@ impl Project {
             workspace,
             backend,
             _pinpoint: pinpoint,
+            _host: host,
         }))
     }
 
@@ -1950,6 +2004,22 @@ mod tests {
             "keys are stable"
         );
         assert_eq!(Location::Local("/w/x".into()).workspace_state_key(), None);
+    }
+
+    #[test]
+    fn verbatim_windows_paths_get_their_plain_spelling() {
+        let plain = |path: &str| without_verbatim_prefix(PathBuf::from(path));
+        assert_eq!(plain(r"\\?\C:\Users\me\p"), PathBuf::from(r"C:\Users\me\p"));
+        assert_eq!(
+            plain(r"\\?\UNC\host\share\p"),
+            PathBuf::from(r"\\host\share\p")
+        );
+        assert_eq!(plain(r"\\?\Volume{1}\p"), PathBuf::from(r"\\?\Volume{1}\p"));
+        assert_eq!(plain(r"C:\p"), PathBuf::from(r"C:\p"));
+        if cfg!(windows) {
+            let project = Project::local(PathBuf::from(r"\\?\C:\Users\me\p"));
+            assert_eq!(project.roots()[0].path, PathBuf::from(r"C:\Users\me\p"));
+        }
     }
 
     #[test]

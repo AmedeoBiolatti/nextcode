@@ -110,6 +110,10 @@ pub struct TerminalFacts {
     pub screen: String,
     /// Exited, with its code when known.
     pub exit: Option<Option<i32>>,
+    /// The shell's directory now (shell report or /proc), when known.
+    pub cwd: Option<String>,
+    /// The last command's exit code, when the shell reports it (OSC 133/633 D).
+    pub last_command_exit: Option<i32>,
 }
 
 pub struct TabPart {
@@ -154,7 +158,27 @@ pub fn context(request: &Value, window: &Window, cx: &App) -> Value {
         reply["focus"] = "workflow".into();
         let (path, project, run) = view.read(cx).context_run(cx);
         reply["project"] = project_json(project);
-        reply["workflow"] = workflow_json(view.read(cx).name(), path, project, run, limits);
+        let view = view.read(cx);
+        let mut workflow = workflow_json(view.name(), path, project, run, limits);
+        workflow["dirty"] = view.is_dirty(cx).into();
+        // A file that does not parse cannot run: say why (the banner's text).
+        let problems: Vec<Value> = view
+            .context_problems()
+            .into_iter()
+            .take(MAX_ITEMS)
+            .map(|(message, place)| {
+                let mut problem = json!({ "message": cap_text(message, 3, false).0 });
+                if let Some((line, column)) = place {
+                    problem["line"] = line.into();
+                    problem["column"] = column.into();
+                }
+                problem
+            })
+            .collect();
+        if !problems.is_empty() {
+            workflow["problems"] = problems.into();
+        }
+        reply["workflow"] = workflow;
         return reply;
     }
     let workspace = match shell {
@@ -260,7 +284,10 @@ pub fn workspace_json(parts: &Parts, limits: Limits, cx: &App) -> Value {
         reply.insert("tests".into(), tests);
     }
     if let Some(session) = &parts.debug_session {
-        reply.insert("debugger".into(), debugger_json(project, session.read(cx)));
+        reply.insert(
+            "debugger".into(),
+            debugger_json(project, session.read(cx), limits),
+        );
     }
     Value::Object(reply)
 }
@@ -406,25 +433,31 @@ pub fn editor_json(
         .iter()
         .take(MAX_ITEMS)
         .map(|note| {
-            json!({
-                "id": note.id,
-                "line": note.start_line,
-                "end_line": note.end_line,
-                "anchor": note.state,
-                "status": if note.open { "open" } else { "resolved" },
-                "to": note.to,
-                "author": note.author,
-                "text": cap_text(&note.text, limits.max_lines, false).0,
-                "replies": note.replies,
-                "visible": note.start_line <= facts.visible.end
-                    && note.end_line > facts.visible.start,
-            })
+            let mut value = note_json(note, limits);
+            value["visible"] = (note.start_line <= facts.visible.end
+                && note.end_line > facts.visible.start)
+                .into();
+            value
         })
         .collect();
     if !notes.is_empty() {
         value["notes"] = notes.into();
     }
     value
+}
+
+fn note_json(note: &crate::editor::NoteFact, limits: Limits) -> Value {
+    json!({
+        "id": note.id,
+        "line": note.start_line,
+        "end_line": note.end_line,
+        "anchor": note.state,
+        "status": if note.open { "open" } else { "resolved" },
+        "to": note.to,
+        "author": note.author,
+        "text": cap_text(&note.text, limits.max_lines, false).0,
+        "replies": note.replies,
+    })
 }
 
 pub fn terminal_json(facts: &TerminalFacts, limits: Limits) -> Value {
@@ -444,6 +477,12 @@ pub fn terminal_json(facts: &TerminalFacts, limits: Limits) -> Value {
     }
     if let Some(Some(code)) = facts.exit {
         value["exit_code"] = code.into();
+    }
+    if let Some(cwd) = &facts.cwd {
+        value["cwd"] = cwd.as_str().into();
+    }
+    if let Some(code) = facts.last_command_exit {
+        value["last_command_exit_code"] = code.into();
     }
     value
 }
@@ -539,16 +578,46 @@ fn tests_json(project: &Project, panel: &TestsPanel, limits: Limits) -> Option<V
     }))
 }
 
-fn debugger_json(project: &Project, session: &DebugSession) -> Value {
+fn debugger_json(project: &Project, session: &DebugSession, limits: Limits) -> Value {
     let mut value = json!({
         "name": session.name().to_string(),
         "state": session.state().label(),
     });
-    if let Some(reason) = session.stop_reason() {
-        value["stop_reason"] = reason.into();
+    if let Some(event) = session.stopped_event() {
+        // `reason` is DAP's (breakpoint/step/exception/entry/pause…); the
+        // adapter's wording goes apart.
+        value["stop_reason"] = event.reason.as_str().into();
+        if let Some(description) = &event.description {
+            value["stop_description"] = description.as_str().into();
+        }
+        if event.reason == "exception" {
+            let exception = match (&event.text, &event.description) {
+                (Some(name), Some(message)) if name != message => format!("{name}: {message}"),
+                (Some(text), _) | (None, Some(text)) => text.clone(),
+                (None, None) => String::new(),
+            };
+            if !exception.is_empty() {
+                value["exception"] = cap_text(&exception, 3, false).0.into();
+            }
+        }
     }
     if let Some(code) = session.exit_code() {
         value["exit_code"] = code.into();
+    }
+    // The program's last output (a traceback after a crash), as the Debug Console shows it.
+    let start = session.output().len().saturating_sub(limits.max_lines);
+    let tail: Vec<&str> = session.output()[start..]
+        .iter()
+        .filter(|line| {
+            use crate::debugger::session::OutputCategory::*;
+            matches!(line.category, Stdout | Stderr | Important)
+        })
+        .map(|line| line.text.trim_end_matches('\n'))
+        .collect();
+    if !tail.is_empty() {
+        let (text, truncated) = cap_text(&tail.join("\n"), limits.max_lines, true);
+        value["output_tail"] = text.into();
+        value["output_truncated"] = (truncated || start > 0).into();
     }
     if let Some(error) = session.error() {
         value["error"] = error.into();
@@ -582,6 +651,11 @@ fn debugger_json(project: &Project, session: &DebugSession) -> Value {
     {
         let locals: Vec<Value> = variables
             .iter()
+            // debugpy's expandable groups ("special variables", "function
+            // variables"): no value of their own.
+            .filter(|v| {
+                !(v.value.is_empty() && v.variables_reference > 0 && v.name.ends_with(" variables"))
+            })
             .take(MAX_ITEMS)
             .map(|variable| {
                 json!({
@@ -612,6 +686,20 @@ fn notebook_json(
         "dirty": view.is_dirty(cx),
         "cells": document.cells().len(),
     });
+    // Notes on any cell, like an editor's (`cell` added; no `visible`).
+    let notes: Vec<Value> = view
+        .note_facts(cx)
+        .iter()
+        .take(MAX_ITEMS)
+        .map(|(cell, note)| {
+            let mut value = note_json(note, limits);
+            value["cell"] = (*cell).into();
+            value
+        })
+        .collect();
+    if !notes.is_empty() {
+        value["notes"] = notes.into();
+    }
     let Some(id) = view.cursor_cell() else {
         return value;
     };

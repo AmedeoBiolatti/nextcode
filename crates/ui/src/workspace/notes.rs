@@ -90,8 +90,22 @@ impl Workspace {
         let path = self.project.join(&root_path, file);
         self.record_position(cx);
         self.forward.clear();
+        let cell = self
+            .note_store
+            .read(cx)
+            .file_notes(root, file)
+            .find(|note| note.id == id)
+            .and_then(|note| note.cell);
         if let Some(editor) = self.open_editor(&path, window, cx) {
             editor.update(cx, |editor, cx| editor.reveal_note(id, window, cx));
+        } else if let Some(cell) = cell
+            && let Some(view) = self
+                .active_tab()
+                .filter(|tab| tab.path == path)
+                .and_then(Tab::notebook)
+                .cloned()
+        {
+            view.update(cx, |view, cx| view.reveal_note(cell, id, window, cx));
         }
     }
 

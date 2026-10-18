@@ -223,6 +223,44 @@ address), Port… (change the local port) and Stop.
   (protocol 4), so nothing listens inside the container.
 - Limits: TCP only (no UDP); local projects have nothing to forward.
 
+## Git credentials and ssh-agent (dev containers and WSL)
+
+Like VS Code's Dev Containers, git inside a dev container (or WSL) project
+uses this machine's credentials, so `git push`/`git fetch` there need no
+second login:
+
+- **HTTPS**: the agent configures `next_code_agent git-credential` as the
+  container user's `credential.helper` (`git config --global`, i.e.
+  `~/.gitconfig` there; never the repository's config), only when that
+  user has no helper of their own. It asks the editor, which runs
+  `git credential fill|approve|reject` here (Windows: `git.exe`, so Git
+  Credential Manager, which may show its sign-in window; a Linux/WSL editor:
+  its git and helpers) with prompts off and a 3-minute limit (30 s for
+  store/erase). Only `http`/`https` credentials are lent; when this machine
+  has none, the answer is empty and git in the container prompts as usual.
+  Requests are answered only while the project is open; the helper then
+  stays in `~/.gitconfig` but answers nothing (git prompts). Credentials
+  are never logged.
+- **SSH**: this machine's ssh-agent (`SSH_AUTH_SOCK`; on Windows, if unset,
+  the OpenSSH agent's `\\.\pipe\openssh-ssh-agent`) is forwarded as a Unix
+  socket in the container (`/tmp/next_code-<uid>/host/…-ssh.sock`, or under
+  `$XDG_RUNTIME_DIR`), exported as `SSH_AUTH_SOCK` to terminals, tasks,
+  language servers and git run through the editor (`ssh-add -l` there lists
+  this machine's keys). Pageant is not supported.
+- **Identity**: this machine's `user.name`/`user.email` (`git config
+  --global`) are copied into the container user's global config when unset
+  there.
+
+WSL projects get the same (VS Code also uses Windows' Git Credential
+Manager in WSL); a helper the user already set in the distro, e.g. GCM
+from Windows, is left alone and keeps working. Settings:
+`"devcontainer": { "forward_git_credentials": false }` lends nothing and
+removes the helper set earlier on the next open; by hand, in the container:
+
+```sh
+git config --global --unset-all credential.helper "^!'.*' git-credential$"
+```
+
 ## Python (uv)
 
 The **Python** panel (left dock) reads `pyproject.toml` and `uv.lock`:
@@ -2002,8 +2040,8 @@ the gutter's right-click menu, Edit menu, palette) notes the selected lines
 or the cursor's line, addressed to the agent by default. Resolved notes are
 hidden; **Show/Hide Resolved Notes** (palette, Notes panel) shows them
 faded. As you type, notes move with their lines (edits above shift them,
-edits inside keep them, deleting their lines orphans them) and the new
-anchors are saved a moment after you stop.
+edits inside keep them, deleting their lines orphans them); the new anchors
+are written when you save, and discarding the edits puts the notes back.
 
 The **Notes** panel (View menu, bottom dock) lists every note of the project
 by file with filters (Open / Resolved / All, Anyone / To me / To agents),
@@ -2017,8 +2055,8 @@ open thread with `reply`, `send`, `resolve`, `reopen`, `delete`, `to`,
 and `…/panel:notes/note:<id>`, so an agent can point at one. The editor reads
 and writes the notes file through the project, so WSL and dev-container
 projects work the same. Notes on Jupyter notebook cells (`cell`) show as `✎`
-icons in their cells; the panel opens the notebook but does not scroll to
-the cell yet.
+icons in their cells; the panel opens the notebook scrolled to the cell with
+the thread open.
 
 Agents use the command line; it edits the file directly, so NextCode need not
 be running (the editor watches the file):

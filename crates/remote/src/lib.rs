@@ -3,12 +3,13 @@
 
 mod client;
 pub mod container;
+pub mod host;
 pub mod launch;
 pub mod wsl;
 
 pub use client::{
-    AgentClient, Initialized, PinpointReply, PipedProcess, REQUEST_TIMEOUT, RunOutput,
+    AgentClient, HostReply, Initialized, PinpointReply, PipedProcess, REQUEST_TIMEOUT, RunOutput,
     StreamHandle, Transport, TunnelHandle, agent_path,
 };
 pub use launch::Connection;
-pub use proto::ListeningPort;
+pub use proto::{HostServices, ListeningPort};

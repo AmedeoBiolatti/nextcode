@@ -190,7 +190,8 @@ pub struct DebugSession {
     threads: Vec<Thread>,
     /// The stopped (or selected) thread.
     thread_id: Option<i64>,
-    stop_reason: Option<String>,
+    /// Why the thread stopped (the last `stopped` event), until it continues.
+    stopped: Option<StoppedEvent>,
     frames: Vec<StackFrame>,
     selected_frame: usize,
     scopes: Vec<Scope>,
@@ -255,7 +256,7 @@ impl DebugSession {
             initialized: false,
             threads: Vec::new(),
             thread_id: None,
-            stop_reason: None,
+            stopped: None,
             frames: Vec::new(),
             selected_frame: 0,
             scopes: Vec::new(),
@@ -786,10 +787,7 @@ impl DebugSession {
             return;
         }
         self.state = SessionState::Stopped;
-        self.stop_reason = Some(match &event.description {
-            Some(description) => description.clone(),
-            None => event.reason.clone(),
-        });
+        self.stopped = Some(event.clone());
         self.thread_id = event
             .thread_id
             .or(self.thread_id)
@@ -818,7 +816,7 @@ impl DebugSession {
 
     fn set_running(&mut self, cx: &mut Context<Self>) {
         self.state = SessionState::Running;
-        self.stop_reason = None;
+        self.stopped = None;
         self.clear_stack();
         cx.emit(DebugSessionEvent::Changed);
     }
@@ -1536,8 +1534,15 @@ impl DebugSession {
         self.thread_id
     }
 
+    /// The stop's description, else its reason (the panel's text).
     pub fn stop_reason(&self) -> Option<&str> {
-        self.stop_reason.as_deref()
+        let event = self.stopped.as_ref()?;
+        Some(event.description.as_deref().unwrap_or(&event.reason))
+    }
+
+    /// The last `stopped` event while stopped.
+    pub fn stopped_event(&self) -> Option<&StoppedEvent> {
+        self.stopped.as_ref()
     }
 
     pub fn frames(&self) -> &[StackFrame] {

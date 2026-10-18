@@ -696,6 +696,15 @@ impl WorkflowView {
         )
     }
 
+    /// The file's current problems (`next_code context`): message and 1-based line, column.
+    pub(crate) fn context_problems(&self) -> Vec<(&str, Option<(usize, usize)>)> {
+        self.graph
+            .problems
+            .iter()
+            .map(|problem| (problem.message.as_str(), problem.place))
+            .collect()
+    }
+
     fn schedule_reparse(&mut self, cx: &mut Context<Self>) {
         self._reparse = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(REPARSE_DELAY).await;
@@ -1940,7 +1949,9 @@ impl WorkflowView {
                 None => reason.clone(),
             },
             (Status::Skipped(reason), _, _) => format!("Skipped: {reason}"),
-            (Status::Ready, Some((_, state)), _) if state.restarts > 0 && state.detail.is_empty() => {
+            (Status::Ready, Some((_, state)), _)
+                if state.restarts > 0 && state.detail.is_empty() =>
+            {
                 format!("Restarted {} times", state.restarts)
             }
             (Status::Running, _, Ready::Manual(prompt)) => prompt.clone(),

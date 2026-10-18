@@ -354,6 +354,14 @@ impl NotebookView {
         match self.document.update(cx, |document, cx| document.save(cx)) {
             Ok(()) => {
                 self.notice = None;
+                let editors: Vec<_> = self
+                    .cells
+                    .values()
+                    .filter_map(|s| s.editor.clone())
+                    .collect();
+                for editor in editors {
+                    editor.update(cx, |editor, cx| editor.write_note_anchors(cx));
+                }
                 cx.notify();
                 true
             }
@@ -545,6 +553,65 @@ impl NotebookView {
         true
     }
 
+    /// Notes on this notebook's cells as `next_code context` reports them:
+    /// (1-based cell, note) where the cell editor shows them (unsaved edits
+    /// included), else found in the cell's source.
+    pub fn note_facts(&self, cx: &App) -> Vec<(usize, crate::editor::NoteFact)> {
+        let Some((store, root, file)) = &self.notes else {
+            return Vec::new();
+        };
+        let document = self.document.read(cx);
+        let mut facts = Vec::new();
+        let mut by_cell: HashMap<usize, Vec<crate::editor::NoteFact>> = HashMap::new();
+        for note in store.read(cx).file_notes(*root, file) {
+            let Some(cell) = note.cell else { continue };
+            let Some(cell_doc) = document.cells().get(cell.wrapping_sub(1)) else {
+                continue;
+            };
+            let shown = by_cell.entry(cell).or_insert_with(|| {
+                self.cells
+                    .get(&cell_doc.id)
+                    .and_then(|state| state.editor.as_ref())
+                    .map(|editor| editor.read(cx).note_facts())
+                    .unwrap_or_default()
+            });
+            let fact = match shown.iter().find(|fact| fact.id == note.id) {
+                Some(fact) => fact.clone(),
+                None => {
+                    let found = note.reanchor(&cell_doc.cell.source);
+                    crate::editor::NoteFact::new(
+                        note,
+                        found.start_line,
+                        found.end_line,
+                        found.state,
+                    )
+                }
+            };
+            facts.push((cell, fact));
+        }
+        facts.sort_by_key(|(cell, fact)| (*cell, fact.start_line));
+        facts
+    }
+
+    /// Scrolls cell `cell` (1-based) into view and opens note `id` in its editor.
+    pub fn reveal_note(
+        &mut self,
+        cell: usize,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.reveal_pinned_cell(cell, cx) {
+            return;
+        }
+        let Some(cell_id) = self.order.get(cell - 1).copied() else {
+            return;
+        };
+        if let Some(editor) = self.ensure_editor(cell_id, window, cx) {
+            editor.update(cx, |editor, cx| editor.reveal_note(id, window, cx));
+        }
+    }
+
     /// The list measures the cell again (its height may have changed).
     fn splice_cell(&mut self, id: CellId) {
         if let Some(index) = self.order.iter().position(|other| *other == id) {
@@ -611,7 +678,12 @@ impl NotebookView {
         state._subscriptions = vec![events, focused];
         self.link_editor(id, cx);
         if let Some((store, root, file)) = self.notes.clone() {
-            let cell = self.document.read(cx).cells().iter().position(|c| c.id == id);
+            let cell = self
+                .document
+                .read(cx)
+                .cells()
+                .iter()
+                .position(|c| c.id == id);
             if let Some(cell) = cell {
                 editor.update(cx, |editor, cx| {
                     editor.set_note_target(store, root, file, Some(cell + 1), cx)

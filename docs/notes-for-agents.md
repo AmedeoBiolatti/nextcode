@@ -103,7 +103,7 @@ With `--format json`: `{"new": [{"note": ID, "index": N}], "notes": [...],
 To see where the person is when a note arrives (file, cursor, selection,
 errors, terminal, failing tests), ask NextCode with `next_code context`
 (`next_code_agent context` inside WSL or a dev container); it lists the
-notes in the active file too. See "What the user is looking at" in
+notes in the active file or notebook too. See "What the user is looking at" in
 [pinpoint-for-agents.md](pinpoint-for-agents.md).
 
 ## The file
@@ -175,5 +175,9 @@ found again:
   deleted on its own.
 
 While the person edits a file in NextCode, the editor moves anchors with the
-text and saves them. Changes made outside the editor are resolved this way
+text and writes them to `notes.json` when the file (or notebook) is saved;
+unsaved edits never reach the file, so `list` matches what is on disk.
+Discarded edits (reload, close without saving) leave the stored anchor in
+charge. `next_code context` reports notes where the editor shows them now,
+unsaved edits included. Changes made outside the editor are resolved this way
 whenever notes are read.
