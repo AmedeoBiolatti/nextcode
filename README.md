@@ -523,6 +523,50 @@ value it is about) and cannot run. Keys of the old JSON format say what
 they became; `restart`, `healthcheck`, `if`, `env_file` and `ready.http`
 are reserved for planned features (see the manual).
 
+**Editing workflow files.** next_code has its own language server for
+workflow files (`crates/workflow_lsp`), built in and run in-process, so it
+needs nothing installed and works the same for local, WSL and
+dev-container projects. It serves the workflow tab's editor and YAML files
+opened in a project (only workflow files: under `next_code/workflows/` or
+`.next_code/workflows/`, or starting with the schema line below; other
+YAML gets nothing from it):
+
+- completion of keys for where the cursor is (a step's, a group's, an
+  input's by its type, `ready`'s conditions, `project` shapes, an
+  artifact's), of values (`depends_on` → the sibling steps not listed yet,
+  `ready`/`completed`, input types, a choice's options as `default`,
+  durations, `ready`/`project` snippets) and of `${…}` variables
+  (`${steps.` → only the steps the step may read, then `status`,
+  `exit_code`, `artifacts.` and the step's artifact labels; `${inputs.` →
+  the inputs; a `}` is added when missing);
+- next_code's own problems as diagnostics, on the key or value they are
+  about;
+- hovers: the schema's description of a key, a step's summary (title,
+  command, readiness, dependencies) on its id or a dependency, an input's
+  on `${inputs.…}`, what a variable reads;
+- Go to Definition from a dependency or `${steps.<id>.…}` to the step,
+  from `${inputs.<id>}` to the input; Find References; Rename of a step
+  id (its key, the siblings' `depends_on` and the variables that read it,
+  scoped as the scheduler resolves them) or an input id;
+- the inputs and steps (groups nested) as document symbols (outline,
+  breadcrumbs, Go to Symbol).
+
+Headless, the same comes through `open`, `diagnostics`, `definition`,
+`document_symbols`, `rename` and the other language-server commands
+(`open` reports `server: "next_code workflows"`). Another YAML server can
+replace it: `"languages": { "yaml": { "server": { "command":
+"yaml-language-server", "args": ["--stdio"] } } }` in `settings.json`.
+
+The format is also a JSON Schema (`crates/workflow/schema/workflow.schema.json`,
+headless `workflow_schema`): next_code keeps a copy as
+`workflow.schema.json` in the user's workflows folder, and new files there
+start with `# yaml-language-server: $schema=./workflow.schema.json`, so
+editors with a YAML language server (VS Code's YAML extension, JetBrains,
+Zed, Neovim) complete keys, describe them on hover and flag mistakes. For
+project workflows copy the schema beside them or map it in `yaml.schemas`
+(see the manual §2.1). next_code's own validation still checks more
+(dependencies, cycles, variables, regexes).
+
 Files of the old JSON format (`.json`/`.jsonc` with a `steps` array) are
 listed with a problem and do not run; their tab has **Convert to YAML**
 (headless: `workflow_convert`), which writes `<name>.yaml` beside the old
@@ -727,7 +771,8 @@ needs it). Workflows run in the window that started them.
 
 Headless: `workflows_list` (groups with their `steps` nested, each entry
 with `kind` and qualified `path`; each workflow's `inputs`),
-`workflow_convert` (an old JSON file to YAML), `workflow_run`
+`workflow_schema` (the format's JSON Schema), `workflow_convert` (an old
+JSON file to YAML), `workflow_run`
 (`inputs`), `workflow_status` (the run's `inputs`; a
 row per step and group: qualified `id`, `kind`, `parent`), `workflow_stop`,
 `workflow_continue`, `workflow_restart` (a group: all its steps),

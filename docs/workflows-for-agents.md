@@ -74,7 +74,69 @@ with an error and cannot run. Convert them: `workflow_convert` (headless,
 §8) or **Convert to YAML** in their tab. The converter writes
 `<name>.yaml` beside the old file (comments and blank lines kept, every
 field renamed, seconds turned into durations) and renames the old file to
-`<name>.jsonc.bak`; it refuses when the YAML file exists.
+`<name>.jsonc.bak`; it refuses when the YAML file exists. In the user's
+folder the converted file starts with the schema line (§2.2).
+
+### 2.1 Editing: the workflow language server
+
+next_code has a language server for workflow files built in
+(`crates/workflow_lsp`, run in-process): in the workflow tab and in YAML
+files of a project's `.next_code/workflows/` (or the user folder, or any
+YAML file starting with the schema line of §2.2) it completes keys,
+values, step ids and `${…}` variables for where the cursor is, shows
+next_code's problems as you type, describes keys on hover, goes from a
+dependency or `${steps.<id>.…}` to its step, renames step and input ids
+everywhere they are used (scoped as runs resolve them), and lists the
+steps as symbols.
+
+Agents reach it headless with the generic language-server commands, on a
+project's workflow file:
+
+```json
+{"id": 1, "cmd": "open", "path": ".next_code/workflows/dev.yaml"}
+{"id": 2, "cmd": "diagnostics", "path": ".next_code/workflows/dev.yaml", "wait_ms": 5000}
+{"id": 3, "cmd": "definition", "path": ".next_code/workflows/dev.yaml", "line": 2, "character": 21}
+{"id": 4, "cmd": "rename", "path": ".next_code/workflows/dev.yaml", "line": 1, "character": 3, "new_name": "postgres"}
+```
+
+`open` answers `{"language": "yaml", "server": "next_code workflows", …}`;
+`rename` writes the file (the step's key, the `depends_on` entries naming
+it and the `${steps.<id>.…}` that read it). `workflows_list` (§7) stays
+the way to validate every file at once.
+
+### 2.2 The JSON Schema
+
+The format is also a JSON Schema (draft-07,
+`crates/workflow/schema/workflow.schema.json`; headless `workflow_schema`
+returns it). next_code keeps a copy, `workflow.schema.json`, in the user's
+workflows folder (written when the folder is listed, replaced when a new
+version differs; never listed as a workflow), and new and converted files
+there start with the line that points YAML editors at it:
+
+```yaml
+# yaml-language-server: $schema=./workflow.schema.json
+```
+
+Editors with a YAML language server (VS Code with Red Hat's YAML
+extension, JetBrains IDEs, Zed, Neovim) then complete keys, show each
+field's description on hover and flag mistakes while typing. For a
+project's `.next_code/workflows/`, copy the file there (commit it with the
+workflows) and add the same line, or map it in VS Code's settings:
+
+```json
+"yaml.schemas": {
+  "C:/Users/<you>/AppData/Roaming/next_code/workflows/workflow.schema.json": [
+    "**/.next_code/workflows/*.yaml", "**/next_code/workflows/*.yaml"
+  ]
+}
+```
+
+The schema checks shapes, keys, types, durations, ports and which fields
+need which; next_code's own validation (§7) is the authority and checks
+more: that dependencies exist, cycles, `${steps.…}`/`${inputs.…}`
+variables, regexes, a default against its input's options and bounds,
+duplicate labels. Old-format keys (`needs`, `onFail`, …) and planned ones
+(`restart`, …) are rejected with a description saying why.
 
 ---
 
@@ -657,6 +719,7 @@ Workflows are named by `"name"`, `"path"` or `"id"` (from
 | Command | Params | Result |
 |---|---|---|
 | `workflows_list` | – | array of `{id, name, path, source, error, inputs, steps, outcome}`; `inputs` as declared: `{id, label, type, description, default, required, placeholder}` plus `options[{value, label}]` (choice) or `min`, `max`, `integer` (number); each step `{id, path, kind: "step", title, depends_on: {"<id>": "ready" or "completed"}, project, run, check, ready, timeout, stop_grace_period, artifacts[{label, path} or {label, url}]}`, each group `{id, path, kind: "group", title, depends_on, project, steps[…]}` (nested). `path` is the qualified id; `project` is where it runs (inherited from its groups); durations as in files (`10m`, `3s`; `ready.delay` too); `${inputs.…}` show unexpanded. Old-format files have an `error` saying to convert them |
+| `workflow_schema` | – | `{schema, file, modeline}`: the format's JSON Schema (§2.2), the name of the copy in the user's workflows folder, and the line that points YAML editors at a copy beside a workflow |
 | `workflow_convert` | name/path/id of an old-format file | `{path, backup, problems}`: the YAML file written beside it (comments kept; an error if it exists), the old file renamed to `<name>.bak`, and the converted file's problems (as the old one had them; `[]` usually). Files are read again |
 | `workflow_run` | name/path/id, `inputs`? (`{"<id>": value}`) | `{run, id}`; starts afresh (a run of it still going is stopped first, each command with its grace). Inputs not given get their defaults; invalid ones are an error listing each (§3.5) |
 | `workflow_status` | name/path/id | `{run, workflow, outcome, inputs, steps[…]}` (error if it has not run); `inputs` the run's values by id (`{"env": "prod", "workers": 8}`). One row per step and group in file order, groups before their steps. Step rows: `{id, kind: "step", parent, title, status, reason, detail, blocked, last_line, check_output, exit_code, exited, elapsed_ms, location, terminal, artifacts[{label, name, path or url, resolved, exists}], artifacts_error}`; group rows: `{id, kind: "group", parent, title, status, reason, detail, blocked, elapsed_ms, steps[qualified ids]}`. `id`/`parent` are qualified ids (`parent` null at the top). `resolved`/`exists` are `null` until the artifacts were checked; `artifacts_error` says why they could not be |

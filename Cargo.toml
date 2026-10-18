@@ -41,6 +41,8 @@ proto = { path = "crates/proto" }
 regex = "1"
 # YAML events with positions: workflow files (`crates/workflow/src/yaml.rs`).
 saphyr-parser = "0.2.2"
+# Tests only: workflow files checked against their JSON Schema (no HTTP/file resolving).
+jsonschema = { version = "0.59", default-features = false }
 remote = { path = "crates/remote" }
 # Already in the tree (gpui's usvg/fontconfig): pytest's JUnit XML reports.
 roxmltree = "0.20"
@@ -80,4 +82,5 @@ unicode-width = "0.2"
 url = "2"
 watcher = { path = "crates/watcher" }
 workflow = { path = "crates/workflow" }
+workflow_lsp = { path = "crates/workflow_lsp" }
 worktree = { path = "crates/worktree" }

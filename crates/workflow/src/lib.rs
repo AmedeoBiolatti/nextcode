@@ -15,8 +15,8 @@
 
 pub mod file;
 pub mod inputs;
-pub mod legacy;
 pub mod layout;
+pub mod legacy;
 pub mod output;
 pub mod run;
 pub mod source;
@@ -25,14 +25,15 @@ pub mod vars;
 pub mod yaml;
 
 pub use file::{
-    Artifact, ArtifactTarget, Condition, DEFAULT_STOP_GRACE, Dependency, MAX_STOP_GRACE,
-    ProjectSpec, Ready, Step, TEMPLATE, Workflow, check, format_duration, parse,
+    Artifact, ArtifactTarget, Condition, DEFAULT_STOP_GRACE, Dependency, GROUP_KEYS,
+    MAX_STOP_GRACE, ProjectSpec, Ready, SCHEMA, SCHEMA_FILE, SCHEMA_MODELINE, STEP_KEYS, Step,
+    TEMPLATE, TOP_KEYS, Workflow, check, format_duration, parse,
 };
 pub use inputs::{Choice, Input, InputKind, InputValue, InputValues};
 pub use layout::{GraphLayout, Metrics, View, layout_workflow};
 pub use output::{AnsiStripper, OutputWatcher, urls_in};
 pub use run::{ArtifactState, Change, CheckResult, Effect, Outcome, Run, Status, StepState};
 pub use source::{
-    InputSpan, Problem, StepSpan, input_spans, path_at, span_of, step_at, step_spans,
+    InputSpan, Problem, StepSpan, input_spans, path_at, span_of, spans_of, step_at, step_spans,
 };
 pub use tree::{StepNode, flatten};

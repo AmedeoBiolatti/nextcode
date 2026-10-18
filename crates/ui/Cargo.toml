@@ -13,6 +13,8 @@ gpui.workspace = true
 ignore.workspace = true
 language.workspace = true
 lsp.workspace = true
+# The workflow files' language server, run in-process.
+workflow_lsp.workspace = true
 nucleo-matcher.workspace = true
 parking_lot.workspace = true
 regex.workspace = true

@@ -1,0 +1,802 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "next_code workflow",
+  "description": "A next_code workflow: steps that bring up a multi-project development environment, in order, with readiness conditions. The format borrows from Docker Compose (depends_on, durations, x- keys) and GitHub Actions (inputs). See docs/workflows-for-agents.md.",
+  "type": "object",
+  "required": [
+    "steps"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "name": {
+      "description": "The workflow's name (default: the file name without extension).",
+      "type": [
+        "string",
+        "number",
+        "boolean"
+      ],
+      "minLength": 1
+    },
+    "description": {
+      "description": "Documentation only.",
+      "type": "string"
+    },
+    "inputs": {
+      "description": "Parameters each run asks for (a form in the GUI, `inputs` of headless `workflow_run`); steps read them as ${inputs.<id>}. Keyed by id, like GitHub Actions' workflow_dispatch inputs.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "propertyNames": {
+        "$ref": "#/definitions/inputId"
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/input"
+      }
+    },
+    "env": {
+      "description": "Environment every step gets (a group's and the step's own `env` win).",
+      "$ref": "#/definitions/env"
+    },
+    "steps": {
+      "description": "The steps, keyed by id, in the order they show (independent steps run in parallel).",
+      "$ref": "#/definitions/steps"
+    }
+  },
+  "patternProperties": {
+    "^x-": {
+      "description": "Shared parts for YAML anchors (`x-api: &api …`, then `<<: *api`), as in Compose files; ignored."
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "text": {
+      "description": "Text (unquoted numbers and booleans count as their text).",
+      "type": [
+        "string",
+        "number",
+        "boolean"
+      ]
+    },
+    "duration": {
+      "description": "A Compose-style duration: 90s, 10m, 1h30m, 500ms, 1.5s; a plain number is seconds.",
+      "anyOf": [
+        {
+          "type": "number",
+          "minimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^(([0-9]+\\.?[0-9]*|\\.[0-9]+)(ms|us|µs|h|m|s))+$"
+        }
+      ]
+    },
+    "stepId": {
+      "description": "A step id: unique among its siblings, no `/` (it joins a group's id and its steps').",
+      "type": "string",
+      "pattern": "^[^/]*[^/\\s][^/]*$"
+    },
+    "inputId": {
+      "description": "An input id: no `/`, `.`, `{`, `}`, `$` or spaces.",
+      "type": "string",
+      "pattern": "^[^/.{}$\\s]+$"
+    },
+    "steps": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "propertyNames": {
+        "$ref": "#/definitions/stepId"
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/step"
+      }
+    },
+    "env": {
+      "description": "Environment variables: names to strings, numbers or booleans (as written). ${workspaceFolder}, ${userHome}, ${env:NAME}, ${inputs.<id>} and ${steps.<id>.…} expand in values.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "boolean"
+        ]
+      }
+    },
+    "condition": {
+      "description": "`ready`: it must be ready (the default). `completed`: it must have finished, ready or failed (a report after an evaluation).",
+      "enum": [
+        "ready",
+        "completed"
+      ]
+    },
+    "dependsOn": {
+      "description": "The siblings this step waits for: an id, a list of ids (each must be ready), or a mapping of ids to `ready` or `completed` (also Compose's `{condition: completed}`).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/stepId"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/stepId"
+          },
+          "uniqueItems": true
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/definitions/stepId"
+          },
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/definitions/condition"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "condition": {
+                    "$ref": "#/definitions/condition"
+                  }
+                },
+                "required": [
+                  "condition"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "location": {
+      "description": "A location string as typed in Open Recent: C:\\src\\p, Ubuntu:~/p, \\\\wsl.localhost\\Ubuntu\\home\\me\\p, devcontainer:<one of those>.",
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "folder": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/location"
+        },
+        {
+          "description": "A folder on this machine.",
+          "type": "object",
+          "properties": {
+            "local": {
+              "type": "string",
+              "pattern": "\\S"
+            }
+          },
+          "required": [
+            "local"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "A Linux path inside a WSL distro.",
+          "type": "object",
+          "properties": {
+            "wsl": {
+              "description": "The distro, e.g. Ubuntu.",
+              "type": "string",
+              "pattern": "\\S"
+            },
+            "path": {
+              "type": "string",
+              "pattern": "\\S"
+            }
+          },
+          "required": [
+            "wsl",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "next_code's own shape, as in recent.json.",
+          "type": "object",
+          "properties": {
+            "Local": {
+              "type": "string",
+              "pattern": "\\S"
+            }
+          },
+          "required": [
+            "Local"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "next_code's own shape, as in recent.json.",
+          "type": "object",
+          "properties": {
+            "Wsl": {
+              "type": "object",
+              "properties": {
+                "distro": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "distro",
+                "path"
+              ]
+            }
+          },
+          "required": [
+            "Wsl"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "project": {
+      "description": "Where the step runs (and opens a project tab): {local: C:/src/p}, {wsl: Ubuntu, path: ~/p}, {devcontainer: <folder>, config: <devcontainer.json>}, or a location string. Omitted: this machine, no project tab.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/folder"
+        },
+        {
+          "description": "A folder opened inside its dev container.",
+          "type": "object",
+          "properties": {
+            "devcontainer": {
+              "$ref": "#/definitions/folder"
+            },
+            "config": {
+              "description": "A specific devcontainer.json.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "devcontainer"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "next_code's own shape, as in recent.json.",
+          "type": "object",
+          "properties": {
+            "DevContainer": {
+              "type": "object",
+              "properties": {
+                "folder": {
+                  "$ref": "#/definitions/folder"
+                },
+                "config": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "folder"
+              ]
+            }
+          },
+          "required": [
+            "DevContainer"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ready": {
+      "description": "When the step counts as done: exactly one condition.",
+      "type": "object",
+      "properties": {
+        "exit": {
+          "description": "`run` exited with code 0 (the default with `run`; without it, the check passed).",
+          "const": true
+        },
+        "output": {
+          "description": "A regex (Rust syntax) the command's output matches, ANSI codes stripped. Plain or single-quoted values keep backslashes: 'ready in \\d+ ms'.",
+          "type": "string",
+          "format": "regex"
+        },
+        "port": {
+          "description": "Something listens on this TCP port where the step runs.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "manual": {
+          "description": "Someone presses Continue; this is the prompt. Quote text with a comma inside {…}: a comma there separates keys.",
+          "$ref": "#/definitions/text"
+        },
+        "delay": {
+          "description": "This long after the command started (or the check passed). A last resort.",
+          "$ref": "#/definitions/duration"
+        },
+        "http": {
+          "description": "Planned, not supported yet: an HTTP URL that answers.",
+          "not": {}
+        },
+        "delay_ms": {
+          "description": "The old JSON format's; now `delay` (a duration: 500ms).",
+          "not": {}
+        }
+      },
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1
+    },
+    "artifact": {
+      "anyOf": [
+        {
+          "description": "A file (relative to the step's cwd, else its project) or an http(s) URL.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "label": {
+              "$ref": "#/definitions/artifactLabel"
+            },
+            "path": {
+              "description": "A file, relative to the step's cwd (else its project).",
+              "type": "string",
+              "pattern": "\\S"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "label": {
+              "$ref": "#/definitions/artifactLabel"
+            },
+            "url": {
+              "description": "An http(s) link.",
+              "type": "string",
+              "pattern": "^https?://"
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "artifactLabel": {
+      "description": "Names the artifact in ${steps.<id>.artifacts.<label>}: not a number (numbers address artifacts by position), no `}`.",
+      "type": "string",
+      "pattern": "^(?![0-9]+$)[^}]*\\S[^}]*$"
+    },
+    "planned": {
+      "description": "Planned, not supported yet (see the workflows manual).",
+      "not": {}
+    },
+    "step": {
+      "description": "A step: a check, a command and when it is ready; or a group of steps (`steps`).",
+      "type": "object",
+      "properties": {
+        "title": {
+          "description": "Shown in the UI (default: the id).",
+          "$ref": "#/definitions/text"
+        },
+        "depends_on": {
+          "$ref": "#/definitions/dependsOn"
+        },
+        "project": {
+          "$ref": "#/definitions/project"
+        },
+        "run": {
+          "description": "Command line run in a terminal tab of the project (PowerShell on Windows, the login shell elsewhere).",
+          "$ref": "#/definitions/text"
+        },
+        "terminal": {
+          "description": "The terminal tab's name (default: the title, else the id).",
+          "$ref": "#/definitions/text"
+        },
+        "check": {
+          "description": "Command run as a process before `run` (PowerShell on Windows, sh elsewhere); exit code 0 passes.",
+          "$ref": "#/definitions/text"
+        },
+        "on_fail": {
+          "description": "Shown when the check fails; the step then waits for Retry instead of failing the workflow.",
+          "$ref": "#/definitions/text"
+        },
+        "ready": {
+          "$ref": "#/definitions/ready"
+        },
+        "timeout": {
+          "description": "Fails the step if it is not ready this long after it started.",
+          "$ref": "#/definitions/duration"
+        },
+        "stop_grace_period": {
+          "description": "How long the command gets after Ctrl+C before it is killed, on every stop (1s to 1h, default 3s).",
+          "$ref": "#/definitions/duration"
+        },
+        "open_urls": {
+          "description": "http(s) URLs the command prints open in the browser (each once) until it is ready.",
+          "type": "boolean"
+        },
+        "env": {
+          "$ref": "#/definitions/env"
+        },
+        "cwd": {
+          "description": "Working directory, relative to the project (the home folder without one).",
+          "$ref": "#/definitions/text"
+        },
+        "artifacts": {
+          "description": "Files and links the step produces: linked in its details, read by later steps as ${steps.<id>.artifacts.<label or index>}.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/artifact"
+          }
+        },
+        "steps": {
+          "description": "Makes this step a group of these steps: its depends_on gates them; they inherit its project, cwd and env.",
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/definitions/stepId"
+          },
+          "additionalProperties": {
+            "$ref": "#/definitions/step"
+          }
+        },
+        "restart": {
+          "$ref": "#/definitions/planned"
+        },
+        "healthcheck": {
+          "$ref": "#/definitions/planned"
+        },
+        "if": {
+          "$ref": "#/definitions/planned"
+        },
+        "env_file": {
+          "$ref": "#/definitions/planned"
+        },
+        "id": {
+          "description": "The old JSON format's; the id is now the step's key in `steps`.",
+          "not": {}
+        },
+        "needs": {
+          "description": "The old JSON format's; now `depends_on`.",
+          "not": {}
+        },
+        "after": {
+          "description": "The old JSON format's; now `depends_on` with `completed` (`depends_on: {eval: completed}`).",
+          "not": {}
+        },
+        "onFail": {
+          "description": "The old JSON format's; now `on_fail`.",
+          "not": {}
+        },
+        "openUrls": {
+          "description": "The old JSON format's; now `open_urls`.",
+          "not": {}
+        },
+        "timeout_s": {
+          "description": "The old JSON format's; now `timeout` (a duration: 10m).",
+          "not": {}
+        },
+        "stop_grace_s": {
+          "description": "The old JSON format's; now `stop_grace_period` (a duration: 30s).",
+          "not": {}
+        }
+      },
+      "patternProperties": {
+        "^x-": {
+          "description": "Ignored: shared parts for YAML anchors."
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "required": [
+                "run"
+              ]
+            },
+            {
+              "required": [
+                "check"
+              ]
+            },
+            {
+              "required": [
+                "ready"
+              ]
+            },
+            {
+              "required": [
+                "steps"
+              ]
+            }
+          ]
+        },
+        {
+          "if": {
+            "required": [
+              "steps"
+            ]
+          },
+          "then": {
+            "description": "A group has title, depends_on, steps, project, env and cwd; its steps do the work.",
+            "propertyNames": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "title",
+                    "depends_on",
+                    "steps",
+                    "project",
+                    "env",
+                    "cwd"
+                  ]
+                },
+                {
+                  "pattern": "^x-"
+                }
+              ]
+            }
+          },
+          "else": {
+            "dependencies": {
+              "on_fail": [
+                "check"
+              ],
+              "open_urls": [
+                "run"
+              ],
+              "terminal": [
+                "run"
+              ],
+              "stop_grace_period": [
+                "run"
+              ]
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "ready": {
+                      "anyOf": [
+                        {
+                          "required": [
+                            "exit"
+                          ]
+                        },
+                        {
+                          "required": [
+                            "output"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "ready"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "run"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "scalar": {
+      "type": [
+        "string",
+        "number",
+        "boolean"
+      ]
+    },
+    "input": {
+      "description": "An input's settings (none: a string input).",
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "type": {
+          "description": "string (a textbox, the default), number, boolean (a checkbox) or choice (a dropdown).",
+          "enum": [
+            "string",
+            "number",
+            "boolean",
+            "choice"
+          ]
+        },
+        "label": {
+          "description": "Shown in the form (default: the id).",
+          "$ref": "#/definitions/text"
+        },
+        "description": {
+          "description": "Helper text under the field.",
+          "$ref": "#/definitions/text"
+        },
+        "default": {
+          "description": "What a run gets when not given a value, and what the form starts with; must be valid for the input.",
+          "$ref": "#/definitions/scalar"
+        },
+        "required": {
+          "description": "string and number: must not be empty.",
+          "type": "boolean"
+        },
+        "placeholder": {
+          "description": "string and number: shown in an empty textbox.",
+          "$ref": "#/definitions/text"
+        },
+        "options": {
+          "description": "choice: the dropdown's entries, values or {value, label}; values unique.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/scalar"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "$ref": "#/definitions/scalar"
+                  },
+                  "label": {
+                    "$ref": "#/definitions/text"
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "min": {
+          "description": "number: the least value.",
+          "type": "number"
+        },
+        "max": {
+          "description": "number: the greatest value.",
+          "type": "number"
+        },
+        "integer": {
+          "description": "number: whole numbers only.",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "The old JSON format's; the id is now the input's key in `inputs`.",
+          "not": {}
+        }
+      },
+      "additionalProperties": false,
+      "if": {
+        "type": "object"
+      },
+      "then": {
+        "allOf": [
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "const": "choice"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "options"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "options"
+                ]
+              }
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "const": "number"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "else": {
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "min"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "max"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "integer"
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "if": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "enum": [
+                    "boolean",
+                    "choice"
+                  ]
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "required"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "placeholder"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

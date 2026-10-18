@@ -64,6 +64,8 @@ use crate::{
     theme,
 };
 
+use crate::lsp_store::{LspStore, LspStoreEvent, RunningServer};
+
 pub(super) const CONTEXT: &str = "WorkflowView";
 /// Card size and spacing of the graph.
 const METRICS: Metrics = Metrics {
@@ -153,6 +155,9 @@ pub struct WorkflowView {
     /// The project the file is read and written through.
     project: Project,
     editor: Entity<Editor>,
+    /// Runs the workflow language server for the editor (completion,
+    /// hovers, problems, go to definition, rename).
+    lsp_store: Entity<LspStore>,
     graph: Graph,
     /// The selected step (or group), by qualified id.
     selected: Option<String>,
@@ -515,9 +520,8 @@ impl WorkflowView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let editor = cx.new(|cx| {
-            Editor::for_file(Buffer::with_path(text, path.clone()), project.clone(), cx)
-        });
+        let editor = cx
+            .new(|cx| Editor::for_file(Buffer::with_path(text, path.clone()), project.clone(), cx));
         let subscriptions = vec![
             cx.subscribe(&editor, |this, _, event, cx| match event {
                 EditorEvent::Edited => this.schedule_reparse(cx),
@@ -528,11 +532,42 @@ impl WorkflowView {
                     cx.notify();
                 }
                 EditorEvent::DirtyChanged => cx.notify(),
+                // Definitions and references are in this file.
+                EditorEvent::Navigate { locations, .. } => {
+                    if let Some(location) =
+                        locations.iter().find(|location| location.path == this.path)
+                    {
+                        let start = location.range.start;
+                        this.editor.update(cx, |editor, cx| editor.go_to(start, cx));
+                    }
+                }
+                EditorEvent::ApplyEdit { edit, server, .. } => {
+                    this.apply_server_edit(edit, server, cx);
+                }
                 _ => {}
             }),
             cx.observe(&editor, |this, _, cx| this.cursor_moved(cx)),
             cx.observe(&workflows, |_, _, cx| cx.notify()),
         ];
+        let (settings, _) = crate::settings::Settings::load();
+        let lsp_store = cx.new(|_| LspStore::new(project.clone(), Arc::new(settings)));
+        let mut subscriptions = subscriptions;
+        subscriptions.push(cx.subscribe(
+            &lsp_store,
+            |this: &mut Self, store, event, cx| match event {
+                LspStoreEvent::ServerStarted(syntax::Language::Yaml, server) => {
+                    let server = server.clone();
+                    this.editor
+                        .update(cx, |editor, cx| editor.attach_server(server, cx));
+                }
+                LspStoreEvent::DiagnosticsUpdated(path) if *path == this.path => {
+                    let diagnostics = store.read(cx).diagnostics(path).to_vec();
+                    this.editor
+                        .update(cx, |editor, cx| editor.set_diagnostics(&diagnostics, cx));
+                }
+                _ => {}
+            },
+        ));
         window.focus(&editor.focus_handle(cx));
         let mut view = Self {
             workflows,
@@ -540,6 +575,7 @@ impl WorkflowView {
             path,
             project,
             editor,
+            lsp_store,
             graph: Graph::default(),
             selected: None,
             cursor_step: None,
@@ -568,7 +604,52 @@ impl WorkflowView {
             _subscriptions: subscriptions,
         };
         view.reparse(cx);
+        view.attach_language_server(cx);
         view
+    }
+
+    /// Starts the YAML language server for the file (in-process; see
+    /// `workflow_lsp`) and attaches the editor once it runs. Not for files
+    /// of the old JSON format.
+    fn attach_language_server(&mut self, cx: &mut Context<Self>) {
+        if self.is_legacy() {
+            return;
+        }
+        let path = self.path.clone();
+        let server = self.lsp_store.update(cx, |store, cx| {
+            store.server(syntax::Language::Yaml, &path, cx)
+        });
+        if let Some(server) = server {
+            self.editor
+                .update(cx, |editor, cx| editor.attach_server(server, cx));
+        }
+    }
+
+    /// A rename's edits to this file (the workflow server edits nothing
+    /// else).
+    fn apply_server_edit(
+        &mut self,
+        edit: &lsp::types::WorkspaceEdit,
+        server: &RunningServer,
+        cx: &mut Context<Self>,
+    ) {
+        let edits: Vec<lsp::types::TextEdit> = edit
+            .changes
+            .iter()
+            .flatten()
+            .filter(|(uri, _)| lsp::uri_to_path(uri).as_deref() == Some(self.path.as_path()))
+            .flat_map(|(_, edits)| edits.iter().cloned())
+            .collect();
+        if edits.is_empty() {
+            return;
+        }
+        let applied = self.editor.update(cx, |editor, cx| {
+            editor.apply_server_edits(&edits, server.encoding, cx)
+        });
+        if let Err(err) = applied {
+            self.notice = Some(format!("Cannot rename: {err}").into());
+            cx.notify();
+        }
     }
 
     /// The workflow's name (as last parsed), else the file's.

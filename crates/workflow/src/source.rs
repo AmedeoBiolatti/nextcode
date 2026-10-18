@@ -99,7 +99,7 @@ pub fn input_spans(text: &str) -> Vec<InputSpan> {
 }
 
 /// [`step_spans`] and [`input_spans`] of a loaded file.
-pub(crate) fn spans_of(root: &Node) -> (Vec<StepSpan>, Vec<InputSpan>) {
+pub fn spans_of(root: &Node) -> (Vec<StepSpan>, Vec<InputSpan>) {
     let steps = root.get("steps").map(steps_of).unwrap_or_default();
     let inputs = root
         .get("inputs")

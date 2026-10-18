@@ -446,6 +446,21 @@ impl LspStore {
 
         if !config.enabled {
             slot.status = ServerStatus::Disabled;
+        } else if config.command == settings::WORKFLOW_SERVER {
+            // Built in: in-process, the same for every kind of project.
+            match start_workflow_server(open_log(language, root)) {
+                Ok((connection, incoming)) => {
+                    let connection = Arc::new(connection);
+                    slot._tasks = vec![
+                        self.listen(key, incoming, cx),
+                        self.initialize(key, &connection, &config, cx),
+                    ];
+                    slot.connection = Some(connection);
+                }
+                Err(err) => {
+                    slot.status = ServerStatus::Failed(format!("failed to start: {err}").into())
+                }
+            }
         } else {
             match self.project.find_executable_in(&config.command, &folder) {
                 Ok(Some(program)) => {
@@ -756,6 +771,23 @@ impl LspStore {
 /// The folders a server started for folder `root` is initialized with and
 /// answers `workspace/workspaceFolders` with: every folder for the first
 /// folder's (it may serve them all), else just its own.
+/// The workflow language server (`workflow_lsp`) on a thread of this
+/// process, over pipes; it ends when the client says `exit` or drops its
+/// end.
+fn start_workflow_server(
+    logger: Option<lsp::Logger>,
+) -> std::io::Result<(
+    LanguageServer,
+    futures::channel::mpsc::UnboundedReceiver<Incoming>,
+)> {
+    let (server_reader, client_writer) = std::io::pipe()?;
+    let (client_reader, server_writer) = std::io::pipe()?;
+    std::thread::Builder::new()
+        .name("workflow-lsp".into())
+        .spawn(move || workflow_lsp::serve(server_reader, server_writer))?;
+    Ok(LanguageServer::new(client_reader, client_writer, logger))
+}
+
 fn server_folders(roots: &[Root], root: usize) -> &[Root] {
     match root {
         0 => roots,

@@ -60,7 +60,11 @@ steps:
     .unwrap();
     assert_eq!(workflow.name, "Env");
     let ids: Vec<&str> = workflow.steps.iter().map(|step| step.id.as_str()).collect();
-    assert_eq!(ids, ["zeta", "b", "c", "d", "e", "f"], "file order, not sorted");
+    assert_eq!(
+        ids,
+        ["zeta", "b", "c", "d", "e", "f"],
+        "file order, not sorted"
+    );
     let a = &workflow.steps[0];
     assert_eq!(a.label(), "First");
     assert_eq!(a.terminal_name(), "Server");
@@ -74,10 +78,7 @@ steps:
     assert_eq!(a.env["V"], "1.10", "as written");
     assert_eq!(a.cwd.as_deref(), Some("sub"));
     assert_eq!(workflow.steps[1].ready, Ready::Manual("Go".into()));
-    assert_eq!(
-        workflow.steps[2].depends_on,
-        [ready("b", Condition::Ready)]
-    );
+    assert_eq!(workflow.steps[2].depends_on, [ready("b", Condition::Ready)]);
     assert_eq!(
         workflow.steps[2].ready,
         Ready::Delay(Duration::from_millis(500))
@@ -123,19 +124,35 @@ steps:
     );
     assert_eq!(
         depends(4),
-        [ready("a", Condition::Ready), ready("b", Condition::Completed)]
+        [
+            ready("a", Condition::Ready),
+            ready("b", Condition::Completed)
+        ]
     );
     assert_eq!(
         depends(5),
-        [ready("a", Condition::Completed), ready("b", Condition::Ready)]
+        [
+            ready("a", Condition::Completed),
+            ready("b", Condition::Ready)
+        ]
     );
     let step = &workflow.steps[4];
     assert_eq!(step.depending(Condition::Ready).collect::<Vec<_>>(), ["a"]);
-    assert_eq!(step.depending(Condition::Completed).collect::<Vec<_>>(), ["b"]);
+    assert_eq!(
+        step.depending(Condition::Completed).collect::<Vec<_>>(),
+        ["b"]
+    );
     assert_eq!(step.upstream().collect::<Vec<_>>(), ["a", "b"]);
 
-    let one = |extra: &str| error(&format!("steps:\n  a: {{run: a}}\n  b: {{run: b, {extra}}}\n"));
-    assert_eq!(one("depends_on: [a, a]"), "`b`: `depends_on` lists `a` twice");
+    let one = |extra: &str| {
+        error(&format!(
+            "steps:\n  a: {{run: a}}\n  b: {{run: b, {extra}}}\n"
+        ))
+    };
+    assert_eq!(
+        one("depends_on: [a, a]"),
+        "`b`: `depends_on` lists `a` twice"
+    );
     assert!(
         one("depends_on: {a: started}").contains("`a`: unknown condition `started`"),
         "{}",
@@ -301,8 +318,16 @@ fn keys_of_the_old_format_and_planned_ones_say_so() {
         assert!(message.contains(now), "{message}");
     }
     assert!(one("ready: {delay_ms: 5}").contains("now `delay`"));
-    for key in ["restart: on_failure", "healthcheck: {}", "if: x", "env_file: .env"] {
-        assert!(one(key).contains("is planned but not supported yet"), "{key}");
+    for key in [
+        "restart: on_failure",
+        "healthcheck: {}",
+        "if: x",
+        "env_file: .env",
+    ] {
+        assert!(
+            one(key).contains("is planned but not supported yet"),
+            "{key}"
+        );
     }
     assert!(one("ready: {http: 'http://x'}").contains("planned"));
 }
@@ -391,10 +416,7 @@ fn problems_point_at_what_they_are_about() {
         [("duplicate key `a`".to_owned(), Some((3, 3)))]
     );
     // File-level problems have no place.
-    assert_eq!(
-        located("name: x\n"),
-        [("missing `steps`".to_owned(), None)]
-    );
+    assert_eq!(located("name: x\n"), [("missing `steps`".to_owned(), None)]);
 }
 
 #[test]
@@ -542,7 +564,10 @@ steps:
     assert_eq!(api.steps[1].id, "db", "ids are unique among siblings");
     assert_eq!(api.steps[2].steps[0].id, "x");
     assert_eq!(api.cwd.as_deref(), Some("srv"));
-    assert!(api.steps[0].env.is_empty(), "as written; flattening inherits");
+    assert!(
+        api.steps[0].env.is_empty(),
+        "as written; flattening inherits"
+    );
 }
 
 #[test]
@@ -566,9 +591,7 @@ fn rejects_bad_groups() {
         let message = group(key);
         assert!(message.contains("a group cannot have"), "{key}: {message}");
     }
-    assert!(
-        error("steps:\n  g:\n    steps: {}\n").contains("a group needs at least one step")
-    );
+    assert!(error("steps:\n  g:\n    steps: {}\n").contains("a group needs at least one step"));
     assert!(error("steps:\n  g:\n    steps: [a]\n").contains("`steps` must be a mapping"));
     assert_eq!(
         error("steps:\n  a/b: {run: x}\n"),
@@ -693,7 +716,10 @@ steps:
     .unwrap();
     assert_eq!(workflow.steps[0].project, workflow.steps[1].project);
     assert!(workflow.steps[0].project.is_some());
-    assert_eq!(workflow.steps[1].env["PROFILE"], "prod", "explicit keys win");
+    assert_eq!(
+        workflow.steps[1].env["PROFILE"], "prod",
+        "explicit keys win"
+    );
 }
 
 #[test]
@@ -845,4 +871,200 @@ steps:
     let both = error("inputs: {a: {type: x}}\nsteps: {s: {}}");
     assert!(both.contains("unknown type `x`"), "{both}");
     assert!(both.contains("needs `run`, `check` or `ready`"), "{both}");
+}
+
+/// The schema, compiled.
+fn schema() -> jsonschema::Validator {
+    let schema: Value = serde_json::from_str(SCHEMA).expect("the schema is JSON");
+    jsonschema::draft7::new(&schema).expect("the schema is a draft-07 schema")
+}
+
+/// A workflow file's text as JSON, as a YAML editor sees it.
+fn as_json(text: &str) -> Value {
+    crate::yaml::load(text)
+        .root
+        .map_or(Value::Null, |root| root.to_json())
+}
+
+/// The keys the schema lists under `properties` at `pointer`.
+fn schema_keys(pointer: &str) -> Vec<String> {
+    let schema: Value = serde_json::from_str(SCHEMA).unwrap();
+    let mut keys: Vec<String> = schema
+        .pointer(pointer)
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("no {pointer}"))
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn sorted(keys: impl IntoIterator<Item = impl ToString>) -> Vec<String> {
+    let mut keys: Vec<String> = keys.into_iter().map(|key| key.to_string()).collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn the_schema_lists_the_keys_the_parser_knows() {
+    assert_eq!(
+        schema_keys("/properties"),
+        sorted(TOP_KEYS),
+        "top-level keys"
+    );
+    let old = RENAMED_KEYS.iter().map(|(old, _)| *old);
+    assert_eq!(
+        schema_keys("/definitions/step/properties"),
+        sorted(
+            STEP_KEYS
+                .iter()
+                .copied()
+                .chain(PLANNED_KEYS.iter().copied())
+                .chain(old)
+        ),
+        "step keys, planned keys and the old format's"
+    );
+    let schema: Value = serde_json::from_str(SCHEMA).unwrap();
+    let group = schema
+        .pointer("/definitions/step/allOf/1/then/propertyNames/anyOf/0/enum")
+        .unwrap();
+    assert_eq!(
+        sorted(
+            group
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| key.as_str().unwrap())
+        ),
+        sorted(GROUP_KEYS)
+    );
+    assert_eq!(
+        schema_keys("/definitions/input/properties"),
+        sorted(inputs::INPUT_KEYS.iter().copied().chain(["id"])),
+        "input keys (and the old `id`)"
+    );
+    assert_eq!(
+        schema_keys("/definitions/ready/properties"),
+        sorted([
+            "exit", "output", "port", "manual", "delay", "http", "delay_ms"
+        ])
+    );
+    assert!(TEMPLATE.starts_with(SCHEMA_MODELINE));
+    assert!(SCHEMA_MODELINE.ends_with(SCHEMA_FILE));
+}
+
+#[test]
+fn the_schema_and_the_parser_agree() {
+    let validator = schema();
+    let cases: &[(&str, bool)] = &[
+        (TEMPLATE, true),
+        ("steps: {}", true),
+        ("steps:", true),
+        (
+            "name: x\nx-shared: &s {run: y}\nsteps:\n  a: {<<: *s}\n",
+            true,
+        ),
+        (
+            "inputs:\n  env: {type: choice, options: [dev, {value: prod, label: P}], default: dev}\n  n: {type: number, min: 1, max: 9, integer: true, required: true}\n  b: {type: boolean}\n  note:\nsteps: {a: {run: x}}\n",
+            true,
+        ),
+        (
+            "env: {A: 1, B: true}\nsteps:\n  a: {run: x, timeout: 1h30m, stop_grace_period: 2.5s, ready: {delay: 500ms}}\n",
+            true,
+        ),
+        (
+            "steps:\n  a: {check: x, on_fail: m, timeout: 90}\n  b: {depends_on: a, run: y, open_urls: true, terminal: T}\n  c: {depends_on: [a, b], ready: {manual: go}}\n  d: {depends_on: {a: completed, b: ready, c: {condition: ready}}, run: z}\n",
+            true,
+        ),
+        (
+            "steps:\n  a:\n    run: x\n    project: {devcontainer: {wsl: Ubuntu, path: ~/p}, config: c.json}\n    artifacts: [out.txt, {label: r, path: r.html}, {url: 'https://x'}]\n  b: {run: y, project: 'Ubuntu:~/p'}\n  c: {run: y, project: {Wsl: {distro: U, path: /p}}}\n",
+            true,
+        ),
+        (
+            "steps:\n  g:\n    depends_on: [a]\n    project: {local: C:/p}\n    env: {A: x}\n    cwd: s\n    steps:\n      x: {run: x}\n  a: {run: a}\n",
+            true,
+        ),
+        // Problems the schema sees too.
+        ("name: x", false),
+        ("steps: [a]", false),
+        ("colour: red\nsteps: {}", false),
+        ("steps:\n  a: {}\n", false),
+        ("steps:\n  a: {rum: x}\n", false),
+        ("steps:\n  a: {run: x, needs: [b]}\n", false),
+        ("steps:\n  a: {run: x, restart: always}\n", false),
+        ("steps:\n  a: {run: x, timeout: soon}\n", false),
+        (
+            "steps:\n  a: {run: x, ready: {exit: true, port: 1}}\n",
+            false,
+        ),
+        ("steps:\n  a: {run: x, ready: {port: 0}}\n", false),
+        ("steps:\n  a: {run: x, ready: {delay_ms: 5}}\n", false),
+        ("steps:\n  a: {check: x, ready: {output: y}}\n", false),
+        ("steps:\n  a: {run: x, on_fail: m}\n", false),
+        ("steps:\n  a: {check: x, open_urls: true}\n", false),
+        ("steps:\n  a: {run: x, depends_on: {b: started}}\n", false),
+        ("steps:\n  a: {run: x, depends_on: [b, b]}\n", false),
+        ("steps:\n  a/b: {run: x}\n", false),
+        (
+            "steps:\n  a: {run: x, artifacts: [{label: '7', path: p}]}\n",
+            false,
+        ),
+        (
+            "steps:\n  a: {run: x, artifacts: [{url: 'ftp://x'}]}\n",
+            false,
+        ),
+        (
+            "steps:\n  a: {run: x, project: {local: C:/p, path: x}}\n",
+            false,
+        ),
+        ("steps:\n  g: {run: x, steps: {a: {run: y}}}\n", false),
+        ("steps:\n  g: {steps: {}}\n", false),
+        ("inputs: [a]\nsteps: {}", false),
+        ("inputs: {a: {type: date}}\nsteps: {}", false),
+        ("inputs: {a: {type: choice}}\nsteps: {}", false),
+        ("inputs: {a: {min: 1}}\nsteps: {}", false),
+        (
+            "inputs: {a: {type: boolean, required: true}}\nsteps: {}",
+            false,
+        ),
+        ("inputs: {a.b: {}}\nsteps: {}", false),
+        ("inputs: {a: {id: a}}\nsteps: {}", false),
+    ];
+    for (text, valid) in cases {
+        assert_eq!(parse(text, "f").is_ok(), *valid, "parser: {text}");
+        let instance = as_json(text);
+        let errors: Vec<String> = validator
+            .iter_errors(&instance)
+            .map(|err| format!("{err} at {}", err.instance_path()))
+            .collect();
+        assert_eq!(errors.is_empty(), *valid, "schema: {text}\n{errors:#?}");
+    }
+}
+
+#[test]
+fn files_the_converter_writes_fit_the_schema() {
+    let old = r#"// Header
+{
+  "name": "Demo",
+  "inputs": [{ "id": "env", "type": "choice", "options": ["dev", "prod"] }],
+  "steps": [
+    { "id": "vpn", "check": "ping host", "onFail": "Connect" },
+    { "id": "api", "needs": ["vpn"], "project": { "devcontainer": "C:/src/api" },
+      "run": "serve", "ready": { "port": 8000 }, "timeout_s": 600, "stop_grace_s": 30,
+      "openUrls": true, "env": { "A": "1", "N": 2 } },
+    { "id": "wait", "needs": "api", "ready": { "delay_ms": 1500 } },
+    { "id": "report", "after": ["api"], "run": "report", "artifacts": ["out/log.txt"] },
+    { "id": "svc", "steps": [{ "id": "db", "run": "db", "ready": { "port": 5432 } }] }
+  ]
+}"#;
+    let converted = crate::legacy::convert(old).unwrap();
+    assert!(parse(&converted, "f").is_ok());
+    let instance = as_json(&converted);
+    let validator = schema();
+    let errors: Vec<String> = validator
+        .iter_errors(&instance)
+        .map(|err| err.to_string())
+        .collect();
+    assert!(errors.is_empty(), "{converted}\n{errors:#?}");
 }

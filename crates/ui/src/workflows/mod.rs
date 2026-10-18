@@ -123,7 +123,19 @@ const EXTENSIONS: &[&str] = &[".yaml", ".yml", ".jsonc", ".json"];
 
 /// Whether a file named `name` is a workflow file (of either format).
 pub fn is_workflow_file(name: &str) -> bool {
-    EXTENSIONS.iter().any(|extension| name.ends_with(extension))
+    EXTENSIONS.iter().any(|extension| name.ends_with(extension)) && !name.ends_with(".schema.json")
+}
+
+/// Writes the format's JSON Schema into `dir` as [`workflow::SCHEMA_FILE`]
+/// unless it is there already, as this version has it: YAML editors find
+/// it through the template's first line (`workflow::SCHEMA_MODELINE`).
+/// Returns its path.
+pub fn write_schema(dir: &Path) -> std::io::Result<PathBuf> {
+    let path = dir.join(workflow::SCHEMA_FILE);
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(workflow::SCHEMA) {
+        std::fs::write(&path, workflow::SCHEMA)?;
+    }
+    Ok(path)
 }
 
 /// A workflow file's name without its extension (a workflow without
@@ -175,10 +187,14 @@ pub struct Converted {
 /// exists) and renames the old file to `<name>.bak` (or `.bak2`, …).
 /// Blocks.
 pub fn convert_file(project: &Project, path: &Path, text: &str) -> Result<Converted, String> {
-    let yaml = workflow::legacy::convert(text)?;
+    let mut yaml = workflow::legacy::convert(text)?;
     let dir = path.parent().unwrap_or(Path::new(""));
     let target = project.join(dir, &format!("{}.yaml", file_stem(path)));
     let exists = |path: &Path| project.kind(path).ok().flatten().is_some();
+    // Point YAML editors at the schema when a copy is beside the file.
+    if exists(&project.join(dir, workflow::SCHEMA_FILE)) {
+        yaml = format!("{}\n{yaml}", workflow::SCHEMA_MODELINE);
+    }
     if exists(&target) {
         return Err(format!(
             "{} already exists: rename or remove it first",
@@ -583,7 +599,9 @@ impl Workflows {
         }
         let path = found.path;
         let project = match &found.source {
-            Source::User => Project::local(path.parent().map(Path::to_path_buf).unwrap_or_default()),
+            Source::User => {
+                Project::local(path.parent().map(Path::to_path_buf).unwrap_or_default())
+            }
             Source::Project(location) => self
                 .host
                 .projects(cx)
@@ -610,7 +628,13 @@ impl Workflows {
                 return;
             };
             let found = cx
-                .background_spawn(async move { discover(user_dir.as_deref(), &projects) })
+                .background_spawn(async move {
+                    // Keeps the schema beside the user's workflows current.
+                    if let Some(dir) = user_dir.as_deref().filter(|dir| dir.is_dir()) {
+                        write_schema(dir).ok();
+                    }
+                    discover(user_dir.as_deref(), &projects)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.discovered = found;
@@ -1361,7 +1385,8 @@ impl Host for WindowHost {
 }
 
 /// Writes a new commented workflow file in `dir` (`workflow.yaml`, else
-/// `workflow-2.yaml`, …) and returns its path.
+/// `workflow-2.yaml`, …), and the schema its first line names, and returns
+/// its path.
 pub fn create_template(dir: &Path) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = (1..)
@@ -1372,6 +1397,7 @@ pub fn create_template(dir: &Path) -> std::io::Result<PathBuf> {
         .find(|path| !path.exists())
         .expect("a free name");
     std::fs::write(&path, workflow::TEMPLATE)?;
+    write_schema(dir)?;
     Ok(path)
 }
 

@@ -4,7 +4,7 @@
 //! local child process, a socket, or a stream tunnelled through a remote agent.
 //! I/O runs on dedicated threads; requests are executor-agnostic futures.
 
-mod codec;
+pub mod codec;
 mod uri;
 
 use std::{

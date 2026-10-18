@@ -362,7 +362,10 @@ fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestApp
     settle(cx);
     assert_eq!(
         view.read_with(cx, |view, _| view.problems()),
-        [("`join` depends on unknown step `nope`".to_owned(), Some((6, 28)))]
+        [(
+            "`join` depends on unknown step `nope`".to_owned(),
+            Some((6, 28))
+        )]
     );
     assert_eq!(
         columns(&view, cx),
@@ -530,7 +533,10 @@ fn groups_expand_in_place_and_stay_expanded_across_edits(cx: &mut TestAppContext
     assert_eq!(cursor_step(&view, cx).as_deref(), Some("svc/inner/x"));
 
     // Edits keep the groups expanded.
-    let edited = GROUPED.replace("completed}, check: exit 0}", "completed}, check: 'exit 0 '}");
+    let edited = GROUPED.replace(
+        "completed}, check: exit 0}",
+        "completed}, check: 'exit 0 '}",
+    );
     editor.update(cx, |editor, cx| editor.set_text(&edited, cx));
     settle(cx);
     assert_eq!(ids(&boxes(cx)).len(), 6);
@@ -722,8 +728,20 @@ fn an_old_json_file_is_listed_with_a_problem_and_converts_from_its_tab(cx: &mut 
     cx.run_until_parked();
     let yaml = root.join("user").join("old.yaml");
     let converted = std::fs::read_to_string(&yaml).unwrap();
-    assert!(converted.starts_with("# Kept.\nname: Old\n"), "{converted}");
-    assert!(converted.contains("b: {depends_on: [a], check: exit 0, timeout: 1m30s}"), "{converted}");
+    // The listing wrote the schema beside the user's workflows, so the
+    // converted file points YAML editors at it.
+    assert!(root.join("user").join(workflow::SCHEMA_FILE).exists());
+    assert!(
+        converted.starts_with(&format!(
+            "{}\n# Kept.\nname: Old\n",
+            workflow::SCHEMA_MODELINE
+        )),
+        "{converted}"
+    );
+    assert!(
+        converted.contains("b: {depends_on: [a], check: exit 0, timeout: 1m30s}"),
+        "{converted}"
+    );
     assert!(!old.exists());
     assert!(root.join("user").join("old.jsonc.bak").exists());
     let tabs = window
@@ -768,6 +786,94 @@ fn an_old_json_file_is_listed_with_a_problem_and_converts_from_its_tab(cx: &mut 
     .unwrap_err();
     assert!(error.contains("already exists"), "{error}");
     assert!(again.exists(), "left as it was");
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cleanup(root);
+}
+
+#[test]
+fn new_workflows_come_with_the_schema_their_first_line_names() {
+    let dir = std::env::temp_dir().join(format!("nc-workflows-schema-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let path = create_template(&dir).unwrap();
+    assert_eq!(path, dir.join("workflow.yaml"));
+    let schema = dir.join(workflow::SCHEMA_FILE);
+    assert_eq!(std::fs::read_to_string(&schema).unwrap(), workflow::SCHEMA);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .starts_with(workflow::SCHEMA_MODELINE)
+    );
+    // An outdated copy is replaced; the schema is not a workflow.
+    std::fs::write(&schema, "{}").unwrap();
+    write_schema(&dir).unwrap();
+    assert_eq!(std::fs::read_to_string(&schema).unwrap(), workflow::SCHEMA);
+    assert!(!is_workflow_file(workflow::SCHEMA_FILE));
+    assert!(is_workflow_file("old.json") && is_workflow_file("dev.yml"));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[gpui::test]
+fn the_tab_s_editor_gets_problems_and_completions_from_the_workflow_server(
+    cx: &mut TestAppContext,
+) {
+    let root = root("server");
+    // Where the user's workflows are: the server serves that folder.
+    let dir = root.join("user").join("next_code").join("workflows");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dev.yaml");
+    let text = "steps:\n  db: {run: d}\n  api: {depends_on: [db], run: a}\n  web:\n    run: w\n";
+    std::fs::write(&path, text).unwrap();
+    cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
+    cx.run_until_parked();
+    let window = cx.windows()[0].downcast::<Shell>().unwrap();
+    let view = window
+        .update(cx, |shell, window, cx| {
+            shell.open_workflow(&Source::User, &path, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    let editor = view.read_with(cx, |view, _| view.editor());
+    wait_until(cx, "the server", |cx| {
+        editor.read_with(cx, |editor, _| editor.server_version().is_some())
+    });
+
+    // The server's problems show in the editor, where they are.
+    let broken = text.replace("[db]", "[zz]");
+    editor.update(cx, |editor, cx| editor.set_text(&broken, cx));
+    wait_until(cx, "a problem", |cx| {
+        !editor
+            .read_with(cx, |editor, _| editor.diagnostic_ranges())
+            .is_empty()
+    });
+    let problems = editor.read_with(cx, |editor, _| editor.diagnostic_ranges());
+    assert_eq!(problems[0].1, "`api` depends on unknown step `zz`");
+    assert_eq!(&broken[problems[0].0.clone()], "zz");
+
+    // Completion of a dependency: the other steps.
+    let typed = format!("{broken}    depends_on: [");
+    editor.update(cx, |editor, cx| {
+        editor.set_text(&typed, cx);
+        editor.set_cursor(typed.len(), cx);
+        editor.complete_at_cursor(cx);
+    });
+    wait_until(cx, "completions", |cx| {
+        !editor
+            .read_with(cx, |editor, _| editor.completion_labels())
+            .is_empty()
+    });
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.completion_labels()),
+        ["db", "api"]
+    );
+    editor.update(cx, |editor, cx| editor.accept_completion_at(0, cx));
+    assert!(
+        editor
+            .read_with(cx, |editor, _| editor.text())
+            .ends_with("depends_on: [db")
+    );
     window
         .update(cx, |_, window, _| window.remove_window())
         .unwrap();

@@ -533,6 +533,11 @@ impl Settings {
     }
 }
 
+/// The `command` of the workflow language server built into next_code
+/// (`workflow_lsp`), run in-process: YAML's default. Another command (e.g.
+/// `yaml-language-server` with `--stdio`) replaces it.
+pub const WORKFLOW_SERVER: &str = "next_code-workflows";
+
 fn default_server(language: Language) -> Option<ServerConfig> {
     let (command, args, settings, install_hint): (&str, &[&str], Value, Option<&'static str>) =
         match language {
@@ -549,6 +554,8 @@ fn default_server(language: Language) -> Option<ServerConfig> {
                 json!({}),
                 Some("rustup component add rust-analyzer"),
             ),
+            // Workflow files (other YAML gets nothing from it).
+            Language::Yaml => (WORKFLOW_SERVER, &[], json!({}), None),
             Language::C | Language::Cpp => (
                 "clangd",
                 &[],

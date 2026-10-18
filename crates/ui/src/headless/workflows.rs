@@ -179,12 +179,7 @@ fn depends_json(step: &workflow::Step) -> Value {
     Value::Object(
         step.depends_on
             .iter()
-            .map(|dependency| {
-                (
-                    dependency.step.clone(),
-                    json!(dependency.condition.name()),
-                )
-            })
+            .map(|dependency| (dependency.step.clone(), json!(dependency.condition.name())))
             .collect(),
     )
 }
@@ -407,6 +402,15 @@ impl Session {
             let result = workflows.update(cx, |workflows, cx| -> Result<Value, String> {
                 if command == "workflows_list" {
                     return Ok(list_json(workflows));
+                }
+                if command == "workflow_schema" {
+                    let schema: Value =
+                        serde_json::from_str(workflow::SCHEMA).map_err(|err| err.to_string())?;
+                    return Ok(json!({
+                        "schema": schema,
+                        "file": workflow::SCHEMA_FILE,
+                        "modeline": workflow::SCHEMA_MODELINE,
+                    }));
                 }
                 if command == "workflow_convert" {
                     let name = query(&request)?;

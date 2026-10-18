@@ -337,10 +337,10 @@ impl ProjectSpec {
 
 /// The keys at the top of the file (and `x-…` ones, which hold shared
 /// parts for YAML anchors, as in Compose files).
-const TOP_KEYS: &[&str] = &["name", "description", "inputs", "env", "steps", "$schema"];
+pub const TOP_KEYS: &[&str] = &["name", "description", "inputs", "env", "steps", "$schema"];
 
 /// The keys a step may have.
-const STEP_KEYS: &[&str] = &[
+pub const STEP_KEYS: &[&str] = &[
     "title",
     "depends_on",
     "project",
@@ -359,7 +359,7 @@ const STEP_KEYS: &[&str] = &[
 ];
 
 /// The keys a group (a step with `steps`) may have.
-const GROUP_KEYS: &[&str] = &["title", "depends_on", "steps", "project", "env", "cwd"];
+pub const GROUP_KEYS: &[&str] = &["title", "depends_on", "steps", "project", "env", "cwd"];
 
 /// Keys of the format that are designed but not supported yet (see the
 /// workflows manual): an error says so instead of "unknown key".
@@ -650,7 +650,10 @@ fn parse_step(entry: &Entry, path: &str, problems: &mut Vec<Problem>) -> Result<
         Data::Null => &empty,
         _ => {
             return Err(at(
-                format!("a step is a mapping (`run`, `ready`, …), not {}", node.kind()),
+                format!(
+                    "a step is a mapping (`run`, `ready`, …), not {}",
+                    node.kind()
+                ),
                 node.start,
             ));
         }
@@ -717,7 +720,9 @@ fn parse_step(entry: &Entry, path: &str, problems: &mut Vec<Problem>) -> Result<
     };
     let depends_on = match get("depends_on") {
         None => Vec::new(),
-        Some(field) => dependencies(&field.value).map_err(|(message, offset)| at(message, offset))?,
+        Some(field) => {
+            dependencies(&field.value).map_err(|(message, offset)| at(message, offset))?
+        }
     };
     let project = match get("project") {
         None => None,
@@ -734,9 +739,10 @@ fn parse_step(entry: &Entry, path: &str, problems: &mut Vec<Problem>) -> Result<
     let cwd = string("cwd")?;
     let ready = match get("ready") {
         None => None,
-        Some(field) => {
-            Some(ready(&field.value).map_err(|(message, offset)| at(format!("`ready`: {message}"), offset))?)
-        }
+        Some(field) => Some(
+            ready(&field.value)
+                .map_err(|(message, offset)| at(format!("`ready`: {message}"), offset))?,
+        ),
     };
     let duration_field = |key: &str| -> Result<Option<(Duration, usize)>, Problem> {
         match get(key) {
@@ -784,10 +790,7 @@ fn parse_step(entry: &Entry, path: &str, problems: &mut Vec<Problem>) -> Result<
                 artifacts
             }
             _ => {
-                return Err(at(
-                    "`artifacts` must be a list".into(),
-                    field.value.start,
-                ));
+                return Err(at("`artifacts` must be a list".into(), field.value.start));
             }
         },
     };
@@ -1155,7 +1158,10 @@ fn ready(node: &Node) -> Result<Ready, (String, usize)> {
                 .into(),
             entry.key_start,
         )),
-        _ => Err((format!("unknown condition `{}`: {SHAPES}", entry.key), entry.key_start)),
+        _ => Err((
+            format!("unknown condition `{}`: {SHAPES}", entry.key),
+            entry.key_start,
+        )),
     }
 }
 
@@ -1481,7 +1487,9 @@ fn input_ref_problems(text: &str, ids: &[String]) -> Vec<(String, Option<String>
     let mut problems = Vec::new();
     for found in inputs::input_refs(text) {
         match found {
-            Err(err) => problems.push((err, text.find("${inputs.").map(|at| text[at..].to_owned()))),
+            Err(err) => {
+                problems.push((err, text.find("${inputs.").map(|at| text[at..].to_owned())))
+            }
             Ok(found) if ids.iter().any(|id| id == found.id) => {}
             Ok(found) => {
                 let known = match ids {
@@ -1508,8 +1516,22 @@ fn env_input_problems(env: &BTreeMap<String, String>, ids: &[String]) -> Option<
     (!problems.is_empty()).then_some(problems)
 }
 
+/// The format as a JSON Schema (draft-07), for editors with a YAML
+/// language server and for agents; [`check`] is the authority, the schema
+/// says less (it cannot see dependencies, variables or regexes).
+pub const SCHEMA: &str = include_str!("../schema/workflow.schema.json");
+
+/// What the schema's copy beside workflow files is called (a
+/// `yaml-language-server` modeline finds it: [`SCHEMA_MODELINE`]).
+pub const SCHEMA_FILE: &str = "workflow.schema.json";
+
+/// The first line that points YAML editors at [`SCHEMA_FILE`] in the same
+/// folder.
+pub const SCHEMA_MODELINE: &str = "# yaml-language-server: $schema=./workflow.schema.json";
+
 /// A new workflow file: every field shown and explained.
-pub const TEMPLATE: &str = r#"# A workflow starts a development environment in one go: checks, commands
+pub const TEMPLATE: &str = r#"# yaml-language-server: $schema=./workflow.schema.json
+# A workflow starts a development environment in one go: checks, commands
 # in the terminals of several projects (opened as needed, dev containers
 # included), in order, with readiness conditions, browser links and manual
 # steps. Its tab (Run > Open Workflow…) shows this file next to the steps'

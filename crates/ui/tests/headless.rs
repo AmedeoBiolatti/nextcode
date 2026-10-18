@@ -2717,6 +2717,10 @@ fn headless_mode_runs_a_workflow_across_projects() {
         refused["error"].as_str().unwrap().contains("cannot run"),
         "{refused}"
     );
+    // The format's schema, for editors and agents.
+    let schema = headless.call(json!({ "cmd": "workflow_schema" }));
+    assert_eq!(schema["result"]["schema"]["title"], "next_code workflow", "{schema}");
+    assert_eq!(schema["result"]["file"], "workflow.schema.json");
     // The old file: listed with a problem until converted.
     let old = list.iter().find(|w| w["name"] == "old").unwrap();
     assert!(
@@ -4324,4 +4328,59 @@ fn headless_mode_runs_notebooks_in_wsl() {
         "",
     );
     assert_eq!(kernels.trim(), "0", "no kernel left running");
+}
+
+/// A workflow file through the language-server commands: next_code's
+/// built-in workflow server (in-process) diagnoses, navigates, outlines
+/// and renames it.
+#[test]
+fn headless_mode_serves_workflow_files_with_the_built_in_server() {
+    let root = std::env::temp_dir().join(format!("next_code_wf_lsp_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join(".next_code/workflows")).unwrap();
+    let root = root.canonicalize().unwrap();
+    let file = root.join(".next_code/workflows/dev.yaml");
+    fs::write(
+        &file,
+        "steps:\n  db: {run: d}\n  api: {depends_on: [db, zz], run: 'a ${steps.db.status}'}\n",
+    )
+    .unwrap();
+    let mut headless = Headless::start(&root);
+    headless.next(|line| line["event"] == "ready");
+    let path = ".next_code/workflows/dev.yaml";
+    let open = headless.call(json!({ "cmd": "open", "path": path, "timeout_ms": 30_000 }));
+    assert_eq!(open["result"]["language"], "yaml", "{open}");
+    assert_eq!(open["result"]["server"], "next_code workflows", "{open}");
+    let diagnostics =
+        headless.call(json!({ "cmd": "diagnostics", "path": path, "wait_ms": 5_000 }));
+    let found = &diagnostics["result"][0]["diagnostics"];
+    assert_eq!(found[0]["message"], "`api` depends on unknown step `zz`", "{diagnostics}");
+    // From `db` in api's depends_on to db's key.
+    let definition = headless.call(
+        json!({ "cmd": "definition", "path": path, "line": 2, "character": 21 }),
+    );
+    assert_eq!(
+        definition["result"][0]["range"]["start"],
+        json!({ "line": 1, "character": 2 }),
+        "{definition}"
+    );
+    let symbols = headless.call(json!({ "cmd": "document_symbols", "path": path }));
+    let names: Vec<&str> = symbols["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|symbol| symbol["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["db", "api"], "{symbols}");
+    let renamed = headless.call(json!({
+        "cmd": "rename", "path": path, "line": 1, "character": 3, "new_name": "postgres"
+    }));
+    assert_eq!(renamed["result"]["applied"], true, "{renamed}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "steps:\n  postgres: {run: d}\n  api: {depends_on: [postgres, zz], run: 'a ${steps.postgres.status}'}\n"
+    );
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
 }
