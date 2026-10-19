@@ -8,6 +8,9 @@
 
 ## Completed
 
+- Project-tab drag reordering: `shell::DraggedProject` carries the originating shell and `TabTarget`, so the source survives index changes; `drop_project_tab` inserts before a top-level tab or appends at `+`/empty strip space. It remaps `active` without calling `activate` (focus, dirty buffers and running workspaces stay intact; unloaded projects/workflows do not open), saves via `remember`, and ignores stale/foreign sources. The existing file/panel `DragPreview` is shared through `workspace`.
+  - Verified: Linux and Windows `shell::tests` (10 pass, including left/right/end moves, no-op boundaries, active/focus preservation, saved order, unloaded workflow/WSL tabs and stale/foreign sources); Windows clippy has no warnings in the changed code (existing `worktree`/GPUI warnings remain). Linux `--automation`: right/left/end drops, drop at `+` without a dialog, dragging a workflow tab, dirty editor preserved during reordering, then restart with the same order and active project. Native Windows GUI dragging was not exercised.
+
 - M0, M1 (see README).
 - M2, WSL host agent:
   - `crates/worktree`: file operations shared by the editor and the agent (listing with ignore rules, file list, text decoding, writes, stat, executable/venv lookup; skips `PATH` entries on Windows drives inside WSL).

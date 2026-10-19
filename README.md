@@ -1223,6 +1223,9 @@ asks about unsaved files first.
   **Save Workspace As…**: see [multi-root workspaces](#multi-root-workspaces).
 - Opening a project that is already open (in any window) switches to its
   tab. `Ctrl+Alt+]` / `Ctrl+Alt+[` cycle the tabs.
+- Drag project or workflow tabs left/right to reorder them, just like file
+  tabs. Drop on a tab to insert before it, or on `+`/empty strip space to
+  append. The current project stays active, and the order survives a restart.
 - The command bar (`Ctrl+Shift+P` or `F1`) lists every command available
   where focus is, with its shortcut; typed words filter it (in any order),
   `Enter` runs the command where focus was.

@@ -135,6 +135,13 @@ struct Tab {
     _subscription: Option<Subscription>,
 }
 
+/// A stable source tab: its index can change while the mouse is dragging.
+struct DraggedProject {
+    shell: EntityId,
+    target: TabTarget,
+    title: SharedString,
+}
+
 impl Tab {
     fn unloaded(target: TabTarget) -> Self {
         Self {
@@ -851,6 +858,42 @@ impl Shell {
             Content::Workflow(view) => window.focus(&view.focus_handle(cx)),
             Content::Unloaded | Content::Connecting(_) => window.focus(&self.focus_handle),
         }
+        self.remember(window, cx);
+        cx.notify();
+    }
+
+    /// Inserts before a tab, or appends in the strip's empty space. Moving
+    /// a project keeps its workspace and the current focus alive.
+    fn drop_project_tab(
+        &mut self,
+        dragged: &DraggedProject,
+        before: Option<usize>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged.shell != cx.entity_id() {
+            return;
+        }
+        let Some(from) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.target == dragged.target)
+        else {
+            return;
+        };
+        let before = before.unwrap_or(self.tabs.len());
+        let insert = before - usize::from(from < before);
+        if from == insert {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(insert, tab);
+        self.active = if self.active == from {
+            insert
+        } else {
+            let after_remove = self.active - usize::from(self.active > from);
+            after_remove + usize::from(after_remove >= insert)
+        };
         self.remember(window, cx);
         cx.notify();
     }
@@ -2146,7 +2189,12 @@ impl Shell {
                     copy += 1;
                     key = format!("{}#{copy}", tab.pin_key());
                 }
-                let title = tab.title(cx);
+                let title: SharedString = tab.title(cx).into();
+                let dragged = DraggedProject {
+                    shell: cx.entity_id(),
+                    target: tab.target.clone(),
+                    title: title.clone(),
+                };
                 div()
                     .id(("project-tab", index))
                     .flex()
@@ -2169,6 +2217,17 @@ impl Shell {
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.activate(index, window, cx)),
                     )
+                    .on_drag(dragged, |dragged, _, _, cx| {
+                        cx.new(|_| crate::workspace::DragPreview(dragged.title.clone()))
+                    })
+                    .drag_over::<DraggedProject>(|style, _, _, _| {
+                        style.border_l_2().border_color(theme::accent())
+                    })
+                    .on_drop(
+                        cx.listener(move |this, dragged: &DraggedProject, window, cx| {
+                            this.drop_project_tab(dragged, Some(index), window, cx);
+                        }),
+                    )
                     .children(match &tab.target {
                         TabTarget::Project(_) => None,
                         TabTarget::Workflow { .. } => {
@@ -2184,9 +2243,9 @@ impl Shell {
                     .child(match (&tab.content, &tab.target) {
                         (Content::Connecting(_), _)
                         | (Content::Unloaded, TabTarget::Workflow { .. }) => {
-                            format!("{} …", tab.title(cx))
+                            format!("{title} …").into()
                         }
-                        _ => tab.title(cx),
+                        _ => title.clone(),
                     })
                     .when(tab.dirty_count(cx) > 0 && tab.location().is_none(), |row| {
                         row.child(div().text_xs().text_color(theme::muted()).child("●"))
@@ -2224,8 +2283,23 @@ impl Shell {
                             this.prompt_for_project(false, window, cx)
                         }),
                     )
+                    .drag_over::<DraggedProject>(|style, _, _, _| {
+                        style.border_l_2().border_color(theme::accent())
+                    })
+                    .on_drop(cx.listener(|this, dragged: &DraggedProject, window, cx| {
+                        this.drop_project_tab(dragged, None, window, cx);
+                    }))
                     .pin("new-project-tab")
                     .label("Open Project…"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .drag_over::<DraggedProject>(|style, _, _, _| style.bg(theme::hover_row()))
+                    .on_drop(cx.listener(|this, dragged: &DraggedProject, window, cx| {
+                        this.drop_project_tab(dragged, None, window, cx);
+                    })),
             )
             .pin("project-tabs")
     }
@@ -2696,6 +2770,130 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn dragging_project_tabs_keeps_the_active_project_and_saves_the_order(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, alpha, beta) = two_projects("drag-order");
+        std::fs::create_dir_all(root.join("gamma")).unwrap();
+        cx.update(app_state::init);
+        let window = open_shell(alpha, cx);
+        cx.dispatch_action(window.into(), OpenRecentProject { location: beta });
+        cx.dispatch_action(
+            window.into(),
+            OpenRecentProject {
+                location: Location::Local(root.join("gamma")),
+            },
+        );
+        let focus = window
+            .update(cx, |_, window, cx| window.focused(cx))
+            .unwrap();
+        let move_tab = |from: usize, before, cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |shell, window, cx| {
+                    let dragged = DraggedProject {
+                        shell: cx.entity_id(),
+                        target: shell.tabs[from].target.clone(),
+                        title: shell.tabs[from].title(cx).into(),
+                    };
+                    shell.drop_project_tab(&dragged, before, window, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        // The active tab moves left, then right to the end.
+        move_tab(2, Some(0), cx);
+        assert_eq!(
+            tabs(window, cx),
+            (vec!["gamma".into(), "alpha".into(), "beta".into()], 0)
+        );
+        move_tab(0, None, cx);
+        assert_eq!(
+            tabs(window, cx),
+            (vec!["alpha".into(), "beta".into(), "gamma".into()], 2)
+        );
+        // Moving another tab across the active one preserves the project.
+        move_tab(0, None, cx);
+        assert_eq!(
+            tabs(window, cx),
+            (vec!["beta".into(), "gamma".into(), "alpha".into()], 1)
+        );
+        move_tab(2, Some(0), cx);
+        assert_eq!(
+            tabs(window, cx),
+            (vec!["alpha".into(), "beta".into(), "gamma".into()], 2)
+        );
+        // Dropping on itself or immediately before its neighbour is a no-op.
+        move_tab(0, Some(0), cx);
+        move_tab(0, Some(1), cx);
+        assert_eq!(
+            tabs(window, cx),
+            (vec!["alpha".into(), "beta".into(), "gamma".into()], 2)
+        );
+        assert_eq!(
+            window
+                .update(cx, |_, window, cx| window.focused(cx))
+                .unwrap(),
+            focus,
+        );
+        // A final leftward move is what the next launch restores.
+        move_tab(2, Some(0), cx);
+        settle(cx);
+        assert_eq!(
+            saved(&app_state::load().unwrap()),
+            [(vec!["gamma".into(), "alpha".into(), "beta".into()], 0)]
+        );
+        cleanup(root);
+    }
+
+    #[gpui::test]
+    fn dragging_unloaded_tabs_never_opens_them_or_moves_a_stale_or_foreign_source(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, alpha, _) = two_projects("drag-unloaded");
+        let window = open_shell(alpha, cx);
+        window
+            .update(cx, |shell, window, cx| {
+                let remote = TabTarget::Project(Location::Wsl {
+                    distro: "NotStarted".into(),
+                    path: "/unloaded".into(),
+                });
+                let workflow = TabTarget::Workflow {
+                    workflow: root.join("build.yaml"),
+                    project: None,
+                };
+                shell.tabs.push(Tab::unloaded(remote.clone()));
+                shell.tabs.push(Tab::unloaded(workflow.clone()));
+                let mut dragged = DraggedProject {
+                    shell: cx.entity_id(),
+                    target: remote,
+                    title: "remote".into(),
+                };
+                shell.drop_project_tab(&dragged, Some(0), window, cx);
+                assert_eq!(shell.active, 1);
+                assert!(matches!(shell.tabs[0].content, Content::Unloaded));
+                dragged.target = workflow.clone();
+                shell.drop_project_tab(&dragged, Some(0), window, cx);
+                assert_eq!(shell.active, 2);
+                assert!(matches!(shell.tabs[0].content, Content::Unloaded));
+                assert!(matches!(shell.tabs[1].content, Content::Unloaded));
+                // The originating window, not the folder name, owns a drag.
+                let other = cx.new(|_| ());
+                dragged.shell = other.entity_id();
+                shell.drop_project_tab(&dragged, None, window, cx);
+                assert_eq!(shell.tabs[0].target, workflow);
+                // A source closed while dragging must not move its successor.
+                dragged.shell = cx.entity_id();
+                shell.remove_tab(0, window, cx);
+                shell.drop_project_tab(&dragged, None, window, cx);
+                assert_eq!(shell.tabs.len(), 2);
+                assert_eq!(shell.active, 1);
+                assert!(matches!(shell.tabs[0].content, Content::Unloaded));
+            })
+            .unwrap();
+        cleanup(root);
     }
 
     #[gpui::test]

@@ -70,6 +70,8 @@ mod symbols;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use docks::DragPreview;
+
 use panes::{Pane, PaneId, PaneNode};
 
 actions!(
