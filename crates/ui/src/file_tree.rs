@@ -1,7 +1,8 @@
 //! Project file tree: lazily read, gitignore-aware, virtualized, with the
 //! file operations of PyCharm's Project view and VS Code's Explorer:
 //! Ctrl/Shift+click and keyboard selection, a context menu (rows and empty
-//! space), New File / Folder / Python File / Python Package (Alt+Insert) and
+//! space), New File (with an optional type: `Tab` opens the type list) /
+//! Folder / Python File / Python Package (Alt+Insert) and
 //! Rename (F2, Shift+F6) in an inline name editor with live checks,
 //! Cut/Copy/Paste (Ctrl+X/C/V), Duplicate (Ctrl+D), Delete, Copy Path /
 //! Copy Relative Path, Reveal in the file manager (local projects), Open in
@@ -28,10 +29,10 @@ use std::{
 };
 
 use gpui::{
-    App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     FontWeight, KeyBinding, Modifiers, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel,
-    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, actions, anchored,
-    deferred, div, point, prelude::*, px, uniform_list,
+    ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
+    actions, anchored, deferred, div, point, prelude::*, px, uniform_list,
 };
 use worktree::FileKind;
 
@@ -40,6 +41,7 @@ use crate::{
     editor::{self, Editor, EditorEvent},
     file_icons,
     file_ops::{self, NewKind},
+    file_types::{self, FileType},
     pinpoint::{self, Pin},
     project::Project,
     selectable::selectable,
@@ -86,7 +88,12 @@ actions!(
         SelectAllRows,
         Cancel,
         ConfirmName,
-        CancelName
+        CancelName,
+        ShowTypes,
+        TypeUp,
+        TypeDown,
+        ChooseType,
+        CloseTypes
     ]
 );
 
@@ -119,7 +126,22 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", Cancel, ctx),
         KeyBinding::new("enter", ConfirmName, Some("FileTreeInput > Editor")),
         KeyBinding::new("escape", CancelName, Some("FileTreeInput")),
+        // New File's type list: Tab (or Alt+Down, a combo box's key) opens
+        // it; typing filters; Shift+Tab or Escape go back to the name.
+        KeyBinding::new("tab", ShowTypes, Some("FileTreeInput > Editor")),
+        KeyBinding::new("alt-down", ShowTypes, Some("FileTreeInput > Editor")),
+        KeyBinding::new("up", TypeUp, Some("FileTreeTypes > Editor")),
+        KeyBinding::new("down", TypeDown, Some("FileTreeTypes > Editor")),
+        KeyBinding::new("enter", ChooseType, Some("FileTreeTypes > Editor")),
+        KeyBinding::new("tab", ChooseType, Some("FileTreeTypes > Editor")),
+        KeyBinding::new("shift-tab", CloseTypes, Some("FileTreeTypes > Editor")),
+        KeyBinding::new("escape", CloseTypes, Some("FileTreeTypes")),
     ]);
+}
+
+/// New Python File…'s preselected type.
+pub fn python_type() -> Option<&'static FileType> {
+    file_types::by_id("python").ok().flatten()
 }
 
 /// What the tree asks of the workspace.
@@ -176,7 +198,38 @@ struct Editing {
     kind: EditKind,
     input: Entity<Editor>,
     error: Option<SharedString>,
+    /// New File's type list, while open.
+    types: Option<TypeList>,
     _subscriptions: Vec<Subscription>,
+}
+
+impl Editing {
+    /// New File's chosen type (`Some(None)`: Auto); `None` for other
+    /// editors.
+    fn file_type(&self) -> Option<Option<&'static FileType>> {
+        match self.kind {
+            EditKind::New {
+                kind: NewKind::File(file_type),
+                ..
+            } => Some(file_type),
+            _ => None,
+        }
+    }
+}
+
+/// New File's type list: a filter input over [`file_types::filter`].
+struct TypeList {
+    filter: Entity<Editor>,
+    /// The entry Up/Down moved to, which Enter chooses.
+    highlighted: usize,
+    scroll: ScrollHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl TypeList {
+    fn entries(&self, cx: &App) -> Vec<Option<&'static FileType>> {
+        file_types::filter(&self.filter.read(cx).text())
+    }
 }
 
 /// The open context menu (or Alt+Insert's New popup).
@@ -500,12 +553,8 @@ impl FileTree {
                 index,
                 Row {
                     path: dir.clone(),
-                    // Only picks the icon (see `render_row`).
-                    name: if *kind == NewKind::PythonFile {
-                        "new.py".into()
-                    } else {
-                        SharedString::default()
-                    },
+                    // The icon follows the typed name (see `render_row`).
+                    name: SharedString::default(),
                     is_dir: kind.is_dir(),
                     package: *kind == NewKind::PythonPackage,
                     depth,
@@ -910,22 +959,51 @@ impl FileTree {
     }
 
     fn start_new(&mut self, kind: NewKind, window: &mut Window, cx: &mut Context<Self>) {
-        let dir = self.folder_of(self.target().as_deref());
+        self.start_new_near(self.target(), kind, window, cx);
+    }
+
+    /// New… in the folder of `near` (a folder, or a file's folder; the
+    /// root without one).
+    fn start_new_near(
+        &mut self,
+        near: Option<PathBuf>,
+        kind: NewKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = self.folder_of(near.as_deref());
         self.menu = None;
         self.reveal(&self.project.join(&dir, "x"));
         self.start_editing(EditKind::New { dir, kind }, "", window, cx);
     }
 
+    /// New File… (of `file_type`, when given) from outside the tree: in the
+    /// folder of `near` (the active editor's file) when it is in the
+    /// project, else of the tree's selection.
+    pub fn start_new_file(
+        &mut self,
+        near: Option<PathBuf>,
+        file_type: Option<&'static FileType>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let near = near
+            .filter(|path| self.project.root_index_of(path).is_some())
+            .or_else(|| self.target());
+        self.start_new_near(near, NewKind::File(file_type), window, cx);
+    }
+
     fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_new(NewKind::File, window, cx);
+        self.start_new(NewKind::File(None), window, cx);
     }
 
     fn new_folder(&mut self, _: &NewFolder, window: &mut Window, cx: &mut Context<Self>) {
         self.start_new(NewKind::Folder, window, cx);
     }
 
+    /// New Python File…: New File with Python chosen.
     fn new_python_file(&mut self, _: &NewPythonFile, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_new(NewKind::PythonFile, window, cx);
+        self.start_new(NewKind::File(python_type()), window, cx);
     }
 
     fn new_python_package(
@@ -985,22 +1063,12 @@ impl FileTree {
             }
         });
         let focus = input.focus_handle(cx);
-        // Clicking elsewhere keeps a valid name (VS Code) and drops an
-        // invalid one.
-        let blurred = cx.on_blur(&focus, window, |this, window, cx| {
-            if this.editing.is_some() {
-                this.finish_editing(window, cx);
-                if this.editing.is_some() {
-                    this.editing = None;
-                    this.rebuild_rows();
-                    cx.notify();
-                }
-            }
-        });
+        let blurred = cx.on_blur(&focus, window, Self::editor_blurred);
         self.editing = Some(Editing {
             kind,
             input,
             error: None,
+            types: None,
             _subscriptions: vec![edited, blurred],
         });
         self.rebuild_rows();
@@ -1018,21 +1086,42 @@ impl FileTree {
         cx.notify();
     }
 
+    /// Focus left the name input or the type filter. Moving between the two
+    /// keeps editing (back in the name closes the list); anywhere else
+    /// keeps a valid name (VS Code) and drops an invalid one.
+    fn editor_blurred(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editing) = &mut self.editing else {
+            return;
+        };
+        if editing.input.focus_handle(cx).is_focused(window) {
+            if editing.types.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        if editing
+            .types
+            .as_ref()
+            .is_some_and(|types| types.filter.focus_handle(cx).is_focused(window))
+        {
+            return;
+        }
+        self.finish_editing(window, cx);
+        if self.editing.is_some() {
+            self.editing = None;
+            self.rebuild_rows();
+            cx.notify();
+        }
+    }
+
     /// The problem with the typed name, if any: invalid for the platform,
     /// or taken in the folder (as listed; the operation checks again).
     fn input_error(&self, cx: &App) -> Option<String> {
         let editing = self.editing.as_ref()?;
         let text = editing.input.read(cx).text();
         let windows = file_ops::windows_names(&self.project);
-        let (dir, name, own) = match &editing.kind {
-            EditKind::New { dir, kind } => {
-                let input = file_ops::new_entry_input(&text, *kind);
-                let parts = match file_ops::new_entry_parts(&input, windows) {
-                    Ok(parts) => parts,
-                    Err(err) => return Some(err),
-                };
-                (dir.clone(), parts[0].to_owned(), None)
-            }
+        let (dir, kind) = match &editing.kind {
+            EditKind::New { dir, kind } => (dir, *kind),
             EditKind::Rename { path, .. } => {
                 let name = text.trim();
                 if let Err(err) = file_ops::check_name(name, windows) {
@@ -1041,31 +1130,52 @@ impl FileTree {
                 let own = path
                     .file_name()
                     .map(|own| own.to_string_lossy().into_owned());
-                let dir = path.parent().unwrap_or(self.project.root()).to_path_buf();
-                (dir, name.to_owned(), own)
+                if own
+                    .as_deref()
+                    .is_some_and(|own| file_ops::same_name(own, name, windows))
+                {
+                    return None;
+                }
+                let dir = path.parent().unwrap_or(self.project.root());
+                let taken = self.children.get(dir).is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| file_ops::same_name(&entry.name, name, windows))
+                });
+                return taken
+                    .then(|| format!("A file or folder `{name}` already exists at this location"));
             }
         };
-        if own
-            .as_deref()
-            .is_some_and(|own| file_ops::same_name(own, &name, windows))
+        let (base, relative) = match file_ops::new_entry_input(&self.project, dir, &text, kind) {
+            Ok(found) => found,
+            Err(err) => return Some(err),
+        };
+        if let NewKind::File(file_type) = kind
+            && file_types::picks_free_name(file_type, &text)
         {
             return None;
         }
-        let taken = self.children.get(&dir).is_some_and(|entries| {
-            entries
+        let parts = match file_ops::new_entry_parts(&relative, windows) {
+            Ok(parts) => parts,
+            Err(err) => return Some(err),
+        };
+        // Down the listed folders: a typed path into existing folders
+        // (`src/new.py`) is fine, a taken name or a file on the way is not.
+        let mut folder = base;
+        for (index, part) in parts.iter().enumerate() {
+            let entry = self
+                .children
+                .get(&folder)?
                 .iter()
-                .any(|entry| file_ops::same_name(&entry.name, &name, windows))
-        });
-        // A typed path into an existing folder (`src/new.py`) is fine.
-        let into_folder = matches!(editing.kind, EditKind::New { .. })
-            && text.trim().len() > name.len()
-            && self.children.get(&dir).is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry.is_dir && file_ops::same_name(&entry.name, &name, windows))
-            });
-        (taken && !into_folder)
-            .then(|| format!("A file or folder `{name}` already exists at this location"))
+                .find(|entry| file_ops::same_name(&entry.name, part, windows))?;
+            if index + 1 == parts.len() || !entry.is_dir {
+                return Some(format!(
+                    "A file or folder `{part}` already exists at this location"
+                ));
+            }
+            folder = entry.path.clone();
+        }
+        None
     }
 
     fn check_input(&mut self, cx: &mut Context<Self>) {
@@ -1077,14 +1187,18 @@ impl FileTree {
     }
 
     /// Enter: creates or renames when the name is fine (else shows why);
-    /// an unchanged or empty-and-new name just closes the editor.
+    /// an unchanged name, or no name for a new entry that needs one, just
+    /// closes the editor.
     fn finish_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editing) = &self.editing else {
             return;
         };
         let text = editing.input.read(cx).text();
         let text = text.trim().to_owned();
-        if text.is_empty() && matches!(editing.kind, EditKind::New { .. }) {
+        if text.is_empty()
+            && matches!(editing.kind, EditKind::New { .. })
+            && !editing.file_type().is_some_and(file_types::name_optional)
+        {
             return self.cancel_editing(window, cx);
         }
         if let Some(error) = self.input_error(cx) {
@@ -1096,7 +1210,11 @@ impl FileTree {
         let Some(editing) = self.editing.take() else {
             return;
         };
-        let refocus = editing.input.focus_handle(cx).is_focused(window);
+        let refocus = editing.input.focus_handle(cx).is_focused(window)
+            || editing
+                .types
+                .as_ref()
+                .is_some_and(|types| types.filter.focus_handle(cx).is_focused(window));
         self.rebuild_rows();
         if refocus {
             window.focus(&self.focus_handle);
@@ -1104,7 +1222,12 @@ impl FileTree {
         cx.notify();
         match editing.kind {
             EditKind::New { dir, kind } => {
-                let what = format!("Could not create `{text}`");
+                let what = match (text.as_str(), kind) {
+                    ("", NewKind::File(Some(file_type))) => {
+                        format!("Could not create a {}", file_type.label)
+                    }
+                    _ => format!("Could not create `{text}`"),
+                };
                 self.run(
                     what,
                     move |project| file_ops::create(project, &dir, &text, kind),
@@ -1148,6 +1271,146 @@ impl FileTree {
 
     fn cancel_name(&mut self, _: &CancelName, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_editing(window, cx);
+    }
+
+    /// Tab / Alt+Down in New File's name (or a click on the selector):
+    /// opens the type list with the chosen type highlighted and focuses
+    /// its filter.
+    fn show_types(&mut self, _: &ShowTypes, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editing) = &mut self.editing else {
+            return;
+        };
+        let Some(file_type) = editing.file_type() else {
+            return;
+        };
+        if let Some(types) = &editing.types {
+            window.focus(&types.filter.focus_handle(cx));
+            return;
+        }
+        let filter = cx.new(Editor::single_line);
+        let edited = cx.subscribe(&filter, |this: &mut Self, _, event, cx| {
+            if let EditorEvent::Edited = event {
+                this.filter_types(cx);
+            }
+        });
+        let focus = filter.focus_handle(cx);
+        let blurred = cx.on_blur(&focus, window, Self::editor_blurred);
+        let highlighted = file_types::filter("")
+            .iter()
+            .position(|entry| *entry == file_type)
+            .unwrap_or(0);
+        let scroll = ScrollHandle::new();
+        scroll.scroll_to_item(highlighted);
+        editing.types = Some(TypeList {
+            filter,
+            highlighted,
+            scroll,
+            _subscriptions: vec![edited, blurred],
+        });
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    /// Typing in the filter: the first matching type is highlighted.
+    fn filter_types(&mut self, cx: &mut Context<Self>) {
+        let Some(types) = self
+            .editing
+            .as_mut()
+            .and_then(|editing| editing.types.as_mut())
+        else {
+            return;
+        };
+        let query = types.filter.read(cx).text();
+        let entries = file_types::filter(&query);
+        // Auto matches most single letters; a typed query means a type.
+        types.highlighted =
+            usize::from(!query.trim().is_empty() && entries.len() > 1 && entries[0].is_none());
+        types.scroll.scroll_to_item(types.highlighted);
+        cx.notify();
+    }
+
+    fn move_type_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(types) = self
+            .editing
+            .as_mut()
+            .and_then(|editing| editing.types.as_mut())
+        else {
+            return;
+        };
+        let count = types.entries(cx).len() as isize;
+        if count == 0 {
+            return;
+        }
+        types.highlighted = (types.highlighted as isize + delta).rem_euclid(count) as usize;
+        types.scroll.scroll_to_item(types.highlighted);
+        cx.notify();
+    }
+
+    fn type_up(&mut self, _: &TypeUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_type_highlight(-1, cx);
+    }
+
+    fn type_down(&mut self, _: &TypeDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_type_highlight(1, cx);
+    }
+
+    /// Enter / Tab in the type list: the highlighted type.
+    fn choose_type(&mut self, _: &ChooseType, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .editing
+            .as_ref()
+            .and_then(|editing| editing.types.as_ref())
+            .map(|types| types.highlighted)
+        else {
+            return;
+        };
+        self.choose_type_at(index, window, cx);
+    }
+
+    /// Chooses the list's `index`th entry and goes back to the name.
+    fn choose_type_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editing) = &mut self.editing else {
+            return;
+        };
+        let Some(entry) = editing
+            .types
+            .as_ref()
+            .and_then(|types| types.entries(cx).get(index).copied())
+        else {
+            return;
+        };
+        if let EditKind::New { kind, .. } = &mut editing.kind {
+            *kind = NewKind::File(entry);
+        }
+        self.close_types(window, cx);
+        self.check_input(cx);
+    }
+
+    /// Escape / Shift+Tab in the type list: back to the name, unchanged.
+    fn close_types_action(&mut self, _: &CloseTypes, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_types(window, cx);
+    }
+
+    fn close_types(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editing) = &mut self.editing else {
+            return;
+        };
+        window.focus(&editing.input.focus_handle(cx));
+        editing.types = None;
+        cx.notify();
+    }
+
+    /// A click on the type selector opens or closes the list.
+    fn toggle_types(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|editing| editing.types.is_some())
+        {
+            self.close_types(window, cx);
+        } else {
+            self.show_types(&ShowTypes, window, cx);
+        }
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
@@ -1666,6 +1929,11 @@ impl Render for FileTree {
             .on_action(cx.listener(Self::confirm_name))
             .on_action(cx.listener(Self::cancel_name))
             .on_action(cx.listener(Self::input_newline))
+            .on_action(cx.listener(Self::show_types))
+            .on_action(cx.listener(Self::type_up))
+            .on_action(cx.listener(Self::type_down))
+            .on_action(cx.listener(Self::choose_type))
+            .on_action(cx.listener(Self::close_types_action))
             .size_full()
             .flex()
             .flex_col()
@@ -1763,11 +2031,12 @@ impl FileTree {
             let icon = if row.is_dir {
                 file_icons::folder("", false, row.package)
             } else {
-                // The typed name decides later; a Python file shows as one.
-                file_icons::file(&row.name)
+                file_icons::file(&self.new_file_icon_name(cx))
             };
+            let editing = self.editing.as_ref();
             return div()
                 .id(("file-tree-new", index))
+                .relative()
                 .w_full()
                 .flex()
                 .items_center()
@@ -1777,11 +2046,9 @@ impl FileTree {
                 .pr_2()
                 .child(div().flex_none().w(px(10.)))
                 .child(icon)
-                .children(
-                    self.editing
-                        .as_ref()
-                        .map(|editing| self.render_input(editing)),
-                )
+                .children(editing.map(|editing| self.render_input(editing)))
+                .children(editing.and_then(|editing| self.render_type_selector(editing, cx)))
+                .children(editing.and_then(|editing| self.render_type_list(editing, cx)))
                 .pin("new-entry")
                 .into_any_element();
         }
@@ -1918,6 +2185,208 @@ impl FileTree {
             .label(row.name.clone())
             .interactive(true)
             .into_any_element()
+    }
+
+    /// The file name New File's icon goes by: the typed name as the chosen
+    /// type completes it (the type's own icon while nothing is typed).
+    fn new_file_icon_name(&self, cx: &App) -> String {
+        let Some(editing) = &self.editing else {
+            return String::new();
+        };
+        let text = editing.input.read(cx).text();
+        let windows = file_ops::windows_names(&self.project);
+        match editing.file_type() {
+            Some(Some(file_type)) if text.trim().is_empty() => file_types::icon_name(file_type),
+            Some(Some(file_type)) => file_types::new_path(Some(file_type), &text, windows)
+                .map(|(_, path)| path.rsplit('/').next().unwrap_or_default().to_owned())
+                .unwrap_or_else(|_| file_types::icon_name(file_type)),
+            _ => text,
+        }
+    }
+
+    /// New File's type selector beside the name: the chosen type, else
+    /// Auto with the type the typed name implies, faint.
+    fn render_type_selector(
+        &self,
+        editing: &Editing,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let file_type = editing.file_type()?;
+        let open = editing.types.is_some();
+        let detected = match file_type {
+            Some(_) => None,
+            None => file_types::detect(
+                &editing.input.read(cx).text(),
+                file_ops::windows_names(&self.project),
+            ),
+        };
+        let label: SharedString = match (file_type, detected) {
+            (Some(file_type), _) => file_type.label.into(),
+            (None, Some(detected)) => format!("Auto · {}", detected.label).into(),
+            (None, None) => "Auto".into(),
+        };
+        let icon = file_type.or(detected).map(|shown| {
+            div()
+                .flex_none()
+                .when(file_type.is_none(), |icon| icon.opacity(0.6))
+                .child(file_icons::file(&file_types::icon_name(shown)))
+        });
+        Some(
+            div()
+                .id("file-tree-new-type")
+                .flex_none()
+                .max_w(px(120.))
+                .h(px(20.))
+                .px_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_xs()
+                .border_1()
+                .rounded_sm()
+                .border_color(if open {
+                    theme::accent()
+                } else {
+                    theme::border()
+                })
+                .bg(theme::background())
+                .cursor_pointer()
+                .when(file_type.is_none(), |selector| {
+                    selector.text_color(theme::muted())
+                })
+                .children(icon)
+                .child(div().min_w_0().truncate().child(label.clone()))
+                .child(div().flex_none().text_color(theme::muted()).child("▾"))
+                // The name keeps focus until the list opens.
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_types(window, cx)))
+                .pin("type")
+                .label(format!("Type: {label}"))
+                .interactive(true)
+                .into_any_element(),
+        )
+    }
+
+    /// New File's open type list under the selector: a filter input, then
+    /// the matching types with their icons and extensions.
+    fn render_type_list(
+        &self,
+        editing: &Editing,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let types = editing.types.as_ref()?;
+        let chosen = editing.file_type()?;
+        let entries = types.entries(cx);
+        let empty = entries.is_empty();
+        let items =
+            entries.into_iter().enumerate().map(|(at, entry)| {
+                let label = file_types::label(entry);
+                div()
+                    .id(("file-tree-type", at))
+                    .h(px(22.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(at == types.highlighted, |item| item.bg(theme::active_row()))
+                    .hover(|style| style.bg(theme::hover_row()))
+                    .child(div().flex_none().w(px(file_icons::SIZE)).children(
+                        entry.map(|entry| file_icons::file(&file_types::icon_name(entry))),
+                    ))
+                    // The label stays whole; the hint (where the file goes)
+                    // gives way.
+                    .child(div().flex_none().child(label))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_right()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .children(entry.and_then(file_types::hint)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(12.))
+                            .text_color(theme::accent())
+                            .child(if entry == chosen { "✓" } else { "" }),
+                    )
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.choose_type_at(at, window, cx)),
+                    )
+                    .pin(format!("item:{}", file_types::id(entry)))
+                    .label(label)
+                    .interactive(true)
+            });
+        Some(
+            div()
+                .absolute()
+                .top(px(ROW_HEIGHT - 1.))
+                .right(px(8.))
+                .child(
+                    deferred(
+                        anchored().anchor(Corner::TopRight).snap_to_window().child(
+                            div()
+                                .id("file-tree-types")
+                                .occlude()
+                                .w(px(280.))
+                                .p_1()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .text_sm()
+                                .text_color(theme::text())
+                                .bg(theme::panel())
+                                .border_1()
+                                .border_color(theme::border())
+                                .rounded_md()
+                                .shadow_lg()
+                                .child(
+                                    div()
+                                        .key_context("FileTreeTypes")
+                                        .h(px(22.))
+                                        .px_1()
+                                        .border_1()
+                                        .border_color(theme::accent())
+                                        .bg(theme::background())
+                                        .child(types.filter.clone())
+                                        .pin("filter")
+                                        .label("Filter types"),
+                                )
+                                .child(
+                                    div()
+                                        .id("file-tree-type-items")
+                                        .max_h(px(300.))
+                                        .overflow_y_scroll()
+                                        .track_scroll(&types.scroll)
+                                        .flex()
+                                        .flex_col()
+                                        .children(items)
+                                        .when(empty, |list| {
+                                            list.child(
+                                                div()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .text_color(theme::muted())
+                                                    .child("No matching type"),
+                                            )
+                                        }),
+                                )
+                                .pin("type-list"),
+                        ),
+                    )
+                    .with_priority(1),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The selection in tree order.
@@ -2252,6 +2721,168 @@ mod tests {
         assert!(root.join("docs").is_dir());
         assert_eq!(names(&tree, cx), ["docs", "src", "a.py", "b.py"]);
         assert_eq!(selection(&tree, cx), ["docs"]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// New File's chosen type id (`auto` without one).
+    fn chosen(tree: &Entity<FileTree>, cx: &mut VisualTestContext) -> Option<&'static str> {
+        tree.read_with(cx, |tree, _| {
+            tree.editing
+                .as_ref()
+                .and_then(Editing::file_type)
+                .map(file_types::id)
+        })
+    }
+
+    /// The open type list's entries (ids) and the highlighted one.
+    fn type_list(
+        tree: &Entity<FileTree>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(Vec<&'static str>, &'static str)> {
+        tree.read_with(cx, |tree, cx| {
+            let types = tree.editing.as_ref()?.types.as_ref()?;
+            let entries: Vec<&str> = types.entries(cx).into_iter().map(file_types::id).collect();
+            let highlighted = entries[types.highlighted];
+            Some((entries, highlighted))
+        })
+    }
+
+    fn name_focused(tree: &Entity<FileTree>, cx: &mut VisualTestContext) -> bool {
+        cx.update(|window, cx| {
+            tree.read(cx)
+                .editing
+                .as_ref()
+                .is_some_and(|editing| editing.input.focus_handle(cx).is_focused(window))
+        })
+    }
+
+    #[gpui::test]
+    fn new_file_types_are_chosen_by_keyboard_and_written_with_their_template(
+        cx: &mut TestAppContext,
+    ) {
+        let root = project_dir("new-typed");
+        let (tree, cx, events) = open_tree(&root, cx);
+        tree.update_in(cx, |tree, window, cx| tree.new_file(&NewFile, window, cx));
+        cx.run_until_parked();
+        assert_eq!(chosen(&tree, cx), Some("auto"));
+        cx.simulate_input("analysis");
+
+        // Tab opens the list on the chosen type (Auto); typing filters it
+        // and highlights the first type; Up/Down wrap.
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        let (entries, highlighted) = type_list(&tree, cx).unwrap();
+        assert_eq!(entries.len(), file_types::TYPES.len() + 1);
+        assert_eq!(highlighted, "auto");
+        assert!(!name_focused(&tree, cx));
+        cx.simulate_input("note");
+        cx.run_until_parked();
+        assert_eq!(
+            type_list(&tree, cx),
+            Some((vec!["jupyter", "marimo"], "jupyter"))
+        );
+        cx.simulate_keystrokes("down");
+        assert_eq!(type_list(&tree, cx).unwrap().1, "marimo");
+        cx.simulate_keystrokes("down");
+        assert_eq!(type_list(&tree, cx).unwrap().1, "jupyter");
+
+        // Enter chooses it and goes back to the name; the editing stays.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(type_list(&tree, cx), None);
+        assert_eq!(chosen(&tree, cx), Some("jupyter"));
+        assert!(name_focused(&tree, cx));
+        assert!(events.borrow().is_empty());
+
+        // Escape closes the list only; Shift+Tab too.
+        cx.simulate_keystrokes("alt-down");
+        cx.run_until_parked();
+        assert!(type_list(&tree, cx).is_some());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(type_list(&tree, cx), None);
+        assert!(name_focused(&tree, cx));
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        assert_eq!(type_list(&tree, cx), None);
+        assert_eq!(chosen(&tree, cx), Some("jupyter"));
+        assert!(name_focused(&tree, cx));
+
+        // Enter creates `analysis.ipynb`: an empty notebook that opens.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let created = root.join("analysis.ipynb");
+        let text = fs::read_to_string(&created).unwrap();
+        assert_eq!(notebook::ipynb::parse(&text).unwrap().cells.len(), 1);
+        assert_eq!(*events.borrow(), [FileTreeEvent::Created(created)]);
+        assert!(tree.read_with(cx, |tree, _| tree.editing.is_none()));
+
+        // A second Escape (in the name) cancels New File.
+        tree.update_in(cx, |tree, window, cx| tree.new_file(&NewFile, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("tab escape escape");
+        cx.run_until_parked();
+        assert!(tree.read_with(cx, |tree, _| tree.editing.is_none()));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[gpui::test]
+    fn types_with_their_own_names_need_none_typed(cx: &mut TestAppContext) {
+        let root = project_dir("new-workflow");
+        let (tree, cx, events) = open_tree(&root, cx);
+        // From inside src: the workflow still goes to the project root.
+        cx.simulate_keystrokes("down right down");
+        tree.update_in(cx, |tree, window, cx| tree.new_file(&NewFile, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input("workflow");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(chosen(&tree, cx), Some("workflow"));
+        assert_eq!(error(&tree, cx), None);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let created = root
+            .join(".next_code")
+            .join("workflows")
+            .join("workflow.yaml");
+        workflow::file::check(&fs::read_to_string(&created).unwrap(), "workflow").unwrap();
+        assert_eq!(*events.borrow(), [FileTreeEvent::Created(created)]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[gpui::test]
+    fn new_python_file_is_new_file_with_python_chosen(cx: &mut TestAppContext) {
+        let root = project_dir("new-python");
+        let (tree, cx, events) = open_tree(&root, cx);
+        tree.update_in(cx, |tree, window, cx| {
+            tree.new_python_file(&NewPythonFile, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(chosen(&tree, cx), Some("python"));
+        // The extension is added, so `a` is taken by `a.py`.
+        cx.simulate_input("a");
+        cx.run_until_parked();
+        assert_eq!(
+            error(&tree, cx).as_deref(),
+            Some("A file or folder `a.py` already exists at this location")
+        );
+        cx.simulate_input("pp");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            *events.borrow(),
+            [FileTreeEvent::Created(root.join("app.py"))]
+        );
+        // Without a name (and a type needing one), Enter just closes.
+        tree.update_in(cx, |tree, window, cx| {
+            tree.new_python_file(&NewPythonFile, window, cx)
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(tree.read_with(cx, |tree, _| tree.editing.is_none()));
         fs::remove_dir_all(&root).ok();
     }
 

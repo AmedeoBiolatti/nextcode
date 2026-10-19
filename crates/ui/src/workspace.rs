@@ -2082,6 +2082,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_file_finder))
             .on_action(cx.listener(Self::save_all))
             .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(Self::new_file))
+            .on_action(cx.listener(Self::new_python_file))
             .on_action(cx.listener(Self::reopen_in_container))
             .on_action(cx.listener(Self::add_folder_to_workspace))
             .on_action(cx.listener(Self::save_workspace_as))

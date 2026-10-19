@@ -3,7 +3,8 @@
 //! edits first, e.g. rust-analyzer's `mod` lines; then tabs, unsaved
 //! edits, documents and breakpoints follow; `didRenameFiles` after),
 //! deletes (one confirmation naming the items and any unsaved files; their
-//! tabs close), new files opening in an editor, and Open in Terminal.
+//! tabs close), new files opening in an editor, New File… from anywhere in
+//! the window (File menu, palette), and Open in Terminal.
 
 use std::{io, time::Duration};
 
@@ -15,7 +16,7 @@ use worktree::FileKind;
 use super::*;
 use crate::{
     file_ops::{self, FileMove},
-    file_tree::FileTreeEvent,
+    file_tree::{self, FileTreeEvent, NewFile, NewPythonFile},
     lsp_store::RunningServer,
 };
 
@@ -52,6 +53,36 @@ impl Workspace {
             FileTreeEvent::RemoveFolder(index) => self.remove_folder(*index, cx),
             FileTreeEvent::Notice(message) => self.file_notice(message.clone(), cx),
         }
+    }
+
+    /// New File… (File menu, palette) while focus is outside the tree:
+    /// shows the Files panel and starts the name row in the active file's
+    /// folder (else the tree's selection's).
+    pub(super) fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_new_file(None, window, cx);
+    }
+
+    /// New Python File…: New File… with Python chosen.
+    pub(super) fn new_python_file(
+        &mut self,
+        _: &NewPythonFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_new_file(file_tree::python_type(), window, cx);
+    }
+
+    fn start_new_file(
+        &mut self,
+        file_type: Option<&'static crate::file_types::FileType>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(PanelId::Files, cx);
+        let near = self.active_tab().map(|tab| tab.path.clone());
+        self.file_tree.update(cx, |tree, cx| {
+            tree.start_new_file(near, file_type, window, cx)
+        });
     }
 
     fn file_notice(&mut self, message: String, cx: &mut Context<Self>) {

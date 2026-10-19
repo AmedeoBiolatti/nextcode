@@ -205,6 +205,40 @@ fn headless_mode_creates_renames_copies_and_deletes_files() {
     assert!(root.join("empty").is_dir());
     fs::write(&module, "x = 1\n").unwrap();
 
+    // New File's types: extensions, fixed names, template text, roots.
+    let notebook = ok(json!({ "cmd": "create_file", "path": "pkg/analysis", "type": "jupyter" }));
+    let notebook_path = root.join("pkg").join("analysis.ipynb");
+    assert_eq!(notebook["path"], notebook_path.to_string_lossy().as_ref());
+    let notebook_text = fs::read_to_string(&notebook_path).unwrap();
+    assert!(
+        notebook_text.contains("\"cell_type\": \"code\""),
+        "{notebook_text}"
+    );
+    let docker = ok(json!({ "cmd": "create_file", "path": "pkg", "type": "dockerfile" }));
+    assert_eq!(
+        docker["path"],
+        root.join("pkg")
+            .join("Dockerfile")
+            .to_string_lossy()
+            .as_ref()
+    );
+    let workflow = ok(json!({ "cmd": "create_file", "path": "pkg/deploy", "type": "workflow" }));
+    let workflow_path = root
+        .join(".next_code")
+        .join("workflows")
+        .join("deploy.yaml");
+    assert_eq!(workflow["path"], workflow_path.to_string_lossy().as_ref());
+    assert!(
+        fs::read_to_string(&workflow_path)
+            .unwrap()
+            .starts_with("# yaml-language-server")
+    );
+    let ignore = ok(json!({ "cmd": "create_file", "type": "gitignore" }));
+    assert_eq!(
+        ignore["path"],
+        root.join(".gitignore").to_string_lossy().as_ref()
+    );
+
     // Replies spell paths natively (`\` on Windows).
     let native = |relative: &str| {
         root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
@@ -244,6 +278,8 @@ fn headless_mode_creates_renames_copies_and_deletes_files() {
     assert_eq!(into_itself, "Cannot move `pkg` into itself");
     let exists = fails(json!({ "cmd": "create_file", "path": "pkg/sub/main.py" }));
     assert!(exists.contains("already exists"), "{exists}");
+    let unknown = fails(json!({ "cmd": "create_file", "path": "x", "type": "cobol" }));
+    assert!(unknown.contains("Unknown file type `cobol`"), "{unknown}");
     let empty = fails(json!({ "cmd": "create_dir", "path": "a/.." }));
     assert!(!empty.is_empty());
     let moved =

@@ -1378,11 +1378,15 @@ PyCharm has no equivalent), for local, WSL and dev container projects alike.
   `Shift`+click / `Shift+Up/Down` select a range, `Up/Down/Home/End` move,
   `Right/Left` open/close folders, `Ctrl+A` selects every visible row.
 - **Context menu** (right-click a row, or empty space for the project
-  root): New File / Folder / Python File (adds `.py`) / Python Package
+  root): New File / Folder / Python File (New File with Python chosen) /
+  Python Package
   (folder with `__init__.py`), Cut, Copy, Paste, Duplicate, Copy Path,
   Copy Relative Path, Rename, Delete, Reveal in File Explorer (local
   projects), Open in Terminal (a shell in that folder). `Alt+Insert` shows
   the New items under the selected row (`Up/Down/Enter` choose).
+- **New File…** is also in the File menu and the command palette wherever
+  focus is: it shows the Files panel and starts in the active file's
+  folder.
 - **Names** are typed in place (VS Code style): New puts an input at the top
   of the folder (the selected folder, or the selected file's folder); a
   path such as `pkg/sub/mod.py` creates the folders too. Rename (`F2` or
@@ -1391,7 +1395,28 @@ PyCharm has no equivalent), for local, WSL and dev container projects alike.
   projects `\ < > : " | ? *`, control characters, trailing dot/space and
   reserved names (`CON`, `NUL`, `COM1`…), and names already taken.
   `Enter` applies, `Escape` cancels, clicking elsewhere applies a valid
-  name. A new file opens in an editor.
+  name. A new file opens in an editor (a notebook in the notebook view).
+- **File types**: New File's row has a type selector beside the name,
+  **Auto** by default (the name is used as typed; the type its extension
+  implies shows faintly). `Tab` (or `Alt+Down`, or a click) opens the type
+  list; typing filters it (by name or extension), `Up/Down` and `Enter`
+  (or `Tab`) choose, `Escape` or `Shift+Tab` go back to the name (a second
+  `Escape` cancels). Types: Text, Python, Jupyter Notebook, marimo
+  Notebook, Markdown, JSON, YAML, TOML, Rust, JavaScript, TypeScript,
+  TypeScript React, HTML, CSS, Shell script, PowerShell, C, C++, Go, SQL,
+  Dockerfile, Dev Container config, NextCode Workflow, .gitignore. A
+  chosen type adds its extension when the name has none of its own
+  (`analysis` → `analysis.ipynb`, `tool.py` stays) and writes its starter
+  text: an empty notebook with one code cell (Python kernel), a marimo
+  app with one cell, the commented workflow template (and its schema
+  beside it), a dev container `name` + `image`, a `#!/usr/bin/env bash`
+  line; the others start empty. The name may stay empty for the types
+  that name their file: Dockerfile (`Dockerfile`, or `<name>.Dockerfile`),
+  .gitignore (a typed name is its folder), Dev Container config
+  (`.devcontainer/devcontainer.json`, or `.devcontainer/<name>/…`, at the
+  workspace folder's root) and NextCode Workflow
+  (`.next_code/workflows/<name>.yaml` at the project root; no name:
+  `workflow.yaml`, `workflow-2.yaml`, …).
 - **Cut/Copy/Paste** (`Ctrl+X/C/V`) paste into the selected folder (or the
   selected file's folder); copies whose name is taken become `name
   copy.ext`, `name copy 2.ext`…; a cut entry moves (refused if the name is
@@ -2174,7 +2199,8 @@ cargo run --release -p next_code -- --headless --wsl Ubuntu ~/project
 ```
 
 Commands: `info`, `list_dir`, `list_files`, `read`, `write`, `stat`,
-`create_file`, `create_dir`, `rename_path` (with the language servers'
+`create_file` (`type`? creates a file as New File… does for that type),
+`create_dir`, `rename_path` (with the language servers'
 `willRenameFiles` edits), `copy_path`, `delete_path`,
 `search`, `replace` (`pattern`, `replacement`, the search options, optional
 `paths`; per-file counts, skipped and failed files), `watch`/`unwatch`,

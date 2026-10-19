@@ -310,6 +310,11 @@ const HIDDEN: &[&str] = &[
     "file_tree::Cancel",
     "file_tree::ConfirmName",
     "file_tree::CancelName",
+    "file_tree::ShowTypes",
+    "file_tree::TypeUp",
+    "file_tree::TypeDown",
+    "file_tree::ChooseType",
+    "file_tree::CloseTypes",
     // Notebook selection and modes.
     "notebook::CommandMode",
     "notebook::EditMode",

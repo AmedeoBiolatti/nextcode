@@ -90,6 +90,8 @@ impl Default for MenuBar {
                 menu(
                     "File",
                     vec![
+                        plain("file_tree::NewFile"),
+                        separator(),
                         plain("app::OpenProject"),
                         plain("app::OpenProjectInNewWindow"),
                         plain("app::OpenRecent"),

@@ -18,6 +18,7 @@ mod file_finder;
 mod file_icons;
 mod file_ops;
 mod file_tree;
+mod file_types;
 mod git_dialogs;
 mod git_log;
 mod headless;

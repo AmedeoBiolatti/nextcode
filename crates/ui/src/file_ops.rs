@@ -19,15 +19,19 @@ use lsp::types::{
 };
 use worktree::FileKind;
 
-use crate::{lsp_store::RunningServer, project::Project};
+use crate::{
+    file_types::{self, Base, FileType},
+    lsp_store::RunningServer,
+    project::Project,
+};
 
 /// What New… creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewKind {
-    File,
+    /// A file, of a type when chosen (its name, place and starter text:
+    /// see [`file_types`]); without one the name is used as typed.
+    File(Option<&'static FileType>),
     Folder,
-    /// A file; `.py` is added when the name lacks it.
-    PythonFile,
     /// A folder with an empty `__init__.py`.
     PythonPackage,
 }
@@ -107,15 +111,28 @@ pub fn new_entry_parts(input: &str, windows: bool) -> Result<Vec<&str>, String> 
     Ok(parts)
 }
 
-/// The name a new entry typed as `input` gets for `kind` (`.py` added to
-/// Python files).
-pub fn new_entry_input(input: &str, kind: NewKind) -> String {
-    let input = input.trim();
-    if kind == NewKind::PythonFile && !input.ends_with(".py") {
-        format!("{input}.py")
-    } else {
-        input.to_owned()
-    }
+/// Where a new entry typed as `input` in `dir` goes for `kind`, and the
+/// `/`-separated path typed there (see [`file_types::new_path`]): typed
+/// files of some types go to the folder's or the project's root.
+pub fn new_entry_input(
+    project: &Project,
+    dir: &Path,
+    input: &str,
+    kind: NewKind,
+) -> Result<(PathBuf, String), String> {
+    let NewKind::File(file_type) = kind else {
+        return Ok((dir.to_path_buf(), input.trim().to_owned()));
+    };
+    let (base, relative) = file_types::new_path(file_type, input, windows_names(project))?;
+    let base = match base {
+        Base::Dir => dir.to_path_buf(),
+        Base::FolderRoot => project
+            .root_index_of(dir)
+            .map_or(project.root(), |index| &project.roots()[index].path)
+            .to_path_buf(),
+        Base::ProjectRoot => project.root().to_path_buf(),
+    };
+    Ok((base, relative))
 }
 
 /// Whether two names are the same entry: equal, or equal ignoring case
@@ -170,16 +187,26 @@ fn exists_error(path: &Path) -> io::Error {
     )
 }
 
-/// Creates the entry typed as `input` in `dir`; see [`new_entry_parts`].
-/// Returns the new file or folder.
+/// Creates the entry typed as `input` in `dir`; see [`new_entry_input`]
+/// and [`new_entry_parts`]. Returns the new file or folder.
 pub fn create(project: &Project, dir: &Path, input: &str, kind: NewKind) -> io::Result<PathBuf> {
-    let input = new_entry_input(input, kind);
-    let parts = new_entry_parts(&input, windows_names(project)).map_err(invalid)?;
-    create_at(project, &project.join(dir, &parts.join("/")), kind)
+    let (base, relative) = new_entry_input(project, dir, input, kind).map_err(invalid)?;
+    if let NewKind::File(Some(file_type)) = kind
+        && file_types::picks_free_name(Some(file_type), input)
+    {
+        for n in 1.. {
+            let path = project.join(&base, &file_types::numbered(file_type, n));
+            if project.kind(&path)?.is_none() {
+                return create_at(project, &path, kind);
+            }
+        }
+    }
+    let parts = new_entry_parts(&relative, windows_names(project)).map_err(invalid)?;
+    create_at(project, &project.join(&base, &parts.join("/")), kind)
 }
 
-/// Creates `path` (and its missing parent folders); fails if something is
-/// there already.
+/// Creates `path` (and its missing parent folders) with the starter text
+/// of its type; fails if something is there already.
 pub fn create_at(project: &Project, path: &Path, kind: NewKind) -> io::Result<PathBuf> {
     if project.kind(path)?.is_some() {
         return Err(exists_error(path));
@@ -189,15 +216,40 @@ pub fn create_at(project: &Project, path: &Path, kind: NewKind) -> io::Result<Pa
     {
         project.create_dir_all(parent)?;
     }
-    if kind.is_dir() {
-        project.create_dir_all(path)?;
-        if kind == NewKind::PythonPackage {
+    match kind {
+        NewKind::Folder => project.create_dir_all(path)?,
+        NewKind::PythonPackage => {
+            project.create_dir_all(path)?;
             project.create_file(&project.join(path, "__init__.py"))?;
         }
-    } else {
-        project.create_file(path)?;
+        NewKind::File(file_type) => {
+            project.create_file(path)?;
+            if let Some(file_type) = file_type {
+                write_template(project, path, file_type)?;
+            }
+        }
     }
     Ok(path.to_path_buf())
+}
+
+/// Fills a new file of `file_type` with its starter text; a workflow's
+/// folder also gets the schema its first line names.
+fn write_template(project: &Project, path: &Path, file_type: &FileType) -> io::Result<()> {
+    let root = project
+        .root_index_of(path)
+        .map_or(project.root(), |index| &project.roots()[index].path);
+    if let Some(text) = file_types::template(file_type, &name_of(path), &name_of(root)) {
+        project.write(path, text.into_bytes())?;
+    }
+    if file_types::is_workflow(file_type)
+        && let Some(dir) = path.parent()
+    {
+        let schema = project.join(dir, workflow::SCHEMA_FILE);
+        if project.read_text(&schema).ok().as_deref() != Some(workflow::SCHEMA) {
+            project.write(&schema, workflow::SCHEMA.as_bytes().to_vec())?;
+        }
+    }
+    Ok(())
 }
 
 /// `path` renamed to `name` in the same folder.
@@ -553,9 +605,6 @@ mod tests {
         assert!(new_entry_parts("/abs", false).is_err());
         assert!(new_entry_parts("dir/", false).is_err());
         assert!(new_entry_parts("ok/../x", false).is_err());
-        assert_eq!(new_entry_input("tool", NewKind::PythonFile), "tool.py");
-        assert_eq!(new_entry_input("tool.py", NewKind::PythonFile), "tool.py");
-        assert_eq!(new_entry_input("tool", NewKind::File), "tool");
     }
 
     #[test]
@@ -592,17 +641,17 @@ mod tests {
     fn create_rename_copy_and_delete_on_disk() {
         let (root, project) = temp_project("ops");
         // Nested names create their folders; an existing name is refused.
-        let file = create(&project, &root, "pkg/sub/mod.py", NewKind::File).unwrap();
+        let file = create(&project, &root, "pkg/sub/mod.py", NewKind::File(None)).unwrap();
         assert_eq!(file, root.join("pkg").join("sub").join("mod.py"));
         assert!(file.is_file());
-        let err = create(&project, &root, "pkg/sub/mod.py", NewKind::File).unwrap_err();
+        let err = create(&project, &root, "pkg/sub/mod.py", NewKind::File(None)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert!(err.to_string().starts_with("`mod.py` already exists in "));
-        let err = create(&project, &root, "bad//name", NewKind::File).unwrap_err();
+        let err = create(&project, &root, "bad//name", NewKind::File(None)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let package = create(&project, &root, "tools", NewKind::PythonPackage).unwrap();
         assert!(package.join("__init__.py").is_file());
-        let script = create(&project, &root, "run", NewKind::PythonFile).unwrap();
+        let script = create(&project, &root, "run", python()).unwrap();
         assert_eq!(script, root.join("run.py"));
         let folder = create(&project, &root, "empty", NewKind::Folder).unwrap();
         assert!(folder.is_dir());
@@ -657,6 +706,65 @@ mod tests {
         )
         .unwrap();
         assert!(!root.join("tools").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn python() -> NewKind {
+        typed("python")
+    }
+
+    fn typed(id: &str) -> NewKind {
+        NewKind::File(file_types::by_id(id).unwrap())
+    }
+
+    #[test]
+    fn typed_files_get_their_names_places_and_starter_text() {
+        let (root, project) = temp_project("typed");
+        let sub = root.join("src");
+        fs::create_dir_all(&sub).unwrap();
+        let read = |path: &Path| fs::read_to_string(path).unwrap();
+
+        // Extensions are added where New File was started.
+        let notebook = create(&project, &sub, "analysis", typed("jupyter")).unwrap();
+        assert_eq!(notebook, sub.join("analysis.ipynb"));
+        let parsed = notebook::ipynb::parse(&read(&notebook)).unwrap();
+        assert_eq!(parsed.cells.len(), 1);
+        let app = create(&project, &sub, "app", typed("marimo")).unwrap();
+        assert!(notebook::marimo::is_marimo(&read(&app)));
+        let script = create(&project, &sub, "deploy", typed("shell")).unwrap();
+        assert_eq!(script, sub.join("deploy.sh"));
+        assert!(read(&script).starts_with("#!/usr/bin/env bash\n"));
+        let plain = create(&project, &sub, "notes", typed("markdown")).unwrap();
+        assert_eq!(read(&plain), "");
+
+        // Fixed names, with or without a typed name.
+        let docker = create(&project, &sub, "", typed("dockerfile")).unwrap();
+        assert_eq!(docker, sub.join("Dockerfile"));
+        let ignore = create(&project, &sub, "build", typed("gitignore")).unwrap();
+        assert_eq!(ignore, sub.join("build").join(".gitignore"));
+
+        // Dev containers and workflows go to the roots, wherever started.
+        let config = create(&project, &sub, "", typed("devcontainer")).unwrap();
+        assert_eq!(config, root.join(".devcontainer").join("devcontainer.json"));
+        let parsed = devcontainer::Config::parse(&read(&config)).unwrap();
+        assert_eq!(
+            parsed.name.as_deref(),
+            root.file_name().and_then(|name| name.to_str())
+        );
+        let workflows = root.join(".next_code").join("workflows");
+        let first = create(&project, &sub, "", typed("workflow")).unwrap();
+        assert_eq!(first, workflows.join("workflow.yaml"));
+        let second = create(&project, &sub, " ", typed("workflow")).unwrap();
+        assert_eq!(second, workflows.join("workflow-2.yaml"));
+        let named = create(&project, &sub, "deploy", typed("workflow")).unwrap();
+        assert_eq!(named, workflows.join("deploy.yaml"));
+        workflow::file::check(&read(&named), "deploy").unwrap();
+        assert_eq!(
+            read(&workflows.join(workflow::SCHEMA_FILE)),
+            workflow::SCHEMA
+        );
+        let err = create(&project, &sub, "deploy", typed("workflow")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         fs::remove_dir_all(&root).unwrap();
     }
 

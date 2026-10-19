@@ -1,11 +1,15 @@
-//! Headless file operations, the Files tree's: `create_file`, `create_dir`,
-//! `rename_path` (with the running language servers' `willRenameFiles`
-//! edits and open documents following), `copy_path`, `delete_path`.
+//! Headless file operations, the Files tree's: `create_file` (with New
+//! File's `type`?), `create_dir`, `rename_path` (with the running language
+//! servers' `willRenameFiles` edits and open documents following),
+//! `copy_path`, `delete_path`.
 
 use futures::future::{Either, select};
 
 use super::*;
-use crate::file_ops::{self, NewKind};
+use crate::{
+    file_ops::{self, NewKind},
+    file_types,
+};
 
 /// How long `rename_path` waits for each language server's edits.
 const WILL_RENAME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -23,6 +27,7 @@ fn check_last_name(project: &Project, path: &Path) -> io::Result<()> {
 impl Session {
     pub(super) fn files(&mut self, id: Value, cmd: &str, request: &Value, cx: &mut Context<Self>) {
         match cmd {
+            "create_file" if !request["type"].is_null() => self.create_typed_file(id, request, cx),
             "create_file" | "create_dir" => {
                 let path = match param_str(request, "path") {
                     Ok(path) => self.path(request, path),
@@ -31,7 +36,7 @@ impl Session {
                 let kind = if cmd == "create_dir" {
                     NewKind::Folder
                 } else {
-                    NewKind::File
+                    NewKind::File(None)
                 };
                 self.blocking(id, cx, move |project| {
                     check_last_name(project, &path)?;
@@ -56,6 +61,44 @@ impl Session {
             "delete_path" => self.delete_path(id, request, cx),
             _ => self.rename_path(id, request, cx),
         }
+    }
+
+    /// `create_file` with `type`: New File's rules (see `file_types`).
+    /// `path`'s last part is the typed name; an existing folder (or no
+    /// `path`: the root) is where an unnamed Dockerfile, .gitignore, dev
+    /// container config or workflow goes.
+    fn create_typed_file(&mut self, id: Value, request: &Value, cx: &mut Context<Self>) {
+        let file_type = match request["type"]
+            .as_str()
+            .ok_or_else(|| "`type` must be a string".to_owned())
+            .and_then(file_types::by_id)
+        {
+            Ok(file_type) => file_type,
+            Err(err) => return self.out.reply(&id, Err(err)),
+        };
+        let path = request["path"]
+            .as_str()
+            .map(|path| self.path(request, path));
+        let root = self.project.roots()[self.root(request)].path.clone();
+        self.blocking(id, cx, move |project| {
+            let (dir, input) = match path {
+                None => (root, String::new()),
+                Some(path) if matches!(project.kind(&path)?, Some(FileKind::Dir)) => {
+                    (path, String::new())
+                }
+                Some(path) => {
+                    check_last_name(project, &path)?;
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let dir = path.parent().unwrap_or(project.root()).to_path_buf();
+                    (dir, name)
+                }
+            };
+            let path = file_ops::create(project, &dir, &input, NewKind::File(file_type))?;
+            Ok(json!({ "path": path_json(&path) }))
+        });
     }
 
     /// `delete_path`: `path` or `paths`, `trash`?; open documents close.
