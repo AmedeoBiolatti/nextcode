@@ -77,6 +77,7 @@ use inlay_hints::RowInlays;
 use lines::IndentStyle;
 use selections::{Selection, SelectionSet, is_whole_word, is_word_char};
 
+pub use self::notes::{AddNote, NoteFact};
 pub use brackets::JumpToBracket;
 pub use call_hierarchy::ShowCallHierarchy;
 pub use code_actions::{
@@ -105,7 +106,6 @@ pub use lines::{
     MoveLineUp, Outdent, ToggleBlockComment, ToggleLineComment,
 };
 pub use navigation::{FindReferences, GoToDefinition, GoToImplementation, GoToTypeDefinition};
-pub use self::notes::{AddNote, NoteFact};
 pub use rename::{CancelRename, ConfirmRename, RenameSymbol};
 pub use selections::{
     AddCursorAbove, AddCursorBelow, CollapseSelections, EditorState, SelectAllOccurrences,
@@ -539,9 +539,10 @@ pub struct Editor {
     symbols: symbols::SymbolState,
     inlay: inlay_hints::InlayHintState,
     signature: signature_help::SignatureHelpState,
-    /// The identifier underlined while Ctrl is held over it (Ctrl+click
-    /// goes to its definition).
-    link: Option<Range<usize>>,
+    /// The Ctrl+hover link: the identifier under the mouse while Ctrl is
+    /// held, underlined where the server has a definition (Ctrl+click goes
+    /// to it).
+    link: navigation::LinkState,
     /// Where the mouse last moved over the text, for `link` when only a
     /// modifier changes.
     mouse_position: Option<Point<Pixels>>,
@@ -974,7 +975,7 @@ impl Editor {
             symbols: symbols::SymbolState::new(),
             inlay: inlay_hints::InlayHintState::default(),
             signature: signature_help::SignatureHelpState::default(),
-            link: None,
+            link: navigation::LinkState::default(),
             mouse_position: None,
             hover: None,
             _hover_delay: None,
@@ -1082,7 +1083,7 @@ impl Editor {
         self.clear_symbols();
         self.clear_inlay_hints();
         self.dismiss_signature_help();
-        self.link = None;
+        self.link = navigation::LinkState::default();
         if let Some(doc) = self.lsp.take()
             && close
             && doc.cell.is_none()
@@ -1105,7 +1106,7 @@ impl Editor {
         self.symbols_handed_over();
         self.clear_inlay_hints();
         self.dismiss_signature_help();
-        self.link = None;
+        self.link = navigation::LinkState::default();
         self.hover = None;
         self.hover_word = None;
         self._hover_delay = None;
@@ -1563,6 +1564,7 @@ impl Editor {
             self.hover = None;
             self.hover_word = None;
             self._hover_delay = None;
+            self.clear_link();
             self.notice = None;
             self.git_text_edited(cx);
         }
@@ -1885,6 +1887,8 @@ impl Editor {
                 }
             }
         } else if modifiers.secondary() {
+            // Ctrl+click: Go to Definition there; no selection drag.
+            self.clear_link();
             self.set_selections(SelectionSet::single(cursor), cx);
             self.request_definition(offset, cx);
         } else {
@@ -1962,7 +1966,7 @@ impl Editor {
                 self.minimap_mouse_moved(event.position, cx);
                 self.sticky_mouse_moved(event.position, cx);
                 self.blame_mouse_moved(event.position, cx);
-                self.update_link(Some(event.position), event.modifiers.secondary(), cx);
+                self.link_mouse_moved(event.position, event.modifiers.secondary(), cx);
                 self.update_hover(event.position, cx)
             }
         }
@@ -2043,9 +2047,7 @@ impl Editor {
         if !hovered {
             self.clear_blame_hover(cx);
             self.mouse_position = None;
-            if self.link.take().is_some() {
-                cx.notify();
-            }
+            self.link_mouse_left(cx);
         }
     }
 
@@ -2056,7 +2058,7 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.update_link(self.mouse_position, event.modifiers.secondary(), cx);
+        self.link_modifiers_changed(event.modifiers.secondary(), cx);
     }
 
     /// Replaces diagnostics with a server's, given in its position encoding.
@@ -2186,7 +2188,7 @@ impl Editor {
         self.scroll.y = (self.scroll.y - delta.y).max(px(0.));
         self.hover = None;
         self._hover_delay = None;
-        self.link = None;
+        self.clear_link();
         cx.notify();
     }
 
@@ -2779,7 +2781,7 @@ impl Editor {
                     self.paint_spelling(layout, row, text_left, top, window);
 
                     // The Ctrl+hover link to a definition.
-                    if let Some(link) = &self.link
+                    if let Some(link) = &self.link.shown
                         && link.start < end
                         && start < link.end
                     {
@@ -3481,7 +3483,7 @@ impl Render for Editor {
                     .when(!self.notebook_cell, |text| text.flex_1())
                     .relative()
                     .overflow_hidden()
-                    .cursor(if self.link.is_some() {
+                    .cursor(if self.link.shown.is_some() {
                         CursorStyle::PointingHand
                     } else {
                         CursorStyle::IBeam

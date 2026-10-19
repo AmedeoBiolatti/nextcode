@@ -22,6 +22,7 @@ mod file_types;
 mod git_dialogs;
 mod git_log;
 mod headless;
+mod hscrollbar;
 mod instance;
 mod launch;
 mod layout;

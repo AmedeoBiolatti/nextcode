@@ -296,6 +296,22 @@ editor at their line and column: compiler-style `path:line:column`,
 hyperlinks (`ls --hyperlink`, `gcc`, `cargo` with hyperlinks on) open their
 target. A link wrapped over several rows is one link.
 
+Terminal lines are not wrapped at the panel's edge: a line wider than the
+view (a long `printf`, output printed while the panel was wider, a long
+command being typed) stays one row, and a left-right bar appears over the
+bottom edge while any row on screen is wider. Drag its thumb, press the
+track (the thumb centres there and drags), turn the wheel over it, or use
+Shift+wheel or a trackpad's sideways scroll anywhere in the terminal. The
+offset stays where you put it while output arrives (following the end of
+the output as before); typing brings the cursor back into view, and it
+returns to the start when nothing on screen is wider (`clear`,
+full-screen programs). Programs still see the panel's width (the pty
+follows the view, so `vim`/`htop` fit it and shells wrap their input as
+they expect): the emulator wraps there and only the display joins the
+rows, so a line keeps its full width when the panel narrows or widens.
+Selection, copy, Ctrl+click on links and Pinpoint use the cells shown.
+Lines over 2048 columns are cut into rows of that width.
+
 ## Notebooks
 
 Jupyter notebooks (`.ipynb`, nbformat 4) and [marimo](https://marimo.io)
@@ -861,7 +877,9 @@ them in a banner with line and column (click: go there) over the last
 good graph, dimmed. Clicking a card puts the cursor on its key; the
 card holding the cursor is highlighted. A selected card shows details
 below the graph: state, wait/failure reason or manual prompt, last output
-lines, artifacts (links), Terminal (the project's terminal tab, or this
+lines (not wrapped: wider lines scroll sideways with Shift+wheel or the
+left-right bar over the box's bottom edge, as in terminals),
+artifacts (links), Terminal (the project's terminal tab, or this
 machine's terminal inside the workflow tab), Continue, Restart/Retry. A
 terminal inside the tab fills the details' pane, which a divider
 separates from the graph: drag it to resize (the graph keeps 90 px, the
@@ -970,7 +988,9 @@ toolbar and sections:
 
 The **Debug Console** (bottom dock) shows the program's stdout, stderr (red)
 and the adapter's messages, and evaluates what you type in the selected
-frame (Up/Down for history). A bar above the editors shows the session's
+frame (Up/Down for history). Long lines are not wrapped: the output
+scrolls sideways (Shift+wheel, trackpad, the left-right bar at its bottom).
+A bar above the editors shows the session's
 state with the same toolbar.
 
 | Command | Keys |
@@ -1660,15 +1680,23 @@ key remapping and `.vimrc`.
 
 | Command (Go menu) | Keys |
 |---|---|
-| Go to Definition | `F12`, `Ctrl+B`, `Ctrl+click` |
+| Go to Definition | `F12`, `Ctrl+B`, `Ctrl+click` (`Cmd` on macOS) |
 | Go to Declaration | Go menu / command bar |
 | Go to Type Definition (of the variable or expression's type) | `Ctrl+Shift+B` |
 | Go to Implementation (of a trait/interface or its method) | `Ctrl+F12`, `Ctrl+Alt+B` |
 | Find References | `Shift+F12`, `Alt+F7` |
 
 One result opens directly, several open the locations picker; `Alt+Left`
-goes back. While `Ctrl` is held, the identifier under the mouse is
-underlined and the pointer becomes a hand: a click goes to its definition.
+goes back. On the definition itself, Go to Definition (and Ctrl+click)
+finds its usages instead, as in VS Code and JetBrains IDEs. While `Ctrl`
+is held, an identifier under the mouse that the language server has a
+definition for is underlined and the pointer becomes a hand (asked once
+the mouse rests on a word for a moment, remembered per word until the
+next edit); a click goes to its definition without starting a selection.
+This works in notebook cells, read-only files and remote (WSL, dev
+container) projects alike, and in the editor under the mouse even when
+another one (another cell or pane) has focus. Alt+click (add a cursor),
+Shift+Alt+drag and middle-drag (column selection) are unchanged.
 Commands the server does not support say so in the status bar.
 
 ### Parameter hints and inlay hints

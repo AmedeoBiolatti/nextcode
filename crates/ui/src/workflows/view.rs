@@ -58,6 +58,7 @@ use super::{
 use crate::{
     debugger::panel::Tooltip,
     editor::{Editor, EditorEvent},
+    hscrollbar,
     pinpoint::Pin,
     project::Project,
     selectable::selectable,
@@ -2172,25 +2173,44 @@ impl WorkflowView {
                         .children(artifacts),
                 )
                 .when(shows_output, |details| {
-                    // One block, so a selection can span the lines.
+                    // One block, so a selection can span the lines; long
+                    // lines are not wrapped but scroll sideways, with the
+                    // left-right bar over the bottom edge.
                     details.child(
                         div()
-                            .id("step-output")
                             .flex_1()
                             .min_h_0()
                             .mx_3()
                             .mb_2()
-                            .px_2()
-                            .py_1()
+                            .relative()
                             .rounded_sm()
                             .bg(theme::background())
-                            .font_family(theme::MONO_FONT)
-                            .text_xs()
-                            .text_color(theme::muted())
-                            .whitespace_nowrap()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.output_scroll)
-                            .child(selectable("step-output-text", output))
+                            .child(
+                                div()
+                                    .id("step-output")
+                                    .size_full()
+                                    .px_2()
+                                    .py_1()
+                                    .font_family(theme::MONO_FONT)
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .whitespace_nowrap()
+                                    .overflow_scroll()
+                                    .track_scroll(&self.output_scroll)
+                                    // As wide as the longest line.
+                                    .flex()
+                                    .flex_col()
+                                    .items_start()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .child(selectable("step-output-text", output)),
+                                    ),
+                            )
+                            .child(hscrollbar::for_handle(
+                                "step-output-hscrollbar",
+                                &self.output_scroll,
+                            ))
                             .pin("output"),
                     )
                 })

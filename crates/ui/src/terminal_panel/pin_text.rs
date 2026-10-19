@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use gpui::{Bounds, Pixels, Point, Size, Window, point, size};
+use gpui::{Bounds, Pixels, Point, SharedString, Size, Window, point, size};
 use terminal::Snapshot;
 
 use crate::{
@@ -14,9 +14,10 @@ use crate::{
 };
 
 /// The visible screen as text: rows joined with `\n`, trailing blanks
-/// trimmed.
+/// trimmed. Built once per shaped screen and kept with it (see
+/// `TerminalLayout`): recording it for Pinpoint each frame copies nothing.
 pub(super) struct Screen {
-    text: String,
+    text: SharedString,
     rows: Vec<ScreenRow>,
 }
 
@@ -52,11 +53,10 @@ impl Screen {
                 chars,
             });
         }
-        Self { text, rows }
-    }
-
-    pub(super) fn text(&self) -> &str {
-        &self.text
+        Self {
+            text: text.into(),
+            rows,
+        }
     }
 
     /// Cell rects of `range` (bytes of the screen text), one per row,
@@ -127,6 +127,16 @@ impl Screen {
             .find(|&&(_, first, width)| first <= column && column < first + width)
             .map(|&(at, ..)| at)
     }
+
+    /// Columns `start..end` of the lowest occurrence of `text`.
+    fn columns_of(&self, text: &str) -> Option<(usize, usize)> {
+        let at = self.text.rfind(text)?;
+        let end = at + text.len();
+        let row = self.rows.iter().find(|row| row.range.contains(&at))?;
+        let (_, start, _) = *row.chars.iter().find(|(byte, ..)| *byte >= at)?;
+        let (_, last, width) = *row.chars.iter().rev().find(|(byte, ..)| *byte < end)?;
+        Some((start, last + width))
+    }
 }
 
 /// The 1-based terminal number in `path` (`…/terminal:<n>`).
@@ -149,7 +159,7 @@ fn wants(want: &TerminalWant, number: Option<usize>, path: &str) -> bool {
 /// In prepaint: the screen's text on the terminal's node `path`, reports
 /// for wanted terminal text, and the picker's word.
 pub(super) fn record(
-    snapshot: &Snapshot,
+    screen: &Screen,
     path: &str,
     origin: Point<Pixels>,
     cell: Size<Pixels>,
@@ -158,8 +168,7 @@ pub(super) fn record(
     if path.is_empty() {
         return;
     }
-    let screen = Screen::new(snapshot);
-    pinpoint::set_text(window, path, screen.text().to_owned().into());
+    pinpoint::set_text(window, path, screen.text.clone());
     let mask = window.content_mask().bounds;
     let report = |id, range: Option<Range<usize>>| {
         let rects = range.map(|range| screen.rects(range, origin, cell));
@@ -241,7 +250,11 @@ impl super::TerminalPanel {
             if !view.read(cx).terminal.scroll_to_text(text) {
                 return Err(format!("no terminal line holds {text:?}"));
             }
-            view.update(cx, |_, cx| cx.notify());
+            // Sideways too, when its line is wider than the view.
+            view.update(cx, |view, cx| {
+                view.reveal_columns = Screen::new(&view.terminal.snapshot()).columns_of(text);
+                view.screen_changed(cx);
+            });
         }
         Ok(())
     }
@@ -321,14 +334,14 @@ mod tests {
     #[test]
     fn screen_text_maps_to_cells_wide_chars_included() {
         let screen = screen(&["$ ls", "日本 ok", "", "done  "]);
-        assert_eq!(screen.text(), "$ ls\n日本 ok\n\ndone");
-        let ok = pinpoint_text::nth_match(screen.text(), "ok", 1).unwrap();
+        assert_eq!(screen.text.as_str(), "$ ls\n日本 ok\n\ndone");
+        let ok = pinpoint_text::nth_match(&screen.text, "ok", 1).unwrap();
         // `日本` takes 4 cells: `ok` starts at cell 5.
         assert_eq!(rects(&screen, ok), [(50., 20., 20.)]);
-        let wide = pinpoint_text::nth_match(screen.text(), "本", 1).unwrap();
+        let wide = pinpoint_text::nth_match(&screen.text, "本", 1).unwrap();
         assert_eq!(rects(&screen, wide), [(20., 20., 20.)]);
         // Across rows: one rect per row with text.
-        let across = 2..screen.text().len();
+        let across = 2..screen.text.len();
         assert_eq!(
             rects(&screen, across),
             [(20., 0., 20.), (0., 20., 70.), (0., 60., 40.)]
@@ -343,7 +356,7 @@ mod tests {
         let text = |line, column, end_line, end_column| {
             screen
                 .line_range(line, column, end_line, end_column)
-                .map(|r| &screen.text()[r])
+                .map(|r| &screen.text[r])
         };
         assert_eq!(text(2, None, None, None), Some("日本 ok"));
         assert_eq!(text(2, Some(2), None, Some(2)), Some("本"));

@@ -250,9 +250,12 @@ pub struct SnapshotCell {
     pub spacer: bool,
 }
 
-/// The visible screen, resolved to colors.
+/// The visible screen, resolved to colors: on the primary screen one row
+/// per line however wide (see `Rows`), so rows can be wider than the pty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
+    /// Row width: the pty's columns, or the widest row (and the cursor
+    /// after it) when wider.
     pub columns: usize,
     pub rows: usize,
     /// Row-major, `columns * rows` cells.
@@ -265,7 +268,8 @@ pub struct Snapshot {
     pub app_cursor: bool,
     pub bracketed_paste: bool,
     pub alt_screen: bool,
-    /// Per row: the line continues on the next row (soft wrap).
+    /// Per row: the line continues on the next row (a line cut at the
+    /// widest row, or the alternate screen's soft wrap).
     pub wrapped: Vec<bool>,
     /// OSC 8 hyperlinks by cell index (`row * columns + column`), sorted.
     pub hyperlinks: Vec<(usize, Arc<str>)>,
@@ -733,9 +737,18 @@ impl Terminal {
         self.io.resize(size);
     }
 
-    /// Scrolls the view into history (positive) or back toward the output.
+    /// Scrolls the view `lines` display rows into history (positive) or
+    /// back toward the output.
     pub fn scroll(&self, lines: i32) {
-        self.term.lock().scroll_display(Scroll::Delta(lines));
+        let mut term = self.term.lock();
+        let offset = term.grid().display_offset() as i32;
+        let target = {
+            let rows = Rows::of(&*term);
+            let screen = rows.screen(rows.bottom - offset, term.screen_lines());
+            let end = rows.scrolled(&screen, lines);
+            (rows.bottom - end).clamp(0, -rows.top)
+        };
+        term.scroll_display(Scroll::Delta(target - offset));
     }
 
     pub fn scroll_to_bottom(&self) {
@@ -767,10 +780,13 @@ impl Terminal {
         true
     }
 
+    /// What shows: on the primary screen each line is one row however wide
+    /// (its soft-wrapped rows joined, see [`Rows`]), so the view scrolls
+    /// sideways rather than wrapping; the alternate screen as it is.
     pub fn snapshot(&self) -> Snapshot {
         let term = self.term.lock();
         let content = term.renderable_content();
-        let (columns, rows) = (term.columns(), term.screen_lines());
+        let (grid_columns, rows) = (term.columns(), term.screen_lines());
         let colors = content.colors;
         let resolve = |color: Color, bold: bool| -> Rgb {
             match color {
@@ -801,62 +817,90 @@ impl Terminal {
             wide: false,
             spacer: false,
         };
+        let grid = term.grid();
+        let lines = Rows::of(&*term);
+        let spans = lines.screen(lines.bottom - content.display_offset as i32, rows);
+        let mode = content.mode;
+        let cursor_point = content.cursor.point;
+        let cursor = (mode.contains(TermMode::SHOW_CURSOR)
+            && content.cursor.shape != CursorShape::Hidden)
+            .then(|| {
+                let line = cursor_point.line.0;
+                let row = spans
+                    .iter()
+                    .position(|span| (span.start..=span.end).contains(&line))?;
+                let joined = (line - spans[row].start) as usize;
+                Some((row, joined * grid_columns + cursor_point.column.0))
+            })
+            .flatten();
+        // A joined row is as wide as its text (and the cursor after it);
+        // the rest at least the screen.
+        let columns = spans
+            .iter()
+            .filter(|span| span.end > span.start)
+            .map(|span| {
+                let last = &grid[Line(span.end)];
+                let used = (0..grid_columns)
+                    .rev()
+                    .find(|&column| !is_blank(&last[Column(column)]))
+                    .map_or(0, |column| column + 1);
+                (span.end - span.start) as usize * grid_columns + used
+            })
+            .chain(cursor.map(|(_, column)| column + 1))
+            .fold(grid_columns, usize::max);
         let mut cells = vec![blank; columns * rows];
         let mut wrapped = vec![false; rows];
         let mut hyperlinks: Vec<(usize, Arc<str>)> = Vec::new();
-        let offset = content.display_offset as i32;
-        for indexed in content.display_iter {
-            let row = indexed.point.line.0 + offset;
-            let column = indexed.point.column.0;
-            if row < 0 || row as usize >= rows || column >= columns {
-                continue;
+        for (row, span) in spans.iter().enumerate() {
+            wrapped[row] = lines.wraps(span.end);
+            for line in span.start..=span.end {
+                let base = (line - span.start) as usize * grid_columns;
+                let joined = line < span.end;
+                let grid_row = &grid[Line(line)];
+                for column in 0..grid_columns.min(columns - base) {
+                    let cell = &grid_row[Column(column)];
+                    let flags = cell.flags;
+                    // A wide character that did not fit went to the next
+                    // row; joined, the gap it left is a blank.
+                    if joined && flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+                    let bold = flags.contains(Flags::BOLD);
+                    let mut fg = resolve(cell.fg, bold);
+                    let mut bg = resolve(cell.bg, false);
+                    if flags.contains(Flags::DIM) {
+                        fg = dim(fg);
+                    }
+                    if flags.contains(Flags::INVERSE) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+                    if flags.contains(Flags::HIDDEN) {
+                        fg = bg;
+                    }
+                    let index = row * columns + base + column;
+                    if let Some(link) = cell.hyperlink() {
+                        // One allocation per link, not per cell.
+                        let uri = match hyperlinks.last() {
+                            Some((_, last)) if **last == *link.uri() => last.clone(),
+                            _ => Arc::from(link.uri()),
+                        };
+                        hyperlinks.push((index, uri));
+                    }
+                    cells[index] = SnapshotCell {
+                        c: cell.c,
+                        fg,
+                        bg,
+                        bold,
+                        italic: flags.contains(Flags::ITALIC),
+                        underline: flags.intersects(Flags::ALL_UNDERLINES),
+                        strikeout: flags.contains(Flags::STRIKEOUT),
+                        wide: flags.contains(Flags::WIDE_CHAR),
+                        spacer: flags
+                            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                    };
+                }
             }
-            let cell = indexed.cell;
-            let flags = cell.flags;
-            let bold = flags.contains(Flags::BOLD);
-            let mut fg = resolve(cell.fg, bold);
-            let mut bg = resolve(cell.bg, false);
-            if flags.contains(Flags::DIM) {
-                fg = dim(fg);
-            }
-            if flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if flags.contains(Flags::HIDDEN) {
-                fg = bg;
-            }
-            let index = row as usize * columns + column;
-            if column + 1 == columns && flags.contains(Flags::WRAPLINE) {
-                wrapped[row as usize] = true;
-            }
-            if let Some(link) = cell.hyperlink() {
-                // One allocation per link, not per cell.
-                let uri = match hyperlinks.last() {
-                    Some((_, last)) if **last == *link.uri() => last.clone(),
-                    _ => Arc::from(link.uri()),
-                };
-                hyperlinks.push((index, uri));
-            }
-            cells[index] = SnapshotCell {
-                c: cell.c,
-                fg,
-                bg,
-                bold,
-                italic: flags.contains(Flags::ITALIC),
-                underline: flags.intersects(Flags::ALL_UNDERLINES),
-                strikeout: flags.contains(Flags::STRIKEOUT),
-                wide: flags.contains(Flags::WIDE_CHAR),
-                spacer: flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
-            };
         }
-
-        let mode = content.mode;
-        let cursor_point = content.cursor.point;
-        let cursor_row = cursor_point.line.0 + offset;
-        let cursor = (mode.contains(TermMode::SHOW_CURSOR)
-            && content.cursor.shape != CursorShape::Hidden
-            && (0..rows as i32).contains(&cursor_row))
-        .then_some((cursor_row as usize, cursor_point.column.0));
 
         Snapshot {
             columns,
@@ -864,13 +908,220 @@ impl Terminal {
             cells,
             cursor,
             display_offset: content.display_offset,
-            history: term.grid().history_size(),
+            history: grid.history_size(),
             app_cursor: mode.contains(TermMode::APP_CURSOR),
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
             alt_screen: mode.contains(TermMode::ALT_SCREEN),
             wrapped,
             hyperlinks,
         }
+    }
+}
+
+/// Widest joined row: a longer line is cut every this many columns (in
+/// whole screen rows), so a huge line costs a bounded snapshot.
+const MAX_ROW_COLUMNS: usize = 2048;
+
+/// Grid lines `start..=end` (rows of one soft-wrapped line) shown as one
+/// display row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Span {
+    start: i32,
+    end: i32,
+}
+
+/// How grid lines (`top` = -history ..= `bottom` = last screen row) show
+/// as display rows. On the primary screen a line the emulator soft-wrapped
+/// is one row again, so long lines scroll sideways instead of wrapping:
+/// the pty stays as wide as the view (programs and shells line-edit at
+/// the width they are told, and the emulator wraps there as they expect),
+/// and only the display joins the rows. Joining is cut every `per` rows
+/// (from the line's start). The alternate screen (full-screen programs,
+/// sized to the view) shows its rows as they are.
+struct Rows<W> {
+    top: i32,
+    bottom: i32,
+    per: i32,
+    /// Whether a grid line continues on the next (soft wrap).
+    wraps: W,
+    join: bool,
+}
+
+impl<'a> Rows<Box<dyn Fn(i32) -> bool + 'a>> {
+    fn of<T>(term: &'a Term<T>) -> Self {
+        let grid = term.grid();
+        let last = Column(term.columns() - 1);
+        Self {
+            top: -(grid.history_size() as i32),
+            bottom: term.screen_lines() as i32 - 1,
+            per: (MAX_ROW_COLUMNS / term.columns()).max(1) as i32,
+            wraps: Box::new(move |line| grid[Line(line)][last].flags.contains(Flags::WRAPLINE)),
+            join: !term.mode().contains(TermMode::ALT_SCREEN),
+        }
+    }
+}
+
+impl<W: Fn(i32) -> bool> Rows<W> {
+    /// Whether `line` continues on the next grid line.
+    fn wraps(&self, line: i32) -> bool {
+        line < self.bottom && (self.wraps)(line)
+    }
+
+    /// The display row holding grid line `line`.
+    fn span(&self, line: i32) -> Span {
+        if !self.join {
+            return Span {
+                start: line,
+                end: line,
+            };
+        }
+        let mut first = line;
+        while first > self.top && self.wraps(first - 1) {
+            first -= 1;
+        }
+        let mut last = line;
+        while self.wraps(last) {
+            last += 1;
+        }
+        let start = first + (line - first) / self.per * self.per;
+        Span {
+            start,
+            end: last.min(start + self.per - 1),
+        }
+    }
+
+    fn before(&self, span: Span) -> Option<Span> {
+        (span.start > self.top).then(|| self.span(span.start - 1))
+    }
+
+    fn after(&self, span: Span) -> Option<Span> {
+        (span.end < self.bottom).then(|| self.span(span.end + 1))
+    }
+
+    /// `count` display rows ending with the one holding grid line
+    /// `anchor`; with too few above it (the top of the history), more
+    /// from below it.
+    fn screen(&self, anchor: i32, count: usize) -> Vec<Span> {
+        let mut spans = vec![self.span(anchor.clamp(self.top, self.bottom))];
+        while spans.len() < count
+            && let Some(before) = self.before(spans[spans.len() - 1])
+        {
+            spans.push(before);
+        }
+        spans.reverse();
+        while spans.len() < count
+            && let Some(after) = self.after(spans[spans.len() - 1])
+        {
+            spans.push(after);
+        }
+        spans
+    }
+
+    /// The grid line that ends the screen after scrolling `screen` by
+    /// `lines` display rows (positive: into the history).
+    fn scrolled(&self, screen: &[Span], lines: i32) -> i32 {
+        let Some(mut span) = screen.last().copied() else {
+            return self.bottom;
+        };
+        for _ in 0..lines.unsigned_abs() {
+            let next = if lines > 0 {
+                self.before(span)
+            } else {
+                self.after(span)
+            };
+            match next {
+                Some(next) => span = next,
+                None => break,
+            }
+        }
+        span.end
+    }
+}
+
+/// A cell that shows nothing: a space (or nothing) on the default
+/// background.
+fn is_blank(cell: &alacritty_terminal::term::cell::Cell) -> bool {
+    matches!(cell.c, ' ' | '\0' | '\t')
+        && cell.bg == Color::Named(NamedColor::Background)
+        && !cell
+            .flags
+            .intersects(Flags::INVERSE | Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+}
+
+#[cfg(test)]
+mod rows {
+    use super::*;
+
+    /// Grid lines -`history`..`screen`, those in `wrapping` continuing on
+    /// the next.
+    fn rows(history: i32, screen: i32, wrapping: &[i32], per: i32) -> Rows<impl Fn(i32) -> bool> {
+        let wrapping = wrapping.to_vec();
+        Rows {
+            top: -history,
+            bottom: screen - 1,
+            per,
+            wraps: move |line| wrapping.contains(&line),
+            join: true,
+        }
+    }
+
+    fn span(start: i32, end: i32) -> Span {
+        Span { start, end }
+    }
+
+    #[test]
+    fn wrapped_rows_join_and_the_screen_fills_from_history() {
+        // Lines 1-2 are one line: the screen of 4 takes one more from history.
+        let rows = rows(5, 4, &[1], 100);
+        assert_eq!(
+            rows.screen(3, 4),
+            [span(-1, -1), span(0, 0), span(1, 2), span(3, 3)]
+        );
+        // A line ending below the anchor shows whole.
+        assert_eq!(rows.screen(1, 2), [span(0, 0), span(1, 2)]);
+    }
+
+    #[test]
+    fn at_the_top_of_history_the_screen_continues_below() {
+        let rows = rows(0, 5, &[0, 1], 100);
+        assert_eq!(rows.screen(2, 3), [span(0, 2), span(3, 3), span(4, 4)]);
+        // Scrolling up there stays; down moves one display row.
+        let screen = rows.screen(2, 2);
+        assert_eq!(screen, [span(0, 2), span(3, 3)]);
+        assert_eq!(rows.scrolled(&screen, 3), 2);
+        assert_eq!(rows.scrolled(&screen, -1), 4);
+    }
+
+    #[test]
+    fn huge_lines_are_cut_every_per_rows() {
+        // One line over grid lines 0..=6, 3 rows per display row.
+        let rows = rows(0, 8, &[0, 1, 2, 3, 4, 5], 3);
+        assert_eq!(rows.span(4), span(3, 5));
+        assert_eq!(rows.span(6), span(6, 6));
+        assert_eq!(
+            rows.screen(7, 4),
+            [span(0, 2), span(3, 5), span(6, 6), span(7, 7)]
+        );
+        assert!(rows.wraps(5), "a cut row continues on the next");
+    }
+
+    #[test]
+    fn scrolling_counts_display_rows() {
+        // History -4..=-1 (lines -3,-2 joined), screen 0..=2.
+        let rows = rows(4, 3, &[-3], 100);
+        let screen = rows.screen(2, 3);
+        assert_eq!(screen, [span(0, 0), span(1, 1), span(2, 2)]);
+        assert_eq!(rows.scrolled(&screen, 1), 1);
+        assert_eq!(rows.scrolled(&screen, 4), -2, "the joined line is one row");
+        assert_eq!(rows.scrolled(&rows.screen(-2, 3), -1), 0);
+    }
+
+    #[test]
+    fn the_alternate_screen_keeps_its_rows() {
+        let mut rows = rows(0, 3, &[0], 100);
+        rows.join = false;
+        assert_eq!(rows.screen(2, 3), [span(0, 0), span(1, 1), span(2, 2)]);
+        assert!(rows.wraps(0));
     }
 }
 
@@ -1006,10 +1257,10 @@ mod tests {
 
         terminal.resize(40, 10);
         let snapshot = terminal.snapshot();
-        assert_eq!(
-            (snapshot.columns, snapshot.rows, snapshot.cells.len()),
-            (40, 10, 400)
-        );
+        // Lines wider than 40 columns (a long prompt) stay one wider row.
+        assert_eq!(snapshot.rows, 10);
+        assert!(snapshot.columns >= 40, "{}", snapshot.columns);
+        assert_eq!(snapshot.cells.len(), snapshot.columns * 10);
 
         terminal.write(&b"exit\r"[..]);
         assert!(
@@ -1162,15 +1413,63 @@ mod screen_links {
     }
 
     #[test]
-    fn a_url_wrapped_over_rows_is_one_link() {
-        // "see " + a 28-character URL: 16 columns on row 0, 12 on row 1.
-        let snapshot = screen(b"see https://example.com/abcdefgh done", "done");
+    fn a_line_wrapped_by_the_emulator_shows_as_one_wide_row() {
+        // "see " + a 28-character URL + " done": 37 columns on a 20-column
+        // screen, which the emulator wraps; the snapshot joins it.
+        let snapshot = screen(b"see https://example.com/abcdefgh done\r\n$ ", "$");
+        assert_eq!(snapshot.columns, 37);
+        assert_eq!(snapshot.cells.len(), 37 * 4);
+        assert_eq!(
+            snapshot.text().lines().next(),
+            Some("see https://example.com/abcdefgh done")
+        );
+        assert_eq!(snapshot.wrapped, [false; 4]);
+        // The cursor after the prompt, on the next row.
+        assert_eq!(snapshot.cursor, Some((1, 2)));
         let url = LinkTarget::Url("https://example.com/abcdefgh".into());
-        let from_first = snapshot.link_at(0, 10).unwrap();
-        assert_eq!(from_first.target, url);
-        assert_eq!(from_first.cells, [(0, 4..20), (1, 0..12)]);
-        assert_eq!(snapshot.link_at(1, 3), Some(from_first));
-        assert_eq!(snapshot.link_at(1, 14), None, "`done` is not part of it");
+        let link = snapshot.link_at(0, 10).unwrap();
+        assert_eq!(link.target, url);
+        assert_eq!(link.cells, [(0, 4..32)]);
+        assert_eq!(snapshot.link_at(0, 25), Some(link));
+        assert_eq!(snapshot.link_at(0, 34), None, "`done` is not part of it");
+    }
+
+    #[test]
+    fn scrolling_moves_by_display_rows() {
+        let long = "x".repeat(45);
+        let output = format!("a\r\n{long}\r\nb\r\nc\r\nd");
+        let (tx, rx) = std_mpsc::channel();
+        let (terminal, _events) =
+            Terminal::attach(20, 4, 10, Palette::default(), Arc::new(Sink), rx, None).unwrap();
+        tx.send(PtyOutput::Data(output.into_bytes())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !terminal.snapshot().text().ends_with('d') {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let lines = |terminal: &Terminal| -> Vec<String> {
+            terminal
+                .snapshot()
+                .text()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(lines(&terminal), [long.as_str(), "b", "c", "d"]);
+        terminal.scroll(1);
+        assert_eq!(lines(&terminal), ["a", long.as_str(), "b", "c"]);
+        terminal.scroll(5);
+        assert_eq!(lines(&terminal)[0], "a", "the top of the history");
+        terminal.scroll(-1);
+        assert_eq!(lines(&terminal), [long.as_str(), "b", "c", "d"]);
+    }
+
+    #[test]
+    fn the_cursor_after_a_wrapped_line_stays_on_its_row() {
+        // 25 characters on a 20-column screen, the cursor after them.
+        let snapshot = screen(b"abcdefghijklmnopqrstuvwxy", "y");
+        assert_eq!(snapshot.cursor, Some((0, 25)));
+        assert_eq!(snapshot.columns, 26, "wide enough to show the cursor");
     }
 
     #[test]

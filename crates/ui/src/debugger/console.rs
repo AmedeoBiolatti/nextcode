@@ -5,15 +5,16 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, Hsla, KeyBinding, ScrollStrategy, Subscription,
-    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    App, Context, Entity, FocusHandle, Focusable, Hsla, KeyBinding, ListHorizontalSizingBehavior,
+    ScrollStrategy, Subscription, UniformListScrollHandle, Window, div, prelude::*, px,
+    uniform_list,
 };
 
 use super::{
     ClearConsole, NextConsoleInput, PreviousConsoleInput, SubmitConsoleInput,
     session::{DebugSession, DebugSessionEvent, OutputCategory},
 };
-use crate::{editor::Editor, pinpoint::Pin, selectable::selectable, theme};
+use crate::{editor::Editor, hscrollbar, pinpoint::Pin, selectable::selectable, theme};
 
 const ROW_HEIGHT: f32 = 18.;
 const HISTORY_LIMIT: usize = 100;
@@ -151,10 +152,12 @@ impl Focusable for DebugConsole {
 
 impl Render for DebugConsole {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self
-            .session
-            .as_ref()
-            .map_or(0, |session| session.read(cx).output().len());
+        let (count, widest) = self.session.as_ref().map_or((0, None), |session| {
+            let output = session.read(cx).output();
+            // Monospace: the most bytes is (about) the widest line.
+            let widest = (0..output.len()).max_by_key(|&index| output[index].text.len());
+            (output.len(), widest)
+        });
         let output = if count == 0 {
             div()
                 .flex_1()
@@ -167,7 +170,9 @@ impl Render for DebugConsole {
                 ))
                 .into_any_element()
         } else {
-            uniform_list(
+            // Long lines are not wrapped: the list scrolls sideways (Shift+
+            // wheel, trackpads, the left-right bar over its bottom edge).
+            let list = uniform_list(
                 "debug-console",
                 count,
                 cx.processor(|this, range: Range<usize>, _, cx| {
@@ -194,6 +199,8 @@ impl Render for DebugConsole {
                         .collect()
                 }),
             )
+            .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+            .with_width_from_item(widest)
             .track_scroll(self.scroll.clone())
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                 // Scrolling up stops following; reaching the end resumes.
@@ -204,10 +211,18 @@ impl Render for DebugConsole {
                 this.follow = -offset.y >= max.height - px(2.);
                 cx.notify();
             }))
-            .flex_1()
-            .min_h_0()
-            .pin("output")
-            .into_any_element()
+            .size_full();
+            div()
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .child(list)
+                .child(hscrollbar::for_handle(
+                    "debug-console-hscrollbar",
+                    &self.scroll.0.borrow().base_handle,
+                ))
+                .pin("output")
+                .into_any_element()
         };
         div()
             .track_focus(&self.focus_handle)
