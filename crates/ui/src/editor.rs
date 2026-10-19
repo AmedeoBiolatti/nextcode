@@ -13,9 +13,8 @@ use gpui::{
 };
 use lsp::types::{
     DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncKind, Uri,
-    VersionedTextDocumentIdentifier, notification,
+    DidOpenTextDocumentParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier, notification,
 };
 use syntax::{HighlightSpan, Language, Syntax};
 use text::{Bias, Buffer, Change, Encoding};
@@ -46,6 +45,7 @@ mod go_to_line;
 mod indent_guides;
 mod inlay_hints;
 mod lines;
+mod lsp_sync;
 mod minimap;
 mod navigation;
 mod notes;
@@ -53,6 +53,7 @@ mod pin_text;
 mod pins;
 mod project_settings;
 mod rename;
+pub(crate) mod save;
 mod scrollbar;
 mod selections;
 pub(crate) mod semantic;
@@ -64,6 +65,8 @@ mod sticky_scroll;
 mod symbols;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_large;
 mod vim;
 
 use display_map::{DisplayMap, DisplayRow};
@@ -383,6 +386,9 @@ pub enum EditorEvent {
     Edited,
     /// The buffer was written to its file.
     Saved,
+    /// A save found the file changed on disk since the buffer last matched
+    /// it and left it alone; `Editor::save_overwriting` writes anyway.
+    SaveConflict,
     /// Open one of these locations (a picker when there are several).
     Navigate {
         locations: Vec<language::Location>,
@@ -506,6 +512,10 @@ pub struct Editor {
     /// Where the buffer's file lives; `None` for input fields.
     project: Option<Project>,
     syntax: Option<Syntax>,
+    /// Reduced features for a very large file (see `LARGE_FILE_BYTES`):
+    /// no syntax tree, language server, spell check or minimap colours;
+    /// the status bar says so.
+    large_file: bool,
     /// Input-field mode: no gutter or status bar; Enter, Tab and vertical
     /// motion bubble up to the parent view.
     single_line: bool,
@@ -583,6 +593,8 @@ pub struct Editor {
     vim: vim::VimState,
     /// Sticky notes on this file's lines.
     notes: self::notes::NotesState,
+    /// The save under way and the ones asked for meanwhile.
+    save: save::SaveState,
 }
 
 /// A mouse drag in progress.
@@ -705,7 +717,16 @@ struct EditorLayout {
 /// One visible screen row.
 struct RowLayout {
     row: DisplayRow,
+    /// The text of `clip`.
     shaped: ShapedLine,
+    /// The bytes of the row that are laid out: all of it unless the row
+    /// runs past the view, then the part in and around it (see
+    /// `row_clip`). Offsets outside are placed a column per byte.
+    clip: Range<usize>,
+    /// Where `clip` starts, from the row's text start: an em per column
+    /// before it.
+    clip_x: Pixels,
+    em_width: Pixels,
     /// Space before the text (continuation indent).
     indent: Pixels,
     /// The line number, on a line's first row.
@@ -724,26 +745,41 @@ struct RowLayout {
 }
 
 impl RowLayout {
-    /// x of buffer `offset` (on this row) from the row's text start; an
-    /// inlay hint at `offset` is drawn after it.
+    /// x of buffer `offset` (on this row) from the laid-out text's start
+    /// (`EditorLayout::text_left`); an inlay hint at `offset` is drawn
+    /// after it. Offsets outside `clip` are estimated a column per byte:
+    /// they are off the view.
     fn x_for(&self, offset: usize) -> Pixels {
-        let index = self.inlays.display_index(offset - self.row.range.start);
+        if offset < self.clip.start {
+            return -self.em_width * (self.clip.start - offset) as f32;
+        }
+        if offset > self.clip.end {
+            return self.shaped.width + self.em_width * (offset - self.clip.end) as f32;
+        }
+        let index = self.inlays.display_index(offset - self.clip.start);
         self.shaped.x_for_index(index)
     }
 
-    /// The buffer offset nearest `x` (from the row's text start); clicks
-    /// on an inlay hint land beside it.
+    /// The buffer offset nearest `x` (from the laid-out text's start);
+    /// clicks on an inlay hint land beside it, ones outside `clip` on its
+    /// nearer end.
     fn offset_closest_to(&self, x: Pixels) -> usize {
         let index = self.shaped.closest_index_for_x(x);
-        self.row.range.start + self.inlays.buffer_offset(index)
+        self.clip.start + self.inlays.buffer_offset(index)
     }
 
     /// The buffer offset of the character under `x`, if text (not an
     /// inlay hint) is there.
     fn offset_under(&self, x: Pixels) -> Option<usize> {
         let index = self.shaped.index_for_x(x)?;
-        (!self.inlays.is_inlay(index))
-            .then(|| self.row.range.start + self.inlays.buffer_offset(index))
+        (!self.inlays.is_inlay(index)).then(|| self.clip.start + self.inlays.buffer_offset(index))
+    }
+
+    /// Width of the whole row's text from its start (`clip_x` included),
+    /// estimated past `clip`.
+    #[allow(dead_code)]
+    fn text_width(&self) -> Pixels {
+        self.clip_x + self.x_for(self.row.range.end)
     }
 }
 
@@ -764,9 +800,10 @@ impl EditorLayout {
         self.text_bounds.top() + self.line_height * (self.first_row + index) as f32 - scroll_y
     }
 
-    /// Window x where `row`'s text starts.
+    /// Window x where `row`'s laid-out text starts (its `clip`; the whole
+    /// row unless it runs past the view).
     fn text_left(&self, row: &RowLayout, scroll_x: Pixels) -> Pixels {
-        self.text_bounds.left() - scroll_x + row.indent
+        self.text_bounds.left() - scroll_x + row.indent + row.clip_x
     }
 
     /// The `⋯` box after `rows[index]`'s text.
@@ -790,10 +827,109 @@ const MIN_WRAP_COLUMNS: usize = 16;
 /// Lines read to detect the indentation style.
 const INDENT_SAMPLE_LINES: usize = 2000;
 
+/// Files larger than this, or with a line longer than `LARGE_LINE_BYTES`,
+/// open with reduced features (`Editor::large_file`): parsing, a language
+/// server and spell checking would stall the UI on them.
+const LARGE_FILE_BYTES: usize = 8 * 1024 * 1024;
+const LARGE_LINE_BYTES: usize = 64 * 1024;
+
+/// Columns laid out beyond each side of the view on rows longer than it
+/// (see `row_clip`).
+const CLIP_MARGIN_COLUMNS: usize = 128;
+
+/// Whether `buffer` gets reduced features: one pass over its lines, only
+/// when it is big enough for a line to be too long.
+fn is_large_file(buffer: &Buffer) -> bool {
+    buffer.len() > LARGE_FILE_BYTES
+        || (buffer.len() > LARGE_LINE_BYTES && buffer.longest_line_bytes() > LARGE_LINE_BYTES)
+}
+
+/// Files up to this size are reloaded from disk through a diff (only the
+/// changed text is edited); bigger ones are replaced whole.
+const MINIMAL_RELOAD_BYTES: usize = 2 * 1024 * 1024;
+
+/// `selections` after `changes` (in order): cursors move after text
+/// inserted at them, selection edges stay outside it.
+fn selections_through(changes: &[Change], selections: &SelectionSet) -> SelectionSet {
+    let map = |offset: usize, bias: Bias| {
+        changes
+            .iter()
+            .fold(offset, |offset, change| change.map_offset(offset, bias))
+    };
+    selections.map(|s| {
+        let (anchor, head) = if s.reversed() {
+            (Bias::Left, Bias::Right)
+        } else {
+            (Bias::Right, Bias::Left)
+        };
+        Selection {
+            anchor: map(s.anchor, if s.is_empty() { Bias::Right } else { anchor }),
+            head: map(s.head, if s.is_empty() { Bias::Right } else { head }),
+            goal: s.goal,
+            at_row_end: false,
+        }
+    })
+}
+
+/// The part of a row that is laid out: its bytes (the whole row unless
+/// it runs past the view) and the columns before them.
+struct RowClip {
+    range: Range<usize>,
+    columns_before: usize,
+}
+
+/// Cuts `row` to the columns in `window` (the view and a margin; `None`
+/// when rows wrap, as nothing scrolls sideways then), snapped to chars,
+/// so shaping and highlighting a long line cost the view's width, not
+/// the line's (VS Code's `stopRenderingLineAfter`). Rows that fit are
+/// not scanned.
+fn row_clip(buffer: &Buffer, row: &DisplayRow, window: Option<&Range<usize>>) -> RowClip {
+    let full = RowClip {
+        range: row.range.clone(),
+        columns_before: 0,
+    };
+    let Some(window) = window else {
+        return full;
+    };
+    // Every column is at least a byte: such a row is inside the window.
+    if window.start == 0 && row.range.len() <= window.end {
+        return full;
+    }
+    let (mut start, mut columns_before) = (None, 0);
+    let mut end = row.range.end;
+    let (mut columns, mut at) = (0, row.range.start);
+    for c in buffer.chunks(row.range.clone()).flat_map(str::chars) {
+        if start.is_none() && columns >= window.start {
+            start = Some(at);
+            columns_before = columns;
+        }
+        if columns >= window.end {
+            end = at;
+            break;
+        }
+        columns += display_map::char_width(c);
+        at += c.len_utf8();
+    }
+    // A row ending before the window shows nothing of itself.
+    let start = start.unwrap_or_else(|| {
+        columns_before = columns;
+        row.range.end
+    });
+    RowClip {
+        range: start..end.max(start),
+        columns_before,
+    }
+}
+
 impl Editor {
     pub fn new(mut buffer: Buffer, cx: &mut Context<Self>) -> Self {
         let language = buffer.path().and_then(Language::from_path);
-        let syntax = language.and_then(|language| Syntax::new(language, &buffer));
+        let large_file = is_large_file(&buffer);
+        let syntax = if large_file {
+            None
+        } else {
+            language.and_then(|language| Syntax::new(language, &buffer))
+        };
         buffer.drain_changes();
         let sample: Vec<String> = (0..buffer.line_count().min(INDENT_SAMPLE_LINES))
             .map(|line| buffer.line_text(line))
@@ -825,6 +961,7 @@ impl Editor {
             error: None,
             project: None,
             syntax,
+            large_file,
             single_line: false,
             text_area: false,
             notebook_cell: false,
@@ -868,6 +1005,7 @@ impl Editor {
             sticky: Default::default(),
             vim: Default::default(),
             notes: Default::default(),
+            save: Default::default(),
         }
     }
 
@@ -903,10 +1041,11 @@ impl Editor {
     /// Opens this document on `server` (no-op if already open there) and
     /// asks for its semantic tokens.
     pub fn attach_server(&mut self, server: Arc<RunningServer>, cx: &mut Context<Self>) {
-        if self
-            .lsp
-            .as_ref()
-            .is_some_and(|doc| Arc::ptr_eq(&doc.server, &server))
+        if self.large_file
+            || self
+                .lsp
+                .as_ref()
+                .is_some_and(|doc| Arc::ptr_eq(&doc.server, &server))
         {
             return;
         }
@@ -984,8 +1123,10 @@ impl Editor {
         self.refresh_inlay_hints(cx);
     }
 
-    /// Sends the drained `changes` to the server: one incremental edit when
-    /// possible, otherwise the full text. Returns whether it sent them.
+    /// Sends the drained `changes` to the server: one incremental event
+    /// per change when the server takes them (and the batch allows it,
+    /// see `lsp_sync::incremental_changes`), otherwise the full text.
+    /// Returns whether it sent them.
     fn sync_changes(&mut self) -> bool {
         let Some(doc) = &mut self.lsp else {
             return false;
@@ -996,30 +1137,19 @@ impl Editor {
             return true;
         }
         let server = &doc.server;
-        let content_changes =
-            if server.sync == TextDocumentSyncKind::INCREMENTAL && self.changes.len() == 1 {
-                let change = self.changes[0];
-                let (start, end) = match server.encoding {
-                    Encoding::Utf8 => (change.start_point, change.old_end_point),
-                    Encoding::Utf16 => (change.start_utf16, change.old_end_utf16),
-                };
-                vec![TextDocumentContentChangeEvent {
-                    range: Some(lsp::types::Range::new(
-                        lsp_position(start),
-                        lsp_position(end),
-                    )),
-                    range_length: None,
-                    text: self.buffer.slice(change.start..change.new_end),
-                }]
-            } else if server.sync != TextDocumentSyncKind::NONE {
-                vec![TextDocumentContentChangeEvent {
-                    range: None,
-                    range_length: None,
-                    text: self.buffer.slice(0..self.buffer.len()),
-                }]
-            } else {
-                return false;
-            };
+        if server.sync == TextDocumentSyncKind::NONE {
+            return false;
+        }
+        let incremental = (server.sync == TextDocumentSyncKind::INCREMENTAL)
+            .then(|| lsp_sync::incremental_changes(&self.changes, &self.buffer, server.encoding))
+            .flatten();
+        let content_changes = incremental.unwrap_or_else(|| {
+            vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: self.buffer.slice(0..self.buffer.len()),
+            }]
+        });
         doc.version += 1;
         server
             .connection
@@ -1094,7 +1224,14 @@ impl Editor {
     }
 
     /// An editor for a file of `project`; the buffer must have its path.
-    pub fn for_file(buffer: Buffer, project: Project, cx: &mut Context<Self>) -> Self {
+    /// The document joins the crash recovery dump (`startup::register_document`).
+    pub fn for_file(mut buffer: Buffer, project: Project, cx: &mut Context<Self>) -> Self {
+        if let Some(path) = buffer.path().map(|path| path.to_path_buf()) {
+            if buffer.disk_stamp().is_none() {
+                buffer.set_disk_stamp(save::disk_stamp(&project, &path));
+            }
+            crate::startup::register_document(path, buffer.document_handle());
+        }
         Self {
             project: Some(project),
             ..Self::new(buffer, cx)
@@ -1176,19 +1313,38 @@ impl Editor {
     /// Brings in the file's current contents after an external change.
     /// Unsaved edits are only overwritten when `force` is set.
     pub fn reload_from_disk(&mut self, force: bool, cx: &mut Context<Self>) -> ReloadOutcome {
-        let Some(text) = self
+        let Some((project, path)) = self
             .project
-            .as_ref()
-            .zip(self.buffer.path())
-            .and_then(|(project, path)| project.read_text(path).ok())
+            .clone()
+            .zip(self.buffer.path().map(|path| path.to_path_buf()))
         else {
             return ReloadOutcome::Failed;
         };
+        // Taken before the read: a file that changes in between looks
+        // changed to the next save instead of being overwritten.
+        let stamp = save::disk_stamp(&project, &path);
+        let Ok(text) = project.read_text(&path) else {
+            return ReloadOutcome::Failed;
+        };
         let was_dirty = self.buffer.is_dirty();
-        if was_dirty && !force && self.buffer.slice(0..self.buffer.len()) != text {
+        let same = self.buffer.equals(&text);
+        if was_dirty && !force && !same {
             return ReloadOutcome::Conflict;
         }
-        if !self.buffer.reload(&text) {
+        self.buffer.set_disk_stamp(stamp);
+        // Only what differs is edited (as one undo step), so folds,
+        // diagnostics, selections and notes elsewhere stay where they are;
+        // a big file is replaced whole rather than diffed on the UI thread.
+        let reloaded = if same || self.large_file || text.len() > MINIMAL_RELOAD_BYTES {
+            self.buffer.reload(&text)
+        } else {
+            let edits = crate::workspace_edit::minimal_edits(&self.text(), &text);
+            match self.buffer.reload_with_edits(&text, edits) {
+                Ok(reloaded) => reloaded,
+                Err(_) => self.buffer.reload(&text),
+            }
+        };
+        if !reloaded {
             // Same text as on disk (e.g. our own save): nothing to redraw
             // except a cleared dirty marker.
             self.finish_change(was_dirty, cx);
@@ -1199,9 +1355,10 @@ impl Editor {
         }
         let before = self.selections.clone();
         let transaction = self.buffer.transaction_id();
-        self.selections = before.clamped(&self.buffer);
+        let changes: Vec<Change> = self.buffer.drain_changes().collect();
+        self.selections = selections_through(&changes, &before).clamped(&self.buffer);
         self.record_history(transaction, before);
-        self.finish_change(was_dirty, cx);
+        self.finish_change_with(changes, was_dirty, cx);
         if was_dirty {
             // Unsaved edits discarded: their note positions go too.
             self.notes_reloaded(cx);
@@ -1212,43 +1369,7 @@ impl Editor {
         ReloadOutcome::Reloaded
     }
 
-    pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
-        let was_dirty = self.buffer.is_dirty();
-        let written = match (&self.project, self.buffer.path()) {
-            (Some(project), Some(path)) => {
-                project.write(path, self.buffer.slice(0..self.buffer.len()).into_bytes())
-            }
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "buffer has no file",
-            )),
-        };
-        let saved = match written {
-            Ok(()) => {
-                self.buffer.mark_saved();
-                self.error = None;
-                if let Some(doc) = &self.lsp {
-                    doc.server
-                        .connection
-                        .notify::<notification::DidSaveTextDocument>(DidSaveTextDocumentParams {
-                            text_document: TextDocumentIdentifier::new(doc.uri.clone()),
-                            text: doc.server.save_includes_text.then(|| self.text()),
-                        });
-                }
-                self.write_note_anchors(cx);
-                cx.emit(EditorEvent::Saved);
-                // A saved `settings.json` or theme file applies at once.
-                theme::refresh(cx);
-                true
-            }
-            Err(err) => {
-                self.error = Some(format!("Save failed: {err}").into());
-                false
-            }
-        };
-        self.finish_change(was_dirty, cx);
-        saved
-    }
+    // Saving (`Editor::save`, `Editor::save_overwriting`) is in `save.rs`.
 
     /// Moves every selection's head to `target`'s offset (with its goal
     /// column and row-end affinity); without `select` the selection
@@ -1430,6 +1551,8 @@ impl Editor {
         self.map_symbols();
         self.snippet_edited();
         self.spell_edited();
+        self.find_edited();
+        self.minimap_edited();
         self.debug_gutter_edited(cx);
         self.notes_edited(cx);
         // Folds move with the text (or open when edited inside); edited
@@ -1650,7 +1773,7 @@ impl Editor {
         let x = position.x - layout.text_bounds.left() + self.scroll.x;
         match layout.row_layout_at(position.y, self.scroll.y) {
             Some((_, row)) => {
-                let offset = row.offset_closest_to(x - row.indent);
+                let offset = row.offset_closest_to(x - row.indent - row.clip_x);
                 let offset = offset.min(row.row.range.end);
                 (offset, row.row.wraps_at(offset))
             }
@@ -2204,6 +2327,29 @@ impl Editor {
         let first_row = (self.scroll.y / line_height).floor() as usize;
         let visible_rows = (viewport.height / line_height).ceil() as usize + 1;
         let display_rows = self.display.rows(&self.buffer, first_row, visible_rows);
+        // Where the view will be once it follows the cursor, roughly (a
+        // column per char), so the rows are cut around there; the exact
+        // adjustment comes below, once they are shaped.
+        if self.autoscroll && columns.is_none() {
+            let x = em_width * self.buffer.column(primary_head) as f32;
+            let margin = em_width * 2.;
+            if x < self.scroll.x {
+                self.scroll.x = (x - margin).max(px(0.));
+            } else if x + margin > self.scroll.x + viewport.width {
+                self.scroll.x = x + margin - viewport.width;
+            }
+        }
+        // What each row shows of its text: rows longer than the view are
+        // cut to the columns in and around it (none wrap then).
+        let clip_window = columns.is_none().then(|| {
+            let first = (self.scroll.x / em_width).floor().max(0.) as usize;
+            let count = (viewport.width / em_width).ceil().max(0.) as usize;
+            first.saturating_sub(CLIP_MARGIN_COLUMNS)..first + count + CLIP_MARGIN_COLUMNS
+        });
+        let clips: Vec<RowClip> = display_rows
+            .iter()
+            .map(|row| row_clip(&self.buffer, row, clip_window.as_ref()))
+            .collect();
 
         // Chevrons: folded lines always, foldable ones while the mouse is
         // over the gutter (VS Code).
@@ -2224,19 +2370,34 @@ impl Editor {
             .and_then(|doc| doc.server.semantic_legend.as_ref());
         let styler = semantic::Styler::new(&theme, self.language(), legend);
         let base_run = run(0, text_color);
-        // Highlighted per run of consecutive shown lines: folded text is
-        // never highlighted.
+        // Highlighted per run of consecutive whole rows (folded text is
+        // never highlighted); a cut row is queried for its shown part
+        // alone, so a long line's tokens off the view are never visited.
         let mut spans = Vec::new();
         if let Some(syntax) = &self.syntax {
-            let mut rest = display_rows.as_slice();
-            while let Some(first) = rest.first() {
-                let consecutive = rest
-                    .windows(2)
-                    .take_while(|pair| pair[1].line <= pair[0].line + 1)
-                    .count();
-                let end = rest[consecutive].range.end;
-                spans.extend(syntax.highlights(&self.buffer, first.range.start..end));
-                rest = &rest[consecutive + 1..];
+            // The run of whole rows being collected and its last line.
+            let mut run: Option<(Range<usize>, usize)> = None;
+            for (row, clip) in display_rows.iter().zip(&clips) {
+                let whole = clip.range == row.range;
+                if whole
+                    && let Some((range, last_line)) = &mut run
+                    && row.line <= *last_line + 1
+                {
+                    range.end = row.range.end;
+                    *last_line = row.line;
+                    continue;
+                }
+                if let Some((range, _)) = run.take() {
+                    spans.extend(syntax.highlights(&self.buffer, range));
+                }
+                if whole {
+                    run = Some((row.range.clone(), row.line));
+                } else if !clip.range.is_empty() {
+                    spans.extend(syntax.highlights(&self.buffer, clip.range.clone()));
+                }
+            }
+            if let Some((range, _)) = run {
+                spans.extend(syntax.highlights(&self.buffer, range));
             }
         }
 
@@ -2255,8 +2416,9 @@ impl Editor {
             ..run(0, theme::inlay_hint())
         };
         let mut row_inlays = Vec::new();
-        for row in display_rows {
-            let range = row.range.clone();
+        for (row, clip) in display_rows.into_iter().zip(clips) {
+            // The shown part of the row (all of it, usually).
+            let range = clip.range.clone();
             // Tabs render as one space for now; byte offsets stay aligned.
             let text = self.buffer.slice(range.clone()).replace('\t', " ");
             let first_span = spans.partition_point(|span| span.range.end <= range.start);
@@ -2282,10 +2444,10 @@ impl Editor {
             row_inlays.clear();
             row_inlays.extend(
                 self.display
-                    .inlays_in(row.range.clone())
+                    .inlays_in(clip.range.clone())
                     .iter()
                     .filter(|inlay| inlay.offset < row.range.end || row.last)
-                    .map(|inlay| (inlay.offset - row.range.start, inlay)),
+                    .map(|inlay| (inlay.offset - clip.range.start, inlay)),
             );
             let (text, runs, inlays) =
                 inlay_hints::splice_inlays(&text, runs, &row_inlays, &inlay_run);
@@ -2330,6 +2492,9 @@ impl Editor {
                 folded: (row.last && folded_header).then(|| self.buffer.line_end(line)),
                 row,
                 shaped,
+                clip_x: em_width * clip.columns_before as f32,
+                clip: clip.range,
+                em_width,
                 number,
                 mark,
                 chevron,
@@ -2352,7 +2517,28 @@ impl Editor {
                 .iter()
                 .find(|row| row.row.shows(primary_head, primary_at_row_end))
         {
-            let x = row.x_for(primary_head);
+            // A cursor still off the row's laid-out part (wide chars
+            // threw the estimate above off by more than the margin) is
+            // placed by counting the columns up to it, once; the view
+            // lands on it and another frame lays that part out.
+            let columns_between = |range: Range<usize>| {
+                let columns: usize = self
+                    .buffer
+                    .chunks(range)
+                    .flat_map(str::chars)
+                    .map(display_map::char_width)
+                    .sum();
+                em_width * columns as f32
+            };
+            let x = if primary_head < row.clip.start {
+                window.refresh();
+                columns_between(row.row.range.start..primary_head)
+            } else if primary_head > row.clip.end {
+                window.refresh();
+                row.clip_x + row.shaped.width + columns_between(row.clip.end..primary_head)
+            } else {
+                row.clip_x + row.x_for(primary_head)
+            };
             let margin = em_width * 2.;
             if x < self.scroll.x {
                 self.scroll.x = (x - margin).max(px(0.));
@@ -3363,6 +3549,17 @@ impl Render for Editor {
                                 .flex()
                                 .gap_4()
                                 .min_w_0()
+                                .children(self.large_file.then(|| {
+                                    div()
+                                        .flex_none()
+                                        .text_color(theme::warning())
+                                        .child(selectable(
+                                            "large-file",
+                                            "Large file: reduced features",
+                                        ))
+                                        .pin("large-file")
+                                        .label("Large file: no syntax, language server or spell check")
+                                }))
                                 .children(
                                     self.lsp_status.clone().map(|(status, color)| {
                                         div()

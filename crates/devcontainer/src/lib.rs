@@ -56,6 +56,12 @@ pub trait Host: Send + Sync {
     fn env_var(&self, name: &str) -> Option<String>;
     /// Windows paths (`\`, drive letters) rather than POSIX ones.
     fn windows(&self) -> bool;
+    /// Whether the user trusts the project folder: its `initializeCommand`
+    /// (a program of the repository's choosing, run on this machine) runs
+    /// only then. Untrusted unless the host says otherwise.
+    fn trusted(&self) -> bool {
+        false
+    }
 }
 
 fn join(host: &dyn Host, dir: &str, name: &str) -> String {
@@ -450,7 +456,12 @@ pub fn up(
         ));
     }
 
-    if let Some(initialize) = &config.initialize_command {
+    if config.initialize_command.is_some() && !host.trusted() {
+        progress(
+            "Skipping initializeCommand: it runs on this machine, in trusted folders only \
+             (Trust the folder in its window, then reopen it in the container)",
+        );
+    } else if let Some(initialize) = &config.initialize_command {
         let shell: &[&str] = if host.windows() {
             &["cmd.exe", "/C"]
         } else {
@@ -968,5 +979,98 @@ mod tests {
                 ("ghi", false, "")
             ]
         );
+    }
+
+    /// A host with a `devcontainer.json` and no docker, recording what runs.
+    struct Recording {
+        trusted: bool,
+        runs: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl Host for Recording {
+        fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            _: Option<&[u8]>,
+            _: Duration,
+        ) -> io::Result<Output> {
+            self.runs
+                .lock()
+                .unwrap()
+                .push((program.to_owned(), args.to_vec()));
+            if program == "docker" {
+                return Err(io::Error::other("no docker here"));
+            }
+            Ok(Output {
+                code: Some(0),
+                stdout: b"hello from initializeCommand\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+        fn read_file(&self, _: &str) -> io::Result<Option<Vec<u8>>> {
+            Ok(Some(
+                br#"{ "image": "debian", "initializeCommand": "echo hello" }"#.to_vec(),
+            ))
+        }
+        fn write_file(&self, _: &str, _: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn list_dirs(&self, _: &str) -> io::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn temp_dir(&self) -> String {
+            "/tmp".into()
+        }
+        fn env_var(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn windows(&self) -> bool {
+            false
+        }
+        fn trusted(&self) -> bool {
+            self.trusted
+        }
+    }
+
+    #[test]
+    fn initialize_command_runs_in_trusted_folders_only() {
+        let config = "/home/me/proj/.devcontainer/devcontainer.json";
+        let untrusted = Recording {
+            trusted: false,
+            runs: Default::default(),
+        };
+        let mut log = Vec::new();
+        assert!(up(&untrusted, config, &mut |line| log.push(line.to_owned())).is_err());
+        let runs = untrusted.runs.lock().unwrap();
+        assert!(
+            runs.iter().all(|(program, _)| program == "docker"),
+            "{runs:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with("Skipping initializeCommand")),
+            "{log:?}"
+        );
+
+        let trusted = Recording {
+            trusted: true,
+            runs: Default::default(),
+        };
+        let mut log = Vec::new();
+        assert!(up(&trusted, config, &mut |line| log.push(line.to_owned())).is_err());
+        let runs = trusted.runs.lock().unwrap();
+        assert_eq!(
+            runs[0],
+            (
+                "/bin/sh".to_owned(),
+                vec!["-c".to_owned(), "echo hello".to_owned()]
+            )
+        );
+        assert!(
+            log.contains(&"hello from initializeCommand".to_owned()),
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|line| line.starts_with("Skipping")));
     }
 }

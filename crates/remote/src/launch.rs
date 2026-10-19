@@ -336,6 +336,8 @@ echo '{LAUNCH_MARK} missing'"#
         }),
         Err(_) => {
             child.kill().ok();
+            // Reaped, or it stays a zombie on Unix.
+            child.wait().ok();
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(

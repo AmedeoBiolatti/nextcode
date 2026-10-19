@@ -4529,3 +4529,53 @@ steps:
     assert!(headless.child.wait().unwrap().success());
     fs::remove_dir_all(&root).ok();
 }
+
+/// Workflows outside the default folders: a folder from
+/// `NEXT_CODE_WORKFLOW_FOLDERS`, and a file run by its absolute path.
+#[test]
+fn headless_mode_lists_workflow_folders_and_runs_files_by_path() {
+    let root = std::env::temp_dir().join(format!("next_code_wf_folders_{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    for dir in ["main", "team", "elsewhere", "config"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let root = root.canonicalize().unwrap();
+    fs::write(root.join("team/deploy.yaml"), "name: Team deploy\nsteps: {a: {check: exit 0}}\n").unwrap();
+    let single = root.join("elsewhere/one.yaml");
+    fs::write(&single, "name: One off\nsteps: {b: {check: exit 0}}\n").unwrap();
+    let mut headless = Headless::launch(
+        &[root.join("main").as_os_str()],
+        &[
+            ("XDG_CONFIG_HOME", &root.join("config")),
+            ("NEXT_CODE_WORKFLOW_FOLDERS", &root.join("team")),
+        ],
+    );
+    let ready = headless.next(|line| line["event"].is_string());
+    assert_eq!(ready["event"], "ready", "{ready}");
+    let list = headless.call(json!({ "cmd": "workflows_list" }));
+    let team = list["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|found| found["name"] == "Team deploy")
+        .cloned()
+        .unwrap_or_else(|| panic!("{list}"));
+    assert_eq!(team["source"], root.join("team").display().to_string(), "{team}");
+    let run = headless.call(json!({ "cmd": "workflow_run", "name": "Team deploy" }));
+    assert_eq!(run["ok"], true, "{run}");
+    // A file anywhere, by its absolute path: listed from then on.
+    let run = headless.call(json!({ "cmd": "workflow_run", "path": single.to_string_lossy() }));
+    assert_eq!(run["ok"], true, "{run}");
+    let status = status_until(&mut headless, &single.to_string_lossy(), |status| {
+        status["outcome"] == "ready"
+    });
+    assert_eq!(status["workflow"], "One off");
+    let list = headless.call(json!({ "cmd": "workflows_list" }));
+    assert!(
+        list["result"].as_array().unwrap().iter().any(|found| found["name"] == "One off"),
+        "{list}"
+    );
+    assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);
+    assert!(headless.child.wait().unwrap().success());
+    fs::remove_dir_all(&root).ok();
+}

@@ -9,10 +9,15 @@
 //! text access). Without wrapping or folds, rows are lines and nothing is
 //! stored.
 
-use std::ops::Range;
+use std::{cell::RefCell, ops::Range};
 
 use text::{Bias, Buffer, Change};
 use unicode_width::UnicodeWidthChar;
+
+/// Lines whose wrap positions are kept (`DisplayMap::line_breaks` is
+/// asked for every shown line several times a frame; a long line is
+/// walked once instead).
+const BREAKS_CACHE_LINES: usize = 256;
 
 /// A folded region. The header line stays visible; the lines after it,
 /// through `end`'s line, are hidden.
@@ -239,6 +244,11 @@ pub(super) struct DisplayMap {
     line_count: usize,
     /// Inlay hints, sorted by offset; moved through edits.
     inlays: Vec<Inlay>,
+    /// Wrap positions (`line_breaks`) of lines asked for lately, while
+    /// wrapping: (line, row starts, continuation indent); emptied by
+    /// edits, inlays and a new width, replaced round robin.
+    breaks: RefCell<Vec<(usize, Vec<usize>, usize)>>,
+    breaks_next: std::cell::Cell<usize>,
 }
 
 impl DisplayMap {
@@ -251,7 +261,13 @@ impl DisplayMap {
             row_starts: Vec::new(),
             line_count: buffer.line_count(),
             inlays: Vec::new(),
+            breaks: RefCell::new(Vec::new()),
+            breaks_next: std::cell::Cell::new(0),
         }
+    }
+
+    fn forget_breaks(&mut self) {
+        self.breaks.get_mut().clear();
     }
 
     #[cfg(test)]
@@ -284,6 +300,7 @@ impl DisplayMap {
             return false;
         }
         let old = std::mem::replace(&mut self.inlays, inlays);
+        self.forget_breaks();
         if let Some(width) = self.wrap {
             let mut lines: Vec<usize> = old
                 .iter()
@@ -309,6 +326,7 @@ impl DisplayMap {
             return;
         }
         self.wrap = columns;
+        self.forget_breaks();
         self.line_rows.clear();
         if let Some(width) = columns {
             self.line_rows = (0..buffer.line_count())
@@ -344,6 +362,18 @@ impl DisplayMap {
         if changes.is_empty() {
             return;
         }
+        self.forget_breaks();
+        // One change inside one line leaves every other line's rows where
+        // they are: the rows after it shift by its new count, no rebuild.
+        let single_line = changes.len() == 1 && {
+            let change = &changes[0];
+            change.start_point.row == change.old_end_point.row
+                && change.old_end_point.row == change.new_end_point.row
+        };
+        let folds_before = self.folds.len();
+        let rows_before = single_line
+            .then(|| self.line_rows.get(changes[0].start_point.row).copied())
+            .flatten();
         for change in changes {
             self.folds = self
                 .folds
@@ -376,6 +406,21 @@ impl DisplayMap {
                 if *rows == 0 {
                     *rows = Self::count_rows(buffer, line, width, inlays);
                 }
+            }
+        }
+        if single_line && self.folds.len() == folds_before && !self.row_starts.is_empty() {
+            let line = changes[0].start_point.row;
+            if !self.is_hidden(line) {
+                let delta = match (rows_before, self.line_rows.get(line)) {
+                    (Some(before), Some(&after)) => after as isize - before as isize,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    for start in &mut self.row_starts[line + 1..] {
+                        *start = start.saturating_add_signed(delta);
+                    }
+                }
+                return;
             }
         }
         self.rebuild(buffer);
@@ -525,16 +570,33 @@ impl DisplayMap {
     /// continuation indent.
     pub fn line_breaks(&self, buffer: &Buffer, line: usize) -> (Vec<usize>, usize) {
         let start = buffer.line_start(line);
-        let mut starts = vec![start];
-        let indent = match self.wrap {
-            Some(width) => wrap_line(
-                Self::line_chars(buffer, line),
-                width,
-                (Self::line_inlays(&self.inlays, buffer, line), start),
-                |at| starts.push(start + at),
-            ),
-            None => 0,
+        let Some(width) = self.wrap else {
+            return (vec![start], 0);
         };
+        if let Some((_, starts, indent)) = self
+            .breaks
+            .borrow()
+            .iter()
+            .find(|(cached, ..)| *cached == line)
+        {
+            return (starts.clone(), *indent);
+        }
+        let mut starts = vec![start];
+        let indent = wrap_line(
+            Self::line_chars(buffer, line),
+            width,
+            (Self::line_inlays(&self.inlays, buffer, line), start),
+            |at| starts.push(start + at),
+        );
+        let mut cache = self.breaks.borrow_mut();
+        let entry = (line, starts.clone(), indent);
+        if cache.len() < BREAKS_CACHE_LINES {
+            cache.push(entry);
+        } else {
+            let next = self.breaks_next.get();
+            cache[next] = entry;
+            self.breaks_next.set((next + 1) % BREAKS_CACHE_LINES);
+        }
         (starts, indent)
     }
 
@@ -800,6 +862,48 @@ mod tests {
         assert_eq!(map.row_count(), 4);
         map.set_wrap(&buffer, None);
         assert_eq!(map.row_count(), 2);
+    }
+
+    #[test]
+    fn single_line_edits_keep_the_rows_after_in_step_without_a_rebuild() {
+        let mut buffer = buffer("aaaa bbbb\ncc\n{\n  x\n}\ndd eeee ffff");
+        let mut map = DisplayMap::new(&buffer);
+        map.set_wrap(&buffer, Some(5));
+        map.fold(&buffer, [Fold::lines(&buffer, 2, 3)]);
+        let check = |map: &DisplayMap, buffer: &Buffer| {
+            let mut fresh = DisplayMap::new(buffer);
+            fresh.set_wrap(buffer, Some(5));
+            fresh.fold(buffer, map.folds().iter().copied());
+            for line in 0..buffer.line_count() {
+                assert_eq!(map.line_row(line), fresh.line_row(line), "line {line}");
+            }
+            assert_eq!(map.row_count(), fresh.row_count());
+        };
+        let edit = |buffer: &mut Buffer, map: &mut DisplayMap, range: Range<usize>, text: &str| {
+            buffer.edit(range, text);
+            let changes: Vec<Change> = buffer.drain_changes().collect();
+            map.edit(buffer, &changes);
+        };
+        assert_eq!(map.line_breaks(&buffer, 1).0.len(), 1);
+        // Growing line 1 within itself shifts the rows after it.
+        edit(&mut buffer, &mut map, 10..12, "cccc dddd eeee");
+        check(&map, &buffer);
+        assert_eq!(
+            map.line_breaks(&buffer, 1).0.len(),
+            3,
+            "not the cached breaks"
+        );
+        edit(&mut buffer, &mut map, 10..24, "c");
+        check(&map, &buffer);
+        assert_eq!(map.line_breaks(&buffer, 1).0.len(), 1);
+        // The last line, with nothing after it, and a line that is hidden.
+        let end = buffer.len();
+        edit(&mut buffer, &mut map, end..end, " gggg hhhh");
+        check(&map, &buffer);
+        let inside = buffer.line_start(3) + 1;
+        edit(&mut buffer, &mut map, inside..inside, "yyyy yyyy");
+        assert!(map.folds().is_empty(), "editing hidden text opens the fold");
+        check(&map, &buffer);
     }
 
     fn inlay(offset: usize, label: &str) -> Inlay {

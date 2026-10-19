@@ -225,7 +225,8 @@ impl Render for WorkflowPicker {
                         .child(selectable(
                             "empty",
                             "No workflows. Run > New Workflow… creates one in the user folder; \
-                             projects can have .next_code/workflows/*.yaml.",
+                             projects can have .next_code/workflows/*.yaml; Run > Add Workflow \
+                             Folder… lists another folder.",
                         ))
                         .pin("empty")
                         .interactive(false),

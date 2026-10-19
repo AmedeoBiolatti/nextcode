@@ -399,7 +399,8 @@ pub fn check_document(
 impl Editor {
     /// The settings and scope spelling uses here, `None` when off.
     fn spell_config(&self) -> Option<(Arc<Settings>, Scope)> {
-        if self.single_line {
+        // A very large file is not checked (`Editor::large_file`).
+        if self.single_line || self.large_file {
             return None;
         }
         let settings = self.file_settings();

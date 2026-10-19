@@ -8,8 +8,9 @@
 //! kept in an [`OutputCache`].
 
 use std::{
-    cell::RefCell,
+    cell::Cell,
     collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -102,13 +103,103 @@ impl OutputCache {
             .get_or_insert_with(key, || decode_image(format, data, base64))
     }
 
-    /// `parts` joined, without ANSI escapes, with their colours.
-    fn text(&mut self, parts: &[&str]) -> Rc<CachedText> {
-        let key = content_hash(parts.iter().map(|part| part.as_bytes()));
-        self.texts.get_or_insert_with(key, || {
-            Rc::new(CachedText::new(ansi::parse(&parts.concat())))
-        })
+    /// `parts` joined, without ANSI escapes, with their colours, cut to
+    /// the lines `options` show (only those are hashed and parsed), and
+    /// the lines left out.
+    fn text(&mut self, parts: &[&str], options: &OutputOptions) -> (Rc<CachedText>, usize) {
+        self.windowed(parts, options, None)
     }
+
+    /// [`Self::text`] for the stream output `id`, which may keep growing:
+    /// its shown lines stay parsed once it printed past the limit, and
+    /// the lines left out are counted again only when it grew.
+    fn stream(
+        &mut self,
+        id: &ElementId,
+        text: &str,
+        options: &OutputOptions,
+    ) -> (Rc<CachedText>, usize) {
+        self.windowed(&[text], options, Some(id))
+    }
+
+    fn windowed(
+        &mut self,
+        parts: &[&str],
+        options: &OutputOptions,
+        id: Option<&ElementId>,
+    ) -> (Rc<CachedText>, usize) {
+        let limit = (!options.expanded && options.max_lines > 0).then_some(options.max_lines);
+        let (shown, rest) = window(parts, limit);
+        // An output's own entry when its hidden lines are counted on it.
+        let identity = id.map_or(0, |id| {
+            let mut hasher = DefaultHasher::new();
+            id.hash(&mut hasher);
+            hasher.finish()
+        });
+        let tail = [limit.unwrap_or(0).to_le_bytes(), identity.to_le_bytes()];
+        let key = content_hash(
+            shown
+                .iter()
+                .map(|part| part.as_bytes())
+                .chain(tail.iter().map(|bytes| bytes.as_slice())),
+        );
+        let text = self.texts.get_or_insert_with(key, || {
+            Rc::new(CachedText::new(ansi::parse(&shown.concat())))
+        });
+        let hidden = match rest {
+            None => 0,
+            Some((cut, offset)) => {
+                let rest =
+                    std::iter::once(&parts[cut][offset..]).chain(parts[cut + 1..].iter().copied());
+                match id {
+                    Some(_) => {
+                        let total = parts.iter().map(|part| part.len()).sum();
+                        text.hidden_for(total, rest)
+                    }
+                    None => hidden_lines(rest),
+                }
+            }
+        };
+        (text, hidden)
+    }
+}
+
+/// The parts of `parts` holding the first `limit` lines (the last cut
+/// before the line break ending the last line), and where the rest
+/// starts (part, byte offset of that line break) when there is one.
+fn window<'a>(parts: &[&'a str], limit: Option<usize>) -> (Vec<&'a str>, Option<(usize, usize)>) {
+    let Some(limit) = limit else {
+        return (parts.to_vec(), None);
+    };
+    let mut shown = Vec::with_capacity(parts.len());
+    let mut left = limit;
+    for (index, part) in parts.iter().enumerate() {
+        let mut seen = 0;
+        for (at, _) in part.match_indices('\n') {
+            seen += 1;
+            if seen == left {
+                shown.push(&part[..at]);
+                return (shown, Some((index, at)));
+            }
+        }
+        left -= seen;
+        shown.push(part);
+    }
+    (shown, None)
+}
+
+/// The lines in `rest`, what follows the shown lines (from the line break
+/// ending the last of them): one per line break, but the one ending the
+/// text.
+fn hidden_lines<'a>(rest: impl Iterator<Item = &'a str>) -> usize {
+    let (mut count, mut last) = (0, None);
+    for part in rest {
+        count += part.matches('\n').count();
+        if let Some(byte) = part.bytes().last() {
+            last = Some(byte);
+        }
+    }
+    count - usize::from(last == Some(b'\n'))
 }
 
 /// A bounded map: past `capacity` entries, inserting drops the least
@@ -312,14 +403,14 @@ pub(super) fn image_element(image: &DecodedImage, size: Option<(f32, f32)>) -> A
     }
 }
 
-/// A text output: escapes removed (one trailing line break too), colours
-/// kept, lines counted.
+/// The shown part of a text output: escapes removed (one trailing line
+/// break too), colours kept.
 struct CachedText {
     text: SharedString,
     spans: Vec<(Range<usize>, ansi::Style)>,
-    lines: usize,
-    /// The shown part for a line limit: (limit, text, hidden lines).
-    truncated: RefCell<Option<(usize, SharedString, usize)>>,
+    /// For a stream's entry: the lines past the shown ones, and the length
+    /// of the whole text they were counted for.
+    hidden: Cell<Option<(usize, usize)>>,
 }
 
 impl CachedText {
@@ -331,45 +422,25 @@ impl CachedText {
                 text.pop();
             }
         }
-        let lines = if text.is_empty() {
-            0
-        } else {
-            text.bytes().filter(|&b| b == b'\n').count() + 1
-        };
         Self {
             text: text.into(),
             spans,
-            lines,
-            truncated: RefCell::new(None),
+            hidden: Cell::new(None),
         }
     }
 
-    /// The text to show and the lines left out.
-    fn shown(&self, options: &OutputOptions) -> (SharedString, usize) {
-        if options.expanded || options.max_lines == 0 || self.lines <= options.max_lines {
-            return (self.text.clone(), 0);
-        }
-        let mut truncated = self.truncated.borrow_mut();
-        if let Some((limit, text, hidden)) = truncated.as_ref()
-            && *limit == options.max_lines
+    /// The lines in `rest` (see [`hidden_lines`]) of a text `total` bytes
+    /// long, counted once per length.
+    fn hidden_for<'a>(&self, total: usize, rest: impl Iterator<Item = &'a str>) -> usize {
+        if let Some((counted_for, hidden)) = self.hidden.get()
+            && counted_for == total
         {
-            return (text.clone(), *hidden);
+            return hidden;
         }
-        let (end, hidden) =
-            truncation(&self.text, options.max_lines).unwrap_or((self.text.len(), 0));
-        let text: SharedString = self.text[..end].to_owned().into();
-        *truncated = Some((options.max_lines, text.clone(), hidden));
-        (text, hidden)
+        let hidden = hidden_lines(rest);
+        self.hidden.set(Some((total, hidden)));
+        hidden
     }
-}
-
-/// Where `text` is cut to show `max_lines` lines (before the line break
-/// ending the last one) and how many lines are left out; `None` when it
-/// has no more lines.
-fn truncation(text: &str, max_lines: usize) -> Option<(usize, usize)> {
-    let end = text.match_indices('\n').nth(max_lines.checked_sub(1)?)?.0;
-    let hidden = text[end..].bytes().filter(|&b| b == b'\n').count();
-    Some((end, hidden))
 }
 
 /// How an ANSI style shows, with `palette` for indexed colours.
@@ -469,10 +540,11 @@ pub(super) fn render_output_inner(
     on_action: &OnAction,
     cx: &App,
 ) -> AnyElement {
+    let id = id.into();
     let body = match view(output) {
         View::Stream { text, stderr } => {
-            let text = cache.text(&[text]);
-            text_block(&text, options, on_action).when(stderr, |block| {
+            let (text, hidden) = cache.stream(&id, text, options);
+            text_block(&text, hidden, on_action).when(stderr, |block| {
                 block.bg(theme::error().opacity(0.08)).px_1().rounded_sm()
             })
         }
@@ -491,8 +563,8 @@ pub(super) fn render_output_inner(
                 }
                 parts.push(line.as_str());
             }
-            let text = cache.text(&parts);
-            text_block(&text, options, on_action)
+            let (text, hidden) = cache.text(&parts, options);
+            text_block(&text, hidden, on_action)
         }
         View::Data(rich, metadata) => {
             let element = match (plotly_figure(output), &rich) {
@@ -631,20 +703,16 @@ fn data_element(
                     .into_any_element(),
             }
         }
-        Rich::Latex(text) => {
-            text_block(&cache.text(&[text]), options, on_action).into_any_element()
-        }
+        Rich::Latex(text) => plain_block(text, cache, options, on_action).into_any_element(),
         Rich::Json(value) => {
             let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
-            text_block(&cache.text(&[&pretty]), options, on_action).into_any_element()
+            plain_block(&pretty, cache, options, on_action).into_any_element()
         }
         Rich::Widget { model_id, plain } => {
             widget_output(model_id, plain, cache, options, on_action, cx)
         }
         Rich::MarimoUi { parts, .. } => marimo_ui::render(parts, options, on_action, cx),
-        Rich::Plain(text) => {
-            text_block(&cache.text(&[text]), options, on_action).into_any_element()
-        }
+        Rich::Plain(text) => plain_block(text, cache, options, on_action).into_any_element(),
         Rich::Unsupported(mimes) => {
             note(format!("No view for this output ({}).", mimes.join(", "))).into_any_element()
         }
@@ -684,26 +752,19 @@ pub(super) fn plain_block(
     options: &OutputOptions,
     on_action: &OnAction,
 ) -> gpui::Div {
-    text_block(&cache.text(&[text]), options, on_action)
+    let (text, hidden) = cache.text(&[text], options);
+    text_block(&text, hidden, on_action)
 }
 
-/// Coloured, selectable text, cut to `options.max_lines` lines with a
-/// "Show more" button.
-fn text_block(text: &CachedText, options: &OutputOptions, on_action: &OnAction) -> gpui::Div {
-    let (shown, hidden) = text.shown(options);
+/// Coloured, selectable text (cut to the shown lines already), with a
+/// "Show more" button when `hidden` lines are left out.
+fn text_block(text: &CachedText, hidden: usize, on_action: &OnAction) -> gpui::Div {
+    let shown = text.text.clone();
     let theme = theme::current();
-    let end = shown.len();
     let highlights: Vec<_> = text
         .spans
         .iter()
-        .take_while(|(range, _)| range.start < end)
-        .map(|(range, style)| {
-            (
-                range.start..range.end.min(end),
-                ansi_highlight(style, &theme.terminal),
-            )
-        })
-        .filter(|(range, _)| !range.is_empty())
+        .map(|(range, style)| (range.clone(), ansi_highlight(style, &theme.terminal)))
         .collect();
     let on_action = on_action.clone();
     mono()
@@ -796,19 +857,54 @@ mod tests {
 
     #[test]
     fn long_texts_show_their_first_lines_and_count_the_rest() {
-        assert_eq!(truncation("a\nb\nc\nd", 2), Some((3, 2)));
-        assert_eq!(truncation("a\nb", 2), None);
-        assert_eq!(truncation("a\nb\nc", 2), Some((3, 1)));
+        assert_eq!(
+            window(&["a\nb\nc\nd"], Some(2)),
+            (vec!["a\nb"], Some((0, 3)))
+        );
+        assert_eq!(window(&["a\nb"], Some(2)), (vec!["a\nb"], None));
+        assert_eq!(
+            window(&["a\n", "b\nc"], Some(2)),
+            (vec!["a\n", "b"], Some((1, 1)))
+        );
+        assert_eq!(window(&["a\nb\nc"], None), (vec!["a\nb\nc"], None));
+        assert_eq!(hidden_lines(["\nc\nd"].into_iter()), 2);
+        assert_eq!(hidden_lines(["\nc", "\n"].into_iter()), 1);
+        assert_eq!(hidden_lines(["\n"].into_iter()), 0);
 
         let mut cache = OutputCache::default();
+        let id = ElementId::Name("stream".into());
         // Five lines (the final line break ends the last one).
-        let text = cache.text(&["1\n2\n3\n4\n5\n"]);
-        assert_eq!(text.lines, 5);
-        assert_eq!(text.shown(&options(2, false)), ("1\n2".into(), 3));
-        assert_eq!(text.shown(&options(5, false)), ("1\n2\n3\n4\n5".into(), 0));
-        assert_eq!(text.shown(&options(2, true)).1, 0, "expanded");
-        assert_eq!(text.shown(&options(0, false)).1, 0, "no limit");
-        assert_eq!(text.shown(&options(4, false)), ("1\n2\n3\n4".into(), 1));
+        let show = |cache: &mut OutputCache, max_lines, expanded| {
+            let (text, hidden) =
+                cache.stream(&id, "1\n2\n3\n4\n5\n", &options(max_lines, expanded));
+            (text.text.to_string(), hidden)
+        };
+        assert_eq!(show(&mut cache, 2, false), ("1\n2".into(), 3));
+        assert_eq!(show(&mut cache, 5, false), ("1\n2\n3\n4\n5".into(), 0));
+        assert_eq!(
+            show(&mut cache, 2, true),
+            ("1\n2\n3\n4\n5".into(), 0),
+            "expanded"
+        );
+        assert_eq!(
+            show(&mut cache, 0, false),
+            ("1\n2\n3\n4\n5".into(), 0),
+            "no limit"
+        );
+        assert_eq!(show(&mut cache, 4, false), ("1\n2\n3\n4".into(), 1));
+
+        // A stream printing past the limit keeps its parsed lines; the
+        // count of the rest follows its length.
+        let (first, hidden) = cache.stream(&id, "1\n2\n3\n", &options(2, false));
+        assert_eq!((&first.text[..], hidden), ("1\n2", 1));
+        let (again, hidden) = cache.stream(&id, "1\n2\n3\n4\n5\n6", &options(2, false));
+        assert!(Rc::ptr_eq(&first, &again), "not parsed again");
+        assert_eq!(hidden, 4);
+        // Another output with the same first lines counts its own rest.
+        let (_, other) = cache.text(&["1\n2\n", "x"], &options(2, false));
+        assert_eq!(other, 1);
+        let (_, other) = cache.text(&["1\n2\n", "x\ny\n"], &options(2, false));
+        assert_eq!(other, 2);
     }
 
     #[test]
@@ -860,7 +956,10 @@ mod tests {
     #[test]
     fn ansi_colours_map_to_the_terminal_palette() {
         let mut cache = OutputCache::default();
-        let text = cache.text(&["\x1b[1;31mError\x1b[0m: \x1b[38;5;196mx\x1b[38;2;1;2;3my\n"]);
+        let (text, _) = cache.text(
+            &["\x1b[1;31mError\x1b[0m: \x1b[38;5;196mx\x1b[38;2;1;2;3my\n"],
+            &options(0, false),
+        );
         assert_eq!(&text.text[..], "Error: xy");
         let theme = theme::current();
         let palette = &theme.terminal;

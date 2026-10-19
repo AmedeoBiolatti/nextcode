@@ -68,7 +68,7 @@ pub use watcher::Batch;
 pub use worktree::{DirEntry, FileKind};
 
 /// Bumped on every incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Bytes a tunnel's sender may have in flight in each direction before the
 /// receiver grants more (see the crate docs).

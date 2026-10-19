@@ -190,10 +190,8 @@ pub(super) fn remember(workflow_id: &str, values: &InputValues) -> io::Result<()
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(&all).map_err(io::Error::other)?,
-    )
+    let json = serde_json::to_string_pretty(&all).map_err(io::Error::other)?;
+    worktree::write_atomic(&path, json.as_bytes())
 }
 
 pub(super) enum InputFormEvent {

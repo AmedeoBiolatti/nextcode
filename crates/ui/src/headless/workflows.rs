@@ -431,6 +431,15 @@ impl Session {
     ) {
         let workflows = self.workflows.clone();
         let out = self.out.clone();
+        // A `path` to a workflow file anywhere on this machine is listed
+        // from now on.
+        if let Some(path) = request["path"].as_str().map(std::path::Path::new)
+            && path.is_absolute()
+            && path.is_file()
+        {
+            let path = path.to_path_buf();
+            workflows.update(cx, |workflows, _| workflows.remember_file(path));
+        }
         // Every command reads the files again first: they may have changed.
         let refresh = workflows.update(cx, |workflows, cx| workflows.refresh(cx));
         let command = command.to_owned();

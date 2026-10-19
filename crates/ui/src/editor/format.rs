@@ -349,13 +349,13 @@ impl Editor {
     /// formatter [`FORMAT_ON_SAVE_TIMEOUT`] before saving unformatted.
     pub(super) fn save_with_format(&mut self, cx: &mut Context<Self>) {
         if !self.format_on_save() {
-            self.save(cx);
+            self.save(cx).detach();
             return;
         }
         let version = self.version;
         // Without a formatter there is nothing to wait for.
         let Ok(task) = self.format_task(None, cx) else {
-            self.save(cx);
+            self.save(cx).detach();
             return;
         };
         let timeout = cx.background_executor().timer(FORMAT_ON_SAVE_TIMEOUT);
@@ -373,12 +373,20 @@ impl Editor {
                         FORMAT_ON_SAVE_TIMEOUT.as_secs()
                     )),
                 };
-                if this.save(cx)
-                    && let Some(problem) = problem
-                {
-                    this.notice = Some(format!("{problem}; saved unformatted").into());
-                    cx.notify();
-                }
+                let save = this.save(cx);
+                let Some(problem) = problem else {
+                    return save.detach();
+                };
+                cx.spawn(async move |this, cx| {
+                    if save.await {
+                        this.update(cx, |this, cx| {
+                            this.notice = Some(format!("{problem}; saved unformatted").into());
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
             })
             .ok();
         }));

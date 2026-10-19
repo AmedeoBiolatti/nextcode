@@ -65,20 +65,17 @@ impl Session {
         Some(crate::layout::project_state_dir(project_key)?.join("session.json"))
     }
 
-    /// The saved session; missing or unreadable files mean none.
+    /// The saved session (or its `.bak`, the previous one, when the file
+    /// does not parse); missing or unreadable files mean none.
     pub fn load(project_key: &str) -> Option<Self> {
-        let json = std::fs::read_to_string(Self::path(project_key)?).ok()?;
-        serde_json::from_str(&json).ok()
+        crate::app_state::load_json_backed(&Self::path(project_key)?)
     }
 
+    /// Writes the session atomically, keeping the previous one as `.bak`.
     pub fn save(&self, project_key: &str) -> std::io::Result<()> {
         let path = Self::path(project_key)
             .ok_or_else(|| std::io::Error::other("no local data directory"))?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        crate::app_state::save_json_backed(&path, self)
     }
 }
 

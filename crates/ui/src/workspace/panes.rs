@@ -738,17 +738,31 @@ impl Workspace {
             let Ok(answer) = answer.await else {
                 return;
             };
-            this.update_in(cx, |this, window, cx| {
-                let close = match answer {
-                    0 => losing.iter().all(|(content, _)| content.save(cx)),
-                    1 => true,
-                    _ => false,
-                };
-                if close {
-                    this.discard_pane(pane, window, cx);
+            let close = match answer {
+                // Closes once every write is done; a failed save keeps the pane.
+                0 => {
+                    let saves = this.update(cx, |_, cx| {
+                        losing
+                            .iter()
+                            .map(|(content, _)| content.save(cx))
+                            .collect::<Vec<_>>()
+                    });
+                    let Ok(saves) = saves else {
+                        return;
+                    };
+                    let mut all = true;
+                    for save in saves {
+                        all &= save.await;
+                    }
+                    all
                 }
-            })
-            .ok();
+                1 => true,
+                _ => false,
+            };
+            if close {
+                this.update_in(cx, |this, window, cx| this.discard_pane(pane, window, cx))
+                    .ok();
+            }
         })
         .detach();
     }

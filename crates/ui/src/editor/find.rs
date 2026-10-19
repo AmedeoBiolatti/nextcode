@@ -1,10 +1,18 @@
 //! Find and replace in the file: the find bar above the text, matches
 //! cached per buffer version and query, highlighted while the bar is open.
+//! A big file is searched on a background thread from a snapshot; until
+//! that search is in, the previous matches follow the edits.
 
 use gpui::Subscription;
 use regex::{Regex, RegexBuilder};
 
 use super::*;
+
+/// Files larger than this are searched in the background.
+const FIND_IN_BACKGROUND_BYTES: usize = 512 * 1024;
+
+/// What a search is for: buffer version, query and options.
+type FindKey = (u64, String, FindOptions);
 
 actions!(
     editor,
@@ -96,11 +104,15 @@ pub(super) struct FindBar {
     pub open: bool,
     pub replace_open: bool,
     pub options: FindOptions,
-    /// Matches for `computed`, sorted.
+    /// Matches for `computed`, sorted (mapped through later edits while a
+    /// background search runs).
     pub matches: Vec<Range<usize>>,
     pub error: Option<SharedString>,
     /// Buffer version, query and options `matches` belong to.
-    computed: Option<(u64, String, FindOptions)>,
+    computed: Option<FindKey>,
+    /// The search running in the background, if any.
+    requested: Option<FindKey>,
+    _task: Option<Task<()>>,
     /// Where incremental search starts: the selection when the bar opened.
     origin: usize,
     _subscriptions: [Subscription; 2],
@@ -131,6 +143,8 @@ impl Editor {
             matches: Vec::new(),
             error: None,
             computed: None,
+            requested: None,
+            _task: None,
             origin: 0,
             open: false,
             _subscriptions: [on_query, on_replacement],
@@ -206,25 +220,90 @@ impl Editor {
         cx.notify();
     }
 
-    /// Recomputes the matches if the buffer, query or options changed.
-    pub(super) fn refresh_find(&mut self, cx: &App) {
+    /// Recomputes the matches if the buffer, query or options changed: at
+    /// once for a small file, on a background thread for a big one (the
+    /// matches from before follow the edits until it is in, see
+    /// `find_edited`).
+    pub(super) fn refresh_find(&mut self, cx: &mut Context<Self>) {
         let Some(find) = &self.find else {
             return;
         };
         let query = find.query.read(cx).text();
-        let key = (self.version, query, find.options);
+        let key: FindKey = (self.version, query, find.options);
         if find.computed.as_ref() == Some(&key) {
             return;
         }
-        let (matches, error) = match compile(&key.1, key.2) {
-            Ok(Some(regex)) => (find_matches(&self.text(), &regex, key.2.whole_word), None),
-            Ok(None) => (Vec::new(), None),
-            Err(err) => (Vec::new(), Some(err.into())),
+        let regex = match compile(&key.1, key.2) {
+            Ok(Some(regex)) => regex,
+            Ok(None) => return self.set_find_matches(Vec::new(), None, key),
+            Err(err) => return self.set_find_matches(Vec::new(), Some(err.into()), key),
         };
+        if self.buffer.len() <= FIND_IN_BACKGROUND_BYTES {
+            let matches = find_matches(&self.text(), &regex, key.2.whole_word);
+            return self.set_find_matches(matches, None, key);
+        }
+        if find.requested.as_ref() == Some(&key) {
+            return;
+        }
+        let snapshot = self.buffer.snapshot();
+        let whole_word = key.2.whole_word;
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        find.requested = Some(key.clone());
+        find._task = Some(cx.spawn(async move |this, cx| {
+            let matches = cx
+                .background_spawn(
+                    async move { find_matches(&snapshot.to_string(), &regex, whole_word) },
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(find) = &mut this.find else {
+                    return;
+                };
+                if find.requested.as_ref() != Some(&key) {
+                    return;
+                }
+                find.requested = None;
+                this.set_find_matches(matches, None, key);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn set_find_matches(
+        &mut self,
+        matches: Vec<Range<usize>>,
+        error: Option<SharedString>,
+        key: FindKey,
+    ) {
         if let Some(find) = &mut self.find {
             find.matches = matches;
             find.error = error;
             find.computed = Some(key);
+            find.requested = None;
+            find._task = None;
+        }
+    }
+
+    /// After an edit (`changes`): the matches follow the text, ones the
+    /// edit touched go, until the search for the new version replaces
+    /// them.
+    pub(super) fn find_edited(&mut self) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        if find.matches.is_empty() {
+            return;
+        }
+        for change in &self.changes {
+            find.matches.retain_mut(|m| {
+                let touched = change.start < m.end && m.start < change.old_end;
+                m.start = change.map_offset(m.start, Bias::Right);
+                m.end = change.map_offset(m.end, Bias::Left);
+                !touched && m.start < m.end
+            });
         }
     }
 
@@ -356,8 +435,17 @@ impl Editor {
             return;
         };
         let range = self.find.as_ref().expect("has a match").matches[index].clone();
-        let text = self.text();
-        let new = replacement_for(&text, &range, &regex, options, &replacement);
+        // Groups are read from the match's lines, not a copy of the file:
+        // anchors and word boundaries see the same neighbours there.
+        let new = if options.regex {
+            let window_start = self.buffer.line_start(self.buffer.line_of(range.start));
+            let window_end = self.buffer.line_end(self.buffer.line_of(range.end));
+            let window = self.buffer.slice(window_start..window_end.max(range.end));
+            let local = range.start - window_start..range.end - window_start;
+            replacement_for(&window, &local, &regex, options, &replacement)
+        } else {
+            replacement
+        };
         let end = range.start + new.len();
         self.commit(
             vec![(range, new)],
@@ -639,7 +727,66 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+    use gpui::TestAppContext;
+
     use super::*;
+    use crate::editor::tests::{editor, type_text, update};
+
+    #[gpui::test]
+    fn big_files_are_searched_in_the_background_and_matches_follow_edits(cx: &mut TestAppContext) {
+        let filler = "x".repeat(FIND_IN_BACKGROUND_BYTES);
+        let window = editor("a.txt", &format!("|foo {filler} foo\nfoo"), cx);
+        let bar = |e: &Editor| {
+            let find = e.find.as_ref().unwrap();
+            (find.matches.clone(), find.requested.is_some())
+        };
+        update(window, cx, |e, w, cx| {
+            e.find(&Find, w, cx);
+            let input = e.find.as_ref().unwrap().query.clone();
+            input.update(cx, |input, cx| input.set_text("foo", cx));
+        });
+        // The query asked for a search; nothing is in before it ran.
+        assert_eq!(
+            window.read_with(cx, |e, _| bar(e)).unwrap(),
+            (Vec::new(), true)
+        );
+        cx.run_until_parked();
+        let (matches, pending) = window.read_with(cx, |e, _| bar(e)).unwrap();
+        assert_eq!(matches.len(), 3);
+        assert!(!pending);
+        let second = matches[1].clone();
+
+        // Typing before the matches moves them at once (the file is not
+        // copied for that); the search then runs again for the new text.
+        update(window, cx, |e, _, cx| e.set_cursor(0, cx));
+        type_text(window, "yy", cx);
+        let (matches, _) = window.read_with(cx, |e, _| bar(e)).unwrap();
+        assert_eq!(matches[0], 2..5);
+        assert_eq!(matches[1], second.start + 2..second.end + 2);
+        cx.run_until_parked();
+        let version = window
+            .read_with(cx, |e, _| {
+                assert_eq!(bar(e).0.len(), 3);
+                (
+                    e.version,
+                    e.find.as_ref().unwrap().computed.clone().unwrap().0,
+                )
+            })
+            .unwrap();
+        assert_eq!(version.0, version.1, "searched for the latest text");
+
+        // Editing inside a match drops it at once.
+        update(window, cx, |e, _, cx| {
+            e.commit(
+                vec![(3..4, String::new())],
+                |_| SelectionSet::single(Selection::cursor(3)),
+                cx,
+            )
+        });
+        let (matches, _) = window.read_with(cx, |e, _| bar(e)).unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0], second.start + 1..second.end + 1);
+    }
 
     fn matches<'a>(text: &'a str, query: &str, options: FindOptions) -> Vec<&'a str> {
         let regex = compile(query, options).unwrap().unwrap();

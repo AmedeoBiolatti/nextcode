@@ -40,6 +40,8 @@ const LABELS: &[(&str, &str)] = &[
     ("search::ReplaceAll", "Replace All in Files"),
     ("workspace::ToggleTerminal", "Terminal Panel"),
     ("workflows::OpenWorkflow", "Open Workflow…"),
+    ("workflows::OpenWorkflowFile", "Open Workflow File…"),
+    ("workflows::AddWorkflowFolder", "Add Workflow Folder…"),
     ("workflows::NewWorkflow", "New Workflow…"),
     ("workflows::RunAll", "Workflow: Run All"),
     ("workflows::StopAll", "Workflow: Stop All"),

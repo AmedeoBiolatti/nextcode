@@ -276,6 +276,8 @@ impl Default for MenuBar {
                         plain("python::Lock"),
                         separator(),
                         plain("workflows::OpenWorkflow"),
+                        plain("workflows::OpenWorkflowFile"),
+                        plain("workflows::AddWorkflowFolder"),
                         plain("workflows::NewWorkflow"),
                         separator(),
                         plain("workspace::NewTerminal"),
@@ -447,7 +449,7 @@ pub fn ensure_file() -> std::io::Result<PathBuf> {
         }
         let json =
             serde_json::to_string_pretty(&MenuBar::default()).map_err(std::io::Error::other)?;
-        std::fs::write(&path, json + "\n")?;
+        worktree::write_atomic(&path, (json + "\n").as_bytes())?;
     }
     Ok(path)
 }

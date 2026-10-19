@@ -12,7 +12,7 @@
 //! alone, so it stays small and starts in a few milliseconds.
 
 use std::{
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -24,6 +24,11 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+
+/// The most of a request or reply line that is read (1 MiB): a local
+/// client cannot make the editor allocate without bound. A longer line is
+/// cut there and fails to parse.
+const MAX_LINE: u64 = 1024 * 1024;
 
 /// A launch, as the editor process receives it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,7 +175,7 @@ fn exchange(endpoint: &Endpoint, line: &str, timeout: Duration) -> Result<Reply,
     stream.write_all(b"\n").map_err(SendError::Io)?;
     stream.flush().map_err(SendError::Io)?;
     let mut answer = String::new();
-    BufReader::new(stream)
+    BufReader::new(stream.take(MAX_LINE))
         .read_line(&mut answer)
         .map_err(SendError::Io)?;
     if answer.trim().is_empty() {
@@ -466,7 +471,7 @@ where
     S: io::Read + io::Write,
 {
     let mut line = String::new();
-    let mut reader = BufReader::new(&mut stream);
+    let mut reader = BufReader::new((&mut stream).take(MAX_LINE));
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
     }
@@ -486,6 +491,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client connection in memory: `input` is what it sends, `output`
+    /// what it is answered.
+    struct Pipe {
+        input: io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl io::Read for Pipe {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl io::Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_endless_request_line_is_cut_at_the_limit() {
+        let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = handled.clone();
+        let mut handler: Handler = Box::new(move |_| {
+            counting.fetch_add(1, Ordering::Relaxed);
+            Reply::Done
+        });
+        // Three times the limit, never a newline: read up to the limit only.
+        let mut pipe = Pipe {
+            input: io::Cursor::new(vec![b'a'; 3 * MAX_LINE as usize]),
+            output: Vec::new(),
+        };
+        answer(&mut pipe, &mut handler);
+        assert_eq!(pipe.input.position(), MAX_LINE);
+        let reply = String::from_utf8(pipe.output).unwrap();
+        assert!(reply.contains("bad request"), "{reply}");
+        assert_eq!(handled.load(Ordering::Relaxed), 0);
+
+        let mut pipe = Pipe {
+            input: io::Cursor::new(br#"{"args":["."]}"#.to_vec()),
+            output: Vec::new(),
+        };
+        let mut handler: Handler = Box::new(|_| Reply::Done);
+        answer(&mut pipe, &mut handler);
+        assert_eq!(
+            String::from_utf8(pipe.output).unwrap(),
+            "{\"result\":\"done\"}\n"
+        );
+    }
 
     fn endpoint(name: &str) -> (Endpoint, PathBuf) {
         let root = std::env::temp_dir().join(format!("next_code-instance-{name}-{}", std::process::id()));

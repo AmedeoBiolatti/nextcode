@@ -28,8 +28,9 @@
 //!   "tests": { "discover_on_save": true, "pytest_args": ["-p", "no:randomly"],
 //!     "cargo_test_args": ["--features", "slow-tests"] },
 //!   "ports": { "auto_forward": true },
-//!   "devcontainer": { "forward_git_credentials": true },
-//!   "git": { "staging_area": false, "update_method": "merge", "inline_blame": false },
+//!   "devcontainer": { "forward_git_credentials": true, "ssh_agent_forwarding": true },
+//!   "git": { "staging_area": false, "update_method": "merge", "inline_blame": false,
+//!     "credential_hosts": ["github.com"] },
 //!   "editor": { "minimap": { "enabled": true, "max_columns": 120, "side": "right" },
 //!     "sticky_scroll": { "enabled": true, "max_lines": 5 } },
 //!   "spell": { "enabled": true, "languages": ["en_US"], "check_code": true, "in_problems": false },
@@ -39,7 +40,9 @@
 //! A file's effective settings layer, later winning key by key: these, a
 //! workspace file's `"settings"`, then its folder's own
 //! `.next_code/settings.json` (see `Project::settings_for`,
-//! [`Settings::layered`]).
+//! [`Settings::layered`]). Until the user trusts the folder (see `trust`),
+//! the keys of project settings that run programs are left out
+//! ([`without_commands`]).
 
 use std::{
     collections::HashMap,
@@ -87,6 +90,7 @@ pub struct Settings {
     pub spell: SpellSettings,
     pub editor: EditorSettings,
     pub notebook: NotebookSettings,
+    pub workflows: WorkflowSettings,
     /// Vim emulation in file editors ("Toggle Vim Mode" flips it until
     /// the editor exits).
     pub vim_mode: bool,
@@ -146,6 +150,7 @@ impl Default for Settings {
             spell: SpellSettings::default(),
             editor: EditorSettings::default(),
             notebook: NotebookSettings::default(),
+            workflows: WorkflowSettings::default(),
             vim_mode: false,
             vim: VimSettings::default(),
             raw: Arc::new(json!({})),
@@ -282,6 +287,16 @@ impl Default for TestSettings {
     }
 }
 
+/// `"workflows"`: where workflow files are found besides the user's
+/// folder and open projects' `.next_code/workflows`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkflowSettings {
+    /// More folders whose `*.yaml` workflows are listed (absolute, or
+    /// starting with `~`; `\\wsl.localhost\…` paths work on Windows).
+    pub folders: Vec<String>,
+}
+
 /// `"ports"`: port forwarding for WSL and dev container projects.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -303,14 +318,20 @@ impl Default for PortSettings {
 pub struct DevContainerSettings {
     /// Lend this machine's git credentials (`git credential`), ssh-agent
     /// and `user.name`/`user.email` to the project's machine; off also
-    /// removes the git credential helper set there earlier.
+    /// removes the git credential helper set there earlier. Credentials
+    /// are lent for the hosts of the project's git remotes and
+    /// `git.credential_hosts` only.
     pub forward_git_credentials: bool,
+    /// With `forward_git_credentials`, also relay this machine's ssh-agent
+    /// to the project's machine. A project's own settings may turn it off.
+    pub ssh_agent_forwarding: bool,
 }
 
 impl Default for DevContainerSettings {
     fn default() -> Self {
         Self {
             forward_git_credentials: true,
+            ssh_agent_forwarding: true,
         }
     }
 }
@@ -328,6 +349,11 @@ pub struct GitSettings {
     /// Show the author, age and summary of the commit that last changed
     /// the cursor's line after its end (VS Code's inline blame).
     pub inline_blame: bool,
+    /// Hosts (`"github.com"`, `"git.example.com:8443"`) whose credentials
+    /// a WSL or dev container project may ask of this machine besides the
+    /// hosts of its git remotes. The user's settings alone: project
+    /// settings cannot add to it.
+    pub credential_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -646,6 +672,35 @@ pub fn merge(base: &mut Value, overlay: Value) {
     }
 }
 
+/// `layer` (a workspace file's or a folder's settings) without the keys
+/// that make the editor run a program of the project's choosing: language
+/// servers' `command` and `args`, external `formatter`s and
+/// `debug.adapters`; `git.credential_hosts` too, which is the user's
+/// alone. Everything else stays. Project settings of folders the user has
+/// not trusted are layered through this (see `trust`).
+pub fn without_commands(layer: &Value) -> Value {
+    let mut layer = layer.clone();
+    if let Some(languages) = layer.get_mut("languages").and_then(Value::as_object_mut) {
+        for language in languages.values_mut().filter_map(Value::as_object_mut) {
+            if let Some(server) = language.get_mut("server").and_then(Value::as_object_mut) {
+                server.remove("command");
+                server.remove("args");
+            }
+            // `"language_server"` (a name) is fine; a program is not.
+            if language.get("formatter").is_some_and(Value::is_object) {
+                language.remove("formatter");
+            }
+        }
+    }
+    if let Some(debug) = layer.get_mut("debug").and_then(Value::as_object_mut) {
+        debug.remove("adapters");
+    }
+    if let Some(git) = layer.get_mut("git").and_then(Value::as_object_mut) {
+        git.remove("credential_hosts");
+    }
+    layer
+}
+
 /// Sets `"theme"` in the settings file at `path`, keeping everything else;
 /// creates the file if missing.
 pub fn write_theme(path: &Path, name: &str) -> Result<(), String> {
@@ -664,7 +719,41 @@ pub fn write_theme(path: &Path, name: &str) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|err| fail(&err))?;
     }
     let text = serde_json::to_string_pretty(&settings).map_err(|err| fail(&err))?;
-    std::fs::write(path, text + "\n").map_err(|err| fail(&err))
+    worktree::write_atomic(path, (text + "\n").as_bytes()).map_err(|err| fail(&err))
+}
+
+/// Adds `folder` to `"workflows": {"folders": […]}` in the settings file
+/// at `path`, keeping everything else (creates the file if missing);
+/// `false` if it was listed already.
+pub fn add_workflow_folder(path: &Path, folder: &str) -> Result<bool, String> {
+    let fail = |err: &dyn std::fmt::Display| format!("{}: {err}", path.display());
+    let mut settings = match std::fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => json!({}),
+        Ok(text) => serde_json::from_str::<Value>(&text).map_err(|err| fail(&err))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(err) => return Err(fail(&err)),
+    };
+    let Some(object) = settings.as_object_mut() else {
+        return Err(fail(&"not a JSON object"));
+    };
+    let workflows = object.entry("workflows").or_insert_with(|| json!({}));
+    let Some(workflows) = workflows.as_object_mut() else {
+        return Err(fail(&"`workflows` is not an object"));
+    };
+    let folders = workflows.entry("folders").or_insert_with(|| json!([]));
+    let Some(folders) = folders.as_array_mut() else {
+        return Err(fail(&"`workflows.folders` is not a list"));
+    };
+    if folders.iter().any(|known| known.as_str() == Some(folder)) {
+        return Ok(false);
+    }
+    folders.push(folder.into());
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|err| fail(&err))?;
+    }
+    let text = serde_json::to_string_pretty(&settings).map_err(|err| fail(&err))?;
+    worktree::write_atomic(path, (text + "\n").as_bytes()).map_err(|err| fail(&err))?;
+    Ok(true)
 }
 
 /// The value at a dotted `section` (`"basedpyright.analysis"`), or the whole
@@ -683,6 +772,74 @@ pub fn section(settings: &Value, section: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untrusted_layers_keep_everything_but_programs() {
+        let layer = json!({
+            "word_wrap": true,
+            "languages": {
+                "python": {
+                    "inlay_hints": false,
+                    "server": { "command": "./.venv/bin/evil", "args": ["--stdio"],
+                                "enabled": true, "settings": { "a": 1 } },
+                    "formatter": { "command": "./evil", "args": [] }
+                },
+                "rust": { "formatter": "language_server" }
+            },
+            "debug": { "adapters": { "lldb": { "command": "./evil" } } },
+            "git": { "credential_hosts": ["evil.example"], "inline_blame": true },
+            "tests": { "pytest_args": ["-x"] }
+        });
+        assert_eq!(
+            without_commands(&layer),
+            json!({
+                "word_wrap": true,
+                "languages": {
+                    "python": {
+                        "inlay_hints": false,
+                        "server": { "enabled": true, "settings": { "a": 1 } }
+                    },
+                    "rust": { "formatter": "language_server" }
+                },
+                "debug": {},
+                "git": { "inline_blame": true },
+                "tests": { "pytest_args": ["-x"] }
+            })
+        );
+        // Layered over the user's, the user's own programs stay.
+        let user = Settings::default()
+            .layered(&[&json!({ "debug": { "adapters": { "lldb": { "command": "mine" } } } })])
+            .unwrap();
+        let layered = user.layered(&[&without_commands(&layer)]).unwrap();
+        assert_eq!(layered.debug.adapters["lldb"].command, "mine");
+        assert_eq!(
+            layered.server_config(Language::Python).unwrap().command,
+            "basedpyright-langserver"
+        );
+        assert!(layered.word_wrap(None));
+        assert!(layered.git.credential_hosts.is_empty());
+        // Malformed layers pass through (and fail to parse as they would).
+        assert_eq!(without_commands(&Value::Null), Value::Null);
+        let odd = json!({ "languages": { "yaml": "not an object" }, "debug": 3 });
+        assert_eq!(without_commands(&odd), odd);
+    }
+
+    #[test]
+    fn workflow_folders_are_added_once_keeping_the_rest() {
+        let dir = std::env::temp_dir().join(format!("nc-settings-wf-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let path = dir.join("settings.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"theme": "Dark", "workflows": {}}"#).unwrap();
+        assert_eq!(add_workflow_folder(&path, "C:/team/workflows"), Ok(true));
+        assert_eq!(add_workflow_folder(&path, "C:/team/workflows"), Ok(false));
+        assert_eq!(add_workflow_folder(&path, "~/more"), Ok(true));
+        let (settings, error) = Settings::load_from(&path);
+        assert_eq!(error, None);
+        assert_eq!(settings.workflows.folders, ["C:/team/workflows", "~/more"]);
+        assert_eq!(settings.theme.as_deref(), Some("Dark"));
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn user_overrides_layer_over_defaults() {

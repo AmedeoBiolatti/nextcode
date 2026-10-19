@@ -6,9 +6,11 @@
 //! belongs to the line break), matching tree-sitter and LSP row numbering.
 
 use std::{
+    io,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError, Weak},
+    time::SystemTime,
 };
 
 use ropey::Rope;
@@ -30,6 +32,14 @@ struct Transaction {
 }
 
 impl Transaction {
+    /// Text held for undo and redo of this step.
+    fn bytes(&self) -> usize {
+        self.edits
+            .iter()
+            .map(|edit| edit.old.len() + edit.new.len())
+            .sum()
+    }
+
     /// Whether `edits` (sorted, pure insertions) continue typing at the end
     /// of each of this transaction's insertions; same count, no line breaks.
     fn continues_with(&self, edits: &[(Range<usize>, String)]) -> bool {
@@ -145,8 +155,12 @@ struct Document {
     /// The latest text.
     rope: Rope,
     line_ending: &'static str,
-    /// Undo steps, oldest first.
+    /// Undo steps, oldest first; the oldest are dropped when they hold
+    /// more than `undo_limit` bytes of text (see [`Buffer::set_undo_limit`]).
     undo: Vec<Transaction>,
+    /// Sum of `Transaction::bytes` over `undo`.
+    undo_bytes: usize,
+    undo_limit: usize,
     redo: Vec<Transaction>,
     next_transaction: u64,
     /// Undo-stack depth at which the last step was sealed: the next edit
@@ -154,13 +168,116 @@ struct Document {
     sealed_at: Option<usize>,
     /// Undo-stack depth matching the file on disk; `None` if that state is unreachable.
     saved_at: Option<usize>,
+    /// The file as it was when the text last matched it.
+    disk: Option<DiskStamp>,
     /// Per view: changes made through other views it has not synced yet.
     views: Vec<(usize, Vec<Change>)>,
     next_view: usize,
 }
 
+/// Size and modification time of a document's file when the text last
+/// matched it (read, saved or reloaded). Shared by the views; a save
+/// compares it with the file before overwriting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskStamp {
+    pub modified: Option<SystemTime>,
+    pub len: u64,
+}
+
+/// A weak handle on a document for crash recovery: a panic hook reads the
+/// unsaved text of the documents still open through it, without the views
+/// and without blocking on a lock the panicking thread may hold.
+#[derive(Clone)]
+pub struct DocumentHandle(Weak<Mutex<Document>>);
+
+impl DocumentHandle {
+    /// Whether a view still holds the document.
+    pub fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+
+    /// Writes the text to `out` and returns `true` when the document is
+    /// still open, has unsaved changes and its lock is free; otherwise
+    /// nothing is written.
+    pub fn write_unsaved(&self, out: &mut dyn io::Write) -> io::Result<bool> {
+        let Some(document) = self.0.upgrade() else {
+            return Ok(false);
+        };
+        let document = match document.try_lock() {
+            Ok(document) => document,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return Ok(false),
+        };
+        if document.saved_at == Some(document.undo.len()) {
+            return Ok(false);
+        }
+        for chunk in document.rope.chunks() {
+            out.write_all(chunk.as_bytes())?;
+        }
+        Ok(true)
+    }
+}
+
+/// Text the undo history of a document holds at most (old and new text of
+/// every step), before the oldest steps are dropped.
+pub const DEFAULT_UNDO_LIMIT: usize = 64 * 1024 * 1024;
+
+/// The text as of some moment, to read on another thread: ropes share
+/// their nodes, so taking one is cheap and edits made later don't touch it.
+#[derive(Clone)]
+pub struct Snapshot {
+    rope: Rope,
+}
+
+impl Snapshot {
+    pub fn len(&self) -> usize {
+        self.rope.len_bytes()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rope.len_bytes() == 0
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.rope.len_lines()
+    }
+
+    /// The text in pieces, in order.
+    pub fn chunks(&self) -> impl Iterator<Item = &str> {
+        self.rope.chunks()
+    }
+}
+
+impl std::fmt::Display for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for chunk in self.rope.chunks() {
+            f.write_str(chunk)?;
+        }
+        Ok(())
+    }
+}
+
 fn lock(document: &Mutex<Document>) -> MutexGuard<'_, Document> {
     document.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Drops the oldest undo steps while the history holds more than the
+/// limit, always keeping the latest step. The saved and sealed depths
+/// follow (a dropped save point is unreachable, like one in a cleared
+/// redo stack); marks from `Buffer::undo_depth` taken before are stale
+/// by the number of dropped steps.
+fn trim_undo(document: &mut Document) {
+    let mut drop = 0;
+    while document.undo_bytes > document.undo_limit && drop + 1 < document.undo.len() {
+        document.undo_bytes -= document.undo[drop].bytes();
+        drop += 1;
+    }
+    if drop == 0 {
+        return;
+    }
+    document.undo.drain(..drop);
+    document.saved_at = document.saved_at.and_then(|at| at.checked_sub(drop));
+    document.sealed_at = document.sealed_at.and_then(|at| at.checked_sub(drop));
 }
 
 impl Buffer {
@@ -176,9 +293,12 @@ impl Buffer {
                 rope,
                 line_ending,
                 undo: Vec::new(),
+                undo_bytes: 0,
+                undo_limit: DEFAULT_UNDO_LIMIT,
                 redo: Vec::new(),
                 next_transaction: 0,
                 saved_at: Some(0),
+                disk: None,
                 sealed_at: None,
                 views: vec![(0, Vec::new())],
                 next_view: 1,
@@ -297,12 +417,60 @@ impl Buffer {
         document.saved_at != Some(document.undo.len())
     }
 
+    /// The file as it was when the text last matched it (see
+    /// [`DiskStamp`]); `None` when unknown.
+    pub fn disk_stamp(&self) -> Option<DiskStamp> {
+        lock(&self.document).disk
+    }
+
+    /// Records what the file looked like when the text matched it (after
+    /// reading, saving or reloading), for every view.
+    pub fn set_disk_stamp(&mut self, stamp: Option<DiskStamp>) {
+        lock(&self.document).disk = stamp;
+    }
+
+    /// A weak handle on the document for crash recovery.
+    pub fn document_handle(&self) -> DocumentHandle {
+        DocumentHandle(Arc::downgrade(&self.document))
+    }
+
     pub fn len(&self) -> usize {
         self.rope.len_bytes()
     }
 
     pub fn is_empty(&self) -> bool {
         self.rope.len_bytes() == 0
+    }
+
+    /// Whether the text is exactly `text`, without copying it out.
+    pub fn equals(&self, text: &str) -> bool {
+        self.rope == text
+    }
+
+    /// Bytes of the longest line, line break included: one pass over the
+    /// lines.
+    pub fn longest_line_bytes(&self) -> usize {
+        self.rope
+            .lines()
+            .map(|line| line.len_bytes())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The text as of now, for another thread (cheap, see [`Snapshot`]).
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            rope: self.rope.clone(),
+        }
+    }
+
+    /// Caps the undo history of the document at `bytes` of text (old and
+    /// new text of every step); the oldest steps go first, the latest one
+    /// always stays. [`DEFAULT_UNDO_LIMIT`] unless set.
+    pub fn set_undo_limit(&mut self, bytes: usize) {
+        let mut document = lock(&self.document);
+        document.undo_limit = bytes;
+        trim_undo(&mut document);
     }
 
     /// Number of lines; a trailing line break starts an extra empty line.
@@ -537,6 +705,41 @@ impl Buffer {
         true
     }
 
+    /// [`Buffer::reload`] through `edits`, which must turn the text into
+    /// `text` (what is now on disk) and are applied as one undo step (as
+    /// for [`Buffer::edit_batch`]), so positions outside them keep their
+    /// meaning: folds, diagnostics and selections survive. Marks the
+    /// buffer saved; returns `false` if there were no edits.
+    pub fn reload_with_edits(
+        &mut self,
+        text: &str,
+        mut edits: Vec<(Range<usize>, String)>,
+    ) -> Result<bool, OverlappingEdits> {
+        edits.sort_by_key(|(range, _)| range.start);
+        if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+            return Err(OverlappingEdits);
+        }
+        edits.retain(|(range, text)| !(range.is_empty() && text.is_empty()));
+        let document = Arc::clone(&self.document);
+        let mut document = lock(&document);
+        self.sync_locked(&mut document);
+        self.line_ending = line_ending_of(text);
+        if edits.is_empty() {
+            document.line_ending = self.line_ending;
+            document.saved_at = Some(document.undo.len());
+            return Ok(false);
+        }
+        // A reload is its own step, never part of the typing before it.
+        document.sealed_at = Some(document.undo.len());
+        self.edit_locked(&mut document, edits);
+        document.saved_at = Some(document.undo.len());
+        debug_assert!(
+            self.rope == text,
+            "the edits must produce the reloaded text"
+        );
+        Ok(true)
+    }
+
     /// Applies several edits as one undo step. Ranges refer to the current
     /// text and must not overlap; inserts at the same offset keep their order.
     /// Single-line insertions at the end of each of the previous step's
@@ -586,6 +789,7 @@ impl Buffer {
             for ((_, text), edit) in edits.iter().zip(last.edits.iter_mut().rev()) {
                 edit.new.push_str(text);
             }
+            document.undo_bytes += edits.iter().map(|(_, text)| text.len()).sum::<usize>();
         } else {
             let mut transaction = Vec::with_capacity(edits.len());
             for (range, text) in edits.into_iter().rev() {
@@ -599,10 +803,13 @@ impl Buffer {
             }
             document.next_transaction += 1;
             let id = document.next_transaction;
-            document.undo.push(Transaction {
+            let transaction = Transaction {
                 id,
                 edits: transaction,
-            });
+            };
+            document.undo_bytes += transaction.bytes();
+            document.undo.push(transaction);
+            trim_undo(document);
         }
         self.publish(document, first);
     }
@@ -624,6 +831,7 @@ impl Buffer {
         let mut document = lock(&document);
         self.sync_locked(&mut document);
         let transaction = document.undo.pop()?;
+        document.undo_bytes -= transaction.bytes();
         let first_change = self.changes.len();
         for edit in transaction.edits.iter().rev() {
             self.replace(edit.offset..edit.offset + edit.new.len(), &edit.old);
@@ -657,6 +865,7 @@ impl Buffer {
             .sum();
         let inserted = first.offset.saturating_add_signed(shift)
             ..first.offset.saturating_add_signed(shift) + first.new.len();
+        document.undo_bytes += transaction.bytes();
         document.undo.push(transaction);
         self.publish(&mut document, first_change);
         Some(inserted)
@@ -967,6 +1176,90 @@ mod tests {
     }
 
     #[test]
+    fn reload_with_edits_touches_only_the_edits_and_is_one_clean_step() {
+        let mut buffer = Buffer::new("a\nb\nc\n");
+        buffer.edit(0..0, "x");
+        buffer.drain_changes();
+        assert!(buffer.is_dirty());
+        let edits = vec![(3..4, "B".into()), (7..7, "d\n".into())];
+        assert!(buffer.reload_with_edits("xa\nB\nc\nd\n", edits).unwrap());
+        assert!(buffer.equals("xa\nB\nc\nd\n"));
+        assert!(!buffer.is_dirty());
+        let changes: Vec<Change> = buffer.drain_changes().collect();
+        assert_eq!(changes.len(), 2, "one change per edit, nothing else");
+        assert!(changes.iter().all(|change| change.start >= 3));
+        // Both edits revert together; the typing before stays its own step.
+        assert!(buffer.undo().is_some());
+        assert!(buffer.equals("xa\nb\nc\n"));
+        assert!(buffer.is_dirty());
+        assert!(buffer.undo().is_some());
+        assert!(buffer.equals("a\nb\nc\n"));
+        // Nothing to do when the edits are empty: only the saved mark moves.
+        buffer.edit(0..0, "y");
+        assert!(!buffer.reload_with_edits("ya\nb\nc\n", Vec::new()).unwrap());
+        assert!(!buffer.is_dirty());
+        assert_eq!(
+            buffer.reload_with_edits("", vec![(0..2, "".into()), (1..3, "".into())]),
+            Err(OverlappingEdits)
+        );
+    }
+
+    #[test]
+    fn undo_history_is_capped_by_bytes_and_the_save_point_follows() {
+        let mut buffer = Buffer::new("");
+        buffer.set_undo_limit(10);
+        buffer.edit(0..0, "aaaa");
+        buffer.seal_undo();
+        buffer.edit(4..4, "bbbb");
+        buffer.mark_saved();
+        buffer.seal_undo();
+        // 12 bytes of history: the oldest step goes, the save point stays
+        // one undo away.
+        buffer.edit(8..8, "cccc");
+        assert_eq!(buffer.undo_depth(), 2);
+        assert!(buffer.is_dirty());
+        assert_eq!(buffer.undo(), Some(8..8));
+        assert!(!buffer.is_dirty(), "the save point moved with the history");
+        assert_eq!(buffer.undo(), Some(4..4));
+        assert!(buffer.is_dirty());
+        assert_eq!(buffer.undo(), None, "the oldest step is gone");
+        assert!(buffer.equals("aaaa"));
+        // Redo brings the steps (and their bytes) back.
+        assert!(buffer.redo().is_some());
+        assert!(!buffer.is_dirty());
+        assert!(buffer.redo().is_some());
+        assert!(buffer.equals("aaaabbbbcccc"));
+
+        // A save point in a dropped step is unreachable: the buffer stays
+        // dirty however far it is undone. The latest step always stays,
+        // even one over the limit.
+        let mut buffer = Buffer::new("aa");
+        buffer.set_undo_limit(4);
+        buffer.edit(2..2, "bbbb");
+        buffer.seal_undo();
+        buffer.edit(6..6, "cccccccc");
+        assert_eq!(buffer.undo_depth(), 1);
+        assert!(buffer.undo().is_some());
+        assert!(buffer.equals("aabbbb"));
+        assert!(buffer.is_dirty(), "the saved text is no longer reachable");
+        assert_eq!(buffer.undo(), None);
+    }
+
+    #[test]
+    fn snapshots_keep_the_text_of_their_moment() {
+        let mut buffer = Buffer::new("one\ntwo");
+        let snapshot = buffer.snapshot();
+        buffer.edit(0..3, "1");
+        assert_eq!(snapshot.to_string(), "one\ntwo");
+        assert_eq!(snapshot.len(), 7);
+        assert_eq!(snapshot.line_count(), 2);
+        assert!(buffer.equals("1\ntwo"));
+        assert!(!buffer.equals("1\ntwo\n"));
+        assert_eq!(buffer.longest_line_bytes(), 3);
+        assert_eq!(Buffer::new("").longest_line_bytes(), 0);
+    }
+
+    #[test]
     fn batch_inserts_at_one_offset_keep_order_and_overlaps_are_rejected() {
         let mut buffer = Buffer::new("x");
         buffer
@@ -1021,6 +1314,35 @@ mod tests {
         buffer.redo();
         assert_eq!(buffer.slice(0..buffer.len()), "xab\nyab\n");
         assert_eq!(buffer.transaction_id(), id);
+    }
+
+    #[test]
+    fn document_handles_give_unsaved_text_while_the_document_lives() {
+        let mut buffer = Buffer::with_path("one\n", PathBuf::from("a.txt"));
+        let handle = buffer.document_handle();
+        let mut out = Vec::new();
+        assert!(!handle.write_unsaved(&mut out).unwrap(), "nothing unsaved");
+        buffer.edit(4..4, "two\n");
+        assert!(handle.write_unsaved(&mut out).unwrap());
+        assert_eq!(out, b"one\ntwo\n");
+        buffer.mark_saved();
+        out.clear();
+        assert!(!handle.write_unsaved(&mut out).unwrap());
+        buffer.edit(0..0, "x");
+        // The stamp is shared by the views; the handle outlives none of them.
+        let stamp = DiskStamp {
+            modified: None,
+            len: 4,
+        };
+        buffer.set_disk_stamp(Some(stamp));
+        let view = buffer.link();
+        assert_eq!(view.disk_stamp(), Some(stamp));
+        assert!(handle.is_alive());
+        drop(buffer);
+        drop(view);
+        assert!(!handle.is_alive());
+        assert!(!handle.write_unsaved(&mut out).unwrap());
+        assert!(out.is_empty());
     }
 
     #[test]

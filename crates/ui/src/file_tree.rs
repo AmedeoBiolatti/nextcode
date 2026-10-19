@@ -34,7 +34,6 @@ use gpui::{
     ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
     actions, anchored, deferred, div, point, prelude::*, px, uniform_list,
 };
-use worktree::FileKind;
 
 use crate::{
     commands,
@@ -251,11 +250,74 @@ enum ClipboardMode {
     Copy,
 }
 
-/// Files and folders being dragged from a tree.
+/// Files and folders being dragged from a tree: the row dragged, which takes
+/// the selection along when it is selected (resolved by
+/// [`FileTree::dragged_paths`] when needed, not per rendered row).
 #[derive(Clone)]
 pub struct DraggedPaths {
     tree: EntityId,
-    paths: Vec<PathBuf>,
+    path: PathBuf,
+    selected: bool,
+}
+
+/// The selected entries: a set for the per-row lookups, and the order they
+/// were selected in.
+#[derive(Default)]
+struct Selection {
+    order: Vec<PathBuf>,
+    set: HashSet<PathBuf>,
+}
+
+impl Selection {
+    fn contains(&self, path: &Path) -> bool {
+        self.set.contains(path)
+    }
+
+    /// In selection order.
+    #[cfg(test)]
+    fn paths(&self) -> &[PathBuf] {
+        &self.order
+    }
+
+    fn first(&self) -> Option<&PathBuf> {
+        self.order.first()
+    }
+
+    fn last(&self) -> Option<&PathBuf> {
+        self.order.last()
+    }
+
+    fn set(&mut self, paths: Vec<PathBuf>) {
+        self.set.clear();
+        self.order = paths;
+        let set = &mut self.set;
+        self.order.retain(|path| set.insert(path.clone()));
+    }
+
+    fn insert(&mut self, path: PathBuf) {
+        if self.set.insert(path.clone()) {
+            self.order.push(path);
+        }
+    }
+
+    /// Whether `path` was selected.
+    fn remove(&mut self, path: &Path) -> bool {
+        let removed = self.set.remove(path);
+        if removed {
+            self.order.retain(|selected| selected != path);
+        }
+        removed
+    }
+
+    fn retain(&mut self, keep: impl Fn(&Path) -> bool) {
+        self.order.retain(|path| keep(path));
+        self.set.retain(|path| keep(path));
+    }
+
+    fn clear(&mut self) {
+        self.order.clear();
+        self.set.clear();
+    }
 }
 
 struct DragPreview {
@@ -286,15 +348,30 @@ pub struct FileTree {
     /// top level.
     root_rows: bool,
     expanded: HashSet<PathBuf>,
-    /// Directory listings, read once per directory on first expand.
+    /// Directory listings, read off the UI thread when a folder first shows
+    /// (see [`FileTree::load_listings`]). A listing that changed on disk
+    /// stays, and is shown, until its re-read arrives.
     children: HashMap<PathBuf, Vec<Entry>>,
+    /// Listings to read again, with the generation of the change: a read
+    /// started before it leaves the listing stale.
+    stale: HashMap<PathBuf, u64>,
+    /// Reads in flight, with their generation; an older result is dropped.
+    loading: HashMap<PathBuf, u64>,
+    /// Counts changes and reads, to order them.
+    generation: u64,
+    /// Folders the rows need listed, from the last [`FileTree::rebuild_rows`].
+    wanted: Vec<PathBuf>,
     rows: Vec<Row>,
-    /// Selected entries, in selection order.
-    selection: Vec<PathBuf>,
+    /// Each entry row's index by path (`new_entry` rows left out).
+    row_of: HashMap<PathBuf, usize>,
+    selection: Selection,
     /// The entry keys move from (the last one clicked or reached).
     lead: Option<PathBuf>,
     /// Where Shift+click / Shift+arrow ranges start.
     anchor: Option<PathBuf>,
+    /// Scroll to the lead once its row shows: it was just created or moved
+    /// into a listing still being read.
+    scroll_when_listed: bool,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     menu: Option<TreeMenu>,
@@ -323,10 +400,16 @@ impl FileTree {
             header: header.into(),
             root_rows,
             children: HashMap::new(),
+            stale: HashMap::new(),
+            loading: HashMap::new(),
+            generation: 0,
+            wanted: Vec::new(),
             rows: Vec::new(),
-            selection: Vec::new(),
+            row_of: HashMap::new(),
+            selection: Selection::default(),
             lead: None,
             anchor: None,
+            scroll_when_listed: false,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             menu: None,
@@ -334,7 +417,7 @@ impl FileTree {
             clipboard: None,
             own_changes: Vec::new(),
         };
-        tree.rebuild_rows();
+        tree.rebuild(cx);
         tree
     }
 
@@ -350,11 +433,15 @@ impl FileTree {
     fn set_selection(&mut self, paths: Vec<PathBuf>) {
         self.lead = paths.last().cloned();
         self.anchor = self.lead.clone();
-        self.selection = paths;
+        self.selection.set(paths);
+        self.scroll_when_listed = false;
     }
 
     /// Re-reads the directories containing created or removed `paths`
-    /// (everything when `rescan`), keeping expansion state.
+    /// (everything when `rescan`), keeping expansion state. Nothing is
+    /// read here: the listings arrive off the UI thread, and a folder
+    /// that went away closes when its parent's listing comes back without
+    /// it.
     pub fn refresh<'a>(
         &mut self,
         paths: impl IntoIterator<Item = &'a Path>,
@@ -362,7 +449,14 @@ impl FileTree {
         cx: &mut Context<Self>,
     ) {
         if rescan {
-            self.children.clear();
+            self.generation += 1;
+            let generation = self.generation;
+            self.stale.extend(
+                self.children
+                    .keys()
+                    .chain(self.loading.keys())
+                    .map(|dir| (dir.clone(), generation)),
+            );
         } else {
             for path in paths {
                 if !self.is_own_change(path) {
@@ -370,26 +464,118 @@ impl FileTree {
                 }
             }
         }
-        // Keep expansion when the answer is unknown (e.g. agent disconnected).
-        let project = &self.project;
-        self.expanded
-            .retain(|dir| !matches!(project.kind(dir), Ok(None | Some(FileKind::File))));
-        self.rebuild_rows();
-        cx.notify();
+        self.rebuild(cx);
     }
 
-    /// Forgets the listing showing `path` (so it is read again).
+    /// Marks the listing showing `path` to be read again.
     fn invalidate(&mut self, path: &Path) {
         let parent = path.parent();
         if let Some(parent) = parent {
-            self.children.remove(parent);
+            self.mark_stale(parent);
         }
         // An `__init__.py` makes its folder a package: re-read the
         // listing showing that folder.
         if path.file_name().is_some_and(|name| name == "__init__.py")
             && let Some(grandparent) = parent.and_then(Path::parent)
         {
-            self.children.remove(grandparent);
+            self.mark_stale(grandparent);
+        }
+    }
+
+    /// `dir`'s listing (one shown, or being read) changed on disk.
+    fn mark_stale(&mut self, dir: &Path) {
+        if self.children.contains_key(dir) || self.loading.contains_key(dir) {
+            self.generation += 1;
+            self.stale.insert(dir.to_path_buf(), self.generation);
+        }
+    }
+
+    /// Rebuilds the rows and starts reading the listings they lack.
+    fn rebuild(&mut self, cx: &mut Context<Self>) {
+        self.rebuild_rows();
+        self.load_listings(cx);
+        cx.notify();
+    }
+
+    /// Reads the listings the rows want (folders shown open without one,
+    /// or with one that changed) off the UI thread; [`FileTree::listed`]
+    /// takes each result.
+    fn load_listings(&mut self, cx: &mut Context<Self>) {
+        for dir in std::mem::take(&mut self.wanted) {
+            if self.loading.contains_key(&dir) {
+                continue;
+            }
+            self.generation += 1;
+            let generation = self.generation;
+            self.loading.insert(dir.clone(), generation);
+            let project = self.project.clone();
+            let read = dir.clone();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_spawn(async move { read_dir(&project, &read) })
+                    .await;
+                this.update(cx, |this, cx| this.listed(dir, generation, result, cx))
+                    .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// A listing arrived. Open folders it no longer has (gone, or ignored
+    /// now) close; an unreadable folder (e.g. the agent disconnected)
+    /// keeps what it showed.
+    fn listed(
+        &mut self,
+        dir: PathBuf,
+        generation: u64,
+        result: io::Result<Vec<Entry>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.loading.get(&dir) != Some(&generation) {
+            return;
+        }
+        self.loading.remove(&dir);
+        if self
+            .stale
+            .get(&dir)
+            .is_some_and(|&since| since < generation)
+        {
+            self.stale.remove(&dir);
+        }
+        match result {
+            Ok(entries) => {
+                let present: HashSet<&Path> = entries
+                    .iter()
+                    .filter(|entry| entry.is_dir)
+                    .map(|entry| entry.path.as_path())
+                    .collect();
+                let vanished: Vec<PathBuf> = self
+                    .expanded
+                    .iter()
+                    .filter(|open| {
+                        open.parent() == Some(dir.as_path()) && !present.contains(open.as_path())
+                    })
+                    .cloned()
+                    .collect();
+                if !vanished.is_empty() {
+                    let under = |path: &Path| vanished.iter().any(|gone| path.starts_with(gone));
+                    self.expanded.retain(|open| !under(open));
+                    self.children.retain(|listed, _| !under(listed));
+                    self.stale.retain(|listed, _| !under(listed));
+                    self.loading.retain(|listed, _| !under(listed));
+                }
+                self.children.insert(dir, entries);
+            }
+            Err(_) => {
+                self.children.entry(dir).or_default();
+            }
+        }
+        self.rebuild(cx);
+        if self.scroll_when_listed
+            && let Some(index) = self.lead_index()
+        {
+            self.scroll.scroll_to_item(index, ScrollStrategy::Top);
+            self.scroll_when_listed = false;
         }
     }
 
@@ -448,8 +634,11 @@ impl FileTree {
         if let Some((_, paths)) = &mut self.clipboard {
             *paths = paths.iter().map(|path| follow(path)).collect();
         }
-        self.children
-            .retain(|dir, _| !moves.iter().any(|(from, _)| dir.starts_with(from)));
+        // Listings under a moved entry went with it; reads of them are moot.
+        let moved = |dir: &Path| moves.iter().any(|(from, _)| dir.starts_with(from));
+        self.children.retain(|dir, _| !moved(dir));
+        self.stale.retain(|dir, _| !moved(dir));
+        self.loading.retain(|dir, _| !moved(dir));
         for (from, to) in moves {
             self.invalidate(from);
             self.invalidate(to);
@@ -457,9 +646,8 @@ impl FileTree {
         }
         let selection = moves.iter().map(|(_, to)| to.clone()).collect();
         self.set_selection(selection);
-        self.rebuild_rows();
-        self.scroll_to_lead();
-        cx.notify();
+        self.rebuild(cx);
+        self.scroll_to_lead_when_shown();
     }
 
     /// Entries the workspace deleted.
@@ -475,22 +663,24 @@ impl FileTree {
             clipboard.retain(|path| !gone(path));
         }
         self.children.retain(|dir, _| !gone(dir));
+        self.stale.retain(|dir, _| !gone(dir));
+        self.loading.retain(|dir, _| !gone(dir));
         for path in paths {
             self.invalidate(path);
         }
-        self.rebuild_rows();
-        cx.notify();
+        self.rebuild(cx);
     }
 
     /// Shows new entries (created or pasted here) and selects them.
     fn created(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
         self.expect_changes(paths.iter().cloned());
         for path in paths {
-            // Every new folder on the way (`a/b/c.py`) needs its listing read.
+            // Every new folder on the way (`a/b/c.py`) needs its listing
+            // read: the listed folder nearest to the entry changed.
             let root = self.project.root_for(path).path.clone();
             let mut current = path.as_path();
             while let Some(parent) = current.parent() {
-                self.children.remove(parent);
+                self.mark_stale(parent);
                 if parent == root || !parent.starts_with(&root) {
                     break;
                 }
@@ -500,16 +690,25 @@ impl FileTree {
             self.reveal(path);
         }
         self.set_selection(paths.to_vec());
-        self.rebuild_rows();
-        self.scroll_to_lead();
-        cx.notify();
+        self.rebuild(cx);
+        self.scroll_to_lead_when_shown();
     }
 
+    /// Rebuilds the rows from the listings at hand (a folder shown open
+    /// without one is noted in `wanted` for [`FileTree::load_listings`]).
     fn rebuild_rows(&mut self) {
         self.rows.clear();
+        self.wanted.clear();
+        let mut listing = Listing {
+            children: &self.children,
+            stale: &self.stale,
+            expanded: &self.expanded,
+            rows: &mut self.rows,
+            wanted: &mut self.wanted,
+        };
         if self.root_rows {
             for root in self.project.roots() {
-                self.rows.push(Row {
+                listing.rows.push(Row {
                     path: root.path.clone(),
                     name: root.name.clone().into(),
                     is_dir: true,
@@ -518,27 +717,12 @@ impl FileTree {
                     new_entry: false,
                     root: true,
                 });
-                if self.expanded.contains(&root.path) {
-                    push_rows(
-                        &self.project,
-                        &mut self.children,
-                        &self.expanded,
-                        &root.path,
-                        1,
-                        &mut self.rows,
-                    );
+                if listing.expanded.contains(&root.path) {
+                    listing.push_rows(&root.path, 1);
                 }
             }
         } else {
-            let root = self.project.root().to_path_buf();
-            push_rows(
-                &self.project,
-                &mut self.children,
-                &self.expanded,
-                &root,
-                0,
-                &mut self.rows,
-            );
+            listing.push_rows(self.project.root(), 0);
         }
         if let Some(Editing {
             kind: EditKind::New { dir, kind },
@@ -563,22 +747,27 @@ impl FileTree {
                 },
             );
         }
+        self.row_of = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !row.new_entry)
+            .map(|(index, row)| (row.path.clone(), index))
+            .collect();
         // An entry being renamed that went away (deleted outside) ends
         // the editor.
         if let Some(Editing {
             kind: EditKind::Rename { path, .. },
             ..
         }) = &self.editing
-            && !self.rows.iter().any(|row| row.path == *path)
+            && !self.row_of.contains_key(path)
         {
             self.editing = None;
         }
     }
 
     fn row_index(&self, path: &Path) -> Option<usize> {
-        self.rows
-            .iter()
-            .position(|row| !row.new_entry && row.path == path)
+        self.row_of.get(path).copied()
     }
 
     fn lead_index(&self) -> Option<usize> {
@@ -588,6 +777,14 @@ impl FileTree {
     fn scroll_to_lead(&self) {
         if let Some(index) = self.lead_index() {
             self.scroll.scroll_to_item(index, ScrollStrategy::Top);
+        }
+    }
+
+    /// Scrolls to the lead now, or once the listing holding it arrives.
+    fn scroll_to_lead_when_shown(&mut self) {
+        match self.lead_index() {
+            Some(index) => self.scroll.scroll_to_item(index, ScrollStrategy::Top),
+            None => self.scroll_when_listed = self.lead.is_some(),
         }
     }
 
@@ -680,11 +877,11 @@ impl FileTree {
         .detach();
     }
 
-    fn toggle_dir(&mut self, path: &Path) {
+    fn toggle_dir(&mut self, path: &Path, cx: &mut Context<Self>) {
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_path_buf());
         }
-        self.rebuild_rows();
+        self.rebuild(cx);
     }
 
     fn activate(&mut self, index: usize, focus_editor: bool, cx: &mut Context<Self>) {
@@ -693,7 +890,7 @@ impl FileTree {
         };
         let path = row.path.clone();
         if row.is_dir {
-            self.toggle_dir(&path);
+            self.toggle_dir(&path, cx);
         } else {
             cx.emit(FileTreeEvent::Open { path, focus_editor });
         }
@@ -716,11 +913,8 @@ impl FileTree {
         let (path, is_dir) = (row.path.clone(), row.is_dir);
         self.menu = None;
         if modifiers.secondary() {
-            match self.selection.iter().position(|selected| *selected == path) {
-                Some(position) => {
-                    self.selection.remove(position);
-                }
-                None => self.selection.push(path.clone()),
+            if !self.selection.remove(&path) {
+                self.selection.insert(path.clone());
             }
             self.lead = Some(path.clone());
             self.anchor = Some(path);
@@ -744,11 +938,13 @@ impl FileTree {
             .and_then(|anchor| self.row_index(anchor))
             .unwrap_or(index);
         let (start, end) = (anchor.min(index), anchor.max(index));
-        self.selection = self.rows[start..=end]
-            .iter()
-            .filter(|row| !row.new_entry)
-            .map(|row| row.path.clone())
-            .collect();
+        self.selection.set(
+            self.rows[start..=end]
+                .iter()
+                .filter(|row| !row.new_entry)
+                .map(|row| row.path.clone())
+                .collect(),
+        );
         self.lead = Some(self.rows[index].path.clone());
         if self.anchor.is_none() {
             self.anchor = self.lead.clone();
@@ -851,8 +1047,7 @@ impl FileTree {
         if self.expanded.contains(&path) {
             self.move_lead(1, false, cx);
         } else {
-            self.toggle_dir(&path);
-            cx.notify();
+            self.toggle_dir(&path, cx);
         }
     }
 
@@ -864,7 +1059,7 @@ impl FileTree {
         let row = &self.rows[index];
         let path = row.path.clone();
         if row.is_dir && self.expanded.contains(&path) {
-            self.toggle_dir(&path);
+            self.toggle_dir(&path, cx);
         } else if let Some(parent) = path.parent()
             && self.row_index(parent).is_some()
         {
@@ -892,12 +1087,13 @@ impl FileTree {
 
     fn select_all_rows(&mut self, _: &SelectAllRows, _: &mut Window, cx: &mut Context<Self>) {
         let lead = self.lead.clone();
-        self.selection = self
-            .rows
-            .iter()
-            .filter(|row| !row.new_entry)
-            .map(|row| row.path.clone())
-            .collect();
+        self.selection.set(
+            self.rows
+                .iter()
+                .filter(|row| !row.new_entry)
+                .map(|row| row.path.clone())
+                .collect(),
+        );
         self.lead = lead.or_else(|| self.selection.first().cloned());
         cx.notify();
     }
@@ -975,6 +1171,7 @@ impl FileTree {
         self.menu = None;
         self.reveal(&self.project.join(&dir, "x"));
         self.start_editing(EditKind::New { dir, kind }, "", window, cx);
+        self.load_listings(cx);
     }
 
     /// New File… (of `file_type`, when given) from outside the tree: in the
@@ -1109,8 +1306,7 @@ impl FileTree {
         self.finish_editing(window, cx);
         if self.editing.is_some() {
             self.editing = None;
-            self.rebuild_rows();
-            cx.notify();
+            self.rebuild(cx);
         }
     }
 
@@ -1256,8 +1452,7 @@ impl FileTree {
         if editing.input.focus_handle(cx).is_focused(window) {
             window.focus(&self.focus_handle);
         }
-        self.rebuild_rows();
-        cx.notify();
+        self.rebuild(cx);
     }
 
     fn confirm_name(&mut self, _: &ConfirmName, window: &mut Window, cx: &mut Context<Self>) {
@@ -1820,57 +2015,56 @@ impl FileTree {
     }
 }
 
-/// Lists one directory; an unreadable one shows as empty. Folders that
-/// could be Python packages are checked for an `__init__.py`.
-fn read_dir(project: &Project, dir: &Path) -> Vec<Entry> {
-    project
-        .read_dir(dir)
-        .unwrap_or_default()
+/// Lists one directory (off the UI thread; for remote projects one agent
+/// round trip, the package check included). Folders that could be Python
+/// packages are those the listing found an `__init__.py` in.
+fn read_dir(project: &Project, dir: &Path) -> io::Result<Vec<Entry>> {
+    Ok(project
+        .read_dir(dir)?
         .into_iter()
-        .map(|entry| {
-            let path = project.join(dir, &entry.name);
-            let package = entry.is_dir
-                && file_icons::may_be_package(&entry.name)
-                && matches!(
-                    project.kind(&project.join(&path, "__init__.py")),
-                    Ok(Some(FileKind::File))
-                );
-            Entry {
-                path,
-                name: entry.name.into(),
-                is_dir: entry.is_dir,
-                package,
-            }
+        .map(|entry| Entry {
+            path: project.join(dir, &entry.name),
+            package: entry.is_dir && entry.package && file_icons::may_be_package(&entry.name),
+            name: entry.name.into(),
+            is_dir: entry.is_dir,
         })
-        .collect()
+        .collect())
 }
 
-fn push_rows(
-    project: &Project,
-    children: &mut HashMap<PathBuf, Vec<Entry>>,
-    expanded: &HashSet<PathBuf>,
-    dir: &Path,
-    depth: usize,
-    rows: &mut Vec<Row>,
-) {
-    if !children.contains_key(dir) {
-        children.insert(dir.to_path_buf(), read_dir(project, dir));
-    }
-    for index in 0..children[dir].len() {
-        let entry = &children[dir][index];
-        let recurse = entry.is_dir && expanded.contains(&entry.path);
-        rows.push(Row {
-            path: entry.path.clone(),
-            name: entry.name.clone(),
-            is_dir: entry.is_dir,
-            package: entry.package,
-            depth,
-            new_entry: false,
-            root: false,
-        });
-        if recurse {
-            let path = entry.path.clone();
-            push_rows(project, children, expanded, &path, depth + 1, rows);
+/// The rows being built from the listings at hand.
+struct Listing<'a> {
+    children: &'a HashMap<PathBuf, Vec<Entry>>,
+    stale: &'a HashMap<PathBuf, u64>,
+    expanded: &'a HashSet<PathBuf>,
+    rows: &'a mut Vec<Row>,
+    /// Open folders without a listing, or with one that changed.
+    wanted: &'a mut Vec<PathBuf>,
+}
+
+impl Listing<'_> {
+    /// The rows of open folder `dir`: its listing, if read (the one at
+    /// hand while a re-read runs), with its open subfolders' rows after
+    /// each.
+    fn push_rows(&mut self, dir: &Path, depth: usize) {
+        if !self.children.contains_key(dir) || self.stale.contains_key(dir) {
+            self.wanted.push(dir.to_path_buf());
+        }
+        let Some(entries) = self.children.get(dir) else {
+            return;
+        };
+        for entry in entries {
+            self.rows.push(Row {
+                path: entry.path.clone(),
+                name: entry.name.clone(),
+                is_dir: entry.is_dir,
+                package: entry.package,
+                depth,
+                new_entry: false,
+                root: false,
+            });
+            if entry.is_dir && self.expanded.contains(&entry.path) {
+                self.push_rows(&entry.path, depth + 1);
+            }
         }
     }
 }
@@ -1967,7 +2161,8 @@ impl Render for FileTree {
                     .drag_over::<DraggedPaths>(|style, _, _, _| style.bg(theme::hover_row()))
                     .on_drop(
                         cx.listener(move |this, dragged: &DraggedPaths, window, cx| {
-                            this.drop_paths(dragged.paths.clone(), header_drop.clone(), window, cx)
+                            let paths = this.dragged_paths(dragged);
+                            this.drop_paths(paths, header_drop.clone(), window, cx)
                         }),
                     )
                     .pin("header")
@@ -1981,7 +2176,8 @@ impl Render for FileTree {
                     .can_drop(accepts)
                     .on_drop(
                         cx.listener(move |this, dragged: &DraggedPaths, window, cx| {
-                            this.drop_paths(dragged.paths.clone(), root_drop.clone(), window, cx)
+                            let paths = this.dragged_paths(dragged);
+                            this.drop_paths(paths, root_drop.clone(), window, cx)
                         }),
                     )
                     .on_mouse_down(
@@ -2076,17 +2272,14 @@ impl FileTree {
                 .unwrap_or(self.project.root())
                 .to_path_buf()
         };
-        // Folders of the project stay where they are.
+        // What the drag takes along is resolved when it starts (or is
+        // dropped), not for every row rendered.
         let dragged = DraggedPaths {
             tree,
-            paths: if selected {
-                let mut paths = self.subjects_in_order();
-                paths.retain(|path| !self.is_root(path));
-                paths
-            } else {
-                vec![row.path.clone()]
-            },
+            path: row.path.clone(),
+            selected,
         };
+        let drag_source = cx.weak_entity();
         let draggable = !row.root;
         let path = row.path.clone();
         let name = row.name.clone();
@@ -2146,8 +2339,12 @@ impl FileTree {
                         }),
                     )
                     .when(draggable, |element| {
-                        element.on_drag(dragged, |dragged: &DraggedPaths, _, _, cx| {
-                            let label = match dragged.paths.as_slice() {
+                        element.on_drag(dragged, move |dragged: &DraggedPaths, _, _, cx| {
+                            let paths = drag_source
+                                .upgrade()
+                                .map(|tree| tree.read(cx).dragged_paths(dragged))
+                                .unwrap_or_default();
+                            let label = match paths.as_slice() {
                                 [path] => path
                                     .file_name()
                                     .map(|name| name.to_string_lossy().into_owned())
@@ -2175,7 +2372,8 @@ impl FileTree {
             })
             .on_drop(
                 cx.listener(move |this, dragged: &DraggedPaths, window, cx| {
-                    this.drop_paths(dragged.paths.clone(), drop_dir.clone(), window, cx)
+                    let paths = this.dragged_paths(dragged);
+                    this.drop_paths(paths, drop_dir.clone(), window, cx)
                 }),
             )
             .pin(format!(
@@ -2397,6 +2595,19 @@ impl FileTree {
             .map(|row| row.path.clone())
             .collect()
     }
+
+    /// What a drag moves: the selection (in tree order, without the
+    /// project's folders, which stay where they are) when the dragged row
+    /// is part of it, else that row alone.
+    fn dragged_paths(&self, dragged: &DraggedPaths) -> Vec<PathBuf> {
+        if dragged.selected && self.selection.contains(&dragged.path) {
+            let mut paths = self.subjects_in_order();
+            paths.retain(|path| !self.is_root(path));
+            paths
+        } else {
+            vec![dragged.path.clone()]
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2505,8 +2716,10 @@ mod tests {
     fn new_file_is_typed_inline_checked_live_and_created(cx: &mut TestAppContext) {
         let root = project_dir("new");
         let (tree, cx, events) = open_tree(&root, cx);
-        // Select a file inside src: New File goes into its folder.
-        cx.simulate_keystrokes("down right down");
+        // Select a file inside src (listed once opened): New File goes
+        // into its folder.
+        cx.simulate_keystrokes("down right");
+        cx.simulate_keystrokes("down");
         assert_eq!(selection(&tree, cx), ["main.py"]);
         tree.update_in(cx, |tree, window, cx| tree.new_file(&NewFile, window, cx));
         cx.run_until_parked();
@@ -2699,6 +2912,9 @@ mod tests {
         tree.update(cx, |tree, cx| {
             tree.moved(&[(root.join("src"), root.join("lib"))], cx)
         });
+        // The root's listing is re-read off the UI thread; the moved
+        // folder's own listing went with it.
+        cx.run_until_parked();
         assert_eq!(
             names(&tree, cx),
             ["lib", "  inner", "  main.py", "a.py", "b.py"]
@@ -2833,7 +3049,8 @@ mod tests {
         let root = project_dir("new-workflow");
         let (tree, cx, events) = open_tree(&root, cx);
         // From inside src: the workflow still goes to the project root.
-        cx.simulate_keystrokes("down right down");
+        cx.simulate_keystrokes("down right");
+        cx.simulate_keystrokes("down");
         tree.update_in(cx, |tree, window, cx| tree.new_file(&NewFile, window, cx));
         cx.run_until_parked();
         cx.simulate_keystrokes("tab");
@@ -2908,9 +3125,10 @@ mod tests {
         let main = web.join("src").join("main.py");
         tree.update(cx, |tree, cx| {
             tree.reveal(&main);
-            tree.rebuild_rows();
+            tree.rebuild(cx);
             tree.select(&main, cx);
         });
+        cx.run_until_parked();
         assert_eq!(
             names(&tree, cx),
             [
@@ -2936,7 +3154,7 @@ mod tests {
         // Left climbs to the folder row, which is never renamed or deleted.
         cx.simulate_keystrokes("left left left");
         assert_eq!(
-            tree.read_with(cx, |tree, _| tree.selection.clone()),
+            tree.read_with(cx, |tree, _| tree.selection.paths().to_vec()),
             std::slice::from_ref(&web)
         );
         assert_eq!(
@@ -2961,9 +3179,11 @@ mod tests {
         let api = project_dir("ws-new-api");
         let web = project_dir("ws-new-web");
         let (tree, cx, events) = open_project_tree(workspace(&[(&api, "api"), (&web, "web")]), cx);
-        // A file selected in the second folder: New File goes next to it.
+        // A file selected in the second folder (listed once opened): New
+        // File goes next to it.
+        tree.update(cx, |tree, cx| tree.click_row(4, Modifiers::none(), 1, cx));
+        cx.run_until_parked();
         tree.update(cx, |tree, cx| {
-            tree.click_row(4, Modifiers::none(), 1, cx);
             let a = tree.row_index(&web.join("a.py")).unwrap();
             tree.click_row(a, Modifiers::none(), 1, cx);
         });
@@ -3055,5 +3275,83 @@ mod tests {
         );
         fs::remove_dir_all(&api).ok();
         fs::remove_dir_all(&web).ok();
+    }
+
+    #[gpui::test]
+    fn external_changes_are_read_off_the_ui_thread_and_gone_folders_close(cx: &mut TestAppContext) {
+        let root = project_dir("refresh");
+        let pkg = root.join("src").join("pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("__init__.py"), "").unwrap();
+        let (tree, cx, _) = open_tree(&root, cx);
+        cx.simulate_keystrokes("down right");
+        assert_eq!(
+            names(&tree, cx),
+            ["src", "  pkg", "  main.py", "a.py", "b.py"]
+        );
+        // The listing says which folders are packages: no stat per folder.
+        assert!(tree.read_with(cx, |tree, _| tree.rows[1].package));
+        cx.simulate_keystrokes("down right");
+        let open = [
+            "src",
+            "  pkg",
+            "    __init__.py",
+            "  main.py",
+            "a.py",
+            "b.py",
+        ];
+        assert_eq!(names(&tree, cx), open);
+
+        // Outside the tree, a file appears and the open package goes.
+        fs::write(root.join("c.py"), "").unwrap();
+        fs::remove_dir_all(&pkg).unwrap();
+        tree.update(cx, |tree, cx| {
+            tree.refresh([root.join("c.py").as_path(), pkg.as_path()], false, cx)
+        });
+        // The rows at hand stay until the re-read listings arrive.
+        assert_eq!(names(&tree, cx), open);
+        cx.run_until_parked();
+        assert_eq!(
+            names(&tree, cx),
+            ["src", "  main.py", "a.py", "b.py", "c.py"]
+        );
+        assert!(tree.read_with(cx, |tree, _| !tree.expanded.contains(&pkg)));
+
+        // A rescan re-reads every listing, keeping what is open.
+        fs::write(root.join("src").join("new.py"), "").unwrap();
+        tree.update(cx, |tree, cx| tree.refresh(std::iter::empty(), true, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            names(&tree, cx),
+            ["src", "  main.py", "  new.py", "a.py", "b.py", "c.py"]
+        );
+        assert!(tree.read_with(cx, |tree, _| tree.loading.is_empty()
+            && tree.stale.is_empty()));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[gpui::test]
+    fn drags_take_the_selection_along_from_a_selected_row_only(cx: &mut TestAppContext) {
+        let root = project_dir("drag-payload");
+        let (tree, cx, _) = open_tree(&root, cx);
+        tree.update(cx, |tree, cx| {
+            tree.click_row(2, Modifiers::none(), 1, cx);
+            tree.click_row(1, Modifiers::secondary_key(), 1, cx);
+            let drag = |path: &Path, selected: bool| DraggedPaths {
+                tree: cx.entity_id(),
+                path: path.to_path_buf(),
+                selected,
+            };
+            // In tree order, whichever was selected first.
+            assert_eq!(
+                tree.dragged_paths(&drag(&root.join("b.py"), true)),
+                [root.join("a.py"), root.join("b.py")]
+            );
+            assert_eq!(
+                tree.dragged_paths(&drag(&root.join("src"), false)),
+                [root.join("src")]
+            );
+        });
+        fs::remove_dir_all(&root).ok();
     }
 }

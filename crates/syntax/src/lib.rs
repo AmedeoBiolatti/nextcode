@@ -427,6 +427,9 @@ struct LanguageConfig {
     query: Query,
     /// Highlight per query capture index.
     highlights: Vec<Option<Highlight>>,
+    /// Set once a parser refused the grammar (reported through
+    /// [`problems`] once).
+    rejected: std::sync::OnceLock<()>,
 }
 
 impl LanguageConfig {
@@ -459,6 +462,7 @@ impl LanguageConfig {
                     grammar,
                     query,
                     highlights,
+                    rejected: std::sync::OnceLock::new(),
                 })
             });
         match result {
@@ -490,9 +494,14 @@ impl Syntax {
     pub fn new(language: Language, buffer: &Buffer) -> Option<Self> {
         let config = language.config()?;
         let mut parser = Parser::new();
-        parser
-            .set_language(&config.grammar)
-            .expect("grammar ABI is supported by the tree-sitter runtime");
+        if let Err(error) = parser.set_language(&config.grammar) {
+            // The library was built against another tree-sitter: plain
+            // text, like a missing library (reported once per language).
+            config.rejected.get_or_init(|| {
+                grammars::report(language, format!("grammar library not usable: {error}"));
+            });
+            return None;
+        }
         let mut syntax = Self {
             language,
             config,
@@ -561,31 +570,12 @@ impl Syntax {
                 .then(b_pattern.cmp(a_pattern))
         });
         captures.dedup_by(|(later, ..), (earlier, ..)| later == earlier);
-
-        let mut layer = vec![None; range.len()];
-        for (node, _, highlight) in captures {
-            let start = node.start.max(range.start) - range.start;
-            let end = node.end.min(range.end).saturating_sub(range.start);
-            if start < end {
-                layer[start..end].fill(Some(highlight));
-            }
-        }
-
-        let mut spans: Vec<HighlightSpan> = Vec::new();
-        for (i, highlight) in layer.into_iter().enumerate() {
-            let Some(highlight) = highlight else { continue };
-            let offset = range.start + i;
-            match spans.last_mut() {
-                Some(last) if last.highlight == highlight && last.range.end == offset => {
-                    last.range.end += 1;
-                }
-                _ => spans.push(HighlightSpan {
-                    range: offset..offset + 1,
-                    highlight,
-                }),
-            }
-        }
-        spans
+        sweep_spans(
+            captures
+                .into_iter()
+                .map(|(node, _, highlight)| (node, highlight)),
+            range,
+        )
     }
 
     /// The bracket matching the `(`, `)`, `[`, `]`, `{` or `}` token at
@@ -782,6 +772,65 @@ pub struct Scope {
     pub header: usize,
     /// Last hidden line.
     pub last: usize,
+}
+
+/// Non-overlapping spans within `range` from `captures` (node ranges with
+/// their highlight, sorted by start, each outer node before the nodes it
+/// contains): one sweep over the captures with a stack of the open nodes,
+/// so the innermost paints each byte; no buffer the size of `range`.
+fn sweep_spans(
+    captures: impl IntoIterator<Item = (Range<usize>, Highlight)>,
+    range: Range<usize>,
+) -> Vec<HighlightSpan> {
+    fn push(spans: &mut Vec<HighlightSpan>, range: Range<usize>, highlight: Highlight) {
+        if range.start >= range.end {
+            return;
+        }
+        match spans.last_mut() {
+            Some(last) if last.highlight == highlight && last.range.end == range.start => {
+                last.range.end = range.end;
+            }
+            _ => spans.push(HighlightSpan { range, highlight }),
+        }
+    }
+
+    /// Paints `*at..to` with the innermost open node, closing the ones
+    /// that end on the way.
+    fn paint(
+        spans: &mut Vec<HighlightSpan>,
+        open: &mut Vec<(usize, Highlight)>,
+        at: &mut usize,
+        to: usize,
+    ) {
+        while *at < to {
+            while open.last().is_some_and(|&(end, _)| end <= *at) {
+                open.pop();
+            }
+            let Some(&(end, highlight)) = open.last() else {
+                *at = to;
+                return;
+            };
+            let stop = end.min(to);
+            push(spans, *at..stop, highlight);
+            *at = stop;
+        }
+    }
+
+    let mut spans = Vec::new();
+    // Open nodes, outermost first: nested, so their ends never increase.
+    let mut open: Vec<(usize, Highlight)> = Vec::new();
+    let mut at = range.start;
+    for (node, highlight) in captures {
+        let start = node.start.max(range.start);
+        let end = node.end.min(range.end);
+        if start >= end {
+            continue;
+        }
+        paint(&mut spans, &mut open, &mut at, start);
+        open.push((end, highlight));
+    }
+    paint(&mut spans, &mut open, &mut at, range.end);
+    spans
 }
 
 fn point(point: text::Point) -> Point {
@@ -1200,6 +1249,26 @@ mod tests {
                 highlight: h("keyword.function")
             })
         );
+    }
+
+    #[test]
+    fn sweep_paints_the_innermost_node_and_merges_equal_neighbours() {
+        let (a, b, c) = (h("keyword"), h("string"), h("comment"));
+        let captures = [(0..10, a), (2..4, b), (3..4, c), (6..8, a), (12..14, b)];
+        let spans = |range: Range<usize>| -> Vec<(Range<usize>, Highlight)> {
+            sweep_spans(captures.iter().cloned(), range)
+                .into_iter()
+                .map(|span| (span.range, span.highlight))
+                .collect()
+        };
+        assert_eq!(
+            spans(0..20),
+            [(0..2, a), (2..3, b), (3..4, c), (4..10, a), (12..14, b)]
+        );
+        // Clipped to the range, including nodes starting before it.
+        assert_eq!(spans(1..9), [(1..2, a), (2..3, b), (3..4, c), (4..9, a)]);
+        assert_eq!(spans(13..13), []);
+        assert_eq!(spans(10..12), []);
     }
 
     #[test]

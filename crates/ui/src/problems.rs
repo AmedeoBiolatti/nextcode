@@ -4,11 +4,12 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use gpui::{
-    Context, Entity, EventEmitter, Hsla, SharedString, Subscription, Window, div, prelude::*, px,
-    uniform_list,
+    Context, Entity, EventEmitter, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
+    px, uniform_list,
 };
 use language::Location;
 use lsp::types::DiagnosticSeverity;
@@ -23,6 +24,9 @@ use crate::{
 };
 
 const ROW_HEIGHT: f32 = 24.;
+/// How long after a diagnostics update the rows are rebuilt: servers
+/// publish hundreds of files in a burst, which makes one rebuild.
+const REBUILD_DELAY: Duration = Duration::from_millis(50);
 
 pub enum ProblemsEvent {
     Open(Location),
@@ -88,6 +92,8 @@ pub struct ProblemsPanel {
     rows: Vec<Row>,
     /// Unknown words of open files (`spell.in_problems`), by path.
     spelling: HashMap<PathBuf, Vec<lsp::types::Diagnostic>>,
+    /// The rebuild due `REBUILD_DELAY` after the first update of a burst.
+    pending_rebuild: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -99,7 +105,7 @@ impl ProblemsPanel {
     pub fn new(project: Project, store: Entity<LspStore>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&store, |this, _, event, cx| {
             if let LspStoreEvent::DiagnosticsUpdated(_) = event {
-                this.rebuild(cx);
+                this.schedule_rebuild(cx);
             }
         });
         let mut panel = Self {
@@ -107,10 +113,27 @@ impl ProblemsPanel {
             store,
             rows: Vec::new(),
             spelling: HashMap::new(),
+            pending_rebuild: None,
             _subscription: subscription,
         };
         panel.rebuild(cx);
         panel
+    }
+
+    /// Rebuilds the rows `REBUILD_DELAY` from now, once for every update
+    /// until then (the rows, and `context_problems`, lag that long).
+    fn schedule_rebuild(&mut self, cx: &mut Context<Self>) {
+        if self.pending_rebuild.is_some() {
+            return;
+        }
+        self.pending_rebuild = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REBUILD_DELAY).await;
+            this.update(cx, |this, cx| {
+                this.pending_rebuild = None;
+                this.rebuild(cx);
+            })
+            .ok();
+        }));
     }
 
     /// Replaces the unknown words listed for `path` (none removes it).
@@ -142,7 +165,7 @@ impl ProblemsPanel {
         } else {
             self.spelling.insert(path.to_path_buf(), diagnostics);
         }
-        self.rebuild(cx);
+        self.schedule_rebuild(cx);
     }
 
     /// Error and warning totals and every listed problem, in panel order

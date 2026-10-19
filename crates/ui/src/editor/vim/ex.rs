@@ -362,10 +362,19 @@ impl Editor {
             "wa" | "wall" => dispatch(window, "workspace::SaveAll", cx)?,
             "q" | "quit" | "clo" | "close" => cx.emit(EditorEvent::Close { discard: bang }),
             "wq" | "x" | "xi" | "xit" | "exi" | "exit" => {
-                if (name.starts_with('w') || self.buffer.is_dirty()) && !self.save(cx) {
+                if !(name.starts_with('w') || self.buffer.is_dirty()) {
+                    cx.emit(EditorEvent::Close { discard: bang });
                     return Ok(());
                 }
-                cx.emit(EditorEvent::Close { discard: bang });
+                // Closes once the write is done; a failed save stays open.
+                let save = self.save(cx);
+                cx.spawn(async move |this, cx| {
+                    if save.await {
+                        this.update(cx, |_, cx| cx.emit(EditorEvent::Close { discard: bang }))
+                            .ok();
+                    }
+                })
+                .detach();
             }
             "e" | "edit" => {
                 if arg.is_empty() {

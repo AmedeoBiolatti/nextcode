@@ -456,10 +456,8 @@ pub fn save_selected(project_key: &str, selected: &str) -> io::Result<()> {
     let state = RunState {
         selected: Some(selected.to_owned()),
     };
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(&state).map_err(io::Error::other)?,
-    )
+    let json = serde_json::to_string_pretty(&state).map_err(io::Error::other)?;
+    worktree::write_atomic(&path, json.as_bytes())
 }
 
 /// Text of a new `.next_code/run.json` for folder `folder`: a commented

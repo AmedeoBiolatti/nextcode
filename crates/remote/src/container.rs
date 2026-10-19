@@ -74,9 +74,11 @@ impl Target for Container {
         // Login profiles reset variables such as PATH: set `env` again after
         // them, so the agent and what it starts see the configured values.
         let script = if login && !self.env.is_empty() {
+            // A key goes into the script as is: only variable names do.
             let exports: String = self
                 .env
                 .iter()
+                .filter(|(key, _)| is_variable_name(key))
                 .map(|(key, value)| format!("export {key}='{}'\n", value.replace('\'', "'\\''")))
                 .collect();
             format!("{exports}{script}")
@@ -97,6 +99,16 @@ impl Target for Container {
             DockerHost::Wsl(_) => wsl::not_available(err),
         }
     }
+}
+
+/// Whether `key` is a shell variable name (`[A-Za-z_][A-Za-z0-9_]*`),
+/// safe to interpolate into a script.
+pub fn is_variable_name(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// Installs (if needed) and starts the agent in `container`, then opens
@@ -143,5 +155,38 @@ mod tests {
                 "x"
             ]
         );
+    }
+
+    #[test]
+    fn only_variable_names_are_exported_in_the_login_script() {
+        let container = Container {
+            host: DockerHost::Local,
+            id: "abc".into(),
+            name: "dev".into(),
+            user: None,
+            env: vec![
+                ("A".into(), "1".into()),
+                ("B C".into(), "x".into()),
+                ("1X".into(), "y".into()),
+                ("D=1; rm -rf /; E".into(), "z".into()),
+                ("".into(), "w".into()),
+                ("_OK_2".into(), "v".into()),
+            ],
+            workdir: None,
+        };
+        let command = container.shell(true, "echo hi", &[]);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args[args.len() - 2],
+            "export A='1'\nexport _OK_2='v'\necho hi"
+        );
+        assert!(is_variable_name("PATH"));
+        assert!(is_variable_name("_"));
+        assert!(!is_variable_name("1A"));
+        assert!(!is_variable_name("A-B"));
+        assert!(!is_variable_name(""));
     }
 }

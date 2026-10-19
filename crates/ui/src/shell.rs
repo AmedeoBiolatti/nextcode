@@ -35,8 +35,8 @@ use crate::{
     theme::{self, Theme},
     theme_picker::{ThemePicker, ThemePickerEvent},
     workflows::{
-        self, NewWorkflow, OpenWorkflow, RunWorkflow, Source, WorkflowPicker, WorkflowPickerEvent,
-        WorkflowView, WorkflowViewEvent, Workflows,
+        self, AddWorkflowFolder, NewWorkflow, OpenWorkflow, OpenWorkflowFile, RunWorkflow, Source,
+        WorkflowPicker, WorkflowPickerEvent, WorkflowView, WorkflowViewEvent, Workflows,
     },
     workspace::{Preload, Workspace, WorkspaceEvent},
 };
@@ -671,6 +671,13 @@ impl Shell {
         let (source, file_project) = match project {
             None => {
                 let dir = path.parent().map(std::path::Path::to_path_buf);
+                // A file outside the user's folder (Open Workflow File…, a
+                // restored tab) is listed too.
+                if dir.as_deref() != self.workflows.read(cx).user_dir() {
+                    let file = path.to_path_buf();
+                    self.workflows
+                        .update(cx, |workflows, cx| workflows.open_file(file, cx).detach());
+                }
                 (Source::User, Project::local(dir.unwrap_or_default()))
             }
             Some(location) => {
@@ -1296,6 +1303,78 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open Workflow File…: any workflow file on this machine, opened in
+    /// its tab and listed (palette, picker, headless) for the session.
+    fn open_workflow_file(
+        &mut self,
+        _: &OpenWorkflowFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = None;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open Workflow".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.open_workflow(&Source::Folder(path.parent().map(std::path::Path::to_path_buf).unwrap_or_default()), &path, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Add Workflow Folder…: a folder whose workflows are listed from now
+    /// on, saved in the settings' `"workflows": {"folders": […]}`.
+    fn add_workflow_folder(
+        &mut self,
+        _: &AddWorkflowFolder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = None;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add Workflow Folder".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(folder) = paths.into_iter().next() else {
+                return;
+            };
+            this.update_in(cx, |this, _, cx| {
+                let saved = crate::settings::Settings::path()
+                    .ok_or_else(|| "no config directory".to_owned())
+                    .and_then(|path| {
+                        crate::settings::add_workflow_folder(&path, &folder.to_string_lossy())
+                    });
+                this.notice = Some(match saved {
+                    Ok(true) => format!("Workflows in {} are listed now", folder.display()),
+                    Ok(false) => format!("{} is listed already", folder.display()),
+                    Err(err) => format!("Could not add the folder: {err}"),
+                }.into());
+                this.workflows
+                    .update(cx, |workflows, cx| workflows.refresh(cx).detach());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// New Workflow…: a commented template in the user's workflows folder,
     /// opened in its tab.
     fn new_workflow(&mut self, _: &NewWorkflow, window: &mut Window, cx: &mut Context<Self>) {
@@ -1329,7 +1408,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<Entity<WorkflowView>> {
         let project = match source {
-            Source::User => None,
+            Source::User | Source::Folder(_) => None,
             Source::Project(location) => Some(location.clone()),
         };
         let target = TabTarget::Workflow {
@@ -2407,6 +2486,8 @@ impl Render for Shell {
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::run_workflow))
             .on_action(cx.listener(Self::new_workflow))
+            .on_action(cx.listener(Self::open_workflow_file))
+            .on_action(cx.listener(Self::add_workflow_folder))
             .on_action(cx.listener(Self::open_workflow_picker))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if this.menu.is_some() && event.keystroke.key == "escape" {

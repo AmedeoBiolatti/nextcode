@@ -648,7 +648,7 @@ impl Ports {
             std::fs::create_dir_all(dir).ok();
         }
         if let Ok(json) = serde_json::to_string_pretty(&saved) {
-            std::fs::write(path, json).ok();
+            worktree::write_atomic(&path, json.as_bytes()).ok();
         }
     }
 }

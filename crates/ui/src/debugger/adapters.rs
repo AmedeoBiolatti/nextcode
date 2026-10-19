@@ -28,6 +28,50 @@ use crate::{project::Project, settings::DebugSettings};
 /// The CodeLLDB release downloaded on request.
 pub const CODELLDB_VERSION: &str = "v1.12.3";
 
+/// The SHA-256 of each [`CODELLDB_VERSION`] release asset, computed from
+/// the files at
+/// `https://github.com/vadimcn/codelldb/releases/download/v1.12.3/<asset>`;
+/// a download is verified against it before anything is unpacked (and
+/// deleted when it does not match).
+fn codelldb_sha256(asset: &str) -> Option<&'static str> {
+    Some(match asset {
+        "codelldb-win32-x64.vsix" => {
+            "a916e509308dac817732f63ca604a8b93ed29cd16f38a2fa9f0b64ed58e8f51a"
+        }
+        "codelldb-linux-x64.vsix" => {
+            "1cd7f386598022b51a5b93b9ffa23e812b23f519cfe1833384ec4bef4bfd1be1"
+        }
+        "codelldb-linux-arm64.vsix" => {
+            "0887f67d440554617894266f80706b700907c36b95e6e49d23b95a0e05318101"
+        }
+        "codelldb-linux-armhf.vsix" => {
+            "20294f0ea876a73c662bb09b1814551a859dc77156564b62c75acf1088ecaf30"
+        }
+        "codelldb-darwin-x64.vsix" => {
+            "e25cc716b94c62c07fec268ff2785d2b797245b160502baef8b9c970a0c4d8e8"
+        }
+        "codelldb-darwin-arm64.vsix" => {
+            "2f114a990e1b368dd1dbd33c80c0e719767af2d228391ec0df0571c957f9ac91"
+        }
+        _ => return None,
+    })
+}
+
+/// The first SHA-256 hex digest in a hashing program's output
+/// (`sha256sum`, `certutil -hashfile`, which may space the bytes out, or
+/// `Get-FileHash`), lower case.
+fn sha256_in(output: &str) -> Option<String> {
+    let is_digest = |token: &str| token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit());
+    output
+        .lines()
+        .flat_map(|line| {
+            std::iter::once(line.split_whitespace().collect::<String>())
+                .chain(line.split_whitespace().map(str::to_owned))
+        })
+        .find(|token| is_digest(token))
+        .map(|token| token.to_lowercase())
+}
+
 /// How long probing for debugpy may take (a cold interpreter start).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Downloading and unpacking CodeLLDB (~55 MB).
@@ -399,13 +443,19 @@ fn codelldb_asset(project: &Project) -> Result<&'static str, PrepareError> {
     }
 }
 
-/// Unpacks a CodeLLDB `.vsix` (a zip) with whatever the machine has.
+/// Downloads a CodeLLDB `.vsix` (a zip), checks its SHA-256 against the
+/// expected one (`$3`) and unpacks it, with whatever the machine has.
 const UNPACK_SCRIPT: &str = r#"set -e
-dir="$1"; url="$2"
+dir="$1"; url="$2"; sha="$3"
 mkdir -p "$dir"; cd "$dir"
 if command -v curl >/dev/null 2>&1; then curl -fsSL -o codelldb.vsix "$url"
 elif command -v wget >/dev/null 2>&1; then wget -qO codelldb.vsix "$url"
 else echo "downloading needs curl or wget" >&2; exit 3; fi
+if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum codelldb.vsix | cut -d' ' -f1) || actual=
+elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 codelldb.vsix | cut -d' ' -f1) || actual=
+elif command -v openssl >/dev/null 2>&1; then actual=$(openssl dgst -sha256 codelldb.vsix | sed 's/^.*= *//') || actual=
+else rm -f codelldb.vsix; echo "verifying the download needs sha256sum, shasum or openssl" >&2; exit 3; fi
+if [ "$actual" != "$sha" ]; then rm -f codelldb.vsix; echo "codelldb.vsix: SHA-256 '$actual' is not the expected $sha; deleted" >&2; exit 4; fi
 if command -v unzip >/dev/null 2>&1; then unzip -qo codelldb.vsix 'extension/*'
 elif command -v bsdtar >/dev/null 2>&1; then bsdtar -xf codelldb.vsix extension
 elif command -v python3 >/dev/null 2>&1; then python3 -m zipfile -e codelldb.vsix .
@@ -418,6 +468,8 @@ rm -f codelldb.vsix"#;
 pub fn download_codelldb(project: &Project) -> Result<String, String> {
     let fail = |err: PrepareError| err.to_string();
     let asset = codelldb_asset(project).map_err(fail)?;
+    let sha256 = codelldb_sha256(asset)
+        .ok_or_else(|| format!("no known SHA-256 for {asset}: it cannot be verified"))?;
     let dir = codelldb_dir(project).map_err(fail)?;
     let url =
         format!("https://github.com/vadimcn/codelldb/releases/download/{CODELLDB_VERSION}/{asset}");
@@ -438,6 +490,10 @@ pub fn download_codelldb(project: &Project) -> Result<String, String> {
         if download.code != Some(0) {
             download
         } else {
+            if let Err(message) = verify_sha256_windows(project, &archive, sha256) {
+                std::fs::remove_file(&archive).ok();
+                return Err(format!("Downloading {url} failed: {message}; deleted"));
+            }
             let unpacked = project
                 .run_program(
                     "tar.exe",
@@ -466,6 +522,7 @@ pub fn download_codelldb(project: &Project) -> Result<String, String> {
                     "sh".into(),
                     dir_text,
                     url.clone(),
+                    sha256.into(),
                 ],
                 &[],
                 None,
@@ -483,4 +540,113 @@ pub fn download_codelldb(project: &Project) -> Result<String, String> {
     downloaded_codelldb(project)
         .map_err(fail)?
         .ok_or_else(|| format!("{asset} did not contain the CodeLLDB adapter"))
+}
+
+/// Checks `archive`'s SHA-256 (on this Windows machine) with `certutil`,
+/// which ships with Windows, else PowerShell's `Get-FileHash`.
+fn verify_sha256_windows(project: &Project, archive: &str, expected: &str) -> Result<(), String> {
+    let attempts: [(&str, Vec<String>); 2] = [
+        (
+            "certutil.exe",
+            vec!["-hashfile".into(), archive.into(), "SHA256".into()],
+        ),
+        (
+            "powershell.exe",
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                format!(
+                    "(Get-FileHash -Algorithm SHA256 -LiteralPath '{}').Hash",
+                    archive.replace('\'', "''")
+                ),
+            ],
+        ),
+    ];
+    let mut problems = Vec::new();
+    for (program, args) in &attempts {
+        match project.run_program(program, args, &[], None, PROBE_TIMEOUT) {
+            Ok(output) if output.code == Some(0) => {
+                let Some(actual) = sha256_in(&String::from_utf8_lossy(&output.stdout)) else {
+                    problems.push(format!("{program} printed no SHA-256"));
+                    continue;
+                };
+                if actual == expected {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "{archive}: SHA-256 {actual} is not the expected {expected} for CodeLLDB \
+                     {CODELLDB_VERSION}"
+                ));
+            }
+            Ok(output) => problems.push(format!(
+                "{program}: {}",
+                String::from_utf8_lossy(&output.stderr)
+                    .trim()
+                    .lines()
+                    .last()
+                    .unwrap_or("failed")
+            )),
+            Err(err) => problems.push(format!("{program}: {err}")),
+        }
+    }
+    Err(format!(
+        "cannot verify the download ({})",
+        problems.join("; ")
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_release_asset_has_a_known_hash() {
+        for asset in [
+            "codelldb-win32-x64.vsix",
+            "codelldb-linux-x64.vsix",
+            "codelldb-linux-arm64.vsix",
+            "codelldb-linux-armhf.vsix",
+            "codelldb-darwin-x64.vsix",
+            "codelldb-darwin-arm64.vsix",
+        ] {
+            let hash = codelldb_sha256(asset).unwrap_or_else(|| panic!("{asset}"));
+            assert_eq!(hash.len(), 64);
+            assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        assert_eq!(codelldb_sha256("codelldb-haiku-x64.vsix"), None);
+    }
+
+    #[test]
+    fn digests_are_found_in_hashing_programs_output() {
+        let digest = "A916E509308DAC817732F63CA604A8B93ED29CD16F38A2FA9F0B64ED58E8F51A";
+        let lower = digest.to_lowercase();
+        assert_eq!(
+            sha256_in(&format!("{lower}  codelldb.vsix\n")),
+            Some(lower.clone())
+        );
+        assert_eq!(
+            sha256_in(&format!(
+                "SHA256 hash of C:\\x\\codelldb.vsix:\r\n{digest}\r\nCertUtil: -hashfile command completed successfully.\r\n"
+            )),
+            Some(lower.clone())
+        );
+        // Older certutil versions space the bytes out.
+        let spaced: String = digest
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| String::from_utf8_lossy(pair).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            sha256_in(&format!("hash:\n{spaced}\n")),
+            Some(lower.clone())
+        );
+        assert_eq!(sha256_in(&format!("{digest}\r\n")), Some(lower));
+        assert_eq!(
+            sha256_in("CertUtil: The system cannot find the file specified."),
+            None
+        );
+        assert_eq!(sha256_in(""), None);
+    }
 }

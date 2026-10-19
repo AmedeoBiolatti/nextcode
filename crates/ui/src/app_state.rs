@@ -231,8 +231,39 @@ fn path() -> Option<PathBuf> {
 
 /// The saved state; `None` when missing or unreadable.
 pub fn load() -> Option<AppState> {
-    let json = std::fs::read_to_string(path()?).ok()?;
-    serde_json::from_str(&json).ok()
+    load_json_backed(&path()?)
+}
+
+/// Reads and parses `path`, or `<path>.bak` (the previous good copy, see
+/// [`save_json_backed`]) when `path` is missing or does not parse.
+pub(crate) fn load_json_backed<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let parse = |path: &Path| {
+        let json = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&json).ok()
+    };
+    parse(path).or_else(|| parse(&backup_path(path)))
+}
+
+/// Writes `value` as pretty JSON to `path` without ever leaving it
+/// truncated (`worktree::write_atomic`), keeping the previous file, when
+/// it parsed, as `<path>.bak` for [`load_json_backed`] to fall back to.
+pub(crate) fn save_json_backed<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
+    if let Ok(old) = std::fs::read_to_string(path)
+        && serde_json::from_str::<serde_json::Value>(&old).is_ok()
+    {
+        std::fs::rename(path, backup_path(path)).ok();
+    }
+    worktree::write_atomic(path, json.as_bytes())
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".bak");
+    PathBuf::from(backup)
 }
 
 /// What a launch without a project reopens: nothing (the welcome screen)
@@ -286,12 +317,7 @@ impl Tracker {
         let Some(path) = path() else {
             return;
         };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).ok();
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&self.state()) {
-            std::fs::write(path, json).ok();
-        }
+        save_json_backed(&path, &self.state()).ok();
     }
 }
 
@@ -611,5 +637,32 @@ mod tests {
                 focused: 0,
             }
         );
+    }
+
+    #[test]
+    fn backed_json_files_fall_back_to_the_previous_good_copy() {
+        let dir = std::env::temp_dir().join(format!("next_code_backed_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let path = dir.join("state.json");
+        assert_eq!(load_json_backed::<Vec<u32>>(&path), None);
+        save_json_backed(&path, &vec![1u32]).unwrap();
+        assert!(!backup_path(&path).exists(), "nothing to keep yet");
+        save_json_backed(&path, &vec![1u32, 2]).unwrap();
+        assert_eq!(load_json_backed::<Vec<u32>>(&path), Some(vec![1, 2]));
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&path)).unwrap(),
+            "[\n  1\n]"
+        );
+        // A truncated main file: the previous copy stands in.
+        std::fs::write(&path, "[1, ").unwrap();
+        assert_eq!(load_json_backed::<Vec<u32>>(&path), Some(vec![1]));
+        // And is not replaced by the broken one on the next save.
+        save_json_backed(&path, &vec![3u32]).unwrap();
+        assert_eq!(load_json_backed::<Vec<u32>>(&path), Some(vec![3]));
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&path)).unwrap(),
+            "[\n  1\n]"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

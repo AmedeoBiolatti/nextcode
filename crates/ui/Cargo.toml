@@ -88,6 +88,8 @@ windows = { version = "0.61", features = [
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    # Child processes die with the editor (`project::process_tree`).
+    "Win32_System_JobObjects",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
@@ -95,3 +97,5 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(unix)'.dependencies]
 # Already in the tree (alacritty_terminal): clean exit on SIGTERM/SIGINT.
 signal-hook = "0.4"
+# Already in the tree: process groups of child processes (`project::process_tree`).
+libc.workspace = true

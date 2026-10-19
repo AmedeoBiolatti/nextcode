@@ -1764,8 +1764,9 @@ mod tests {
         assert_eq!(live(cx), Some((3, AnchorState::Exact)));
         assert_eq!(stored_line(), 2, "unsaved edits are not written");
 
-        update(window, cx, |editor, _, cx| assert!(editor.save(cx)));
+        let saved = update(window, cx, |editor, _, cx| editor.save(cx));
         cx.run_until_parked();
+        assert!(cx.executor().block_test(saved));
         assert_eq!(stored_line(), 3);
 
         // Discarded: back to the file, and to its anchor.

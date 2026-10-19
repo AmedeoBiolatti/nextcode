@@ -135,7 +135,7 @@
 //! | `notebook_save` | `path` | `null`: written in its format (ipynb with outputs; marimo's layout with signatures recomputed) |
 //! | `notebook_close` | `path` | `null` once the kernel process exited |
 //! | `notebook_status` | `path` | `{kernel, interpreter, cells}` |
-//! | `workflows_list` | | `[{id, name, path, source, error, inputs: [{id, label, type, description, default, required, placeholder, options?: [{value, label}], min?, max?, integer?}], steps: [{id, path, kind: "step", title, depends_on: {"<id>": "ready" \| "completed"}, project, run, check, ready, timeout, stop_grace_period, artifacts: [{label, path or url}], policies: {restart, healthcheck, if, env_file}} or {id, path, kind: "group", title, depends_on, if, project, steps: [...]}], outcome}]`: the user's workflows (`<config>/next_code/workflows/*.yaml`) and the project's (`.next_code/workflows/`), read again for every workflow command; `path` is the qualified id (`group/step`); `run`/`project` show `${inputs.…}` unexpanded; durations as written in files (`10m`, `3s`); files of the old JSON format are listed with an `error` saying to convert them |
+//! | `workflows_list` | | `[{id, name, path, source, error, inputs: [{id, label, type, description, default, required, placeholder, options?: [{value, label}], min?, max?, integer?}], steps: [{id, path, kind: "step", title, depends_on: {"<id>": "ready" \| "completed"}, project, run, check, ready, timeout, stop_grace_period, artifacts: [{label, path or url}], policies: {restart, healthcheck, if, env_file}} or {id, path, kind: "group", title, depends_on, if, project, steps: [...]}], outcome}]`: the user's workflows (`<config>/next_code/workflows/*.yaml`), the project's (`.next_code/workflows/`), those of the settings' `workflows.folders` and `NEXT_CODE_WORKFLOW_FOLDERS`, and files named by an absolute `path` in a workflow command, read again for every workflow command; `path` is the qualified id (`group/step`); `run`/`project` show `${inputs.…}` unexpanded; durations as written in files (`10m`, `3s`); files of the old JSON format are listed with an `error` saying to convert them |
 //! | `workflow_schema` | | `{schema, file, modeline}`: the format's JSON Schema (draft-07), the file name next_code keeps a copy under in the user's workflows folder, and the first line that points YAML editors at a copy beside a workflow |
 //! | `workflow_convert` | `name`/`path`/`id` of an old-format file (`.json`/`.jsonc`) | `{path, backup, problems}`: writes the YAML file beside it (comments kept; an error if it exists) and renames the old one to `.bak`; `problems` are the converted file's (as the old one had them) |
 //! | `workflow_run` | `name`, `path` (or its end) or `id`, `inputs`? (`{"<id>": value}`: JSON types, or strings that parse for numbers and booleans) | `{run, id}`; starts it afresh (a run of it going is stopped first, each command with its step's grace; a step starts once its old command is gone); inputs not given get their defaults (not the GUI form's remembered values); invalid or missing required ones are an error listing each (``input `workers`: must be ≤ 64``); progress comes as `workflow_event`s |
@@ -254,10 +254,12 @@ impl Out {
 }
 
 pub fn run(location: Location) {
+    // No window to ask in: the folder the user named is trusted.
+    crate::trust::trust_all();
     Application::headless().run(move |cx: &mut App| {
         let out = Out(Arc::new(Mutex::new(io::stdout())));
         let (lines_tx, lines) = mpsc::unbounded::<String>();
-        thread::Builder::new()
+        let reader = thread::Builder::new()
             .name("headless-stdin".into())
             .spawn(move || {
                 for line in io::stdin().lock().lines().map_while(Result::ok) {
@@ -265,8 +267,14 @@ pub fn run(location: Location) {
                         return;
                     }
                 }
-            })
-            .expect("spawning stdin reader");
+            });
+        if let Err(err) = reader {
+            out.event(
+                "error",
+                json!({ "message": format!("Cannot read commands: {err}") }),
+            );
+            std::process::exit(1);
+        }
         cx.spawn(async move |cx| serve(location, out, lines, cx).await)
             .detach();
     });

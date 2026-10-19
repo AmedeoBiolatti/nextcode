@@ -377,7 +377,7 @@ impl Layout {
             std::fs::create_dir_all(dir)?;
         }
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        worktree::write_atomic(&path, json.as_bytes())
     }
 }
 

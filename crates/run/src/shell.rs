@@ -37,9 +37,21 @@ pub fn quote(text: &str, shell: Shell) -> String {
     }
 }
 
+/// Whether `name` can name an environment variable in a shell line
+/// (`[A-Za-z_][A-Za-z0-9_]*`): anything else would be read as shell
+/// syntax, so configurations with such names are rejected when read.
+pub fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// One line that runs `command` in a fresh terminal (whose shell starts in
 /// `root`): changes directory only when the command's differs, exports
-/// its environment, then runs it.
+/// its environment (variables with names that are not shell words are
+/// left out, see [`is_valid_env_name`]), then runs it.
 pub fn terminal_line(command: &Command, root: &str, shell: Shell) -> String {
     let mut parts = Vec::new();
     let same_dir = command.cwd.trim_end_matches(['/', '\\']) == root.trim_end_matches(['/', '\\']);
@@ -52,6 +64,9 @@ pub fn terminal_line(command: &Command, root: &str, shell: Shell) -> String {
         });
     }
     for (name, value) in &command.env {
+        if !is_valid_env_name(name) {
+            continue;
+        }
         parts.push(match shell {
             Shell::Posix => format!("export {name}={}", quote(value, shell)),
             // An assignment's bare word would be a command call.
@@ -171,6 +186,22 @@ mod tests {
         assert_eq!(
             terminal_line(&run, r"C:\p", Shell::PowerShell),
             r"Set-Location -LiteralPath C:\p\sub; $env:RUST_LOG = 'debug'; & 'C:\Program Files\py.exe' '--' 'a,b' x"
+        );
+    }
+
+    #[test]
+    fn env_names_are_shell_words() {
+        for name in ["A", "_x1", "RUST_LOG", "a9"] {
+            assert!(is_valid_env_name(name), "{name}");
+        }
+        for name in ["", "9a", "A B", "a-b", "x=1", "$(rm -rf /)", "é", "A;B"] {
+            assert!(!is_valid_env_name(name), "{name}");
+        }
+        // Defensive: a name that slipped through never reaches the line.
+        let run = command("make", &[], "/p", &[("OK", "1"), ("A;rm", "x")]);
+        assert_eq!(
+            terminal_line(&run, "/p", Shell::Posix),
+            "export OK=1 && make"
         );
     }
 

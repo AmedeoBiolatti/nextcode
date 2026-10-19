@@ -545,7 +545,13 @@ environment: preconditions, commands in the terminals of several projects
 conditions, browser links and manual gates. Files are found in
 `<config>/next_code/workflows/*.yaml` (or `.yml`; next to `settings.json`;
 `%APPDATA%\next_code\workflows` on Windows) and in each open project's
-`.next_code/workflows/*.yaml`. They are read again before every Run All.
+`.next_code/workflows/*.yaml`, and in any folder listed in `settings.json`
+(`"workflows": {"folders": ["C:/team/workflows", "~/shared/workflows"]}`;
+Run > **Add Workflow Folder…** adds one) or in `NEXT_CODE_WORKFLOW_FOLDERS`
+(separated as in `PATH`). Run > **Open Workflow File…** opens a workflow
+file from anywhere, listed for the rest of the session (headless: any
+command's `path` may be an absolute path to a file anywhere). They are
+read again before every Run All.
 The format borrows what other tools made familiar: steps keyed by id with
 `depends_on` and its conditions, durations and `x-` keys with anchors from
 Docker Compose, `inputs` from GitHub Actions, `${…}` variables from VS

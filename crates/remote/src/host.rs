@@ -3,13 +3,15 @@
 //! machine's `git credential fill|approve|reject` (on Windows `git.exe`, so
 //! Git Credential Manager), and ssh-agent messages are relayed to this
 //! machine's ssh-agent (`SSH_AUTH_SOCK`, on Windows the OpenSSH agent's
-//! pipe). Only `http`/`https` credentials are lent; anything else, and
-//! anything git cannot fill without a terminal, gets an empty answer, so
-//! git on the project's machine falls back to its own prompt. Credentials
-//! are never logged.
+//! pipe). Only `http`/`https` credentials are lent, and only for the hosts
+//! of the project's git remotes and the user's `git.credential_hosts`
+//! ([`Policy`]: any process on the project's machine can ask); anything
+//! else, and anything git cannot fill without a terminal, gets an empty
+//! answer, so git on the project's machine falls back to its own prompt.
+//! Credentials are never logged; a refused host is, once.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::OsString,
     io::{self, Read, Write},
     path::PathBuf,
@@ -161,20 +163,67 @@ fn connect_ssh_agent(path: &std::path::Path) -> io::Result<Box<dyn Duplex>> {
 /// One forwarded ssh-agent connection's own connection here.
 type SshConnection = Arc<Mutex<Option<Box<dyn Duplex>>>>;
 
+/// What one project's machine may ask of this one (see [`serve`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Policy {
+    /// The project root on the agent's machine: `git remote -v` there
+    /// lists the hosts credentials are answered for.
+    pub root: String,
+    /// Hosts answered for besides the remotes' (`git.credential_hosts`).
+    pub credential_hosts: Vec<String>,
+    /// Relay this machine's ssh-agent (`devcontainer.ssh_agent_forwarding`).
+    pub ssh_agent: bool,
+}
+
 /// Answers host services calls with this machine's git and ssh-agent.
 pub struct Host {
     git: Git,
     ssh_agent: Option<PathBuf>,
+    /// Hosts credentials are answered for; `None` is any host (see
+    /// [`Host::allow_hosts`]).
+    allowed: Option<HashSet<String>>,
+    /// Hosts refused so far, each logged once.
+    refused: Mutex<HashSet<String>>,
     connections: Mutex<HashMap<u64, SshConnection>>,
 }
 
 impl Host {
+    /// Answers for any host; [`Host::allow_hosts`] bounds it.
     pub fn new(git: Git, ssh_agent: Option<PathBuf>) -> Self {
         Self {
             git,
             ssh_agent,
+            allowed: None,
+            refused: Mutex::default(),
             connections: Mutex::default(),
         }
+    }
+
+    /// Answers credential requests only for `hosts`, named as git's
+    /// credential protocol does (`host`, or `host:port` for a port in the
+    /// URL; a bare host covers its ports too). Case does not matter.
+    pub fn allow_hosts(mut self, hosts: impl IntoIterator<Item = String>) -> Self {
+        self.allowed = Some(
+            hosts
+                .into_iter()
+                .map(|host| host.trim().to_lowercase())
+                .filter(|host| !host.is_empty())
+                .collect(),
+        );
+        self
+    }
+
+    fn allows(&self, host: &str) -> bool {
+        let Some(allowed) = &self.allowed else {
+            return true;
+        };
+        let host = host.to_lowercase();
+        allowed.contains(&host)
+            || host.rsplit_once(':').is_some_and(|(bare, port)| {
+                !port.is_empty()
+                    && port.bytes().all(|byte| byte.is_ascii_digit())
+                    && allowed.contains(bare)
+            })
     }
 
     /// This machine's git and ssh-agent (one probe connection decides
@@ -226,9 +275,20 @@ impl Host {
     /// The credential protocol answer (empty: nothing to lend).
     pub fn credential(&self, operation: Operation, text: &str) -> Vec<u8> {
         let credential = Credential::parse(text);
-        let lendable = matches!(credential.get("protocol"), Some("https" | "http"))
-            && credential.get("host").is_some_and(|host| !host.is_empty());
-        if !lendable {
+        let Some(host) = credential.get("host").filter(|host| !host.is_empty()) else {
+            return Vec::new();
+        };
+        if !matches!(credential.get("protocol"), Some("https" | "http")) {
+            return Vec::new();
+        }
+        if !self.allows(host) {
+            if self.refused.lock().insert(host.to_lowercase()) {
+                eprintln!(
+                    "next_code: git credential {} for {host} refused: not a host of the \
+                     project's git remotes nor in git.credential_hosts",
+                    operation.git_command()
+                );
+            }
             return Vec::new();
         }
         let timeout = match operation {
@@ -318,16 +378,98 @@ pub fn serve_with(
     )
 }
 
-/// Lends this machine's git credentials, ssh-agent and identity to
-/// `client`'s machine; `enabled` false lends nothing and removes the git
-/// helper an earlier session configured there. Blocks while git runs.
-pub fn serve(client: &Arc<AgentClient>, enabled: bool) -> io::Result<StreamHandle> {
+/// Lends this machine's git credentials (for the hosts of the project's
+/// git remotes and `policy.credential_hosts`), its ssh-agent (if
+/// `policy.ssh_agent`) and its git identity to `client`'s machine;
+/// `enabled` false lends nothing and removes the git helper an earlier
+/// session configured there. Blocks while git runs, here and there.
+pub fn serve(
+    client: &Arc<AgentClient>,
+    enabled: bool,
+    policy: &Policy,
+) -> io::Result<StreamHandle> {
     if !enabled {
         return client.serve_host(HostServices::default(), |_, _| {}, |_| {});
     }
-    let host = Arc::new(Host::detect());
+    let mut host = Host::detect();
+    if !policy.ssh_agent {
+        host.ssh_agent = None;
+    }
+    let hosts = project_remote_hosts(client, &policy.root)
+        .into_iter()
+        .chain(policy.credential_hosts.iter().cloned());
+    let host = Arc::new(host.allow_hosts(hosts));
     let services = host.services();
     serve_with(client, host, services)
+}
+
+/// The hosts of the git remotes of `root` on `client`'s machine, read
+/// once when the project opens (adding a remote takes a reopen). None
+/// when git fails there: then only `git.credential_hosts` are answered.
+fn project_remote_hosts(client: &Arc<AgentClient>, root: &str) -> BTreeSet<String> {
+    // A dev container's workspace is a bind mount usually owned by another
+    // user than the container's, which git refuses ("dubious ownership").
+    let args: Vec<String> = ["-c", "safe.directory=*", "remote", "-v"]
+        .map(String::from)
+        .to_vec();
+    let env = [("GIT_TERMINAL_PROMPT", "0"), ("GIT_OPTIONAL_LOCKS", "0")];
+    match client.run("git", &args, root, &env, None, GIT_TIMEOUT) {
+        Ok(output) if output.code == Some(0) => {
+            remote_hosts(&String::from_utf8_lossy(&output.stdout))
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "next_code: git remote -v in {root}: {}",
+                stderr.trim().lines().next().unwrap_or("failed")
+            );
+            BTreeSet::new()
+        }
+        Err(err) => {
+            eprintln!("next_code: git remote -v in {root}: {err}");
+            BTreeSet::new()
+        }
+    }
+}
+
+/// The hosts named by `git remote -v`'s output (`name<TAB>url (fetch)`
+/// lines), as the credential protocol names them (`host` or `host:port`,
+/// lower case). Local paths and unreadable lines are skipped.
+pub fn remote_hosts(listing: &str) -> BTreeSet<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let rest = line.split_once('\t').map_or(line, |(_, rest)| rest);
+            let url = rest.rsplit_once(" (").map_or(rest, |(url, _)| url);
+            host_of_url(url.trim())
+        })
+        .collect()
+}
+
+/// The `host[:port]` of a git remote URL:
+/// `scheme://[user[:password]@]host[:port]/…`, or the scp-like
+/// `[user@]host:path`. `None` for local paths and `file://` URLs.
+fn host_of_url(url: &str) -> Option<String> {
+    let authority = match url.split_once("://") {
+        Some((scheme, _)) if scheme.is_empty() || scheme.eq_ignore_ascii_case("file") => {
+            return None;
+        }
+        Some((_, rest)) => rest.split(['/', '?', '#']).next()?,
+        None => {
+            // scp-like only without a `/` before the colon; a lone drive
+            // letter is a Windows path.
+            let (before, _) = url.split_once(':')?;
+            if before.contains(['/', '\\']) || before.len() <= 1 {
+                return None;
+            }
+            before
+        }
+    };
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+        .trim();
+    (!host.is_empty()).then(|| host.to_lowercase())
 }
 
 #[cfg(test)]
@@ -391,6 +533,69 @@ mod tests {
             ssh_agent_path(Some(r"\\.\pipe\other".into()), true),
             Some(PathBuf::from(r"\\.\pipe\other"))
         );
+    }
+
+    #[test]
+    fn remote_hosts_come_from_every_url_form() {
+        let listing = "origin\thttps://github.com/me/proj.git (fetch)\n\
+                       origin\thttps://github.com/me/proj.git (push)\n\
+                       upstream\tgit@GitHub.com:them/proj.git (fetch)\n\
+                       internal\tssh://git@git.example.com:2222/x/y (fetch)\n\
+                       port\thttps://user:pw@git.example.com:8443/x?y#z (fetch)\n\
+                       local\t/srv/repo.git (fetch)\n\
+                       win\tC:\\repos\\x (fetch)\n\
+                       file\tfile:///srv/repo (fetch)\n\
+                       odd line without a tab\n";
+        assert_eq!(
+            remote_hosts(listing).into_iter().collect::<Vec<_>>(),
+            ["git.example.com:2222", "git.example.com:8443", "github.com"]
+        );
+        assert!(remote_hosts("").is_empty());
+        assert_eq!(host_of_url("[::1]:8080/x"), None);
+        assert_eq!(
+            host_of_url("http://[::1]:8080/x"),
+            Some("[::1]:8080".into())
+        );
+    }
+
+    #[test]
+    fn only_allowed_hosts_and_their_ports_pass() {
+        let git = || Git {
+            program: PathBuf::from("/nonexistent/git"),
+            args: Vec::new(),
+        };
+        let host = Host::new(git(), None).allow_hosts([
+            "GitHub.com ".into(),
+            "git.example.com:8443".into(),
+            "".into(),
+        ]);
+        assert!(host.allows("github.com"));
+        assert!(host.allows("GITHUB.COM:443"));
+        assert!(host.allows("git.example.com:8443"));
+        assert!(!host.allows("git.example.com"));
+        assert!(!host.allows("git.example.com:8444"));
+        assert!(!host.allows("gitlab.com"));
+        assert!(!host.allows("github.com:evil"));
+        assert!(Host::new(git(), None).allows("anything.test"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_host_never_reaches_git() {
+        // A "git" that would answer anything.
+        let git = Git {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "printf 'username=u\\npassword=leak\\n'".into()],
+        };
+        let host = Host::new(git, None).allow_hosts(["github.com".to_owned()]);
+        for operation in [Operation::Get, Operation::Store, Operation::Erase] {
+            assert!(
+                host.credential(operation, "protocol=https\nhost=evil.test\n")
+                    .is_empty()
+            );
+        }
+        let answer = host.credential(Operation::Get, "protocol=https\nhost=github.com\n");
+        assert!(String::from_utf8_lossy(&answer).contains("password=leak"));
     }
 
     #[test]

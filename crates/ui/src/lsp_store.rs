@@ -741,7 +741,13 @@ impl LspStore {
                             }
                             None => published.diagnostics,
                         };
-                        self.diagnostics.insert(path.clone(), diagnostics);
+                        if diagnostics.is_empty() {
+                            // Servers publish an empty list for every file
+                            // they fixed or closed: no entry stays for it.
+                            self.diagnostics.remove(&path);
+                        } else {
+                            self.diagnostics.insert(path.clone(), diagnostics);
+                        }
                         cx.emit(LspStoreEvent::DiagnosticsUpdated(path));
                     }
                 }

@@ -59,6 +59,11 @@ struct Chunk {
 }
 
 impl Chunk {
+    /// The line after the last one held.
+    fn end_line(&self) -> usize {
+        self.first_line + self.line_starts.len().saturating_sub(1)
+    }
+
     fn line_blocks(&self, line: usize) -> &[Block] {
         let index = line - self.first_line;
         let start = self.line_starts[index] as usize;
@@ -81,8 +86,54 @@ pub(super) struct MinimapState {
     key: Option<CacheKey>,
     chunks: Vec<Chunk>,
     tick: u64,
+    /// Lines edited since the chunks were last checked, as (first line,
+    /// last line before, last line after) in order, so only the chunks
+    /// they touch are rebuilt; `None` once too many to track.
+    edits: Option<Vec<(usize, usize, usize)>>,
     /// The mouse is over the minimap: the slider brightens.
     hovered: bool,
+}
+
+/// Edits tracked between two frames at most, before everything is rebuilt.
+const MAX_TRACKED_EDITS: usize = 256;
+
+impl MinimapState {
+    /// Notes the lines `changes` edited, for `evict_edited`.
+    fn record(&mut self, changes: &[text::Change]) {
+        let Some(edits) = &mut self.edits else {
+            return;
+        };
+        if edits.len() + changes.len() > MAX_TRACKED_EDITS {
+            self.edits = None;
+            return;
+        }
+        edits.extend(changes.iter().map(|change| {
+            (
+                change.start_point.row,
+                change.old_end_point.row,
+                change.new_end_point.row,
+            )
+        }));
+    }
+
+    /// Drops the chunks the recorded edits touched: the ones holding an
+    /// edited line, or every chunk from the first edited line on when
+    /// lines were added or removed (later lines moved). Everything when
+    /// the edits were not tracked.
+    fn evict_edited(&mut self) {
+        let Some(edits) = self.edits.replace(Vec::new()) else {
+            self.chunks.clear();
+            return;
+        };
+        for (start, old_end, new_end) in edits {
+            if old_end == new_end {
+                self.chunks
+                    .retain(|chunk| chunk.first_line > old_end || start >= chunk.end_line());
+            } else {
+                self.chunks.retain(|chunk| chunk.end_line() <= start);
+            }
+        }
+    }
 }
 
 /// Scroll math of a minimap `height` tall for `row_count` rows of
@@ -344,8 +395,14 @@ impl Editor {
         }
     }
 
-    /// Builds the chunks covering `lines` that are missing, dropping all
-    /// of them when the text, theme or settings changed.
+    /// After an edit: notes the lines `changes` touched, so the next frame
+    /// rebuilds only their chunks.
+    pub(super) fn minimap_edited(&mut self) {
+        self.minimap.record(&self.changes);
+    }
+
+    /// Builds the chunks covering `lines` that are missing, dropping the
+    /// ones edited since (all of them when the theme or settings changed).
     fn cache_minimap_blocks(&mut self, lines: Range<usize>) {
         let max_columns = self.file_settings().editor.minimap.max_columns.max(1);
         let theme = theme::current();
@@ -358,8 +415,19 @@ impl Editor {
         let language = self.language();
         let state = &mut self.minimap;
         if state.key != Some(key) {
+            let edited_only = state.key.is_some_and(|old| {
+                CacheKey {
+                    version: key.version,
+                    ..old
+                } == key
+            });
+            if edited_only {
+                state.evict_edited();
+            } else {
+                state.chunks.clear();
+                state.edits = Some(Vec::new());
+            }
             state.key = Some(key);
-            state.chunks.clear();
         }
         state.tick += 1;
         let text = theme::text();
@@ -638,6 +706,68 @@ mod tests {
 
     fn close(a: Pixels, b: f32) -> bool {
         (f32::from(a) - b).abs() < 0.01
+    }
+
+    #[test]
+    fn edits_drop_only_the_chunks_they_touch() {
+        let chunk = |first_line: usize, lines: usize| Chunk {
+            first_line,
+            line_starts: vec![0; lines + 1],
+            blocks: Vec::new(),
+            used: 0,
+        };
+        let change = |start: usize, old_end: usize, new_end: usize| {
+            let point = |row| text::Point { row, column: 0 };
+            text::Change {
+                start: 0,
+                old_end: 0,
+                new_end: 0,
+                start_point: point(start),
+                old_end_point: point(old_end),
+                new_end_point: point(new_end),
+                start_utf16: point(start),
+                old_end_utf16: point(old_end),
+            }
+        };
+        let first_lines = |state: &MinimapState| -> Vec<usize> {
+            state.chunks.iter().map(|chunk| chunk.first_line).collect()
+        };
+        let mut state = MinimapState {
+            chunks: vec![
+                chunk(0, 128),
+                chunk(128, 128),
+                chunk(256, 128),
+                chunk(384, 10),
+            ],
+            edits: Some(Vec::new()),
+            ..Default::default()
+        };
+        // Typing on line 130: only its chunk goes.
+        state.record(&[change(130, 130, 130)]);
+        state.evict_edited();
+        assert_eq!(first_lines(&state), [0, 256, 384]);
+        // A change across lines 255..256 without new lines: both chunks.
+        state.chunks.push(chunk(128, 128));
+        state.record(&[change(255, 256, 256)]);
+        state.evict_edited();
+        assert_eq!(first_lines(&state), [0, 384]);
+        // A new line at 300: its chunk and everything after move.
+        state.chunks.extend([chunk(128, 128), chunk(256, 128)]);
+        state.record(&[change(300, 300, 301)]);
+        state.evict_edited();
+        assert_eq!(first_lines(&state), [0, 128]);
+        // Edits recorded in order: the first untracked batch drops all.
+        state.edits = None;
+        state.record(&[change(0, 0, 0)]);
+        state.evict_edited();
+        assert!(state.chunks.is_empty());
+        assert_eq!(state.edits, Some(Vec::new()), "tracking again");
+        // Too many edits to track: everything goes at the next frame.
+        let many: Vec<_> = (0..MAX_TRACKED_EDITS + 1)
+            .map(|_| change(1, 1, 1))
+            .collect();
+        state.record(&many);
+        assert_eq!(state.edits, None);
     }
 
     #[test]

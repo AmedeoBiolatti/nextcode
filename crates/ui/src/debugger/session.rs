@@ -47,6 +47,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Indexed children fetched per page.
 pub const PAGE: u32 = 100;
 const MAX_OUTPUT_LINES: usize = 10_000;
+/// Lines the output may exceed its cap by before the oldest are dropped.
+const OUTPUT_TRIM: usize = 1_000;
 /// Stack frames fetched per stop.
 const STACK_LEVELS: u32 = 200;
 
@@ -205,6 +207,10 @@ pub struct DebugSession {
     output: Vec<OutputLine>,
     /// The last output line has no line break yet.
     output_open: bool,
+    /// A batch of adapter messages is being applied: `Changed` for their
+    /// output is emitted once at its end (`changed_pending`).
+    batching: bool,
+    changed_pending: bool,
     exit_code: Option<i64>,
     error: Option<String>,
     /// The adapter's last stderr bytes, for crash reports.
@@ -267,6 +273,8 @@ impl DebugSession {
             breakpoint_status: HashMap::new(),
             output: Vec::new(),
             output_open: false,
+            batching: false,
+            changed_pending: false,
             exit_code: None,
             error: None,
             stderr_tail: Arc::default(),
@@ -405,13 +413,29 @@ impl DebugSession {
         );
         self.client = Some(client.clone());
         self._incoming = Some(cx.spawn(async move |this, cx| {
-            while let Some(message) = incoming.next().await {
-                let exited = message == Incoming::Exited;
-                if this
-                    .update(cx, |this, cx| this.on_incoming(message, cx))
-                    .is_err()
-                    || exited
-                {
+            while let Some(first) = incoming.next().await {
+                // Adapters send output in bursts: what arrived together is
+                // applied in one update, and listeners hear `Changed` once.
+                let mut batch = vec![first];
+                while let Ok(more) = incoming.try_recv() {
+                    batch.push(more);
+                }
+                let exited = batch.contains(&Incoming::Exited);
+                let applied = this.update(cx, |this, cx| {
+                    this.batching = true;
+                    for message in batch {
+                        let exited = message == Incoming::Exited;
+                        this.on_incoming(message, cx);
+                        if exited {
+                            break;
+                        }
+                    }
+                    this.batching = false;
+                    if std::mem::take(&mut this.changed_pending) {
+                        cx.emit(DebugSessionEvent::Changed);
+                    }
+                });
+                if applied.is_err() || exited {
                     break;
                 }
             }
@@ -1495,17 +1519,29 @@ impl DebugSession {
             }
             self.output_open = !ended;
         }
-        if self.output.len() > MAX_OUTPUT_LINES {
+        // Draining the front moves every line kept: done once per
+        // `OUTPUT_TRIM` lines over the cap, not per line.
+        if self.output.len() > MAX_OUTPUT_LINES + OUTPUT_TRIM {
             let excess = self.output.len() - MAX_OUTPUT_LINES;
             self.output.drain(..excess);
         }
-        cx.emit(DebugSessionEvent::Changed);
+        self.changed(cx);
+    }
+
+    /// Tells listeners the output changed: at once, or at the end of the
+    /// batch of adapter messages being applied.
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        if self.batching {
+            self.changed_pending = true;
+        } else {
+            cx.emit(DebugSessionEvent::Changed);
+        }
     }
 
     pub fn clear_output(&mut self, cx: &mut Context<Self>) {
         self.output.clear();
         self.output_open = false;
-        cx.emit(DebugSessionEvent::Changed);
+        self.changed(cx);
     }
 
     // Accessors for the views and headless mode.

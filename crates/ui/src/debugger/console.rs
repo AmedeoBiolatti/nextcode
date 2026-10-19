@@ -66,8 +66,10 @@ impl DebugConsole {
 
     pub fn set_session(&mut self, session: Option<Entity<DebugSession>>, cx: &mut Context<Self>) {
         self._session_subscription = session.as_ref().map(|session| {
-            cx.subscribe(session, |this, session, event, cx| match event {
-                DebugSessionEvent::Output { .. } | DebugSessionEvent::Changed => {
+            cx.subscribe(session, |this, session, event, cx| {
+                // `Changed` follows the output (once per batch of adapter
+                // messages); `Output` itself is for headless listeners.
+                if let DebugSessionEvent::Changed = event {
                     if this.follow {
                         let count = session.read(cx).output().len();
                         if count > 0 {
@@ -77,7 +79,6 @@ impl DebugConsole {
                     }
                     cx.notify();
                 }
-                _ => {}
             })
         });
         self.session = session;

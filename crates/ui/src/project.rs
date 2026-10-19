@@ -33,6 +33,10 @@ use crate::{
 };
 
 mod pinpoint;
+mod process_tree;
+
+pub use process_tree::CancelToken;
+use process_tree::{GRACE, Outcome, Tree};
 
 /// What the user asked to open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,9 +424,10 @@ struct ContainerHost {
 
 impl Drop for ContainerHost {
     fn drop(&mut self) {
-        // Detached, so it finishes even when the editor exits right after;
-        // on Unix also in its own process group, so whatever ends the
-        // editor's group (a supervisor, Ctrl+C in a terminal) spares it.
+        // Detached, so it finishes even when the editor exits right after:
+        // outside the editor's job on Windows; on Unix in its own process
+        // group, so whatever ends the editor's group (a supervisor, Ctrl+C
+        // in a terminal) spares it.
         if let Some(args) = &self.stop {
             let mut command = self.docker.docker();
             command
@@ -430,9 +435,7 @@ impl Drop for ContainerHost {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            #[cfg(unix)]
-            std::os::unix::process::CommandExt::process_group(&mut command, 0);
-            command.spawn().ok();
+            process_tree::spawn_detached(&mut command).ok();
         }
     }
 }
@@ -504,13 +507,81 @@ async fn merge_searches(
     .ok();
 }
 
-/// Ends a local child process when dropped.
-struct KillOnDrop(std::process::Child);
+fn cancelled(program: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        format!("{program} was cancelled"),
+    )
+}
 
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        self.0.kill().ok();
-        self.0.wait().ok();
+/// Runs `command` (named `program` in errors) locally in `cwd` to
+/// completion with `input` on its stdin, collecting its output. After
+/// `timeout`, or once `cancel` is cancelled, the process and whatever it
+/// started are asked to end and killed after [`GRACE`].
+fn run_local(
+    mut command: Command,
+    program: &str,
+    cwd: &Path,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    cancel: Option<&CancelToken>,
+) -> io::Result<RunOutput> {
+    let deadline = Instant::now() + timeout;
+    command
+        .current_dir(cwd)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    remote::launch::no_window(&mut command);
+    let mut spawned = Tree::spawn(&mut command)?;
+    let child = spawned.child.as_mut().expect("just spawned");
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    // From here on an error drops the tree, which ends the process.
+    let mut tree = spawned.watch()?;
+    if let (Some(mut stdin), Some(input)) = (stdin, input) {
+        let input = input.to_vec();
+        // Written on a thread so a full output pipe cannot deadlock.
+        thread::Builder::new()
+            .name("run-stdin".into())
+            .spawn(move || {
+                use std::io::Write;
+                stdin.write_all(&input).ok();
+            })?;
+    }
+    let collect = |mut pipe: Box<dyn Read + Send>| {
+        thread::Builder::new()
+            .name("run-output".into())
+            .spawn(move || {
+                let mut data = Vec::new();
+                pipe.read_to_end(&mut data).ok();
+                data
+            })
+    };
+    let stdout = collect(Box::new(stdout))?;
+    let stderr = collect(Box::new(stderr))?;
+    match tree.wait_until(deadline, cancel) {
+        Outcome::Exited(status) => Ok(RunOutput {
+            code: status.and_then(|status| status.code()),
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        }),
+        Outcome::TimedOut => {
+            tree.terminate(GRACE);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{program} did not finish within {} s", timeout.as_secs()),
+            ))
+        }
+        Outcome::Cancelled => {
+            tree.terminate(GRACE);
+            Err(cancelled(program))
+        }
     }
 }
 
@@ -518,20 +589,38 @@ impl Drop for KillOnDrop {
 /// machine (`devcontainer.forward_git_credentials`), or removes the helper
 /// set there earlier when that is off. The handle lands in `slot` unless the
 /// project closed meanwhile (dropping it stops serving).
-fn serve_host(client: Arc<AgentClient>, slot: std::sync::Weak<Mutex<Option<StreamHandle>>>) {
-    let enabled = crate::settings::current()
-        .devcontainer
-        .forward_git_credentials;
+fn serve_host(
+    client: Arc<AgentClient>,
+    project: Project,
+    slot: std::sync::Weak<Mutex<Option<StreamHandle>>>,
+) {
+    let user = crate::settings::current();
+    let enabled = user.devcontainer.forward_git_credentials;
     thread::Builder::new()
         .name("host-services".into())
-        .spawn(move || match remote::host::serve(&client, enabled) {
-            Ok(handle) => {
-                if let Some(slot) = slot.upgrade() {
-                    *slot.lock() = Some(handle);
+        .spawn(move || {
+            // Credentials only for the hosts of the project's remotes (and
+            // the user's `git.credential_hosts`); the project's own settings
+            // (read where it lives) may keep the ssh-agent to this machine.
+            let policy = remote::host::Policy {
+                root: project.root().to_string_lossy().into_owned(),
+                credential_hosts: user.git.credential_hosts.clone(),
+                ssh_agent: enabled
+                    && project
+                        .settings_for(None)
+                        .devcontainer
+                        .ssh_agent_forwarding,
+            };
+            drop(project);
+            match remote::host::serve(&client, enabled, &policy) {
+                Ok(handle) => {
+                    if let Some(slot) = slot.upgrade() {
+                        *slot.lock() = Some(handle);
+                    }
                 }
+                // The project works without; git there prompts by itself.
+                Err(err) => eprintln!("next_code: git credential forwarding unavailable: {err}"),
             }
-            // The project works without; git there prompts by itself.
-            Err(err) => eprintln!("next_code: git credential forwarding unavailable: {err}"),
         })
         .ok();
 }
@@ -569,18 +658,19 @@ impl Project {
                 .ok(),
         };
         let host = Arc::new(Mutex::new(None));
-        if let Backend::Remote { client, .. } = &backend {
-            serve_host(client.clone(), Arc::downgrade(&host));
-        }
-        Self(Arc::new(Inner {
+        let project = Self(Arc::new(Inner {
             root: roots[0].path.clone(),
             folder_settings: Mutex::new((0..roots.len()).map(|_| None).collect()),
             roots,
             workspace,
             backend,
             _pinpoint: pinpoint,
-            _host: host,
-        }))
+            _host: host.clone(),
+        }));
+        if let Backend::Remote { client, .. } = &project.0.backend {
+            serve_host(client.clone(), project.clone(), Arc::downgrade(&host));
+        }
+        project
     }
 
     /// Starts the agent in `distro` and opens `path` there. Blocks for as
@@ -1393,9 +1483,20 @@ impl Project {
         match &self.0.backend {
             Backend::Local => {
                 let mut command = Command::new(program);
-                command.args(args).current_dir(cwd);
+                command
+                    .args(args)
+                    .current_dir(cwd)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
                 remote::launch::no_window(&mut command);
-                LanguageServer::spawn(&mut command, logger)
+                let mut spawned = Tree::spawn(&mut command)?;
+                let child = spawned.child.as_mut().expect("just spawned");
+                let stdin = child.stdin.take().expect("piped stdin");
+                let stdout = child.stdout.take().expect("piped stdout");
+                let stderr = child.stderr.take().expect("piped stderr");
+                let tree = spawned.watch()?;
+                LanguageServer::attach(stdout, stdin, stderr, Box::new(tree), logger)
             }
             Backend::Remote { client, .. } => {
                 client.spawn_language_server(agent_path(program)?, args, agent_path(cwd)?, logger)
@@ -1423,10 +1524,12 @@ impl Project {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
                 remote::launch::no_window(&mut command);
-                let mut child = command.spawn()?;
+                let mut spawned = Tree::spawn(&mut command)?;
+                let child = spawned.child.as_mut().expect("just spawned");
                 let stdin = child.stdin.take().expect("piped stdin");
                 let stdout = child.stdout.take().expect("piped stdout");
                 let mut error = child.stderr.take().expect("piped stderr");
+                let tree = spawned.watch()?;
                 let mut stderr = stderr;
                 thread::Builder::new()
                     .name("piped-stderr".into())
@@ -1439,7 +1542,8 @@ impl Project {
                 Ok(PipedProcess {
                     stdout: Box::new(stdout),
                     stdin: Box::new(stdin),
-                    guard: Box::new(KillOnDrop(child)),
+                    // Dropping it ends the process and what it started.
+                    guard: Box::new(tree),
                 })
             }
             Backend::Remote { client, .. } => {
@@ -1481,14 +1585,17 @@ impl Project {
     /// lives (`cmd /C` on Windows, `sh -c` elsewhere), killing it after
     /// `timeout`.
     pub fn run(&self, command_line: &str, timeout: Duration) -> io::Result<RunOutput> {
-        let (shell, flag) = if self.is_remote() || !cfg!(windows) {
-            ("/bin/sh", "-c")
-        } else {
-            ("cmd.exe", "/C")
-        };
+        #[cfg(windows)]
+        if !self.is_remote() {
+            use std::os::windows::process::CommandExt;
+            // The line goes to cmd as it is: std's quoting (`\"`) is not cmd's.
+            let mut command = Command::new("cmd.exe");
+            command.raw_arg("/C").raw_arg(format!("\"{command_line}\""));
+            return run_local(command, "cmd.exe", &self.0.root, None, timeout, None);
+        }
         self.run_program(
-            shell,
-            &[flag.into(), command_line.into()],
+            "/bin/sh",
+            &["-c".into(), command_line.into()],
             &[],
             None,
             timeout,
@@ -1518,62 +1625,36 @@ impl Project {
         input: Option<&[u8]>,
         timeout: Duration,
     ) -> io::Result<RunOutput> {
+        self.run_program_cancellable(cwd, program, args, env, input, timeout, None)
+    }
+
+    /// [`Project::run_program_in`] that `cancel` can end early: the
+    /// process (and what it started) is asked to end, then killed, and
+    /// the call returns `ErrorKind::Interrupted`; a token cancelled before
+    /// the call fails it at once. Where the project lives behind the agent
+    /// only that early check applies for now.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_program_cancellable(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        env: &[(&str, &str)],
+        input: Option<&[u8]>,
+        timeout: Duration,
+        cancel: Option<&CancelToken>,
+    ) -> io::Result<RunOutput> {
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            return Err(cancelled(program));
+        }
         match &self.0.backend {
             Backend::Remote { client, .. } => {
                 client.run(program, args, agent_path(cwd)?, env, input, timeout)
             }
             Backend::Local => {
                 let mut command = Command::new(program);
-                command
-                    .args(args)
-                    .envs(env.iter().copied())
-                    .current_dir(cwd)
-                    .stdin(if input.is_some() {
-                        Stdio::piped()
-                    } else {
-                        Stdio::null()
-                    })
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                remote::launch::no_window(&mut command);
-                let mut child = command.spawn()?;
-                if let (Some(mut stdin), Some(input)) = (child.stdin.take(), input) {
-                    let input = input.to_vec();
-                    // Written on a thread so a full output pipe cannot deadlock.
-                    thread::spawn(move || {
-                        use std::io::Write;
-                        stdin.write_all(&input).ok();
-                    });
-                }
-                let collect = |mut pipe: Box<dyn Read + Send>| {
-                    thread::spawn(move || {
-                        let mut data = Vec::new();
-                        pipe.read_to_end(&mut data).ok();
-                        data
-                    })
-                };
-                let stdout = collect(Box::new(child.stdout.take().expect("piped stdout")));
-                let stderr = collect(Box::new(child.stderr.take().expect("piped stderr")));
-                let deadline = Instant::now() + timeout;
-                let status = loop {
-                    if let Some(status) = child.try_wait()? {
-                        break status;
-                    }
-                    if Instant::now() >= deadline {
-                        child.kill().ok();
-                        child.wait().ok();
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("{program} did not finish within {} s", timeout.as_secs()),
-                        ));
-                    }
-                    thread::sleep(Duration::from_millis(20));
-                };
-                Ok(RunOutput {
-                    code: status.code(),
-                    stdout: stdout.join().unwrap_or_default(),
-                    stderr: stderr.join().unwrap_or_default(),
-                })
+                command.args(args).envs(env.iter().copied());
+                run_local(command, program, cwd, input, timeout, cancel)
             }
         }
     }
@@ -1654,8 +1735,21 @@ impl Project {
             },
         };
         let mut error = read_error.clone();
-        let workspace = self.workspace_settings();
-        let layered = user.layered(&[workspace, &folder]).unwrap_or_else(|err| {
+        // Project settings of untrusted folders run no programs (see `trust`).
+        let (safe_workspace, safe_folder);
+        let workspace = if crate::trust::is_trusted(self) {
+            self.workspace_settings()
+        } else {
+            safe_workspace = crate::settings::without_commands(self.workspace_settings());
+            &safe_workspace
+        };
+        let folder_layer = if crate::trust::is_root_trusted(self, index) {
+            &folder
+        } else {
+            safe_folder = crate::settings::without_commands(&folder);
+            &safe_folder
+        };
+        let layered = user.layered(&[workspace, folder_layer]).unwrap_or_else(|err| {
             error = Some(format!("{}: {err}", file.display()));
             // The workspace's settings alone may still be fine.
             user.layered(&[workspace]).unwrap_or_else(|err| {
@@ -1841,6 +1935,10 @@ impl git::Runner for GitRunner {
 struct FolderHost(Project);
 
 impl devcontainer::Host for FolderHost {
+    fn trusted(&self) -> bool {
+        crate::trust::is_trusted(&self.0)
+    }
+
     fn run(
         &self,
         program: &str,

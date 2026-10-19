@@ -13,7 +13,6 @@ use std::{
     future::Future,
     io::{self, BufRead, BufReader, Read, Write},
     pin::Pin,
-    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI32, Ordering},
@@ -21,6 +20,7 @@ use std::{
     },
     task::{Context, Poll},
     thread,
+    time::Duration,
 };
 
 use futures::channel::{mpsc as async_mpsc, oneshot};
@@ -86,6 +86,17 @@ pub enum LogKind {
 
 pub type Logger = Arc<dyn Fn(LogKind, &str) + Send + Sync>;
 
+/// Time a server gets to exit after `shutdown`/`exit` before its process is ended.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// A local server process the client owns (see [`LanguageServer::attach`]).
+pub trait ServerProcess: Send {
+    /// Lets the process exit on its own for `grace` (it was told to), then
+    /// ends it and whatever it started. Returns at once; a zero grace ends
+    /// it now.
+    fn end(self: Box<Self>, grace: Duration);
+}
+
 type Responder = oneshot::Sender<Result<Value, Error>>;
 
 struct Shared {
@@ -98,12 +109,10 @@ struct Shared {
 
 impl Shared {
     fn send(&self, message: &Value) {
-        let body = message.to_string();
-        if let Some(logger) = &self.logger {
-            logger(LogKind::Sent, &body);
-        }
+        // Logged by the writer thread, where the body is written: the
+        // caller (often the UI thread) never waits on the log file.
         // A closed writer means the server is gone; pending requests fail via the reader.
-        self.outgoing.send(body.into_bytes()).ok();
+        self.outgoing.send(message.to_string().into_bytes()).ok();
     }
 
     fn notify(&self, method: &str, params: Value) {
@@ -113,18 +122,47 @@ impl Shared {
 
 pub struct LanguageServer {
     shared: Arc<Shared>,
-    child: Mutex<Option<Child>>,
+    /// The local server process, ended on shutdown (after the grace) or drop.
+    process: Mutex<Option<Box<dyn ServerProcess>>>,
     /// Ends a server process running elsewhere when dropped.
     remote_process: Mutex<Option<Box<dyn Send>>>,
 }
 
 impl LanguageServer {
-    /// Starts a client over an existing stream.
+    /// Starts a client over an existing stream. Without the threads for
+    /// it (resource pressure) the client is born exited, see
+    /// [`LanguageServer::try_new`].
     pub fn new(
         reader: impl Read + Send + 'static,
         writer: impl Write + Send + 'static,
         logger: Option<Logger>,
     ) -> (Self, async_mpsc::UnboundedReceiver<Incoming>) {
+        match Self::try_new(reader, writer, logger) {
+            Ok(connected) => connected,
+            Err(err) => {
+                eprintln!("next_code: cannot start the language server client: {err}");
+                let (outgoing, _) = mpsc::channel();
+                let (incoming, incoming_rx) = async_mpsc::unbounded();
+                let shared = Arc::new(Shared {
+                    outgoing,
+                    pending: Mutex::default(),
+                    next_id: AtomicI32::new(1),
+                    exited: AtomicBool::new(true),
+                    logger: None,
+                });
+                incoming.unbounded_send(Incoming::Exited).ok();
+                (Self::with_shared(shared), incoming_rx)
+            }
+        }
+    }
+
+    /// Starts a client over an existing stream; fails when its I/O threads
+    /// cannot be started.
+    pub fn try_new(
+        reader: impl Read + Send + 'static,
+        writer: impl Write + Send + 'static,
+        logger: Option<Logger>,
+    ) -> io::Result<(Self, async_mpsc::UnboundedReceiver<Incoming>)> {
         let (outgoing, outgoing_rx) = mpsc::channel::<Vec<u8>>();
         let (incoming, incoming_rx) = async_mpsc::unbounded();
         let shared = Arc::new(Shared {
@@ -135,6 +173,7 @@ impl LanguageServer {
             logger,
         });
 
+        let writer_logger = shared.logger.clone();
         thread::Builder::new()
             .name("lsp-writer".into())
             .spawn(move || {
@@ -143,38 +182,38 @@ impl LanguageServer {
                     if codec::write_message(&mut writer, &body).is_err() {
                         break;
                     }
+                    if let Some(logger) = &writer_logger {
+                        logger(LogKind::Sent, &String::from_utf8_lossy(&body));
+                    }
                 }
-            })
-            .expect("spawning LSP writer thread");
+            })?;
 
         let reader_shared = shared.clone();
         thread::Builder::new()
             .name("lsp-reader".into())
-            .spawn(move || read_loop(BufReader::new(reader), &reader_shared, &incoming))
-            .expect("spawning LSP reader thread");
+            .spawn(move || read_loop(BufReader::new(reader), &reader_shared, &incoming))?;
 
-        let server = Self {
-            shared,
-            child: Mutex::new(None),
-            remote_process: Mutex::new(None),
-        };
-        (server, incoming_rx)
+        Ok((Self::with_shared(shared), incoming_rx))
     }
 
-    /// Spawns `command` and talks to it over stdin/stdout; stderr goes to the logger.
-    pub fn spawn(
-        command: &mut Command,
+    fn with_shared(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            process: Mutex::new(None),
+            remote_process: Mutex::new(None),
+        }
+    }
+
+    /// Talks to a server process over its `stdin`/`stdout`; the lines it
+    /// writes to `stderr` go to the logger. `process` is ended on shutdown
+    /// (after [`SHUTDOWN_GRACE`]) and when the client is dropped.
+    pub fn attach(
+        stdout: impl Read + Send + 'static,
+        stdin: impl Write + Send + 'static,
+        stderr: impl Read + Send + 'static,
+        process: Box<dyn ServerProcess>,
         logger: Option<Logger>,
     ) -> io::Result<(Self, async_mpsc::UnboundedReceiver<Incoming>)> {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-
         let stderr_logger = logger.clone();
         thread::Builder::new()
             .name("lsp-stderr".into())
@@ -186,8 +225,8 @@ impl LanguageServer {
                 }
             })?;
 
-        let (server, incoming) = Self::new(stdout, stdin, logger);
-        *server.child.lock() = Some(child);
+        let (server, incoming) = Self::try_new(stdout, stdin, logger)?;
+        *server.process.lock() = Some(process);
         Ok((server, incoming))
     }
 
@@ -237,23 +276,15 @@ impl LanguageServer {
         self.shared.send(&message);
     }
 
-    /// Asks the server to shut down and exit, then reaps the child process.
+    /// Asks the server to shut down and exit, then ends its process once
+    /// it had [`SHUTDOWN_GRACE`] to do so itself.
     pub async fn shutdown(&self) {
         // Servers that ignore `shutdown` still get `exit`; a dead one is just reaped.
         self.request::<Shutdown>(()).await.ok();
         self.notify::<Exit>(());
         self.remote_process.lock().take();
-        if let Some(mut child) = self.child.lock().take() {
-            thread::spawn(move || {
-                for _ in 0..20 {
-                    if !matches!(child.try_wait(), Ok(None)) {
-                        return;
-                    }
-                    thread::sleep(std::time::Duration::from_millis(100));
-                }
-                child.kill().ok();
-                child.wait().ok();
-            });
+        if let Some(process) = self.process.lock().take() {
+            process.end(SHUTDOWN_GRACE);
         }
     }
 
@@ -264,9 +295,8 @@ impl LanguageServer {
 
 impl Drop for LanguageServer {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.lock().take() {
-            child.kill().ok();
-            child.wait().ok();
+        if let Some(process) = self.process.lock().take() {
+            process.end(Duration::ZERO);
         }
     }
 }
@@ -528,6 +558,91 @@ mod tests {
         );
         // A late answer for the cancelled request is ignored.
         server.send(json!({ "jsonrpc": "2.0", "id": id, "result": null }));
+    }
+
+    /// Records how it was ended.
+    struct FakeProcess(Arc<Mutex<Vec<Duration>>>);
+
+    impl ServerProcess for FakeProcess {
+        fn end(self: Box<Self>, grace: Duration) {
+            self.0.lock().push(grace);
+        }
+    }
+
+    #[test]
+    fn attached_processes_end_after_shutdown_with_the_grace_and_traffic_is_logged() {
+        let log: Arc<Mutex<Vec<(LogKind, String)>>> = Arc::default();
+        let logger: Logger = {
+            let log = log.clone();
+            Arc::new(move |kind, body: &str| log.lock().push((kind, body.to_owned())))
+        };
+        let (client_reader, server_writer) = io::pipe().unwrap();
+        let (server_reader, client_writer) = io::pipe().unwrap();
+        let (stderr_reader, mut stderr_writer) = io::pipe().unwrap();
+        let ends: Arc<Mutex<Vec<Duration>>> = Arc::default();
+        let (client, _incoming) = LanguageServer::attach(
+            client_reader,
+            client_writer,
+            stderr_reader,
+            Box::new(FakeProcess(ends.clone())),
+            Some(logger),
+        )
+        .unwrap();
+        let mut server = FakeServer {
+            reader: BufReader::new(server_reader),
+            writer: server_writer,
+        };
+
+        let request = client.request::<HoverRequest>(hover_params());
+        let id = server.recv()["id"].clone();
+        server.send(json!({ "jsonrpc": "2.0", "id": id, "result": null }));
+        assert_eq!(block_on(request).unwrap(), None);
+        writeln!(stderr_writer, "warning: slow").unwrap();
+        drop(stderr_writer);
+        // Sent messages are logged by the writer thread, received ones by
+        // the reader, stderr lines by their own: wait for all three.
+        let logged = |kind: LogKind| {
+            for _ in 0..500 {
+                if log.lock().iter().any(|(logged, _)| *logged == kind) {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        assert!(logged(LogKind::Sent));
+        assert!(logged(LogKind::Received));
+        assert!(logged(LogKind::Stderr));
+        assert!(
+            log.lock()
+                .iter()
+                .any(|(kind, body)| *kind == LogKind::Sent && body.contains("textDocument/hover"))
+        );
+
+        // `shutdown` waits for the server's answer: play the server on a thread.
+        let answering = thread::spawn(move || {
+            let shutdown = server.recv();
+            assert_eq!(shutdown["method"], "shutdown");
+            server.send(json!({ "jsonrpc": "2.0", "id": shutdown["id"], "result": null }));
+            assert_eq!(server.recv()["method"], "exit");
+        });
+        block_on(client.shutdown());
+        answering.join().unwrap();
+        assert_eq!(*ends.lock(), [SHUTDOWN_GRACE]);
+        // The process was already handed over: dropping the client ends nothing twice.
+        drop(client);
+        assert_eq!(*ends.lock(), [SHUTDOWN_GRACE]);
+
+        let (client, _incoming) = LanguageServer::attach(
+            io::empty(),
+            io::sink(),
+            io::empty(),
+            Box::new(FakeProcess(ends.clone())),
+            None,
+        )
+        .unwrap();
+        drop(client);
+        assert_eq!(*ends.lock(), [SHUTDOWN_GRACE, Duration::ZERO]);
     }
 
     #[test]

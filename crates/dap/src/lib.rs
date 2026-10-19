@@ -220,12 +220,36 @@ pub struct Client {
 
 impl Client {
     /// Starts a client over an adapter's output (`reader`) and input
-    /// (`writer`).
+    /// (`writer`). Without the threads for it (resource pressure) the
+    /// client is born exited, see [`Client::try_new`].
     pub fn new(
         reader: impl Read + Send + 'static,
         writer: impl Write + Send + 'static,
         logger: Option<Logger>,
     ) -> (Self, async_mpsc::UnboundedReceiver<Incoming>) {
+        match Self::try_new(reader, writer, logger) {
+            Ok(connected) => connected,
+            Err(err) => {
+                eprintln!("next_code: cannot start the debug adapter client: {err}");
+                let (outgoing, _) = mpsc::channel();
+                let (shared, incoming) = Shared::new(Outgoing::Writer(outgoing), None);
+                shared.close();
+                let client = Self {
+                    shared,
+                    guard: Mutex::new(None),
+                };
+                (client, incoming)
+            }
+        }
+    }
+
+    /// Starts a client over an adapter's output (`reader`) and input
+    /// (`writer`); fails when its I/O threads cannot be started.
+    pub fn try_new(
+        reader: impl Read + Send + 'static,
+        writer: impl Write + Send + 'static,
+        logger: Option<Logger>,
+    ) -> io::Result<(Self, async_mpsc::UnboundedReceiver<Incoming>)> {
         let (outgoing, outgoing_rx) = mpsc::channel::<Vec<u8>>();
         let (shared, incoming) = Shared::new(Outgoing::Writer(outgoing), logger);
         thread::Builder::new()
@@ -237,18 +261,16 @@ impl Client {
                         break;
                     }
                 }
-            })
-            .expect("spawning DAP writer thread");
+            })?;
         let reader_shared = shared.clone();
         thread::Builder::new()
             .name("dap-reader".into())
-            .spawn(move || read_loop(reader, &reader_shared))
-            .expect("spawning DAP reader thread");
+            .spawn(move || read_loop(reader, &reader_shared))?;
         let client = Self {
             shared,
             guard: Mutex::new(None),
         };
-        (client, incoming)
+        Ok((client, incoming))
     }
 
     /// A client wired to an in-process [`Peer`] playing the adapter (for

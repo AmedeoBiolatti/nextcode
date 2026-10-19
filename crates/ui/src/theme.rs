@@ -757,7 +757,8 @@ pub fn customize(cx: &mut App) -> Result<PathBuf, String> {
     let path = dir.join(format!("{name}.json"));
     if !path.exists() {
         std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-        std::fs::write(&path, customization(&theme, &name)).map_err(|err| err.to_string())?;
+        worktree::write_atomic(&path, customization(&theme, &name).as_bytes())
+            .map_err(|err| err.to_string())?;
     }
     select(&name, cx)?;
     Ok(path)

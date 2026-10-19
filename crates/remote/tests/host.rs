@@ -282,7 +282,7 @@ fn git_credentials_and_ssh_agent_reach_the_editor_through_the_agent() {
 
     // Turned off: nothing is served and our helper leaves the config; the
     // identity stays.
-    let _off = remote::host::serve(&client, false).unwrap();
+    let _off = remote::host::serve(&client, false, &remote::host::Policy::default()).unwrap();
     assert!(sockets(&sockets_dir, ".sock").is_empty());
     assert_eq!(git_config(&config, &["--get-all", "credential.helper"]), "");
     assert_eq!(git_config(&config, &["user.name"]).trim(), "Ada Lovelace");

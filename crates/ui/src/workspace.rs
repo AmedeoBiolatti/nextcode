@@ -180,12 +180,13 @@ impl TabContent {
         }
     }
 
-    /// Writes a file tab's unsaved changes; false if that failed.
-    fn save(&self, cx: &mut App) -> bool {
+    /// Writes a file tab's unsaved changes; the task says whether that
+    /// succeeded (an editor's write runs off the UI thread).
+    fn save(&self, cx: &mut App) -> Task<bool> {
         match self {
             Self::Editor(editor) => editor.update(cx, |editor, cx| editor.save(cx)),
-            Self::Notebook(view) => view.update(cx, |view, cx| view.save_document(cx)),
-            Self::Diff(_) | Self::Compare(_) => true,
+            Self::Notebook(view) => Task::ready(view.update(cx, |view, cx| view.save_document(cx))),
+            Self::Diff(_) | Self::Compare(_) => Task::ready(true),
         }
     }
 }
@@ -310,6 +311,9 @@ pub(crate) enum OfferKind {
         file: String,
         id: String,
     },
+    /// The folder is not trusted yet: its settings run no programs (see
+    /// `trust`).
+    TrustFolder,
 }
 
 impl OfferKind {
@@ -321,6 +325,7 @@ impl OfferKind {
             Self::PortAvailable { .. } => "Open in Browser",
             Self::OpenAsNotebook { .. } => "Open as Notebook",
             Self::NoteMessage { .. } => "Show Note",
+            Self::TrustFolder => "Trust",
         }
     }
 
@@ -333,6 +338,7 @@ impl OfferKind {
             Self::PortAvailable { port, .. } => format!("offer:port-{port}"),
             Self::OpenAsNotebook { .. } => "offer:open-as-notebook".into(),
             Self::NoteMessage { id, .. } => format!("offer:note-{id}"),
+            Self::TrustFolder => "offer:trust-folder".into(),
         }
     }
 }
@@ -638,6 +644,11 @@ impl Workspace {
         .detach();
         recent::record(&project.location());
         cx.defer_in(window, |this, _, cx| this.load_folder_settings(cx));
+        if let Some(question) = crate::trust::prompt(&project) {
+            cx.defer_in(window, move |this, _, cx| {
+                this.offer(OfferKind::TrustFolder, &question, cx)
+            });
+        }
         // The session is written when the project closes (its tab or
         // window, or the app quits) and restored once the workspace exists.
         let release_subscription = cx.on_release(|this, cx| {
@@ -648,7 +659,10 @@ impl Workspace {
             this.save_session(cx).ok();
             // No kernel outlives the app.
             this.shutdown_notebooks(cx);
-            async {}
+            // Language servers get `shutdown`/`exit` and a grace to leave
+            // (gpui bounds the wait; the rest are ended with the app).
+            this.lsp_store
+                .update(cx, |store, cx| store.shutdown_all(lsp::SHUTDOWN_GRACE, cx))
         });
         cx.defer_in(window, |this, window, cx| this.restore_session(window, cx));
         crate::startup::mark("workspace built");
@@ -1107,6 +1121,49 @@ impl Workspace {
         }
     }
 
+    /// A save found the file changed on disk (`EditorEvent::SaveConflict`):
+    /// overwrite it, reload it (losing the edits), or leave both as they are.
+    fn prompt_overwrite(
+        &mut self,
+        editor: Entity<Editor>,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("{name} changed on disk"),
+            Some(
+                "The file was changed outside the editor since you opened or saved it. \
+                 Overwrite it with your changes, or reload it and lose them?",
+            ),
+            &["Overwrite", "Reload", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await;
+            this.update_in(cx, |this, _, cx| {
+                this.reload_prompts.remove(&path);
+                match answer {
+                    Ok(0) => editor
+                        .update(cx, |editor, cx| editor.save_overwriting(cx))
+                        .detach(),
+                    Ok(1) => {
+                        editor.update(cx, |editor, cx| editor.reload_from_disk(true, cx));
+                    }
+                    _ => {}
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn prompt_reload(
         &mut self,
         editor: Entity<Editor>,
@@ -1291,22 +1348,31 @@ impl Workspace {
         let mut notebook_error = None;
         let buffer = match &existing {
             Some(editor) => editor.read(cx).buffer().link(),
-            None => match self.project.read_text(path) {
-                Ok(text) => {
-                    if self.opens_as_notebook(path, &text) {
-                        match self.open_notebook(path, Some(&text), window, cx) {
-                            Ok(_) => return None,
-                            Err(err) => notebook_error = Some(err),
+            None => {
+                // Taken before the read: a file that changes in between
+                // looks changed to the first save instead of being
+                // overwritten. (The read itself stays on the UI thread:
+                // every caller uses the editor as soon as it opens.)
+                let stamp = crate::editor::save::disk_stamp(&self.project, path);
+                match self.project.read_text(path) {
+                    Ok(text) => {
+                        if self.opens_as_notebook(path, &text) {
+                            match self.open_notebook(path, Some(&text), window, cx) {
+                                Ok(_) => return None,
+                                Err(err) => notebook_error = Some(err),
+                            }
                         }
+                        let mut buffer = Buffer::with_path(&text, path.to_path_buf());
+                        buffer.set_disk_stamp(stamp);
+                        buffer
                     }
-                    Buffer::with_path(&text, path.to_path_buf())
+                    Err(err) => {
+                        self.notice = Some(format!("Cannot open {}: {err}", path.display()).into());
+                        cx.notify();
+                        return None;
+                    }
                 }
-                Err(err) => {
-                    self.notice = Some(format!("Cannot open {}: {err}", path.display()).into());
-                    cx.notify();
-                    return None;
-                }
-            },
+            }
         };
         let project = self.project.clone();
         let editor = cx.new(|cx| Editor::for_file(buffer, project, cx));
@@ -1332,6 +1398,13 @@ impl Workspace {
                             .map(|tab| tab.path.clone());
                         if let Some(path) = path {
                             this.run_file_saved(&path, cx);
+                        }
+                    }
+                    EditorEvent::SaveConflict => {
+                        if let Some(path) = editor.read(cx).buffer().path().map(Path::to_path_buf)
+                            && this.reload_prompts.insert(path.clone())
+                        {
+                            this.prompt_overwrite(editor.clone(), path, window, cx);
                         }
                     }
                     EditorEvent::SymbolsChanged => {}
@@ -1617,6 +1690,13 @@ impl Workspace {
             OfferKind::NoteMessage { root, file, id } => {
                 self.open_note(root, &file, &id, window, cx)
             }
+            OfferKind::TrustFolder => {
+                if let Err(err) = crate::trust::grant(&self.project) {
+                    self.notice = Some(format!("Cannot save the trusted folders: {err}").into());
+                }
+                // Folder settings are layered again, now with their programs.
+                self.load_folder_settings(cx);
+            }
         }
     }
 
@@ -1677,7 +1757,7 @@ impl Workspace {
             .map(|tab| tab.content.clone())
             .collect();
         for content in dirty {
-            content.save(cx);
+            content.save(cx).detach();
         }
     }
 
@@ -1947,14 +2027,21 @@ impl Workspace {
             let Ok(answer) = answer.await else {
                 return;
             };
+            let close = match answer {
+                // Closes once the write is done; a failed save stays open.
+                0 => match this.update(cx, |_, cx| content.save(cx)) {
+                    Ok(save) => save.await,
+                    Err(_) => return,
+                },
+                1 => true,
+                _ => false,
+            };
+            if !close {
+                return;
+            }
             this.update_in(cx, |this, window, cx| {
-                let close = match answer {
-                    0 => content.save(cx),
-                    1 => true,
-                    _ => false,
-                };
                 // The tabs may have changed while the prompt was open.
-                if close && let Some((pane, index)) = this.find_view(content.entity_id()) {
+                if let Some((pane, index)) = this.find_view(content.entity_id()) {
                     this.remove_tab(pane, index, window, cx);
                 }
             })

@@ -331,6 +331,7 @@ fn parse_fields(config: &mut Configuration, rest: &mut Map<String, Value>) -> Re
                         variable.get("name").and_then(Value::as_str),
                         variable.get("value").and_then(Value::as_str),
                     ) {
+                        check_env_name("environment", name)?;
                         config.env.insert(name.to_owned(), value.to_owned());
                     }
                 }
@@ -537,21 +538,34 @@ fn take_features(rest: &mut Map<String, Value>, key: &str) -> Result<Vec<String>
 }
 
 /// `{ "NAME": "value" }`; numbers and booleans are written out, `null`
-/// skipped.
+/// skipped. Names must be variable names (they end up in shell lines).
 fn take_env(rest: &mut Map<String, Value>, key: &str) -> Result<BTreeMap<String, String>, String> {
     match rest.remove(key) {
         None | Some(Value::Null) => Ok(BTreeMap::new()),
         Some(Value::Object(map)) => map
             .into_iter()
             .filter(|(_, value)| !value.is_null())
-            .map(|(name, value)| match value {
-                Value::String(text) => Ok((name, text)),
-                Value::Number(number) => Ok((name, number.to_string())),
-                Value::Bool(flag) => Ok((name, flag.to_string())),
-                _ => Err(format!("`{key}.{name}` must be a string")),
+            .map(|(name, value)| {
+                check_env_name(key, &name)?;
+                match value {
+                    Value::String(text) => Ok((name, text)),
+                    Value::Number(number) => Ok((name, number.to_string())),
+                    Value::Bool(flag) => Ok((name, flag.to_string())),
+                    _ => Err(format!("`{key}.{name}` must be a string")),
+                }
             })
             .collect(),
         Some(_) => Err(format!("`{key}` must be an object")),
+    }
+}
+
+fn check_env_name(key: &str, name: &str) -> Result<(), String> {
+    if shell::is_valid_env_name(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{key}` has an invalid variable name `{name}` (letters, digits and `_`, not starting with a digit)"
+        ))
     }
 }
 
@@ -1354,6 +1368,28 @@ mod tests {
             configs[8].disabled.as_deref(),
             Some("`program` must be a string")
         );
+    }
+
+    #[test]
+    fn invalid_env_names_disable_the_configuration() {
+        let text = r#"{ "configurations": [
+            { "name": "ok", "type": "shell", "command": "make", "env": { "RUST_LOG": "debug", "_X": 1 } },
+            { "name": "bad", "type": "shell", "command": "make", "env": { "A;rm -rf": "x" } },
+            { "name": "digit", "type": "shell", "command": "make", "env": { "1A": "x" } },
+            { "name": "cpp", "type": "cppdbg", "program": "a.out", "environment": [{ "name": "A B", "value": "x" }] },
+        ] }"#;
+        let configs = parse_file(text, Source::RunJson).unwrap();
+        assert_eq!(configs[0].disabled, None);
+        assert_eq!(configs[0].env.len(), 2);
+        assert_eq!(
+            configs[1].disabled.as_deref(),
+            Some(
+                "`env` has an invalid variable name `A;rm -rf` (letters, digits and `_`, not starting with a digit)"
+            )
+        );
+        assert!(configs[1].env.is_empty());
+        assert!(configs[2].disabled.as_deref().unwrap().contains("`1A`"));
+        assert!(configs[3].disabled.as_deref().unwrap().contains("`A B`"));
     }
 
     #[test]

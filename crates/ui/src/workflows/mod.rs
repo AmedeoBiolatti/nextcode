@@ -25,6 +25,7 @@
 
 use std::{
     collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -55,7 +56,15 @@ pub use view::{WorkflowView, WorkflowViewEvent};
 
 actions!(
     workflows,
-    [OpenWorkflow, NewWorkflow, RunAll, StopAll, RetryFailed]
+    [
+        OpenWorkflow,
+        OpenWorkflowFile,
+        AddWorkflowFolder,
+        NewWorkflow,
+        RunAll,
+        StopAll,
+        RetryFailed
+    ]
 );
 
 /// "Run Workflow: <name>" in the command palette.
@@ -100,6 +109,10 @@ pub fn user_dir() -> Option<PathBuf> {
 pub enum Source {
     User,
     Project(Location),
+    /// A folder of `"workflows": {"folders": […]}` (or
+    /// `NEXT_CODE_WORKFLOW_FOLDERS`), or the folder of a file opened with
+    /// Open Workflow File…; on this machine.
+    Folder(PathBuf),
 }
 
 impl Source {
@@ -107,15 +120,51 @@ impl Source {
         match self {
             Self::User => "User".into(),
             Self::Project(location) => location.to_string(),
+            Self::Folder(dir) => dir.display().to_string(),
         }
     }
+}
+
+/// The environment variable listing more workflow folders (separated as
+/// in `PATH`).
+pub const FOLDERS_VARIABLE: &str = "NEXT_CODE_WORKFLOW_FOLDERS";
+
+/// The folders listed besides the user's and the projects': the
+/// settings' `"workflows": {"folders": […]}`, then
+/// `NEXT_CODE_WORKFLOW_FOLDERS`; `~` expanded, each once.
+pub fn extra_folders() -> Vec<PathBuf> {
+    let (settings, _) = crate::settings::Settings::load();
+    let home = dirs::home_dir();
+    let expand = |folder: &str| -> PathBuf {
+        match (folder.strip_prefix('~'), &home) {
+            (Some(rest), Some(home)) => home.join(rest.trim_start_matches(['/', '\\'])),
+            _ => PathBuf::from(folder),
+        }
+    };
+    let mut folders: Vec<PathBuf> = settings
+        .workflows
+        .folders
+        .iter()
+        .filter(|folder| !folder.trim().is_empty())
+        .map(|folder| expand(folder.trim()))
+        .collect();
+    if let Some(list) = std::env::var_os(FOLDERS_VARIABLE) {
+        folders.extend(std::env::split_paths(&list).filter(|dir| !dir.as_os_str().is_empty()));
+    }
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for folder in folders {
+        if !unique.contains(&folder) {
+            unique.push(folder);
+        }
+    }
+    unique
 }
 
 /// A workflow's id ([`Discovered::id`]): the file path, prefixed by the
 /// project for project files. Runs are keyed by it.
 pub fn workflow_id(source: &Source, path: &Path) -> String {
     match source {
-        Source::User => path.to_string_lossy().into_owned(),
+        Source::User | Source::Folder(_) => path.to_string_lossy().into_owned(),
         Source::Project(location) => format!("{location}|{}", path.display()),
     }
 }
@@ -265,7 +314,27 @@ pub struct Discovered {
 }
 
 /// Reads every workflow file: the user's, then each project's. Blocks.
-fn discover(user_dir: Option<&Path>, projects: &[(Location, Project)]) -> Vec<Discovered> {
+/// The workflow files in `dir` (not in subfolders), sorted.
+fn workflow_files(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_workflow_file(&path.to_string_lossy()))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Reads every workflow file: the user's, the extra `folders`', the
+/// `opened` files not found otherwise, then each project's. Blocks.
+fn discover(
+    user_dir: Option<&Path>,
+    folders: &[PathBuf],
+    opened: &[PathBuf],
+    projects: &[(Location, Project)],
+) -> Vec<Discovered> {
     let mut found = Vec::new();
     let mut add = |path: PathBuf, source: Source, text: std::io::Result<String>| {
         let stem = file_stem(&path);
@@ -284,19 +353,31 @@ fn discover(user_dir: Option<&Path>, projects: &[(Location, Project)]) -> Vec<Di
             parsed,
         });
     };
-    if let Some(dir) = user_dir
-        && let Ok(entries) = std::fs::read_dir(dir)
-    {
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file() && is_workflow_file(&path.to_string_lossy()))
-            .collect();
-        paths.sort();
-        for path in paths {
+    if let Some(dir) = user_dir {
+        for path in workflow_files(dir) {
             let text = std::fs::read_to_string(&path);
             add(path, Source::User, text);
         }
+    }
+    let mut listed: Vec<PathBuf> = user_dir.map(workflow_files).unwrap_or_default();
+    for dir in folders.iter().filter(|dir| Some(dir.as_path()) != user_dir) {
+        for path in workflow_files(dir) {
+            if listed.contains(&path) {
+                continue;
+            }
+            listed.push(path.clone());
+            let text = std::fs::read_to_string(&path);
+            add(path, Source::Folder(dir.clone()), text);
+        }
+    }
+    for path in opened {
+        if listed.contains(path) {
+            continue;
+        }
+        listed.push(path.clone());
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let text = std::fs::read_to_string(path);
+        add(path.clone(), Source::Folder(dir), text);
     }
     for (location, project) in projects {
         // Listed directly: `.next_code` may well be git-ignored.
@@ -401,6 +482,9 @@ struct StepRuntime {
     opening: Option<u64>,
     last_port_poll: Option<Instant>,
     port_busy: bool,
+    /// Bumped on each chunk of output the step's command printed: the
+    /// view keeps its joined output lines until this changes.
+    output_generation: u64,
 }
 
 /// A started workflow.
@@ -425,6 +509,15 @@ impl ActiveRun {
     /// Where step `index` runs (`None`: this machine).
     pub fn location(&self, index: usize) -> Option<&Location> {
         self.steps.get(index)?.location.as_ref()
+    }
+
+    /// Changes whenever step `index`'s command printed more (see
+    /// [`StepState::last_lines`]): a key for what was built from its
+    /// output.
+    pub fn output_generation(&self, index: usize) -> u64 {
+        self.steps
+            .get(index)
+            .map_or(0, |step| step.output_generation)
     }
 }
 
@@ -472,6 +565,12 @@ pub enum WorkflowsEvent {
 pub struct Workflows {
     host: Box<dyn Host>,
     user_dir: Option<PathBuf>,
+    /// The extra folders to list; `None`: read them ([`extra_folders`])
+    /// on each refresh.
+    folders: Option<Vec<PathBuf>>,
+    /// Files opened by path (Open Workflow File…, headless `path`), listed
+    /// for the session.
+    opened: Vec<PathBuf>,
     discovered: Vec<Discovered>,
     runs: Vec<ActiveRun>,
     /// Replaced runs whose commands are still stopping (their steps in the
@@ -481,6 +580,8 @@ pub struct Workflows {
     inputs: mpsc::UnboundedSender<Input>,
     pump_scheduled: bool,
     ticking: bool,
+    /// [`Self::display_version`] when observers were last notified.
+    shown: u64,
     /// Feeds terminal output and exits into the runs.
     _inputs: gpui::Task<()>,
 }
@@ -539,6 +640,9 @@ impl Workflows {
         Self {
             host,
             user_dir,
+            // Tests list what they set, not the user's settings.
+            folders: cfg!(test).then(Vec::new),
+            opened: Vec::new(),
             discovered: Vec::new(),
             runs: Vec::new(),
             draining: Vec::new(),
@@ -546,6 +650,7 @@ impl Workflows {
             inputs,
             pump_scheduled: false,
             ticking: false,
+            shown: 0,
             _inputs: task,
         }
     }
@@ -586,6 +691,26 @@ impl Workflows {
         self.user_dir.as_deref()
     }
 
+    /// Lists the workflow file at `path` (anywhere on this machine) from
+    /// now on, and reads the files again.
+    pub fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) -> gpui::Task<()> {
+        self.remember_file(path);
+        self.refresh(cx)
+    }
+
+    /// Lists the workflow file at `path` from the next refresh on.
+    pub fn remember_file(&mut self, path: PathBuf) {
+        if !self.opened.contains(&path) {
+            self.opened.push(path);
+        }
+    }
+
+    /// Lists these folders instead of the settings' and the environment's.
+    #[cfg(test)]
+    pub(crate) fn set_folders(&mut self, folders: Vec<PathBuf>) {
+        self.folders = Some(folders);
+    }
+
     /// Converts workflow `id`, a file of the old JSON format (see
     /// [`convert_file`]), and reads the files again. Blocks.
     pub fn convert(&mut self, id: &str, cx: &mut Context<Self>) -> Result<Converted, String> {
@@ -601,7 +726,7 @@ impl Workflows {
         }
         let path = found.path;
         let project = match &found.source {
-            Source::User => {
+            Source::User | Source::Folder(_) => {
                 Project::local(path.parent().map(Path::to_path_buf).unwrap_or_default())
             }
             Source::Project(location) => self
@@ -624,8 +749,13 @@ impl Workflows {
     /// updated.
     pub fn refresh(&mut self, cx: &mut Context<Self>) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
-            let Ok((user_dir, projects)) = this.update(cx, |this, cx| {
-                (this.user_dir.clone(), this.host.projects(cx))
+            let Ok((user_dir, folders, opened, projects)) = this.update(cx, |this, cx| {
+                (
+                    this.user_dir.clone(),
+                    this.folders.clone(),
+                    this.opened.clone(),
+                    this.host.projects(cx),
+                )
             }) else {
                 return;
             };
@@ -635,7 +765,8 @@ impl Workflows {
                     if let Some(dir) = user_dir.as_deref().filter(|dir| dir.is_dir()) {
                         write_schema(dir).ok();
                     }
-                    discover(user_dir.as_deref(), &projects)
+                    let folders = folders.unwrap_or_else(extra_folders);
+                    discover(user_dir.as_deref(), &folders, &opened, &projects)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -941,6 +1072,9 @@ impl Workflows {
             } => {
                 if let Some(active) = self.run_mut(run) {
                     active.run.output(step, generation, &data, now);
+                    if let Some(runtime) = active.steps.get_mut(step) {
+                        runtime.output_generation += 1;
+                    }
                 }
             }
             Input::Exited {
@@ -1017,7 +1151,68 @@ impl Workflows {
         }
         self.draining.retain(|old| old.run.is_active());
         self.ensure_ticking(cx);
-        cx.notify();
+        // Ticks pump four times a second while a step is active: observers
+        // (the workflow tab, with its graph and the step's output) redraw
+        // only when something they show changed.
+        let version = self.display_version(Instant::now());
+        if version != self.shown {
+            self.shown = version;
+            cx.notify();
+        }
+    }
+
+    /// What the UI shows of the runs, hashed: each step's status, detail,
+    /// exit, check output, artifacts, restarts and health, whether it
+    /// awaits the user, is held, has a terminal, its output generation and
+    /// the whole seconds of its elapsed time (as `elapsed_text` shows
+    /// them). Equal versions look the same.
+    fn display_version(&self, now: Instant) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.runs.len().hash(&mut hasher);
+        for active in &self.runs {
+            active.id.hash(&mut hasher);
+            (active.run.outcome() as u8).hash(&mut hasher);
+            let steps = active.run.steps().iter().zip(&active.steps).enumerate();
+            for (index, (state, runtime)) in steps {
+                state.status.name().hash(&mut hasher);
+                if let Status::Failed(reason) | Status::Skipped(reason) = &state.status {
+                    reason.hash(&mut hasher);
+                }
+                state.detail.hash(&mut hasher);
+                state
+                    .elapsed(now)
+                    .map(|elapsed| elapsed.as_secs())
+                    .hash(&mut hasher);
+                state.exit.hash(&mut hasher);
+                state.check_output.hash(&mut hasher);
+                state.restarts.hash(&mut hasher);
+                state.health_failures.hash(&mut hasher);
+                state.is_blocked().hash(&mut hasher);
+                state.command_live().hash(&mut hasher);
+                match &state.artifacts {
+                    None => 0u8.hash(&mut hasher),
+                    Some(Err(error)) => (1u8, error).hash(&mut hasher),
+                    Some(Ok(artifacts)) => {
+                        (2u8, artifacts.len()).hash(&mut hasher);
+                        for artifact in artifacts {
+                            (&artifact.resolved, artifact.exists).hash(&mut hasher);
+                        }
+                    }
+                }
+                active.run.awaits_user(index).hash(&mut hasher);
+                active.run.is_held(index).hash(&mut hasher);
+                runtime.output_generation.hash(&mut hasher);
+                runtime
+                    .command
+                    .as_ref()
+                    .map(|view| view.entity_id())
+                    .hash(&mut hasher);
+                runtime.location.is_some().hash(&mut hasher);
+                runtime.project.is_some().hash(&mut hasher);
+                runtime.opening.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
     }
 
     fn perform(&mut self, index: usize, effect: Effect, cx: &mut Context<Self>) {

@@ -3685,6 +3685,7 @@ dependencies = [
  "ignore",
  "instance",
  "language",
+ "libc",
  "lsp",
  "next_code_agent",
  "notebook",

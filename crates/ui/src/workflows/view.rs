@@ -28,7 +28,7 @@
 //! `.bak`, and the tab shows the new file ([`WorkflowViewEvent`]).
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashSet,
     path::PathBuf,
     rc::Rc,
@@ -192,6 +192,10 @@ pub struct WorkflowView {
     /// (another step's starts at its end).
     output_scroll: ScrollHandle,
     output_for: Option<String>,
+    /// The selected step's output lines joined, as last built (a run
+    /// notifies four times a second while it goes; the join is redone
+    /// only when more output came).
+    output_text: RefCell<Option<OutputText>>,
     notice: Option<SharedString>,
     /// The inputs form, while Run All waits for it.
     form: Option<(Entity<InputForm>, Subscription)>,
@@ -199,6 +203,15 @@ pub struct WorkflowView {
     refocus: bool,
     _reparse: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A step's last output lines joined with `\n`, for the run, step and
+/// output generation ([`ActiveRun::output_generation`]) they came from.
+struct OutputText {
+    run: u64,
+    step: usize,
+    generation: u64,
+    text: SharedString,
 }
 
 /// `12s`, `3m 05s`, `1h 02m`.
@@ -609,6 +622,7 @@ impl WorkflowView {
             host_terminal: None,
             output_scroll: ScrollHandle::new(),
             output_for: None,
+            output_text: RefCell::new(None),
             notice: None,
             form: None,
             refocus: false,
@@ -861,11 +875,31 @@ impl WorkflowView {
         }
         self.notice = None;
         let editor = self.editor.clone();
-        if editor.read(cx).buffer().is_dirty() && !editor.update(cx, |editor, cx| editor.save(cx)) {
-            self.notice = Some("Could not save the file (see the editor's status bar).".into());
-            return cx.notify();
+        if editor.read(cx).buffer().is_dirty() {
+            // Runs once the write is done.
+            let save = editor.update(cx, |editor, cx| editor.save(cx));
+            cx.spawn(async move |this, cx| {
+                let saved = save.await;
+                this.update(cx, |this, cx| {
+                    if saved {
+                        this.run_saved(cx);
+                    } else {
+                        this.notice =
+                            Some("Could not save the file (see the editor's status bar).".into());
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
         }
-        let text = editor.read(cx).text();
+        self.run_saved(cx);
+    }
+
+    /// Runs the file as saved (the rest of `run_all`).
+    fn run_saved(&mut self, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text();
         match parse_file(&self.path, &text) {
             Ok(parsed) if parsed.inputs.is_empty() => {
                 let id = self.id.clone();
@@ -1958,13 +1992,30 @@ impl WorkflowView {
             (_, Some((_, state)), _) => state.detail.clone(),
             (_, None, _) => "Not started: Run All runs the workflow.".into(),
         };
-        let lines: Vec<String> = state
-            .map(|(_, state)| {
-                state
-                    .last_lines(OUTPUT_LINES)
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect()
+        let output: SharedString = active
+            .zip(state)
+            .map(|(active, (at, state))| {
+                let generation = active.output_generation(at);
+                let mut built = self.output_text.borrow_mut();
+                match built.as_ref() {
+                    Some(text)
+                        if text.run == active.id
+                            && text.step == at
+                            && text.generation == generation =>
+                    {
+                        text.text.clone()
+                    }
+                    _ => {
+                        let text: SharedString = state.last_lines(OUTPUT_LINES).join("\n").into();
+                        *built = Some(OutputText {
+                            run: active.id,
+                            step: at,
+                            generation,
+                            text: text.clone(),
+                        });
+                        text
+                    }
+                }
             })
             .unwrap_or_default();
         let artifacts = self.render_artifacts(step, state, cx);
@@ -2050,7 +2101,7 @@ impl WorkflowView {
         let shows_terminal = terminal.is_some();
         // The output scrolls in what the pane leaves under the details;
         // the terminal, when shown, replaces it (it shows the same).
-        let shows_output = !shows_terminal && !lines.is_empty();
+        let shows_output = !shows_terminal && !output.is_empty();
         let resizable = shows_terminal || shows_output;
         Some((
             div()
@@ -2139,7 +2190,7 @@ impl WorkflowView {
                             .whitespace_nowrap()
                             .overflow_y_scroll()
                             .track_scroll(&self.output_scroll)
-                            .child(selectable("step-output-text", lines.join("\n")))
+                            .child(selectable("step-output-text", output))
                             .pin("output"),
                     )
                 })

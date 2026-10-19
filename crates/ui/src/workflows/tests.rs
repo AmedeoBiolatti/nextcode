@@ -407,7 +407,10 @@ fn a_workflow_tab_shows_the_file_and_a_graph_that_follows_edits(cx: &mut TestApp
     // Run All saves the edits first, then runs what was saved.
     assert!(view.read_with(cx, |view, cx| view.is_dirty(cx)));
     view.update(cx, |view, cx| view.run_all(cx));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), fixed);
+    // Saving is asynchronous: the run starts once the file is written.
+    wait_until(cx, "the save", |_| {
+        std::fs::read_to_string(&path).is_ok_and(|text| text == fixed)
+    });
     assert!(!view.read_with(cx, |view, cx| view.is_dirty(cx)));
     wait_until(cx, "every check", |cx| {
         view.read_with(cx, |view, cx| view.outcome(cx)) == Outcome::Ready
@@ -879,4 +882,160 @@ fn the_tab_s_editor_gets_problems_and_completions_from_the_workflow_server(
         .unwrap();
     cx.run_until_parked();
     cleanup(root);
+}
+
+#[gpui::test]
+fn workflows_are_listed_from_extra_folders_and_opened_files(cx: &mut TestAppContext) {
+    let root = root("folders");
+    let team = root.join("team");
+    let elsewhere = root.join("elsewhere");
+    for dir in [&team, &elsewhere] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(root.join("user").join("mine.yaml"), "name: Mine\nsteps: {}\n").unwrap();
+    std::fs::write(team.join("deploy.yaml"), "name: Team deploy\nsteps: {a: {check: exit 0}}\n").unwrap();
+    std::fs::write(team.join("notes.txt"), "not a workflow").unwrap();
+    let single = elsewhere.join("one.yml");
+    std::fs::write(&single, "name: One off\nsteps: {}\n").unwrap();
+    cx.update(|cx| crate::shell::open_window(Location::Local(root.join("alpha")), None, cx));
+    cx.run_until_parked();
+    let window = cx.windows()[0].downcast::<Shell>().unwrap();
+    let workflows = window
+        .update(cx, |_, window, cx| for_window(window, cx))
+        .unwrap();
+    workflows.update(cx, |workflows, _| {
+        workflows.user_dir = Some(root.join("user"));
+        // The user folder listed again as an extra one: once only.
+        workflows.set_folders(vec![team.clone(), root.join("user")]);
+    });
+    workflows
+        .update(cx, |workflows, cx| workflows.refresh(cx))
+        .detach();
+    cx.run_until_parked();
+    let listed = |cx: &mut TestAppContext| {
+        workflows.read_with(cx, |workflows, _| {
+            workflows
+                .discovered()
+                .iter()
+                .map(|found| (found.name.clone(), found.source.label()))
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(
+        listed(cx),
+        [
+            ("Mine".to_owned(), "User".to_owned()),
+            ("Team deploy".to_owned(), team.display().to_string()),
+        ]
+    );
+    // A file opened from anywhere: its tab, and listed from then on.
+    let view = window
+        .update(cx, |shell, window, cx| {
+            shell.open_workflow(&Source::Folder(elsewhere.clone()), &single, window, cx)
+        })
+        .unwrap()
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |view, _| view.name()), "One off");
+    assert_eq!(
+        listed(cx)[2],
+        ("One off".to_owned(), elsewhere.display().to_string())
+    );
+    // A team workflow runs from its folder.
+    let id = workflows.read_with(cx, |workflows, _| {
+        workflows.lookup("Team deploy").unwrap().id.clone()
+    });
+    workflows
+        .update(cx, |workflows, cx| workflows.start(&id, &Default::default(), cx))
+        .unwrap();
+    wait_until(cx, "the team workflow", |cx| statuses(&workflows, cx) == ["ready"]);
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cleanup(root);
+}
+
+/// A host without projects or terminals, for steps that run nothing.
+struct NoHost;
+
+impl Host for NoHost {
+    fn project(&mut self, location: &Location, _: &mut App) -> Result<Option<Project>, String> {
+        Err(format!("no project {location}"))
+    }
+
+    fn projects(&mut self, _: &mut App) -> Vec<(Location, Project)> {
+        Vec::new()
+    }
+
+    fn start(
+        &mut self,
+        _: &Location,
+        _: &Project,
+        _: &str,
+        _: &str,
+        _: &[String],
+        _: OutputTap,
+        _: &mut App,
+    ) -> Result<Entity<TerminalView>, String> {
+        Err("no terminals".into())
+    }
+
+    fn show(&mut self, _: &Location, _: &Entity<TerminalView>, _: &mut App) {}
+
+    fn open_url(&mut self, _: &str, _: &mut App) {}
+
+    fn open_file(&mut self, _: Option<&Location>, _: &Path, _: &mut App) {}
+}
+
+#[gpui::test]
+fn ticks_notify_the_tab_only_when_something_it_shows_changed(cx: &mut TestAppContext) {
+    let root = root("ticks");
+    let dir = root.join("user");
+    std::fs::write(
+        dir.join("gate.yaml"),
+        "name: Gate\nsteps:\n  gate: {ready: {manual: Go on}}\n",
+    )
+    .unwrap();
+    let workflows = cx.new(|cx| Workflows::new(Box::new(NoHost), Some(dir), cx));
+    let notifies = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counted = notifies.clone();
+    let _watching =
+        cx.update(|cx| cx.observe(&workflows, move |_, _| counted.set(counted.get() + 1)));
+    workflows
+        .update(cx, |workflows, cx| workflows.refresh(cx))
+        .detach();
+    cx.run_until_parked();
+    let id = workflows.read_with(cx, |workflows, _| workflows.discovered()[0].id.clone());
+    workflows.update(cx, |workflows, cx| {
+        workflows.start(&id, &Default::default(), cx).unwrap();
+    });
+    cx.run_until_parked();
+    assert_eq!(statuses(&workflows, cx), ["running"]);
+    assert!(notifies.get() > 0, "starting notifies");
+
+    // The gate waits for the user: ticks change nothing the tab shows,
+    // except the elapsed time once a (real) second.
+    notifies.set(0);
+    let from = Instant::now();
+    for _ in 0..8 {
+        cx.executor().advance_clock(TICK);
+        cx.run_until_parked();
+    }
+    let allowed = from.elapsed().as_secs() as usize + 1;
+    assert!(
+        notifies.get() <= allowed,
+        "{} notifies for 8 idle ticks",
+        notifies.get()
+    );
+
+    // Continue changes the step: that shows.
+    notifies.set(0);
+    workflows.update(cx, |workflows, cx| {
+        assert!(workflows.continue_step(&id, 0, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(statuses(&workflows, cx), ["ready"]);
+    assert!(notifies.get() >= 1, "a state change notifies");
+    std::fs::remove_dir_all(root).ok();
 }

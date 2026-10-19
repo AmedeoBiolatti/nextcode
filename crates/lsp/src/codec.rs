@@ -2,6 +2,10 @@
 
 use std::io::{self, BufRead, Write};
 
+/// The longest body read: a broken or hostile server cannot make the
+/// editor allocate without bound from a `Content-Length` it sends.
+pub const MAX_BODY: usize = 64 * 1024 * 1024;
+
 /// Reads one message body. Returns `None` on a clean end of stream.
 pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     let mut length = None;
@@ -32,11 +36,15 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
             .ok_or_else(|| invalid(format!("malformed header {line:?}")))?;
         if name.trim().eq_ignore_ascii_case("content-length") {
             let value = value.trim();
-            length = Some(
-                value
-                    .parse()
-                    .map_err(|_| invalid(format!("bad Content-Length {value:?}")))?,
-            );
+            let parsed: usize = value
+                .parse()
+                .map_err(|_| invalid(format!("bad Content-Length {value:?}")))?;
+            if parsed > MAX_BODY {
+                return Err(invalid(format!(
+                    "Content-Length {parsed} is over the {MAX_BODY} byte limit"
+                )));
+            }
+            length = Some(parsed);
         }
     }
 }
@@ -63,6 +71,21 @@ content-length:  7\r\n\r\n[1,2,3]";
         assert_eq!(read_message(&mut reader).unwrap().unwrap(), b"{}");
         assert_eq!(read_message(&mut reader).unwrap().unwrap(), b"[1,2,3]");
         assert!(read_message(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_lengths_are_rejected_before_allocating() {
+        let huge = format!("Content-Length: {}\r\n\r\n", u64::MAX);
+        let err = read_message(&mut huge.as_bytes()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let over = format!("Content-Length: {}\r\n\r\n", MAX_BODY + 1);
+        let err = read_message(&mut over.as_bytes()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("limit"), "{err}");
+        // Right at the limit only the missing body fails.
+        let at_limit = format!("Content-Length: {MAX_BODY}\r\n\r\n");
+        let err = read_message(&mut at_limit.as_bytes()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

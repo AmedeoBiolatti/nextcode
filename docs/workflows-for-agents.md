@@ -64,6 +64,8 @@ With `inputs` (§3.5) pass values: `{"cmd": "workflow_run", "name": "Deploy",
 |---|---|
 | `<config>/next_code/workflows/*.yaml` or `*.yml` (Windows: `%APPDATA%\next_code\workflows\`; Linux: `~/.config/next_code/workflows/`) | Personal; use for stacks spanning several repos |
 | `<project>/.next_code/workflows/*.yaml` of every **open** project | Shared with the repo; found only while that project is open |
+| Each folder of `"workflows": {"folders": […]}` in `settings.json` (absolute or `~/…`; GUI: Run > Add Workflow Folder…) and of `NEXT_CODE_WORKFLOW_FOLDERS` (separated as in `PATH`) | Team or shared folders on this machine; `source` is the folder |
+| Any file: Run > Open Workflow File…, or headless `"path": "<absolute path>"` | Listed for the rest of the session |
 
 Files are re-read before every headless workflow command and before every
 Run All, so edit freely between runs.
