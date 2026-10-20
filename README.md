@@ -241,6 +241,11 @@ second login:
   Requests are answered only while the project is open; the helper then
   stays in `~/.gitconfig` but answers nothing (git prompts). Credentials
   are never logged.
+- **Azure DevOps**: when installing its helper, the agent also sets
+  `credential.https://dev.azure.com.useHttpPath=true` if that setting is unset.
+  This preserves the organisation path needed by Windows Git Credential
+  Manager. Existing Azure-specific settings and user-defined helpers are
+  left alone; no credentials are stored in the remote Git configuration.
 - **SSH**: this machine's ssh-agent (`SSH_AUTH_SOCK`; on Windows, if unset,
   the OpenSSH agent's `\\.\pipe\openssh-ssh-agent`) is forwarded as a Unix
   socket in the container (`/tmp/next_code-<uid>/host/…-ssh.sock`, or under

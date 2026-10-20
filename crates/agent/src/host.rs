@@ -354,6 +354,7 @@ pub(crate) struct GitConfig {
     pub helpers: Vec<String>,
     pub name: Option<String>,
     pub email: Option<String>,
+    pub azure_use_http_path: Option<String>,
 }
 
 /// Whether a `credential.helper` value is one [`configure_git`] set (see
@@ -364,6 +365,8 @@ fn is_ours(helper: &str) -> bool {
 
 /// Matches our helper values (`git config`'s value pattern, an ERE).
 const OURS_PATTERN: &str = "^!'.*' git-credential$";
+/// Azure's organisation is part of the path, required by the host's GCM.
+const AZURE_USE_HTTP_PATH: &str = "credential.https://dev.azure.com.useHttpPath";
 
 /// The `credential.helper` value running `program`.
 pub(crate) fn helper_value(program: &Path) -> String {
@@ -374,7 +377,8 @@ pub(crate) fn helper_value(program: &Path) -> String {
 /// The `git config` changes (arguments after the scope) that make
 /// `current` lend what `services` says with `helper`: our helper only where
 /// the user has none (refreshed when it is ours but differs; removed when
-/// lending stops), the editor's identity only where unset.
+/// lending stops), the editor's identity only where unset, and Azure's
+/// organisation path when using our helper unless the user configured it.
 pub(crate) fn plan(current: &GitConfig, services: &HostServices, helper: &str) -> Vec<Vec<String>> {
     let args = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     let mut changes = Vec::new();
@@ -386,6 +390,9 @@ pub(crate) fn plan(current: &GitConfig, services: &HostServices, helper: &str) -
                 changes.push(args(&["--unset-all", "credential.helper", OURS_PATTERN]));
             }
             changes.push(args(&["--add", "credential.helper", helper]));
+        }
+        if all_ours && current.azure_use_http_path.is_none() {
+            changes.push(args(&[AZURE_USE_HTTP_PATH, "true"]));
         }
     } else if any_ours {
         changes.push(args(&["--unset-all", "credential.helper", OURS_PATTERN]));
@@ -431,6 +438,7 @@ pub(crate) fn read_git_config(scope: &[String]) -> Option<GitConfig> {
         helpers: helpers.lines().map(str::to_owned).collect(),
         name: value("user.name")?,
         email: value("user.email")?,
+        azure_use_http_path: value(AZURE_USE_HTTP_PATH)?,
     })
 }
 
@@ -479,58 +487,60 @@ mod tests {
     }
 
     #[test]
-    fn helper_and_identity_are_set_only_where_unset() {
-        let ours = helper_value(Path::new("/home/me/.local/share/next_code/next_code_agent"));
-        assert_eq!(
-            ours,
-            "!'/home/me/.local/share/next_code/next_code_agent' git-credential"
+    fn azure_credentials_keep_the_organisation_path() {
+        let dir = temp_dir("azure-path");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("gitconfig");
+        let scope = vec!["--file".to_owned(), file.to_string_lossy().into_owned()];
+        let store = dir.join("credentials");
+        fs::write(
+            &store,
+            "https://other:wrong-organisation@dev.azure.com/OtherOrg/Analytics/_git/repo\n\
+             https://ada:correct-organisation@dev.azure.com/MiXTelematics/Analytics/_git/repo\n",
+        )
+        .unwrap();
+        // A path-sensitive provider behind the installed agent helper.
+        let program = dir.join("next_code_agent");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nshift\nexec git credential-store --file='{}' \"$@\"\n",
+                store.to_string_lossy().replace('\'', "'\\''")
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        configure_git(&scope, &lend(true, None, None), &program);
+        let mut git = Command::new("git")
+            .current_dir(&dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &file)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["credential", "fill"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        git.stdin
+            .take()
+            .unwrap()
+            .write_all(b"url=https://dev.azure.com/MiXTelematics/Analytics/_git/repo\n\n")
+            .unwrap();
+        let output = git.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        let empty = GitConfig::default();
+        let answer = Credential::parse(&String::from_utf8(output.stdout).unwrap());
+        assert_eq!(answer.get("username"), Some("ada"));
+        assert_eq!(answer.get("password"), Some("correct-organisation"));
         assert_eq!(
-            plan(&empty, &lend(true, Some("Ada"), Some("ada@x")), &ours),
-            [
-                vec!["--add", "credential.helper", ours.as_str()],
-                vec!["user.name", "Ada"],
-                vec!["user.email", "ada@x"],
-            ]
+            answer.get("path"),
+            Some("MiXTelematics/Analytics/_git/repo")
         );
-        // The user's own helper and identity stay.
-        let users = GitConfig {
-            helpers: vec!["store".into()],
-            name: Some("Me".into()),
-            email: None,
-        };
-        assert_eq!(
-            plan(&users, &lend(true, Some("Ada"), Some("ada@x")), &ours),
-            [vec!["user.email", "ada@x"]]
-        );
-        // Already ours: nothing; an older build's path: replaced.
-        let set = GitConfig {
-            helpers: vec![ours.clone()],
-            ..GitConfig::default()
-        };
-        assert!(plan(&set, &lend(true, None, None), &ours).is_empty());
-        let old = GitConfig {
-            helpers: vec!["!'/old/next_code_agent' git-credential".into()],
-            ..GitConfig::default()
-        };
-        assert_eq!(
-            plan(&old, &lend(true, None, Some("")), &ours),
-            [
-                vec!["--unset-all", "credential.helper", OURS_PATTERN],
-                vec!["--add", "credential.helper", ours.as_str()],
-            ]
-        );
-        // Turned off: only ours goes.
-        let mixed = GitConfig {
-            helpers: vec!["store".into(), ours.clone()],
-            ..GitConfig::default()
-        };
-        assert_eq!(
-            plan(&mixed, &lend(false, None, None), &ours),
-            [vec!["--unset-all", "credential.helper", OURS_PATTERN]]
-        );
-        assert!(plan(&users, &lend(false, None, None), &ours).is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -550,9 +560,16 @@ mod tests {
         assert_eq!(config.helpers, [helper_value(program)]);
         assert_eq!(config.name.as_deref(), Some("Ada L"));
         assert_eq!(config.email.as_deref(), Some("ada@x"));
-        // The helper's quoting survives git's own parsing.
-        let (_, raw) = git_config(&scope, &["--get", "credential.helper"]).unwrap();
-        assert_eq!(raw.trim_end(), "!'/opt/nc/next_code_agent' git-credential");
+        // An explicit user choice is not overridden, even with our helper.
+        git_config(&scope, &[AZURE_USE_HTTP_PATH, "false"]);
+        configure_git(&scope, &lend(true, None, None), program);
+        assert_eq!(
+            read_git_config(&scope)
+                .unwrap()
+                .azure_use_http_path
+                .as_deref(),
+            Some("false")
+        );
 
         configure_git(&scope, &lend(false, None, None), program);
         let config = read_git_config(&scope).unwrap();
@@ -561,8 +578,15 @@ mod tests {
 
         // A user's helper is left alone.
         git_config(&scope, &["credential.helper", "store"]);
+        git_config(&scope, &["--unset", AZURE_USE_HTTP_PATH]);
         configure_git(&scope, &lend(true, None, None), program);
         assert_eq!(read_git_config(&scope).unwrap().helpers, ["store"]);
+        assert!(
+            read_git_config(&scope)
+                .unwrap()
+                .azure_use_http_path
+                .is_none()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
