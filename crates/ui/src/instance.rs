@@ -190,6 +190,25 @@ fn stop_serving() {
     }
 }
 
+/// Quits into `launcher` (a newly installed build): saves the windows,
+/// stops answering launches so the new editor can serve them, and starts
+/// `launcher` without arguments, which reopens the saved windows. If it
+/// cannot be started, this editor keeps running.
+pub fn restart(launcher: &Path, cx: &mut App) -> Result<(), String> {
+    QUITTING.store(true, Ordering::Relaxed);
+    app_state::quit(cx);
+    stop_serving();
+    let mut command = std::process::Command::new(launcher);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::project::spawn_detached(&mut command)
+        .map_err(|err| format!("cannot start {}: {err}", launcher.display()))?;
+    cx.quit();
+    Ok(())
+}
+
 /// Carries out a launch handed over by another process. The server is
 /// not stopped here (its thread waits for this answer): once quitting,
 /// it answers `Restart` by itself until the process ends.

@@ -63,6 +63,7 @@ mod test_explorer;
 mod theme;
 mod theme_picker;
 mod trust;
+mod updates;
 mod workspace;
 mod workspace_edit;
 mod workspace_file;

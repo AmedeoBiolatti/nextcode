@@ -329,7 +329,12 @@ impl Default for MenuBar {
                 ),
                 menu(
                     "Help",
-                    vec![plain("app::ShowCommandPalette"), plain("app::About")],
+                    vec![
+                        plain("app::ShowCommandPalette"),
+                        separator(),
+                        plain("app::CheckForUpdates"),
+                        plain("app::About"),
+                    ],
                 ),
             ],
         };

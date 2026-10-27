@@ -26,6 +26,10 @@ asks about unsaved files first.
 - The command bar (`Ctrl+Shift+P` or `F1`) lists every command available
   where focus is, with its shortcut; typed words filter it (in any order),
   `Enter` runs the command where focus was.
+- **Help > Check for Updates…** compares this version with the latest
+  release. An editor installed from a release (see the README's Install
+  section) downloads and installs the new one with that release's install
+  script, then offers to restart, reopening the same windows and tabs.
 
 Like VS Code (`window.restoreWindows: all`), a launch without a project
 reopens the windows that were open when the editor closed: each with its
