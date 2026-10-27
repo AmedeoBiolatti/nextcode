@@ -216,6 +216,7 @@ impl AppState {
                 Location::Local(root) => root.is_dir(),
                 Location::DevContainer { folder, .. } => exists(folder),
                 Location::Wsl { .. }
+                | Location::Remote { .. }
                 | Location::Workspace {
                     distro: Some(_), ..
                 } => true,

@@ -79,6 +79,16 @@ fn read_state() -> anyhow::Result<State> {
     }
 }
 
+/// Whether `builtin` is on as last saved (choices apply once saved), for
+/// work away from the shared model (opening a project on a thread). An
+/// unreadable file means every built-in's default, as on launch.
+pub fn saved_builtin_enabled(builtin: &Builtin) -> bool {
+    read_state()
+        .ok()
+        .and_then(|state| state.builtin.get(builtin.id).copied())
+        .unwrap_or(builtin.default_enabled)
+}
+
 fn save_state(state: &State) -> anyhow::Result<()> {
     let dir = config_dir()?;
     std::fs::create_dir_all(&dir)?;

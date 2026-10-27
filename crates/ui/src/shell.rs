@@ -293,6 +293,7 @@ pub(crate) fn tab_title(location: &Location) -> String {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.display().to_string()),
         Location::Wsl { distro, path } => format!("{} [{distro}]", linux_name(path)),
+        Location::Remote { host, path, .. } => format!("{} [{host}]", linux_name(path)),
         Location::DevContainer { folder, .. } => match folder.as_ref() {
             Location::Wsl { distro, path } => {
                 format!("{} [{distro}, Container]", linux_name(path))
@@ -1111,9 +1112,19 @@ impl Shell {
 
     /// `Ctrl+R`: recent projects, or a typed location.
     fn open_recent(&mut self, _: &OpenRecent, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_project_picker("", window, cx);
+    }
+
+    /// Open Recent with `query` typed (`ssh://` lists SSH hosts).
+    pub(crate) fn show_project_picker(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.menu = None;
         let previous = window.focused(cx);
-        let picker = cx.new(ProjectPicker::new);
+        let picker = cx.new(|cx| ProjectPicker::new(query, cx));
         let subscription = cx.subscribe_in(&picker, window, move |this, _, event, window, cx| {
             this.picker = None;
             match &previous {

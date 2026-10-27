@@ -1,4 +1,4 @@
-# Remote development: WSL and dev containers
+# Remote development: WSL, dev containers and SSH
 
 ## WSL projects
 
@@ -42,6 +42,79 @@ they create (once, with `uv`, which needs the network that first time) a
 virtualenv with ipykernel and marimo in cargo's `target/tmp/notebook-env`,
 else they use a `python3`/`python` that already imports ipykernel; without
 any, they print why and pass as skipped.
+
+## SSH and Tailscale machines
+
+The **Remote - SSH** built-in extension (on by default) opens folders on
+Linux machines you reach with OpenSSH's `ssh`, the way WSL projects open:
+files, watching, search, language servers, terminals, git, port forwarding
+and the git credential / ssh-agent lending below all go through
+`next_code_agent`, which is installed to `~/.local/share/next_code/` on the
+machine and started through a login shell over one `ssh` connection.
+
+**File > Connect to SSH Host…** opens Open Recent at `ssh://`, listing the
+hosts of `~/.ssh/config` (and the files it `Include`s; patterns left out)
+and the Linux machines of your tailnet from `tailscale status --json`
+(online first; by MagicDNS name, else by Tailscale address; marked when they
+run Tailscale SSH). Choosing one types `ssh://<host>/~/`: add a folder, or
+press Enter again to open the home folder. Locations can be typed anywhere a
+location is taken (Open Recent, the command line, workflows):
+
+```sh
+next_code ssh://box/~/src/app            # ~ is the remote home folder
+next_code ssh://me@10.0.0.5:2222/srv/app  # user, port, absolute path
+next_code ssh://box.tail1234.ts.net/~/app # a Tailscale machine
+```
+
+The host is passed to `ssh` as written, so aliases, `User`, `IdentityFile`,
+`ProxyJump`, `ProxyCommand` and the rest of `~/.ssh/config` apply. There is
+no terminal to answer prompts (`BatchMode=yes`): sign-in must work without
+typing, through a key in ssh-agent (`ssh-add`), a key without a passphrase,
+or Tailscale SSH. When Tailscale SSH's check mode asks you to confirm in a
+browser, the connecting page shows its link with an **Open** button and
+waits (up to 3 minutes). A host whose key is not yet in `known_hosts` is
+added (`StrictHostKeyChecking=accept-new`) unless your configuration sets
+`StrictHostKeyChecking` itself; a changed key is always refused. The user's
+own port forwards are not set up on the editor's connection
+(`ClearAllForwardings`). `NEXT_CODE_SSH` overrides the `ssh` program
+(Windows: `C:\Windows\System32\OpenSSH\ssh.exe` when installed, else `ssh`
+on `PATH`).
+
+The machine must be x86_64 Linux with `/bin/sh` and `base64`, like the agent
+itself. The agent that is installed is the one next to the editor
+(`NEXT_CODE_WSL_AGENT` overrides it): on Windows that is the static build of
+`scripts\build-wsl-agent.ps1`, which runs on any distribution. A Linux
+build's own agent needs the remote machine's glibc to be at least as new as
+the build machine's; build a static one for older machines:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release -p next_code_agent --target x86_64-unknown-linux-musl
+NEXT_CODE_WSL_AGENT=$PWD/target/x86_64-unknown-linux-musl/release/next_code_agent next_code
+```
+
+As with WSL and dev containers, the machine borrows this machine's git
+credentials (for the hosts of the project's remotes) and its ssh-agent (see
+[Git credentials and ssh-agent](#git-credentials-and-ssh-agent-dev-containers-and-wsl)),
+much like `ssh -A`: whoever administers the machine can use them while the
+project is open. On machines you do not trust, set
+`"devcontainer": { "forward_git_credentials": false }` (or just
+`"ssh_agent_forwarding": false`) in `settings.json`.
+
+Not yet: password, passphrase and two-factor prompts; dev containers and
+multi-root workspaces on SSH machines (an SSH project has one folder). With
+Remote - SSH off, `ssh://` locations do not open (the connecting page says
+how to turn it on); projects already open stay connected.
+
+The SSH test uses a stand-in `ssh` that runs the remote command locally, so
+it needs no server:
+
+```sh
+cargo build -p next_code_agent
+NEXT_CODE_WSL_AGENT=$PWD/target/debug/next_code_agent \
+    cargo test -p remote --test ssh -- --ignored
+cargo test -p remote --lib tailscale -- --ignored   # lists your tailnet
+```
 
 ## Dev containers
 
