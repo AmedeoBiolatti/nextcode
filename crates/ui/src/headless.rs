@@ -421,9 +421,9 @@ struct Session {
     /// Forwarded ports (WSL and container projects).
     ports: Entity<crate::ports::Ports>,
     /// Workflows (the same model as a window's).
-    workflows: Entity<crate::workflows::Workflows>,
+    workflows: Entity<crate::builtins::workflows::Workflows>,
     /// Open notebooks by path (`notebook_*`).
-    notebooks: HashMap<PathBuf, Entity<crate::notebook::NotebookDocument>>,
+    notebooks: HashMap<PathBuf, Entity<crate::builtins::notebook::NotebookDocument>>,
     _subscription: Subscription,
     _ports_subscription: Subscription,
     _workflows_subscription: Subscription,
@@ -587,9 +587,9 @@ impl Session {
         });
         let store = cx.new(|_| LspStore::new(project.clone(), settings));
         let workflows = cx.new(|cx| {
-            crate::workflows::Workflows::new(
+            crate::builtins::workflows::Workflows::new(
                 Box::new(workflows::HeadlessHost::new(project.clone())),
-                crate::workflows::user_dir(),
+                crate::builtins::workflows::user_dir(),
                 cx,
             )
         });
@@ -1387,7 +1387,7 @@ impl Session {
                 let text = project.read_text(&path)?;
                 return Ok(json!(python::test_at(&text, line)));
             }
-            let info = crate::python_panel::load(project)?;
+            let info = crate::python_env::load(project)?;
             if command == "python_info" {
                 return Ok(match info {
                     None => Value::Null,
@@ -1426,7 +1426,7 @@ impl Session {
                 "python_pin" => python::uv::pin(&version.ok_or_else(|| missing("version"))?),
                 "python_interpreters" => {
                     let output =
-                        crate::python_panel::run_uv(project, &uv, &python::uv::python_list())?;
+                        crate::python_env::run_uv(project, &uv, &python::uv::python_list())?;
                     let interpreters =
                         python::parse_python_list(&String::from_utf8_lossy(&output.stdout))?;
                     return Ok(interpreters
@@ -1447,7 +1447,7 @@ impl Session {
                     ));
                 }
             };
-            let output = crate::python_panel::run_uv(project, &uv, &args)?;
+            let output = crate::python_env::run_uv(project, &uv, &args)?;
             Ok(json!({
                 "code": output.code,
                 "stdout": String::from_utf8_lossy(&output.stdout),

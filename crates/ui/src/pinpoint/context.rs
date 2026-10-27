@@ -2,7 +2,8 @@
 //! otherwise ask them to paste it: the focused area, the active editor
 //! (cursor, selection, lines around it, diagnostics), open tabs, the
 //! terminal's last lines, Problems, the Tests panel, the debugger, the
-//! notebook cell and the workflow run. Read on request only; every list
+//! notebook cell and a file tab's (`builtins::WindowTabView::context`).
+//! Read on request only; every list
 //! and text is capped, and no file content is sent beyond the selections
 //! and `around` lines around the cursor. Documented in
 //! `docs/pinpoint-for-agents.md`; `pinpoint_cli::context_markdown`
@@ -18,7 +19,6 @@ use crate::{
     debugger::session::{Children, DebugSession},
     editor::Editor,
     layout::PanelId,
-    notebook::{RunState, view::NotebookView},
     pinpoint::file_key,
     problems::ProblemsPanel,
     project::Project,
@@ -51,7 +51,7 @@ pub const DEFAULT_AROUND: usize = 20;
 /// Characters of any one text (a long minified line is still one line).
 const MAX_CHARS: usize = 8000;
 /// Entries of any one list (diagnostics, problems, failures, tabs…).
-const MAX_ITEMS: usize = 50;
+pub(crate) const MAX_ITEMS: usize = 50;
 
 /// Request options.
 #[derive(Debug, Clone, Copy)]
@@ -126,7 +126,8 @@ pub struct TabPart {
 
 pub enum ActiveView {
     Editor(Entity<Editor>),
-    Notebook(Entity<NotebookView>),
+    /// A built-in extension's tab of a file (a notebook).
+    File(crate::builtins::BuiltinTab),
     /// A diff or comparison.
     Other,
 }
@@ -145,7 +146,7 @@ pub struct Parts {
     pub debug_session: Option<Entity<DebugSession>>,
 }
 
-/// The `context` reply for `window` (its shown project tab or workflow).
+/// The `context` reply for `window` (its shown project or file tab).
 pub fn context(request: &Value, window: &Window, cx: &App) -> Value {
     let limits = Limits::of(request);
     let mut reply = json!({
@@ -154,31 +155,8 @@ pub fn context(request: &Value, window: &Window, cx: &App) -> Value {
         "title": window.window_title(),
     });
     let shell = window.root::<Shell>().flatten();
-    if let Some(view) = shell.as_ref().and_then(|s| s.read(cx).active_workflow()) {
-        reply["focus"] = "workflow".into();
-        let (path, project, run) = view.read(cx).context_run(cx);
-        reply["project"] = project_json(project);
-        let view = view.read(cx);
-        let mut workflow = workflow_json(view.name(), path, project, run, limits);
-        workflow["dirty"] = view.is_dirty(cx).into();
-        // A file that does not parse cannot run: say why (the banner's text).
-        let problems: Vec<Value> = view
-            .context_problems()
-            .into_iter()
-            .take(MAX_ITEMS)
-            .map(|(message, place)| {
-                let mut problem = json!({ "message": cap_text(message, 3, false).0 });
-                if let Some((line, column)) = place {
-                    problem["line"] = line.into();
-                    problem["column"] = column.into();
-                }
-                problem
-            })
-            .collect();
-        if !problems.is_empty() {
-            workflow["problems"] = problems.into();
-        }
-        reply["workflow"] = workflow;
+    if let Some(tab) = shell.as_ref().and_then(|s| s.read(cx).active_window_tab()) {
+        merge(&mut reply, tab.context(limits, cx));
         return reply;
     }
     let workspace = match shell {
@@ -202,7 +180,7 @@ fn merge(into: &mut Value, from: Value) {
     }
 }
 
-fn project_json(project: &Project) -> Value {
+pub(crate) fn project_json(project: &Project) -> Value {
     let roots: Vec<Value> = project
         .roots()
         .iter()
@@ -212,7 +190,7 @@ fn project_json(project: &Project) -> Value {
 }
 
 /// An absolute path as the project's machine writes it.
-fn path_text(project: &Project, path: &std::path::Path) -> String {
+pub(crate) fn path_text(project: &Project, path: &std::path::Path) -> String {
     let text = path.to_string_lossy();
     if project.is_remote() {
         text.replace('\\', "/")
@@ -230,7 +208,7 @@ pub fn workspace_json(parts: &Parts, limits: Limits, cx: &App) -> Value {
         .focused
         .clone()
         .map(|focused| match (&parts.active, focused.as_str()) {
-            (Some(ActiveView::Notebook(_)), "editor") => "notebook".to_owned(),
+            (Some(ActiveView::File(tab)), "editor") => tab.kind().to_owned(),
             _ => focused,
         });
     reply.insert("focus".into(), focus.into());
@@ -242,8 +220,10 @@ pub fn workspace_json(parts: &Parts, limits: Limits, cx: &App) -> Value {
                 editor_json(project, editor, &editor.context_facts(), limits),
             );
         }
-        Some(ActiveView::Notebook(view)) => {
-            reply.insert("notebook".into(), notebook_json(project, view, limits, cx));
+        Some(ActiveView::File(tab)) => {
+            if let Some(Value::Object(members)) = tab.context(project, limits, cx) {
+                reply.extend(members);
+            }
         }
         _ => {}
     }
@@ -253,7 +233,7 @@ pub fn workspace_json(parts: &Parts, limits: Limits, cx: &App) -> Value {
         .take(MAX_ITEMS)
         .map(|tab| {
             json!({
-                "file": file_key(project, &tab.path),
+                "file": (tab.kind != "extension").then(|| file_key(project, &tab.path)),
                 "title": tab.title,
                 "kind": tab.kind,
                 "dirty": tab.dirty,
@@ -446,7 +426,7 @@ pub fn editor_json(
     value
 }
 
-fn note_json(note: &crate::editor::NoteFact, limits: Limits) -> Value {
+pub(crate) fn note_json(note: &crate::editor::NoteFact, limits: Limits) -> Value {
     json!({
         "id": note.id,
         "line": note.start_line,
@@ -668,145 +648,6 @@ fn debugger_json(project: &Project, session: &DebugSession, limits: Limits) -> V
         value["scope"] = scope.name.as_str().into();
         value["locals"] = locals.into();
     }
-    value
-}
-
-fn notebook_json(
-    project: &Project,
-    view: &Entity<NotebookView>,
-    limits: Limits,
-    cx: &App,
-) -> Value {
-    let view = view.read(cx);
-    let document = view.document().read(cx);
-    let path = view.path(cx);
-    let mut value = json!({
-        "file": file_key(project, &path),
-        "path": path_text(project, &path),
-        "dirty": view.is_dirty(cx),
-        "cells": document.cells().len(),
-    });
-    // Notes on any cell, like an editor's (`cell` added; no `visible`).
-    let notes: Vec<Value> = view
-        .note_facts(cx)
-        .iter()
-        .take(MAX_ITEMS)
-        .map(|(cell, note)| {
-            let mut value = note_json(note, limits);
-            value["cell"] = (*cell).into();
-            value
-        })
-        .collect();
-    if !notes.is_empty() {
-        value["notes"] = notes.into();
-    }
-    let Some(id) = view.cursor_cell() else {
-        return value;
-    };
-    let (Some(index), Some(cell)) = (document.index_of(id), document.cell(id)) else {
-        return value;
-    };
-    let (source, truncated) = cap_text(&cell.cell.source, limits.max_lines, false);
-    let run = match cell.run {
-        RunState::Idle => "idle",
-        RunState::Queued => "queued",
-        RunState::Running { .. } => "running",
-        RunState::Finished { ok: true, .. } => "ok",
-        RunState::Finished { ok: false, .. } => "failed",
-    };
-    let mut active = json!({
-        "index": index + 1,
-        "kind": match cell.cell.kind {
-            notebook::CellKind::Code => "code",
-            notebook::CellKind::Markdown => "markdown",
-            notebook::CellKind::Raw => "raw",
-        },
-        "source": source,
-        "source_truncated": truncated,
-        "execution_count": cell.cell.execution_count,
-        "run": run,
-    });
-    let outputs: Vec<Value> = cell
-        .cell
-        .outputs
-        .iter()
-        .take(10)
-        .map(|output| {
-            let kind = match output {
-                notebook::Output::Stream { name, .. } => name.as_str(),
-                notebook::Output::DisplayData { .. } => "display_data",
-                notebook::Output::ExecuteResult { .. } => "execute_result",
-                notebook::Output::Error { .. } => "error",
-            };
-            let (text, truncated) = cap_text(
-                &notebook::outputs::plain_text(output),
-                limits.max_lines,
-                true,
-            );
-            json!({ "type": kind, "text": text, "truncated": truncated })
-        })
-        .collect();
-    active["outputs"] = outputs.into();
-    if let Some(error) = cell.cell.outputs.iter().find_map(|output| match output {
-        notebook::Output::Error { ename, evalue, .. } => Some(format!("{ename}: {evalue}")),
-        _ => None,
-    }) {
-        active["error"] = error.into();
-    }
-    if let Some(error) = &cell.error {
-        active["marimo_error"] = error.as_str().into();
-    }
-    value["cell"] = active;
-    value
-}
-
-fn workflow_json(
-    name: String,
-    path: &std::path::Path,
-    project: &Project,
-    run: Option<&crate::workflows::ActiveRun>,
-    limits: Limits,
-) -> Value {
-    let mut value = json!({
-        "name": name,
-        "file": file_key(project, path),
-        "path": path_text(project, path),
-    });
-    let Some(active) = run else {
-        value["outcome"] = "idle".into();
-        return value;
-    };
-    let run = &active.run;
-    value["outcome"] = run.outcome().name().into();
-    let tail = (limits.max_lines / 4).max(3);
-    let steps: Vec<Value> = run
-        .nodes()
-        .iter()
-        .zip(run.steps())
-        .take(MAX_ITEMS)
-        .map(|(node, state)| {
-            let mut step = json!({
-                "id": node.path,
-                "status": state.status.name(),
-            });
-            if !state.detail.is_empty() {
-                step["detail"] = state.detail.as_str().into();
-            }
-            match &state.status {
-                workflow::run::Status::Failed(error) => {
-                    step["error"] = error.as_str().into();
-                    let lines = state.last_lines(tail);
-                    if !lines.is_empty() {
-                        step["last_lines"] = lines.join("\n").into();
-                    }
-                }
-                workflow::run::Status::Skipped(why) => step["reason"] = why.as_str().into(),
-                _ => {}
-            }
-            step
-        })
-        .collect();
-    value["steps"] = steps.into();
     value
 }
 

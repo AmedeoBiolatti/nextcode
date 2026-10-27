@@ -4,12 +4,14 @@
 //! to the file on disk; file operations happen on disk and open tabs follow
 //! renames.
 
+use std::{cell::RefCell, rc::Rc};
+
 use lsp::types::{Command, WorkspaceEdit};
 use text::Encoding;
 
 use super::*;
 use crate::{
-    lsp_store::{ApplyEditRequest, RunningServer},
+    lsp_store::{ApplyEditRequest, RunningServer, VirtualDocument},
     workspace_edit::{self, Documents, Failure, FileTargets, ReplaceReport, Report},
 };
 
@@ -33,19 +35,27 @@ impl OpenEditors<'_, '_> {
             .and_then(Tab::editor)
             .cloned()
     }
+
+    /// The virtual document at `path` (a notebook's code cells).
+    fn virtual_document(&mut self, path: &Path) -> Option<Rc<RefCell<dyn VirtualDocument>>> {
+        self.workspace
+            .lsp_store
+            .read(self.cx)
+            .virtual_document(path)
+    }
 }
 
 impl Documents for OpenEditors<'_, '_> {
     fn version(&mut self, path: &Path) -> Option<i32> {
-        if let Some(notebook) = self.workspace.lsp_store.read(self.cx).notebook(path) {
-            return Some(notebook.borrow().version());
+        if let Some(document) = self.virtual_document(path) {
+            return Some(document.borrow().version());
         }
         self.editor(path)?.read(self.cx).server_version()
     }
 
     fn text(&mut self, path: &Path) -> Option<String> {
-        if let Some(notebook) = self.workspace.lsp_store.read(self.cx).notebook(path) {
-            return Some(notebook.borrow().text());
+        if let Some(document) = self.virtual_document(path) {
+            return Some(document.borrow().text());
         }
         Some(self.editor(path)?.read(self.cx).text())
     }
@@ -57,8 +67,8 @@ impl Documents for OpenEditors<'_, '_> {
         encoding: Encoding,
     ) -> Option<Result<(), String>> {
         // A notebook's virtual document: the edits go to its cells.
-        if let Some(notebook) = self.workspace.lsp_store.read(self.cx).notebook(path) {
-            return Some(notebook.borrow().apply_edits(edits, encoding, self.cx));
+        if let Some(document) = self.virtual_document(path) {
+            return Some(document.borrow().apply_edits(edits, encoding, self.cx));
         }
         let editor = self.editor(path)?;
         Some(editor.update(self.cx, |editor, cx| {
@@ -110,6 +120,24 @@ impl Workspace {
         for (editor, path, owner) in moved {
             editor.update(cx, |editor, cx| editor.set_file_path(path.clone(), cx));
             let language = editor.read(cx).language();
+            let markdown = self
+                .all_tabs()
+                .find(|tab| tab.editor() == Some(&editor))
+                .and_then(|tab| tab.markdown.as_ref())
+                .map(|(view, _)| view.clone());
+            if language == Some(Language::Markdown)
+                && let Some(markdown) = markdown
+            {
+                markdown.update(cx, |_, cx| cx.notify());
+            } else {
+                let markdown = self.markdown_view(&editor, cx);
+                for tab in self.panes.iter_mut().flat_map(|pane| &mut pane.tabs) {
+                    if tab.editor() == Some(&editor) {
+                        tab.markdown = markdown;
+                        break;
+                    }
+                }
+            }
             if owner && let Some(language) = language {
                 let server = self
                     .lsp_store
@@ -184,7 +212,7 @@ impl Workspace {
     /// cell's): applies the edit, reports it in that editor's status bar
     /// (failures above the panes, like other errors), then runs the
     /// action's command.
-    pub(super) fn apply_editor_edit(
+    pub(crate) fn apply_editor_edit(
         &mut self,
         editor: Option<&Entity<Editor>>,
         edit: WorkspaceEdit,

@@ -9,18 +9,10 @@
 use notebook::{CellKind, Output, ansi, outputs};
 
 use super::*;
-use crate::notebook::{
+use crate::builtins::notebook::{
     document::{DocCell, KernelStatus, NotebookDocument, RunState},
     kernel::{self, KernelLaunch},
 };
-
-fn kind_name(kind: CellKind) -> &'static str {
-    match kind {
-        CellKind::Code => "code",
-        CellKind::Markdown => "markdown",
-        CellKind::Raw => "raw",
-    }
-}
 
 fn output_json(output: &Output) -> Value {
     let text = outputs::plain_text(output);
@@ -65,7 +57,7 @@ fn cell_json(index: usize, cell: &DocCell) -> Value {
     };
     json!({
         "index": index,
-        "kind": kind_name(cell.cell.kind),
+        "kind": cell.cell.kind.name(),
         "source": cell.cell.source,
         "execution_count": cell.cell.execution_count,
         "status": status,
@@ -108,6 +100,15 @@ fn kernel_json(document: &NotebookDocument) -> Value {
         kernel["message"] = message.as_str().into();
     }
     kernel
+}
+
+/// What a run request answers once nothing runs: the kernel, and the
+/// cells that ran, failed or were skipped since `mark`.
+fn run_json(document: &NotebookDocument, mark: u64) -> Value {
+    json!({
+        "kernel": kernel_json(document),
+        "cells": finished_json(document, mark),
+    })
 }
 
 /// The cells that finished (ran, failed or were skipped) after `mark`.
@@ -180,12 +181,7 @@ impl Session {
                 cx.spawn(async move |_, cx| {
                     idle.await.ok();
                     let result = document
-                        .read_with(cx, |document, _| {
-                            json!({
-                                "kernel": kernel_json(document),
-                                "cells": finished_json(document, mark),
-                            })
-                        })
+                        .read_with(cx, |document, _| run_json(document, mark))
                         .map_err(|err| err.to_string());
                     out.reply(&id, result);
                 })
@@ -219,12 +215,9 @@ impl Session {
             }
             "notebook_insert" => {
                 let result = document.update(cx, |document, cx| {
-                    let kind = match request["kind"].as_str().unwrap_or("code") {
-                        "code" => CellKind::Code,
-                        "markdown" => CellKind::Markdown,
-                        "raw" => CellKind::Raw,
-                        other => return Err(format!("unknown cell kind `{other}`")),
-                    };
+                    let kind = request["kind"].as_str().unwrap_or("code");
+                    let kind = CellKind::from_name(kind)
+                        .ok_or_else(|| format!("unknown cell kind `{kind}`"))?;
                     let index = request["index"]
                         .as_u64()
                         .map_or(document.cells().len(), |index| index as usize);
@@ -276,12 +269,7 @@ impl Session {
                         idle.await.ok();
                     }
                     let result = document
-                        .read_with(cx, |document, _| {
-                            json!({
-                                "kernel": kernel_json(document),
-                                "cells": finished_json(document, mark),
-                            })
-                        })
+                        .read_with(cx, |document, _| run_json(document, mark))
                         .map_err(|err| err.to_string());
                     out.reply(&id, result);
                 })

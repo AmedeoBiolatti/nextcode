@@ -37,7 +37,8 @@ pub struct AppState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedWindow {
-    /// Project tabs as `recent.json` stores locations, and workflow tabs.
+    /// Project tabs as `recent.json` stores locations, and built-in
+    /// extensions' file tabs.
     pub tabs: Vec<TabTarget>,
     #[serde(default)]
     pub active: usize,
@@ -45,26 +46,71 @@ pub struct SavedWindow {
     pub bounds: Option<SavedBounds>,
 }
 
-/// What a window tab shows: a project, or a workflow file (`project`: the
-/// project whose `.next_code/workflows` holds it; `None` for the user's
-/// workflows folder). Files from before workflow tabs list bare
-/// locations, which still read as project tabs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+/// What a window tab shows: a project, or a file in a built-in
+/// extension's tab of kind `kind` (`builtins::WindowTabKind`; `project`:
+/// the project holding it, `None` on this machine). A project is saved as
+/// its location; a file as `{"<kind>": file, "project": …}`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum TabTarget {
-    Workflow {
-        workflow: PathBuf,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+    Project(Location),
+    File {
+        kind: String,
+        path: PathBuf,
         project: Option<Location>,
     },
-    Project(Location),
 }
 
 impl TabTarget {
     pub fn project(&self) -> Option<&Location> {
         match self {
             Self::Project(location) => Some(location),
-            Self::Workflow { .. } => None,
+            Self::File { .. } => None,
+        }
+    }
+}
+
+impl Serialize for TabTarget {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            Self::Project(location) => location.serialize(serializer),
+            Self::File {
+                kind,
+                path,
+                project,
+            } => {
+                let mut map = serializer.serialize_map(None)?;
+                map.serialize_entry(kind, path)?;
+                if let Some(project) = project {
+                    map.serialize_entry("project", project)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TabTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Ok(location) = Location::deserialize(&value) {
+            return Ok(Self::Project(location));
+        }
+        let unknown = || D::Error::custom("neither a project nor a file tab");
+        let fields = value.as_object_mut().ok_or_else(unknown)?;
+        let project = match fields.remove("project") {
+            Some(project) => Option::<Location>::deserialize(project).map_err(D::Error::custom)?,
+            None => None,
+        };
+        let mut fields = fields.iter();
+        match (fields.next(), fields.next()) {
+            (Some((kind, serde_json::Value::String(path))), None) => Ok(Self::File {
+                kind: kind.clone(),
+                path: path.into(),
+                project,
+            }),
+            _ => Err(unknown()),
         }
     }
 }
@@ -162,8 +208,7 @@ impl SavedBounds {
 }
 
 impl AppState {
-    /// Without project folders and local workflow files that no longer
-    /// exist, and without windows left with no tabs by that; `active` and
+    /// Without project folders and local files that no longer exist, and without windows left with no tabs by that; `active` and
     /// `focused` in range.
     fn existing(self) -> Self {
         fn exists(location: &Location) -> bool {
@@ -192,8 +237,8 @@ impl AppState {
         fn tab_exists(tab: &TabTarget) -> bool {
             match tab {
                 TabTarget::Project(location) => exists(location),
-                TabTarget::Workflow { workflow, project } => match project {
-                    None | Some(Location::Local(_)) => workflow.is_file(),
+                TabTarget::File { path, project, .. } => match project {
+                    None | Some(Location::Local(_)) => path.is_file(),
                     Some(location) => exists(location),
                 },
             }
@@ -441,12 +486,14 @@ mod tests {
                             folder: Box::new(Location::Local(PathBuf::from("/src/c"))),
                             config: None,
                         }),
-                        TabTarget::Workflow {
-                            workflow: PathBuf::from("/cfg/workflows/dev.yaml"),
+                        TabTarget::File {
+                            kind: "workflow".into(),
+                            path: PathBuf::from("/cfg/workflows/dev.yaml"),
                             project: None,
                         },
-                        TabTarget::Workflow {
-                            workflow: PathBuf::from("/home/me/b/.next_code/workflows/w.json"),
+                        TabTarget::File {
+                            kind: "workflow".into(),
+                            path: PathBuf::from("/home/me/b/.next_code/workflows/w.json"),
                             project: Some(Location::Wsl {
                                 distro: "Ubuntu".into(),
                                 path: "/home/me/b".into(),
@@ -484,13 +531,30 @@ mod tests {
             json.contains(r#""workflow": "/cfg/workflows/dev.yaml""#),
             "{json}"
         );
+        // As files from before built-in extensions saved workflow tabs.
+        let saved: TabTarget = serde_json::from_str(
+            r#"{ "project": { "Wsl": { "distro": "Ubuntu", "path": "/p" } }, "workflow": "/p/w.yaml" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            saved,
+            TabTarget::File {
+                kind: "workflow".into(),
+                path: PathBuf::from("/p/w.yaml"),
+                project: Some(Location::Wsl {
+                    distro: "Ubuntu".into(),
+                    path: "/p".into(),
+                }),
+            }
+        );
+        assert!(serde_json::from_str::<TabTarget>(r#"{ "a": "/x", "b": "/y" }"#).is_err());
         assert_eq!(minimal.focused, 0);
         assert_eq!(minimal.windows[0].active, 0);
         assert_eq!(minimal.windows[0].bounds, None);
     }
 
     #[test]
-    fn folders_and_workflow_files_that_are_gone_are_not_reopened() {
+    fn folders_and_files_that_are_gone_are_not_reopened() {
         let root = std::env::temp_dir().join(format!("nc-app-state-{}", std::process::id()));
         std::fs::create_dir_all(root.join("kept")).unwrap();
         std::fs::write(root.join("dev.yaml"), "{}").unwrap();
@@ -501,8 +565,9 @@ mod tests {
             path: "/p".into(),
         };
         let project = |location: &Location| TabTarget::Project(location.clone());
-        let workflow = |name: &str, project: Option<Location>| TabTarget::Workflow {
-            workflow: root.join(name),
+        let workflow = |name: &str, project: Option<Location>| TabTarget::File {
+            kind: "workflow".into(),
+            path: root.join(name),
             project,
         };
         let window = |tabs: Vec<TabTarget>, active| SavedWindow {
@@ -510,8 +575,9 @@ mod tests {
             active,
             bounds: None,
         };
-        let remote_workflow = TabTarget::Workflow {
-            workflow: PathBuf::from("/p/.next_code/workflows/w.json"),
+        let remote_workflow = TabTarget::File {
+            kind: "workflow".into(),
+            path: PathBuf::from("/p/.next_code/workflows/w.json"),
             project: Some(wsl.clone()),
         };
         let state = AppState {

@@ -1,7 +1,7 @@
 # Workflows
 
-A workflow is one YAML file that starts a multi-project development
-environment: preconditions, commands in the terminals of several projects
+A workflow (a [built-in extension](built-in-extensions.md), on by default)
+is one YAML file that starts a multi-project development environment: preconditions, commands in the terminals of several projects
 (opened as needed, dev containers included), ordering with readiness
 conditions, browser links and manual gates. Files are found in
 `<config>/next_code/workflows/*.yaml` (or `.yml`; next to `settings.json`;

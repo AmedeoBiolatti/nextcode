@@ -328,7 +328,11 @@ impl Workspace {
     }
 
     fn refresh_all_breakpoint_gutters(&mut self, cx: &mut Context<Self>) {
-        let mut paths: Vec<PathBuf> = self.all_tabs().map(|tab| tab.path.clone()).collect();
+        let mut paths: Vec<PathBuf> = self
+            .all_tabs()
+            .filter_map(Tab::file_path)
+            .map(Path::to_path_buf)
+            .collect();
         paths.sort();
         paths.dedup();
         for path in paths {

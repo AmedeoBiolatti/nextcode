@@ -8,6 +8,7 @@
 ## Editor
 
 - [Window, menus and commands](window-and-commands.md)
+- [Settings](settings.md)
 - [Editing](editing.md)
 - [Vim mode](vim-mode.md)
 - [Code navigation](code-navigation.md)
@@ -18,6 +19,7 @@
 - [Themes and highlighting](themes.md)
 - [Files tree](files-tree.md)
 - [Multi-root workspaces](multi-root-workspaces.md)
+- [Markdown preview](markdown-preview.md)
 
 ## Tools
 
@@ -27,6 +29,12 @@
 - [Python (uv)](python.md)
 - [Notebooks](notebooks.md)
 - [Workflows](workflows.md)
+- [Assembly inspection](assembly-inspection.md)
+
+## Extensions
+
+- [Built-in extensions](built-in-extensions.md): optional features compiled into the editor
+- [Extensions (Rust to WebAssembly)](extensions.md): writing, installing and managing extensions
 
 ## Remote development
 

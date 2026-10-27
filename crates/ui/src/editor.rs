@@ -1,6 +1,6 @@
 //! Multi-line code editor view: buffer state, keyboard/mouse handling, IME, and painting.
 
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{ops::Range, rc::Rc, sync::Arc, time::Duration};
 
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, CursorStyle,
@@ -21,7 +21,6 @@ use text::{Bias, Buffer, Change, Encoding};
 
 use crate::{
     lsp_store::RunningServer,
-    notebook::lsp::CellLink,
     pinpoint::Pin,
     project::Project,
     selectable::selectable,
@@ -37,6 +36,7 @@ mod completion;
 mod debug_gutter;
 mod display_map;
 mod editing;
+mod extensions;
 mod find;
 mod folds;
 pub(crate) mod format;
@@ -80,6 +80,7 @@ use selections::{Selection, SelectionSet, is_whole_word, is_word_char};
 pub use self::notes::{AddNote, NoteFact};
 pub use brackets::JumpToBracket;
 pub use call_hierarchy::ShowCallHierarchy;
+pub use cell_server::CellLink;
 pub use code_actions::{
     CloseCodeActions, ConfirmCodeAction, QuickFix, SelectNextCodeAction, SelectPrevCodeAction,
 };
@@ -668,7 +669,7 @@ struct LspDocument {
     version: i32,
     /// A notebook cell: its place in the notebook's virtual document
     /// (`uri`), which the notebook opens and closes.
-    cell: Option<CellLink>,
+    cell: Option<Rc<dyn CellLink>>,
 }
 
 /// A view's open server document, moved between views of one file
@@ -1604,7 +1605,7 @@ impl Editor {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        self.delete_selections_or(|editor, head| editor.backspace_range(head), cx);
+        self.delete_selections_or(|editor, head| editor.buffer.prev_grapheme(head)..head, cx);
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
@@ -1612,7 +1613,7 @@ impl Editor {
     }
 
     fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.delete_selections_or(|editor, head| editor.buffer.prev_word_start(head)..head, cx);
+        self.delete_selections_or(|editor, head| editor.delete_word_left_range(head), cx);
     }
 
     fn delete_word_right(&mut self, _: &DeleteWordRight, _: &mut Window, cx: &mut Context<Self>) {
@@ -3472,10 +3473,14 @@ impl Render for Editor {
                     .on_action(cx.listener(Self::next_tab_stop))
                     .on_action(cx.listener(Self::previous_tab_stop))
                     .on_action(cx.listener(Self::end_snippet))
-                    .on_action(cx.listener(Self::add_note))
-                    .on_action(cx.listener(Self::submit_note))
-                    .on_action(cx.listener(Self::cancel_note))
-                    .on_action(cx.listener(Self::toggle_resolved_notes))
+                    // Only while sticky notes are on (a store was given).
+                    .when(self.notes_enabled(), |editor| {
+                        editor
+                            .on_action(cx.listener(Self::add_note))
+                            .on_action(cx.listener(Self::submit_note))
+                            .on_action(cx.listener(Self::cancel_note))
+                            .on_action(cx.listener(Self::toggle_resolved_notes))
+                    })
             })
             .child(
                 div()
@@ -3522,6 +3527,8 @@ impl Render for Editor {
                 editor.child(
                     div()
                         .flex()
+                        .min_w_0()
+                        .overflow_hidden()
                         .justify_between()
                         .gap_4()
                         .px_3()

@@ -1,0 +1,19 @@
+[package]
+name = "uppercase"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extension_sdk = { path = "../../../crates/extension_sdk" }
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"
+strip = true

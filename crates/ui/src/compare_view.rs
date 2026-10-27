@@ -14,6 +14,7 @@ use crate::{
     change_tree::{self, Node},
     commit_panel::{change_color, short_revision},
     diff_view::DiffSource,
+    file_icons,
     pinpoint::Pin,
     selectable::selectable,
     theme,
@@ -219,7 +220,7 @@ pub fn render_change_node(
         .pr_2()
         .flex()
         .items_center()
-        .gap_2()
+        .gap_1p5()
         .text_sm()
         .cursor_pointer()
         .hover(|style| style.bg(theme::hover_row()))
@@ -233,8 +234,23 @@ pub fn render_change_node(
             ..
         } => row
             .pl(px(8. + 14. * *depth as f32))
-            .text_color(theme::muted())
-            .child(if *collapsed { "▸" } else { "▾" })
+            .text_color(theme::text())
+            .child(
+                file_icons::icon(
+                    if *collapsed {
+                        "chevron_right"
+                    } else {
+                        "chevron_down"
+                    },
+                    theme::muted(),
+                )
+                .size(px(12.)),
+            )
+            .child(file_icons::folder(
+                label.rsplit('/').next().unwrap_or(label),
+                !*collapsed,
+                false,
+            ))
             .child(text("label", label.clone()))
             .pin(format!("dir:{path}"))
             .label(path.clone())
@@ -247,11 +263,15 @@ pub fn render_change_node(
         } => {
             let change = &changes[*item];
             let renamed = change.orig_path.as_deref().map(|orig| format!("← {orig}"));
-            row.pl(px(22. + 14. * *depth as f32))
+            row.pl(px(26. + 14. * *depth as f32))
+                .child(file_icons::file(name))
                 .child(
                     div()
                         .flex_none()
-                        .text_color(theme::text())
+                        .text_color(change_color(change.change))
+                        .when(change.change == git::Change::Deleted, |name| {
+                            name.line_through()
+                        })
                         .child(text("name", name.clone())),
                 )
                 .child(
@@ -267,6 +287,8 @@ pub fn render_change_node(
                     div()
                         .w(px(12.))
                         .flex_none()
+                        .text_xs()
+                        .font_family(theme::MONO_FONT)
                         .text_color(change_color(change.change))
                         .child(change.change.letter().to_string()),
                 )

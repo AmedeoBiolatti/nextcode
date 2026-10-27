@@ -121,7 +121,10 @@ second login:
 - **HTTPS**: the agent configures `next_code_agent git-credential` as the
   container user's `credential.helper` (`git config --global`, i.e.
   `~/.gitconfig` there; never the repository's config), only when that
-  user has no helper of their own. It asks the editor, which runs
+  user has no helper of their own, or only leftover VS Code container
+  bridges and empty reset entries. In those cases NextCode appends its
+  helper, preserving the existing entries (including system configuration);
+  disabling forwarding removes only NextCode's helper. It asks the editor, which runs
   `git credential fill|approve|reject` here (Windows: `git.exe`, so Git
   Credential Manager, which may show its sign-in window; a Linux/WSL editor:
   its git and helpers) with prompts off and a 3-minute limit (30 s for
@@ -133,7 +136,9 @@ second login:
 - **Azure DevOps**: when installing its helper, the agent also sets
   `credential.https://dev.azure.com.useHttpPath=true` if that setting is unset.
   This preserves the organisation path needed by Windows Git Credential
-  Manager. Existing Azure-specific settings and user-defined helpers are
+  Manager. The editor also preserves this path on its host-side credential
+  calls with a command-scoped setting, without changing the host's Git config.
+  Existing container Azure-specific settings and user-defined helpers are
   left alone; no credentials are stored in the remote Git configuration.
 - **SSH**: this machine's ssh-agent (`SSH_AUTH_SOCK`; on Windows, if unset,
   the OpenSSH agent's `\\.\pipe\openssh-ssh-agent`) is forwarded as a Unix

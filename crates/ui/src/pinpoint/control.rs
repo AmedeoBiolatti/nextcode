@@ -168,7 +168,7 @@ fn window_infos(cx: &mut App) -> Vec<WindowInfo> {
                         .map(|shell| {
                             shell
                                 .read(cx)
-                                .workflow_projects(cx)
+                                .projects(cx)
                                 .into_iter()
                                 .map(|(_, project)| project)
                                 .collect()

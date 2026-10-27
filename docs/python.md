@@ -1,6 +1,7 @@
 # Python (uv)
 
-The **Python** panel (left dock) reads `pyproject.toml` and `uv.lock`:
+The **Python** panel (left dock; a [built-in extension](built-in-extensions.md),
+on by default) reads `pyproject.toml` and `uv.lock`:
 project, interpreter (`.venv`), pinned version (`.python-version`) and the
 dependencies of each section with their locked versions. It runs uv where
 the project lives (Windows, WSL or a dev container):

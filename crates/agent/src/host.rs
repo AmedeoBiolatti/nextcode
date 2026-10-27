@@ -363,6 +363,14 @@ fn is_ours(helper: &str) -> bool {
     helper.starts_with("!'") && helper.ends_with("' git-credential")
 }
 
+// VS Code's bridge belongs to its running editor session. Preserve its
+// configuration, but allow our bridge to answer when it cannot.
+fn is_vscode_bridge(helper: &str) -> bool {
+    helper.starts_with('!')
+        && helper.contains("/tmp/vscode-remote-containers-")
+        && helper.contains(".js git-credential-helper")
+}
+
 /// Matches our helper values (`git config`'s value pattern, an ERE).
 const OURS_PATTERN: &str = "^!'.*' git-credential$";
 /// Azure's organisation is part of the path, required by the host's GCM.
@@ -376,22 +384,26 @@ pub(crate) fn helper_value(program: &Path) -> String {
 
 /// The `git config` changes (arguments after the scope) that make
 /// `current` lend what `services` says with `helper`: our helper only where
-/// the user has none (refreshed when it is ours but differs; removed when
-/// lending stops), the editor's identity only where unset, and Azure's
+/// the user has none or only VS Code bridges/reset entries (refreshed when
+/// it differs; removed when lending stops), the editor's identity only
+/// where unset, and Azure's
 /// organisation path when using our helper unless the user configured it.
 pub(crate) fn plan(current: &GitConfig, services: &HostServices, helper: &str) -> Vec<Vec<String>> {
     let args = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     let mut changes = Vec::new();
-    let all_ours = current.helpers.iter().all(|value| is_ours(value));
+    let can_lend = current
+        .helpers
+        .iter()
+        .all(|value| value.is_empty() || is_ours(value) || is_vscode_bridge(value));
     let any_ours = current.helpers.iter().any(|value| is_ours(value));
     if services.git_credentials {
-        if all_ours && current.helpers != [helper] {
+        if can_lend && current.helpers.last().map(String::as_str) != Some(helper) {
             if any_ours {
                 changes.push(args(&["--unset-all", "credential.helper", OURS_PATTERN]));
             }
             changes.push(args(&["--add", "credential.helper", helper]));
         }
-        if all_ours && current.azure_use_http_path.is_none() {
+        if can_lend && current.azure_use_http_path.is_none() {
             changes.push(args(&[AZURE_USE_HTTP_PATH, "true"]));
         }
     } else if any_ours {
@@ -487,6 +499,37 @@ mod tests {
     }
 
     #[test]
+    fn vscode_and_empty_helpers_allow_forwarding_without_losing_configuration() {
+        let bridge = "!f() { /missing/node /tmp/vscode-remote-containers-old.js git-credential-helper $*; }; f";
+        for (index, helpers) in [vec![bridge], vec![""], vec![bridge, ""]]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = temp_dir(&format!("vscode-{index}"));
+            fs::create_dir_all(&dir).unwrap();
+            let scope = vec![
+                "--file".to_owned(),
+                dir.join("config").to_string_lossy().into_owned(),
+            ];
+            for value in &helpers {
+                git_config(&scope, &["--add", "credential.helper", value]);
+            }
+            let program = Path::new("/opt/nc/next_code_agent");
+            configure_git(&scope, &lend(true, None, None), program);
+            configure_git(&scope, &lend(true, None, None), program);
+            let config = read_git_config(&scope).unwrap();
+            let mut expected: Vec<String> =
+                helpers.iter().map(|value| (*value).to_owned()).collect();
+            expected.push(helper_value(program));
+            assert_eq!(config.helpers, expected);
+            assert_eq!(config.azure_use_http_path.as_deref(), Some("true"));
+            configure_git(&scope, &lend(false, None, None), program);
+            assert_eq!(read_git_config(&scope).unwrap().helpers, helpers);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn azure_credentials_keep_the_organisation_path() {
         let dir = temp_dir("azure-path");
         fs::create_dir_all(&dir).unwrap();
@@ -510,10 +553,24 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        // A leftover bridge fails; an empty global entry resets inherited
+        // helpers. Our bridge must still be installed and supply credentials.
+        let system = dir.join("systemconfig");
+        fs::write(&system, "[credential]\nhelper = !false\n").unwrap();
+        git_config(
+            &scope,
+            &[
+                "--add",
+                "credential.helper",
+                "!f() { /missing/node /tmp/vscode-remote-containers-old.js git-credential-helper $*; }; f",
+            ],
+        );
+        git_config(&scope, &["--add", "credential.helper", ""]);
         configure_git(&scope, &lend(true, None, None), &program);
         let mut git = Command::new("git")
             .current_dir(&dir)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_NOSYSTEM")
+            .env("GIT_CONFIG_SYSTEM", &system)
             .env("GIT_CONFIG_GLOBAL", &file)
             .env("GIT_TERMINAL_PROMPT", "0")
             .args(["credential", "fill"])

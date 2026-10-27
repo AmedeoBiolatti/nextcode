@@ -75,7 +75,7 @@ impl Workspace {
 
     /// The active tab's file (diff tabs: the file they compare).
     fn active_path(&self) -> Option<&Path> {
-        self.active_tab().map(|tab| tab.path.as_path())
+        self.active_tab().and_then(Tab::file_path)
     }
 
     /// The repository git commands act on (PyCharm's): the active
@@ -142,7 +142,13 @@ impl Workspace {
             .active_path()
             .and_then(|path| commit.repo_index_for(path))
             .unwrap_or(0);
-        let popup = cx.new(|cx| BranchesPopup::new(repositories, active, window, cx));
+        let popup = cx.new(|cx| {
+            let mut popup = BranchesPopup::new(repositories, active, window, cx);
+            if let Some(position) = position {
+                popup.set_anchor_x(position.x);
+            }
+            popup
+        });
         let subscription = cx.subscribe_in(&popup, window, |this, _, event, window, cx| {
             this.branches_popup = None;
             match event {

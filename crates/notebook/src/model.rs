@@ -63,6 +63,24 @@ pub enum CellKind {
     Raw,
 }
 
+impl CellKind {
+    /// Its `cell_type` in `.ipynb` files: `code`, `markdown` or `raw`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Markdown => "markdown",
+            Self::Raw => "raw",
+        }
+    }
+
+    /// The kind called `name` (see [`CellKind::name`]).
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Code, Self::Markdown, Self::Raw]
+            .into_iter()
+            .find(|kind| kind.name() == name)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cell {
     pub kind: CellKind,
@@ -226,4 +244,14 @@ pub enum Output {
         /// Lines with ANSI escapes, as the kernel sent them.
         traceback: Vec<String>,
     },
+}
+
+impl Output {
+    /// A display's or result's data by MIME type.
+    pub fn data(&self) -> Option<&MimeBundle> {
+        match self {
+            Self::DisplayData { data, .. } | Self::ExecuteResult { data, .. } => Some(data),
+            Self::Stream { .. } | Self::Error { .. } => None,
+        }
+    }
 }

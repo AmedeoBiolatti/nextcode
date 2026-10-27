@@ -1,5 +1,5 @@
 //! A notebook cell's editor on its notebook's language-server document
-//! (`crate::notebook::lsp`): requests and answers are in the virtual
+//! (`builtins::notebook::lsp`): requests and answers are in the virtual
 //! document, where the cell starts at some line, so positions shift by
 //! that line; answers about other cells are dropped (navigation to them
 //! goes through the notebook). The notebook opens and closes the document,
@@ -11,13 +11,26 @@ use lsp::types::{
 
 use super::*;
 
+/// A notebook cell editor's place in its notebook's language-server
+/// document.
+pub trait CellLink {
+    /// The document line of the cell's first line (`None`: no longer a
+    /// code cell of it).
+    fn start(&self) -> Option<u32>;
+    /// The cell's text is now `text` (an edit in its editor): sends the
+    /// change at once, before requests about it.
+    fn sync(&self, text: &str);
+    /// The document's URI.
+    fn uri(&self) -> Option<Uri>;
+}
+
 impl Editor {
     /// Attaches this cell editor to its notebook's document on `server`
     /// (opened by the notebook; `link` locates the cell).
     pub fn attach_cell_server(
         &mut self,
         server: Arc<RunningServer>,
-        link: CellLink,
+        link: Rc<dyn CellLink>,
         cx: &mut Context<Self>,
     ) {
         if self

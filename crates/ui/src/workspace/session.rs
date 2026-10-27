@@ -3,8 +3,9 @@
 //! editor's selections and scroll. Kept in `session.json` next to the
 //! project's saved layout (`layout::project_state_dir`), written shortly
 //! after a change and when the project closes, read when it opens. Files
-//! that no longer exist are skipped; diff, history and comparison tabs are
-//! not kept. `"restore_session": false` in settings.json turns it off.
+//! that no longer exist are skipped; diff, history, comparison and extension
+//! tabs are not kept. Restoring never executes guest extension code.
+//! `"restore_session": false` in settings.json turns it off.
 //!
 //! ```json
 //! { "root": { "split": { "axis": "horizontal", "ratio": 0.5,
@@ -58,6 +59,8 @@ pub(crate) struct TabState {
     pub path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<EditorState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown_mode: Option<crate::markdown_view::Mode>,
 }
 
 impl Session {
@@ -107,8 +110,12 @@ impl Workspace {
                 for (index, tab) in pane.tabs.iter().enumerate() {
                     let editor = match &tab.content {
                         TabContent::Editor(editor) => Some(editor.read(cx).state()),
-                        TabContent::Notebook(_) => None,
-                        _ => continue,
+                        // Opens as it opened (a notebook) when restored.
+                        TabContent::Builtin(tab) if tab.is_file() => None,
+                        TabContent::Diff(_)
+                        | TabContent::Compare(_)
+                        | TabContent::Extension(_)
+                        | TabContent::Builtin(_) => continue,
                     };
                     if index <= pane.active {
                         active = tabs.len();
@@ -116,6 +123,7 @@ impl Workspace {
                     tabs.push(TabState {
                         path: tab.path.clone(),
                         editor,
+                        markdown_mode: tab.markdown.as_ref().map(|(view, _)| view.read(cx).mode()),
                     });
                 }
                 Node::Pane { tabs, active }
@@ -226,6 +234,13 @@ impl Workspace {
                     }
                     if let (Some(editor), Some(state)) = (editor, &tab.editor) {
                         editor.update(cx, |editor, cx| editor.restore_state(state, cx));
+                    }
+                    if let Some(mode) = tab.markdown_mode
+                        && let Some((view, _)) =
+                            self.active_tab().and_then(|tab| tab.markdown.as_ref())
+                    {
+                        view.clone()
+                            .update(cx, |view, cx| view.restore_mode(mode, cx));
                     }
                     if index <= *active {
                         restored_active = self.active_pane().tabs.len() - 1;

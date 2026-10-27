@@ -85,11 +85,12 @@ fn menu(label: &str, items: Vec<Item>) -> Menu {
 impl Default for MenuBar {
     fn default() -> Self {
         let separator = || plain(SEPARATOR);
-        Self {
+        let mut bar = Self {
             menus: vec![
                 menu(
                     "File",
                     vec![
+                        plain("app::NewProject"),
                         plain("file_tree::NewFile"),
                         separator(),
                         plain("app::OpenProject"),
@@ -113,9 +114,11 @@ impl Default for MenuBar {
                         plain("app::CloseProject"),
                         separator(),
                         plain("app::OpenSettings"),
+                        plain("app::OpenSettingsJson"),
                         plain("app::CustomizeMenus"),
                         plain("app::SelectTheme"),
                         plain("app::CustomizeTheme"),
+                        plain("extensions::ManageExtensions"),
                         separator(),
                         plain("app::Quit"),
                     ],
@@ -130,7 +133,6 @@ impl Default for MenuBar {
                         plain("editor::Copy"),
                         plain("editor::Paste"),
                         plain("editor::CopyReference"),
-                        plain("notes::AddNote"),
                         separator(),
                         plain("editor::Find"),
                         plain("editor::FindReplace"),
@@ -173,9 +175,7 @@ impl Default for MenuBar {
                         labeled("workspace::ToggleSearch", "Search Panel"),
                         labeled("workspace::ToggleCommit", "Commit"),
                         labeled("workspace::ToggleGitLog", "Git"),
-                        plain("workspace::TogglePython"),
                         plain("workspace::ToggleProblems"),
-                        labeled("workspace::ToggleNotes", "Notes"),
                         labeled("workspace::TogglePorts", "Ports"),
                         labeled("workspace::ToggleTests", "Tests"),
                         labeled("workspace::ToggleCallHierarchy", "Call Hierarchy"),
@@ -192,6 +192,14 @@ impl Default for MenuBar {
                         plain("workspace::MoveTabToPreviousPane"),
                         plain("workspace::ClosePane"),
                         separator(),
+                        Item::Submenu {
+                            label: "Markdown".into(),
+                            items: vec![
+                                plain("markdown::ShowSource"),
+                                plain("markdown::ShowPreview"),
+                                plain("markdown::ShowSplit"),
+                            ],
+                        },
                         labeled("editor::ToggleWordWrap", "Word Wrap"),
                         labeled("editor::ToggleInlayHints", "Inlay Hints"),
                         labeled("editor::ToggleVimMode", "Vim Mode"),
@@ -261,24 +269,7 @@ impl Default for MenuBar {
                         separator(),
                         plain("run::RunAllTests"),
                         plain("run::RunFailedTests"),
-                        plain("python::RunTestFile"),
-                        plain("python::RunTestAtCursor"),
                         labeled("workspace::ToggleTests", "Show Tests"),
-                        separator(),
-                        plain("python::RunFile"),
-                        separator(),
-                        plain("notebook::RunCell"),
-                        plain("notebook::RunAll"),
-                        plain("notebook::Interrupt"),
-                        plain("notebook::Restart"),
-                        separator(),
-                        plain("python::Sync"),
-                        plain("python::Lock"),
-                        separator(),
-                        plain("workflows::OpenWorkflow"),
-                        plain("workflows::OpenWorkflowFile"),
-                        plain("workflows::AddWorkflowFolder"),
-                        plain("workflows::NewWorkflow"),
                         separator(),
                         plain("workspace::NewTerminal"),
                         plain("ports::ForwardPort"),
@@ -341,11 +332,39 @@ impl Default for MenuBar {
                     vec![plain("app::ShowCommandPalette"), plain("app::About")],
                 ),
             ],
+        };
+        for item in crate::builtins::ALL
+            .iter()
+            .flat_map(|builtin| builtin.menu_items)
+        {
+            bar.add_builtin_item(item);
         }
+        bar
     }
 }
 
 impl MenuBar {
+    /// A built-in extension's items, after the item running its `after`
+    /// command (last when there is none).
+    fn add_builtin_item(&mut self, item: &crate::builtins::MenuItem) {
+        let Some(menu) = self.menus.iter_mut().find(|menu| menu.label == item.menu) else {
+            return;
+        };
+        let at = menu
+            .items
+            .iter()
+            .position(|existing| {
+                matches!(existing, Item::Plain(command) | Item::Command { command, .. } if command == item.after)
+            })
+            .map_or(menu.items.len(), |index| index + 1);
+        let entries = item.items.iter().map(|entry| match entry {
+            crate::builtins::Entry::Command(command) => plain(command),
+            crate::builtins::Entry::Labeled(command, label) => labeled(command, label),
+            crate::builtins::Entry::Separator => plain(SEPARATOR),
+        });
+        menu.items.splice(at..at, entries);
+    }
+
     /// Command names in the menus that `known` does not contain.
     pub fn unknown_commands(&self, known: &[&str]) -> Vec<String> {
         fn walk(items: &[Item], known: &[&str], unknown: &mut Vec<String>) {

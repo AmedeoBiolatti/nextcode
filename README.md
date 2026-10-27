@@ -17,7 +17,9 @@
 
 - **Editor**: multiple cursors, split panes with session restore, Vim mode,
   themes, spell checking in comments and strings, tree-sitter highlighting
-  for 16 languages.
+  for 16 languages, Markdown preview.
+- **Settings**: a Settings page for every option, the theme included, kept
+  in sync with `settings.json`.
 - **Language servers**: completion, go to definition, find references, call
   hierarchy, parameter and inlay hints, rename, quick fixes, formatting.
 - **Git**: PyCharm-style Commit window, commit graph, side-by-side diffs,
@@ -31,6 +33,9 @@
   (debugpy, CodeLLDB, lldb-dap).
 - **Workflows**: one YAML file that starts a multi-project development
   environment.
+- **Extensions**: sandboxed WebAssembly extensions written in Rust, with
+  native panels, controls and charts; built-in features (notebooks,
+  workflows, Python, sticky notes) can be turned on and off.
 - **Built for agents**: a stable path for every part of the UI (Pinpoint),
   sticky notes between people and agents, a headless JSON mode.
 
@@ -91,10 +96,11 @@ cargo build --release --workspace --locked
 ./target/release/next_code .
 ```
 
-CI builds and tests on Linux and Windows. [Build and run](docs/building.md)
-covers the launcher, the grammar libraries, `scripts/install.ps1` and the
-`dist` profile; [Repository layout](docs/architecture.md) describes the
-crates.
+`scripts/install-linux.sh` (or `scripts\install.ps1` on Windows) installs a
+local build like a release. CI builds and tests on Linux and Windows.
+[Build and run](docs/building.md) covers the launcher, the grammar
+libraries and the `dist` profile; [Repository layout](docs/architecture.md)
+describes the crates.
 
 ## Documentation
 
@@ -114,7 +120,7 @@ workflows, and the tools for agents.
 - **M6.1** window chrome: menu bar, command palette, project tabs, customizable menus — *done*
 - **M7** AI inline completion, chat, agent
 - **M8** debugger (DAP) — *done*
-- **M9** WASM extension API
+- **M9** WASM extensions, local management, Rust SDK and native declarative UI/charts — *done*
 
 ## License
 

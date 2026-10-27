@@ -341,6 +341,16 @@ impl Editor {
         self.sync_notes(cx);
     }
 
+    /// Stops showing notes (sticky notes were turned off).
+    pub fn remove_note_store(&mut self, cx: &mut Context<Self>) {
+        if let Some(store) = self.notes.store.take() {
+            let editor = cx.entity_id();
+            store.update(cx, |store, cx| store.clear_live_positions(editor, cx));
+        }
+        self.notes = Default::default();
+        cx.notify();
+    }
+
     /// The notes of this file where they are now (unsaved edits included).
     pub fn note_facts(&self) -> Vec<NoteFact> {
         self.notes

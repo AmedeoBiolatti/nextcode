@@ -2,8 +2,9 @@
 
 Jupyter notebooks (`.ipynb`, nbformat 4) and [marimo](https://marimo.io)
 notebooks (a `.py` file with `import marimo`, `app = marimo.App(…)` and
-`@app.cell` functions) open in a notebook tab; other `.py` files open as
-text. A marimo tab has **Open as Text**; a marimo file shown as text offers
+`@app.cell` functions) open in a notebook tab (a
+[built-in extension](built-in-extensions.md), on by default); other `.py`
+files open as text. A marimo tab has **Open as Text**; a marimo file shown as text offers
 **Open as Notebook** (also in the command palette).
 
 - **Cells**: code cells are editors (highlighting, brackets, undo, Vim,
