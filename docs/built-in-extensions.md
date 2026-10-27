@@ -17,6 +17,7 @@ turns them all back to their defaults.
 | [Notebooks](notebooks.md) | on | notebook tabs for `.ipynb` and marimo files, the `notebook::*` commands, Run > Run Cell / Run All Cells / Interrupt / Restart, the *Open as Notebook* suggestion |
 | [Python](python.md) | on | the Python panel, the `python::*` commands (Sync, Lock, Run File, Run Tests…) and the *out of date* Sync suggestion |
 | [Sticky Notes](sticky-notes.md) | on | note cards and markers in editors and notebook cells, Add Note, the Notes panel and its count, the *left you a note* suggestion |
+| [Remote - SSH](remote-development.md#ssh-and-tailscale-machines) | on | `ssh://` project locations, File > Connect to SSH Host…, SSH hosts and Tailscale machines in Open Recent |
 
 With Python off, Python files still get their language server, run
 configurations, debugging, notebooks and the Tests panel's pytest tests.
@@ -45,6 +46,10 @@ text editor (`FileTabKind`, the view a `FileTabView`: dirty, saved,
 restored with the session and released like an editor's file), show
 language-server locations in documents of its own, and hook every open
 file's view (`attach`/`detach`), tab changes, file changes and suggestions
-(`OfferKind::Builtin`) with their accept hook. It reaches the window and
-the workspace through the methods in `shell/builtins.rs` and
-`workspace/builtins.rs`; nothing else names it.
+(`OfferKind::Builtin`) with their accept hook. Anywhere, it may add kinds
+of machines projects open on (`Connector`: a scheme, so
+`<scheme>://host/path` is a `Location::Remote`; a function that starts the
+agent there and returns its connection; the machines Open Recent suggests);
+the connector's functions run on threads, and opening checks the saved
+on/off choice. It reaches the window and the workspace through the methods
+in `shell/builtins.rs` and `workspace/builtins.rs`; nothing else names it.

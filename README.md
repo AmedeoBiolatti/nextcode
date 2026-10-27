@@ -24,7 +24,8 @@
   hierarchy, parameter and inlay hints, rename, quick fixes, formatting.
 - **Git**: PyCharm-style Commit window, commit graph, side-by-side diffs,
   branches, worktrees, stash and shelf, blame, hunk staging.
-- **Remote projects**: WSL distros and dev containers, with search,
+- **Remote projects**: WSL distros, dev containers and machines over SSH
+  (Tailscale machines listed for you), with search,
   language servers, terminals and debugging running where the project
   lives, port forwarding, and your git credentials inside.
 - **Python**: uv projects and environments, pytest, Jupyter and marimo
@@ -35,7 +36,7 @@
   environment.
 - **Extensions**: sandboxed WebAssembly extensions written in Rust, with
   native panels, controls and charts; built-in features (notebooks,
-  workflows, Python, sticky notes) can be turned on and off.
+  workflows, Python, sticky notes, Remote - SSH) can be turned on and off.
 - **Built for agents**: a stable path for every part of the UI (Pinpoint),
   sticky notes between people and agents, a headless JSON mode.
 

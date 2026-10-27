@@ -1,6 +1,7 @@
-//! A project tab's content while a remote project (WSL, dev container)
-//! opens: progress, then [`ConnectingEvent::Connected`], or the failure
-//! with a Retry button.
+//! A project tab's content while a remote project (WSL, dev container, a
+//! built-in extension's machine) opens: progress, then
+//! [`ConnectingEvent::Connected`], or the failure with a Retry button. A
+//! link in the progress (Tailscale SSH's sign-in page) gets a button.
 
 use std::io;
 
@@ -122,14 +123,36 @@ impl Connecting {
         match (&self.location, &self.error) {
             (Location::Wsl { distro, .. }, None) => format!("Connecting to WSL distro '{distro}'…"),
             (Location::DevContainer { .. }, None) => "Opening the dev container…".into(),
+            (Location::Remote { scheme, host, .. }, None) => {
+                match crate::builtins::connector(scheme) {
+                    Some((_, connector)) => {
+                        format!("Connecting to {}…", (connector.describe)(host))
+                    }
+                    None => format!("Connecting to {host}…"),
+                }
+            }
             (_, None) => "Opening…".into(),
             (location, Some(_)) => format!("Could not open {location}"),
         }
     }
 }
 
+/// The last web link in `log` (a sign-in page to visit).
+fn last_link(log: &[SharedString]) -> Option<SharedString> {
+    log.iter().rev().find_map(|line| {
+        let start = line.find("https://").or_else(|| line.find("http://"))?;
+        let link = line[start..].split_whitespace().next()?;
+        Some(
+            link.trim_end_matches(['.', ',', ')', '"', '\''])
+                .to_owned()
+                .into(),
+        )
+    })
+}
+
 impl Render for Connecting {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let link = last_link(&self.log);
         div()
             .size_full()
             .flex()
@@ -163,6 +186,20 @@ impl Render for Connecting {
                         .child(selectable("log", self.log.join("\n"))),
                 )
             })
+            .children(link.map(|link| {
+                div()
+                    .id("open-link")
+                    .px_4()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::border())
+                    .cursor_pointer()
+                    .child(format!("Open {link}"))
+                    .on_click(move |_, _, cx| cx.open_url(&link))
+                    .pin("open-link")
+                    .label("Open Link")
+            }))
             .children(self.error.clone().map(|error| {
                 div()
                     .max_w(px(720.))
@@ -186,5 +223,28 @@ impl Render for Connecting {
             }))
             .pin("connecting")
             .label(self.heading())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_last_link_in_the_progress_gets_a_button() {
+        let log: Vec<SharedString> = [
+            "Connecting",
+            "# Tailscale SSH requires an additional check.",
+            "# To authenticate, visit: https://login.tailscale.com/a/abc123.",
+            "Starting the agent",
+        ]
+        .into_iter()
+        .map(SharedString::from)
+        .collect();
+        assert_eq!(
+            last_link(&log).as_ref().map(SharedString::as_ref),
+            Some("https://login.tailscale.com/a/abc123")
+        );
+        assert_eq!(last_link(&log[..2]), None);
     }
 }

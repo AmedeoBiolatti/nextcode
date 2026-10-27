@@ -122,6 +122,7 @@ pub fn keys(location: &Location) -> Vec<String> {
     match location {
         Location::Local(root) => vec![local_key(&root.to_string_lossy())],
         Location::Wsl { distro, path } => vec![wsl_key(distro, path)],
+        Location::Remote { scheme, host, path } => vec![machine_key(scheme, host, path)],
         Location::DevContainer { folder, .. } => keys(folder),
         Location::Workspace {
             distro, folders, ..
@@ -149,9 +150,15 @@ fn local_key(path: &str) -> String {
 }
 
 fn wsl_key(distro: &str, path: &str) -> String {
+    machine_key("wsl", distro, path)
+}
+
+/// A POSIX folder's key on another machine: `<kind>:<machine>:<path>`
+/// (`wsl:Ubuntu:/p`, `ssh:box:/p`).
+fn machine_key(kind: &str, machine: &str, path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     let path = if trimmed.is_empty() { "/" } else { trimmed };
-    format!("wsl:{distro}:{path}")
+    format!("{kind}:{machine}:{path}")
 }
 
 /// The keys of `project`'s folders the user has not trusted.
@@ -319,5 +326,12 @@ mod tests {
             keys(&Location::Local(PathBuf::from("/home/me/proj"))),
             ["/home/me/proj"]
         );
+        // A machine a connector reaches: never the same as a WSL distro.
+        let remote = Location::Remote {
+            scheme: "ssh".into(),
+            host: "me@box:2222".into(),
+            path: "/home/me/proj/".into(),
+        };
+        assert_eq!(keys(&remote), ["ssh:me@box:2222:/home/me/proj"]);
     }
 }

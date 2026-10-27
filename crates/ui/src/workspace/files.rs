@@ -295,7 +295,7 @@ impl Workspace {
             if trash {
                 "You can restore it from the Recycle Bin."
             } else if self.project.is_remote() {
-                "This cannot be undone (no Recycle Bin\nin WSL and dev containers)."
+                "This cannot be undone (no Recycle Bin\nin WSL, dev containers and remote machines)."
             } else {
                 "This cannot be undone."
             }

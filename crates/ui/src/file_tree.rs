@@ -1741,7 +1741,7 @@ impl FileTree {
         cx.notify();
         if self.project.is_remote() {
             return self.notice(
-                "Reveal works for local projects only (this one lives in WSL or a container)"
+                "Reveal works for local projects only (this one lives in WSL, a container or another machine)"
                     .into(),
                 cx,
             );

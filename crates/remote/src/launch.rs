@@ -35,6 +35,9 @@ const LAUNCH_MARK: &str = "NEXT_CODE_LAUNCH";
 /// Text skipped while looking for the launcher's report is capped.
 const MAX_LAUNCH_NOISE: usize = 64 * 1024;
 
+/// Gets a launch command's stderr text (see [`Target::observe_stderr`]).
+pub type StderrObserver = Box<dyn FnMut(&str) + Send>;
+
 /// A project opened on a target through the agent.
 pub struct Connection {
     pub client: Arc<AgentClient>,
@@ -59,6 +62,17 @@ pub trait Target {
     /// distro); `None` falls back to the command's output.
     fn diagnose(&self) -> Option<io::Error> {
         None
+    }
+
+    /// Gets what a launch command writes to stderr, as it comes (a sign-in
+    /// link to show while it waits).
+    fn observe_stderr(&self) -> Option<StderrObserver> {
+        None
+    }
+
+    /// How long a launch may take before it is given up.
+    fn start_timeout(&self) -> Duration {
+        START_TIMEOUT
     }
 }
 
@@ -301,13 +315,18 @@ echo '{LAUNCH_MARK} missing'"#
     let mut stderr = child.stderr.take().expect("piped stderr");
     let tail = Arc::new(Mutex::new(String::new()));
     let stderr_tail = tail.clone();
+    let mut observer = target.observe_stderr();
     thread::Builder::new()
         .name("agent-stderr".into())
         .spawn(move || {
             let mut buffer = [0; 4096];
             while let Ok(n @ 1..) = stderr.read(&mut buffer) {
+                let text = String::from_utf8_lossy(&buffer[..n]);
+                if let Some(observer) = &mut observer {
+                    observer(&text);
+                }
                 let mut tail = stderr_tail.lock();
-                tail.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                tail.push_str(&text);
                 if tail.len() > STDERR_TAIL {
                     let mut cut = tail.len() - STDERR_TAIL;
                     while !tail.is_char_boundary(cut) {
@@ -326,7 +345,8 @@ echo '{LAUNCH_MARK} missing'"#
             let report = read_launch(&mut stdout);
             tx.send((stdout, report)).ok();
         })?;
-    match rx.recv_timeout(START_TIMEOUT) {
+    let timeout = target.start_timeout();
+    match rx.recv_timeout(timeout) {
         Ok((stdout, report)) => Ok(Launcher {
             child,
             stdin,
@@ -343,7 +363,7 @@ echo '{LAUNCH_MARK} missing'"#
                 format!(
                     "{} did not start within {} s",
                     target.describe(),
-                    START_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ),
             ))
         }

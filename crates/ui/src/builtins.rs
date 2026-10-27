@@ -2,15 +2,15 @@
 //! reaches the editor only through what it registers here (commands, items
 //! in the built-in menus, palette entries, window tabs, a model per window
 //! and per workspace, dock panels, editor-area tabs, tabs files open in,
-//! hooks on open files' views, file changes, language-server locations
-//! and offers) and the window's and workspace's
+//! hooks on open files' views, file changes, language-server locations,
+//! offers, and machines projects open on) and the window's and workspace's
 //! methods for them (`shell::builtins`, `workspace::builtins`), so neither
 //! the shell nor the workspace names any of them. Manage Extensions turns
 //! them on and off (`extensions::Extensions::builtin_enabled`); one that is
 //! off has no commands, menu items, panels, offers or tabs (a window tab
 //! with unsaved changes stays until closed).
 
-use std::{path::Path, rc::Rc};
+use std::{io, path::Path, rc::Rc};
 
 use gpui::{
     AnyEntity, AnyView, App, Context, Div, Entity, EntityId, FocusHandle, Focusable, Hsla, Render,
@@ -33,6 +33,7 @@ pub mod assembly;
 pub mod notebook;
 pub mod notes;
 pub mod python;
+pub mod ssh;
 pub mod workflows;
 
 /// Every built-in extension, as Manage Extensions lists them. Menu items
@@ -44,6 +45,7 @@ pub const ALL: &[&Builtin] = &[
     &notebook::BUILTIN,
     &python::BUILTIN,
     &notes::BUILTIN,
+    &ssh::BUILTIN,
 ];
 
 pub struct Builtin {
@@ -99,6 +101,10 @@ pub struct Builtin {
     /// The button of one of its offers (`OfferKind::Builtin`) was pressed;
     /// gets the offer's key.
     pub accept_offer: fn(&mut Workspace, &str, &mut Window, &mut Context<Workspace>),
+
+    // Anywhere:
+    /// Kinds of machines projects open on (`Location::Remote`).
+    pub connectors: &'static [Connector],
 }
 
 impl Builtin {
@@ -126,6 +132,7 @@ impl Builtin {
         files_changed: |_, _, _, _| {},
         navigate: |_, _, _, _| false,
         accept_offer: |_, _, _, _| {},
+        connectors: &[],
     };
 }
 
@@ -370,6 +377,54 @@ pub fn window_tab(key: &str) -> Option<(&'static Builtin, &'static WindowTabKind
         let kind = builtin.window_tabs.iter().find(|kind| kind.key == key)?;
         Some((*builtin, kind))
     })
+}
+
+/// A kind of machine projects open on through the agent: locations
+/// `<scheme>://<host>/<path>` (`Location::Remote`). Its functions run on
+/// background threads (they block) and may run while the extension is off;
+/// opening a location checks that it is on.
+pub struct Connector {
+    /// Its locations' scheme (`ssh`), also part of their projects' state
+    /// and trust keys.
+    pub scheme: &'static str,
+    /// Names a machine in titles and messages (`SSH host 'box'`).
+    pub describe: fn(&str) -> String,
+    pub connect: Connect,
+    /// Machines Open Recent suggests.
+    pub machines: fn() -> Vec<Machine>,
+}
+
+/// `Connector::connect`: starts the agent on `host` and opens `path` there
+/// (absolute, or starting with `~`), reporting steps to `progress`.
+pub type Connect =
+    fn(host: &str, path: &str, progress: &mut dyn FnMut(&str)) -> io::Result<remote::Connection>;
+
+/// A machine a connector suggests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Machine {
+    /// What its locations name it by.
+    pub host: String,
+    /// Where it comes from and its state (`Tailscale · linux · online`).
+    pub detail: String,
+}
+
+/// The connector of locations `scheme://…`, and its extension (on or off).
+pub fn connector(scheme: &str) -> Option<(&'static Builtin, &'static Connector)> {
+    ALL.iter().find_map(|builtin| {
+        let found = builtin
+            .connectors
+            .iter()
+            .find(|connector| connector.scheme == scheme)?;
+        Some((*builtin, found))
+    })
+}
+
+/// The connectors of the built-in extensions that are on.
+pub fn connectors(cx: &mut App) -> Vec<&'static Connector> {
+    on(cx)
+        .into_iter()
+        .flat_map(|builtin| builtin.connectors)
+        .collect()
 }
 
 /// A built-in extension's dock panel.
