@@ -1,0 +1,11 @@
+[package]
+name = "devcontainer"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `portsAttributes` keys matching process command lines.
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

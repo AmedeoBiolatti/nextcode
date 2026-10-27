@@ -1,0 +1,8 @@
+[package]
+name = "pinpoint_cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true

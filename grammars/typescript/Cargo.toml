@@ -1,0 +1,15 @@
+[package]
+name = "grammar_typescript"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Loaded by the editor on first use (see crates/grammar_abi).
+[lib]
+name = "nc_grammar_typescript"
+crate-type = ["cdylib"]
+
+[dependencies]
+grammar_abi.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
