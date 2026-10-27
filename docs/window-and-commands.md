@@ -2,9 +2,11 @@
 
 Top to bottom, a window has the menu bar (File, Edit, Selection, View, Go,
 Run, Git, Help) with the command bar in it, the project tabs, and the active
-project. On Windows the menu bar is also the title bar: the system one is
-hidden, empty space in the bar moves the window (double click maximizes),
-and minimize/maximize/close sit at its right. Each project tab is a whole
+project. On Windows, and on Linux when the compositor leaves decorations
+to the window (GNOME does), the menu bar is also the title bar: the
+system one is hidden, empty space in the bar moves the window (double
+click maximizes), and minimize/maximize/close sit at its right; on Linux
+the window's edges resize it. Each project tab is a whole
 workspace (docks, editor tabs, language servers, terminals); closing it
 asks about unsaved files first.
 
