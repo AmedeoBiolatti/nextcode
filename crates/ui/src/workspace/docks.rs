@@ -1,0 +1,773 @@
+//! Docks: three panel areas (left, right, bottom) whose panels can be
+//! resized, collapsed, reordered and dragged between docks.
+
+use gpui::{
+    AnyElement, AnyView, CursorStyle, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, anchored, deferred,
+};
+
+use super::*;
+use crate::{
+    layout::{DockPosition, MIN_DOCK_SIZE, PanelId},
+    lsp_store::RunningServer,
+    pinpoint::Pin,
+};
+
+/// The dock's pinpoint id.
+fn dock_pin(position: DockPosition) -> &'static str {
+    match position {
+        DockPosition::Left => "left-dock",
+        DockPosition::Right => "right-dock",
+        DockPosition::Bottom => "bottom-dock",
+    }
+}
+
+actions!(
+    workspace,
+    [
+        ToggleFiles,
+        ToggleSearch,
+        ReplaceInFiles,
+        ToggleTerminal,
+        ToggleCommit,
+        ToggleGitLog,
+        TogglePython,
+        ToggleProblems,
+        ToggleNotes,
+        TogglePorts,
+        ToggleCallHierarchy,
+        ToggleOutline,
+        ToggleBottomDock,
+        SaveLayoutAsDefault,
+        ResetLayout,
+    ]
+);
+
+pub fn bind_keys(cx: &mut App) {
+    let ctx = Some("Workspace");
+    cx.bind_keys([
+        KeyBinding::new("secondary-shift-e", ToggleFiles, ctx),
+        KeyBinding::new("alt-1", ToggleFiles, ctx),
+        KeyBinding::new("secondary-shift-f", ToggleSearch, ctx),
+        // PyCharm's Replace in Files; VS Code's Replace in Files.
+        KeyBinding::new("secondary-shift-r", ReplaceInFiles, ctx),
+        KeyBinding::new("secondary-shift-h", ReplaceInFiles, ctx),
+        // PyCharm's Commit tool window; Ctrl+Shift+G is VS Code's Source
+        // Control shortcut.
+        KeyBinding::new("alt-0", ToggleCommit, ctx),
+        KeyBinding::new("ctrl-shift-g", ToggleCommit, ctx),
+        // PyCharm's Git tool window.
+        KeyBinding::new("alt-9", ToggleGitLog, ctx),
+        KeyBinding::new("ctrl-`", ToggleTerminal, ctx),
+        KeyBinding::new("alt-f12", ToggleTerminal, ctx),
+        KeyBinding::new("secondary-shift-m", ToggleProblems, ctx),
+        // JetBrains' Structure tool window.
+        KeyBinding::new("alt-7", ToggleOutline, ctx),
+        KeyBinding::new("secondary-j", ToggleBottomDock, ctx),
+    ]);
+}
+
+const HEADER_HEIGHT: f32 = 30.;
+const STRIP_SIZE: f32 = 26.;
+const HANDLE_SIZE: f32 = 5.;
+
+/// Payload of a panel tab being dragged.
+pub(super) struct DraggedPanel(PanelId);
+
+/// What follows the mouse while a tab is dragged.
+pub(crate) struct DragPreview(pub(crate) SharedString);
+
+impl Render for DragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .text_sm()
+            .bg(theme::active_row())
+            .border_1()
+            .border_color(theme::accent())
+            .rounded_md()
+            .text_color(theme::text())
+            .child(self.0.clone())
+    }
+}
+
+/// The open right-click menu of a panel tab.
+pub(super) struct PanelMenu {
+    panel: PanelId,
+    position: Point<Pixels>,
+}
+
+impl Workspace {
+    fn panel_view(&self, panel: PanelId) -> Option<AnyView> {
+        match panel {
+            PanelId::Files => Some(self.file_tree.clone().into()),
+            PanelId::Problems => Some(self.problems.clone().into()),
+            PanelId::Notes => Some(self.notes_panel.clone().into()),
+            PanelId::Ports => Some(self.ports_panel.clone().into()),
+            PanelId::Terminal => Some(self.terminal.clone().into()),
+            PanelId::Search => Some(self.search.clone().into()),
+            PanelId::Commit => Some(self.commit.clone().into()),
+            PanelId::GitLog => Some(self.git_log.clone().into()),
+            PanelId::Python => Some(self.python.clone().into()),
+            PanelId::Outline => Some(self.outline.clone().into()),
+            PanelId::CallHierarchy => Some(self.call_hierarchy.clone().into()),
+            PanelId::Debug => Some(self.debug.panel.clone().into()),
+            PanelId::DebugConsole => Some(self.debug.console.clone().into()),
+            PanelId::Tests => Some(self.runs.tests.clone().into()),
+        }
+    }
+
+    /// A count beside a panel's title: notes waiting for the person.
+    fn panel_badge(&self, panel: PanelId, cx: &App) -> Option<impl IntoElement + use<>> {
+        let count = match panel {
+            PanelId::Notes => self.notes_badge(cx),
+            _ => 0,
+        };
+        (count > 0).then(|| {
+            div()
+                .ml_1()
+                .px_1()
+                .flex_none()
+                .rounded_md()
+                .text_xs()
+                .bg(theme::accent())
+                .text_color(theme::background())
+                .child(count.to_string())
+                .pin("badge")
+                .label(format!("{count} waiting for you"))
+        })
+    }
+
+    /// Persists the layout for this project; failures only cost the layout.
+    fn layout_changed(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = self.layout.save_for_project(&self.project.state_key()) {
+            self.notice = Some(format!("Could not save layout: {err}").into());
+        }
+        cx.notify();
+    }
+
+    pub(super) fn show_panel(&mut self, panel: PanelId, cx: &mut Context<Self>) {
+        self.layout.activate(panel);
+        if panel == PanelId::Commit {
+            self.refresh_git_status(cx);
+        }
+        self.layout_changed(cx);
+    }
+
+    pub(super) fn move_panel(
+        &mut self,
+        panel: PanelId,
+        to: DockPosition,
+        index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.panel_menu = None;
+        self.layout.move_panel(panel, to, index);
+        self.layout_changed(cx);
+    }
+
+    pub(super) fn toggle_panel(&mut self, panel: PanelId, cx: &mut Context<Self>) {
+        self.layout.toggle_panel(panel);
+        self.layout_changed(cx);
+    }
+
+    pub(super) fn toggle_files(&mut self, _: &ToggleFiles, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_panel(PanelId::Files, cx);
+    }
+
+    /// `Ctrl+Shift+F`: shows search and focuses its query (VS Code behavior:
+    /// it does not hide an already-visible search panel).
+    pub(super) fn toggle_search(
+        &mut self,
+        _: &ToggleSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(PanelId::Search, cx);
+        self.search.read(cx).focus(window, cx);
+    }
+
+    /// `Ctrl+Shift+R` / `Ctrl+Shift+H`: search with the replace field shown.
+    pub(super) fn replace_in_files(
+        &mut self,
+        _: &ReplaceInFiles,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(PanelId::Search, cx);
+        self.search
+            .update(cx, |search, cx| search.open_replace(window, cx));
+    }
+
+    /// Shows the Commit window (refreshing its status) and focuses the
+    /// commit message; hides it when it is the visible panel of a dock that
+    /// has focus inside it (PyCharm's Alt+0).
+    pub(super) fn toggle_commit(
+        &mut self,
+        _: &ToggleCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let visible = self
+            .layout
+            .position_of(PanelId::Commit)
+            .is_some_and(|position| {
+                let dock = self.layout.dock(position);
+                dock.open && dock.active == Some(PanelId::Commit)
+            });
+        if visible && self.commit.read(cx).contains_focus(window, cx) {
+            self.toggle_panel(PanelId::Commit, cx);
+            return self.focus_active(window, cx);
+        }
+        self.show_panel(PanelId::Commit, cx);
+        self.commit.update(cx, |commit, cx| {
+            commit.focus(window, cx);
+        });
+    }
+
+    /// Shows the terminal (starting a shell if none runs) and focuses it, or
+    /// hides it and returns focus to the editor.
+    pub(super) fn toggle_terminal(
+        &mut self,
+        _: &ToggleTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel(PanelId::Terminal, cx);
+        let visible = self
+            .layout
+            .position_of(PanelId::Terminal)
+            .is_some_and(|position| {
+                let dock = self.layout.dock(position);
+                dock.open && dock.active == Some(PanelId::Terminal)
+            });
+        if visible {
+            self.terminal
+                .update(cx, |terminal, cx| terminal.focus(window, cx));
+        } else {
+            self.focus_active(window, cx);
+        }
+    }
+
+    pub(super) fn toggle_problems(
+        &mut self,
+        _: &ToggleProblems,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel(PanelId::Problems, cx);
+    }
+
+    pub(super) fn toggle_ports(&mut self, _: &TogglePorts, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_panel(PanelId::Ports, cx);
+    }
+
+    /// Shows `view` in the Terminal panel (a workflow step's terminal).
+    pub(crate) fn show_terminal_view(
+        &mut self,
+        view: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .terminal
+            .update(cx, |terminal, cx| terminal.show(view, window, cx))
+        {
+            self.show_panel(PanelId::Terminal, cx);
+        }
+    }
+
+    pub(crate) fn project(&self) -> &Project {
+        &self.project
+    }
+
+    pub(crate) fn terminal_panel(&self) -> Entity<TerminalPanel> {
+        self.terminal.clone()
+    }
+
+    /// Forward a Port…: shows the Ports panel with its input focused.
+    pub(super) fn forward_port(
+        &mut self,
+        _: &crate::ports::panel::ForwardPort,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(PanelId::Ports, cx);
+        self.ports_panel
+            .update(cx, |panel, cx| panel.start_forward(window, cx));
+    }
+
+    pub(super) fn toggle_python(
+        &mut self,
+        _: &TogglePython,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel(PanelId::Python, cx);
+    }
+
+    pub(super) fn toggle_call_hierarchy(
+        &mut self,
+        _: &ToggleCallHierarchy,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel(PanelId::CallHierarchy, cx);
+    }
+
+    /// Shows the Outline (focusing it for keyboard navigation) or hides
+    /// it and returns focus to the editor.
+    pub(super) fn toggle_outline(
+        &mut self,
+        _: &ToggleOutline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel(PanelId::Outline, cx);
+        let visible = self
+            .layout
+            .position_of(PanelId::Outline)
+            .is_some_and(|position| {
+                let dock = self.layout.dock(position);
+                dock.open && dock.active == Some(PanelId::Outline)
+            });
+        if visible {
+            self.outline
+                .update(cx, |outline, cx| outline.focus(window, cx));
+        } else {
+            self.focus_active(window, cx);
+        }
+    }
+
+    /// Shows the Call Hierarchy panel rooted at `items` (Show Call
+    /// Hierarchy in an editor) and focuses it.
+    pub(super) fn show_call_hierarchy(
+        &mut self,
+        server: Arc<RunningServer>,
+        items: Vec<lsp::types::CallHierarchyItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_panel(PanelId::CallHierarchy, cx);
+        self.call_hierarchy
+            .update(cx, |panel, cx| panel.show(server, items, window, cx));
+    }
+
+    pub(super) fn toggle_bottom_dock(
+        &mut self,
+        _: &ToggleBottomDock,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.layout.toggle_dock(DockPosition::Bottom);
+        self.layout_changed(cx);
+    }
+
+    pub(super) fn save_layout_as_default(
+        &mut self,
+        _: &SaveLayoutAsDefault,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.panel_menu = None;
+        self.notice = Some(match self.layout.save_as_default() {
+            Ok(()) => "Layout saved as the default for new projects".into(),
+            Err(err) => format!("Could not save default layout: {err}").into(),
+        });
+        cx.notify();
+    }
+
+    pub(super) fn reset_layout(&mut self, _: &ResetLayout, _: &mut Window, cx: &mut Context<Self>) {
+        self.panel_menu = None;
+        self.layout = Layout::default();
+        self.layout_changed(cx);
+    }
+
+    pub(super) fn on_resize_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(split) = self.pane_resize {
+            return self.resize_split(split, event.position, cx);
+        }
+        let Some(position) = self.resizing else {
+            return;
+        };
+        let viewport = window.viewport_size();
+        let (size, limit) = match position {
+            DockPosition::Left => (event.position.x, viewport.width),
+            DockPosition::Right => (viewport.width - event.position.x, viewport.width),
+            DockPosition::Bottom => (viewport.height - event.position.y, viewport.height),
+        };
+        let max = (f32::from(limit) * 0.7).max(MIN_DOCK_SIZE);
+        self.layout.dock_mut(position).size = f32::from(size).clamp(MIN_DOCK_SIZE, max);
+        cx.notify();
+    }
+
+    pub(super) fn on_resize_end(
+        &mut self,
+        _: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.resizing.take().is_some() {
+            self.layout_changed(cx);
+        }
+        if self.pane_resize.take().is_some() {
+            self.schedule_session_save(cx);
+            cx.notify();
+        }
+    }
+
+    /// A dock: open with tabs and the active panel, collapsed to a strip of
+    /// panel buttons, or (when empty) only a drop zone while a tab is dragged.
+    pub(super) fn render_dock(
+        &self,
+        position: DockPosition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let dock = self.layout.dock(position);
+        if dock.panels.is_empty() {
+            return cx
+                .has_active_drag()
+                .then(|| self.render_strip(position, cx));
+        }
+        if !dock.open {
+            return Some(self.render_strip(position, cx));
+        }
+
+        let header = div()
+            .h(px(HEADER_HEIGHT))
+            .flex_none()
+            .flex()
+            .overflow_hidden()
+            .items_center()
+            .border_b_1()
+            .border_color(theme::border())
+            .children(dock.panels.iter().enumerate().map(|(index, &panel)| {
+                self.render_panel_tab(position, index, panel, dock.active == Some(panel), cx)
+            }))
+            // Empty header space: drop to append.
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .drag_over::<DraggedPanel>(|style, _, _, _| style.bg(theme::hover_row()))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedPanel, _, cx| {
+                        this.move_panel(dragged.0, position, None, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("collapse-{}", position.label())))
+                    .px_2()
+                    .text_color(theme::muted())
+                    .hover(|style| style.text_color(theme::text()))
+                    .cursor_pointer()
+                    .child("–")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.layout.dock_mut(position).open = false;
+                        this.layout_changed(cx);
+                    }))
+                    .pin("collapse")
+                    .label("Hide dock"),
+            )
+            .pin("dock-tabs");
+        let active = dock.active;
+        let body = div().flex_1().min_h_0().min_w_0().children(
+            match dock.active.and_then(|panel| self.panel_view(panel)) {
+                Some(view) => Some(view.into_any_element()),
+                None => Some(
+                    div()
+                        .p_3()
+                        .text_sm()
+                        .text_color(theme::muted())
+                        .child(crate::selectable::selectable(
+                            "empty",
+                            "This panel is not available yet.",
+                        ))
+                        .into_any_element(),
+                ),
+            },
+        );
+        // The panel's owner pins its content inside this wrapper.
+        let body = match active {
+            Some(panel) => body
+                .pin(format!("panel:{}", panel.key()))
+                .label(panel.title())
+                .interactive(false),
+            None => body.pin("panel").interactive(false),
+        };
+        let size = px(dock.size);
+        let content = div()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(theme::panel())
+            .drag_over::<DraggedPanel>(|style, _, _, _| {
+                style.border_1().border_color(theme::accent())
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedPanel, _, cx| {
+                this.move_panel(dragged.0, position, None, cx);
+            }))
+            .child(header)
+            .child(body);
+        let content = match position {
+            DockPosition::Left | DockPosition::Right => content.w(size).h_full(),
+            DockPosition::Bottom => content.h(size).w_full(),
+        };
+        let handle = self.render_resize_handle(position, window, cx);
+        let dock = match position {
+            DockPosition::Left => div().h_full().flex().child(content).child(handle),
+            DockPosition::Right => div().h_full().flex().child(handle).child(content),
+            DockPosition::Bottom => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(handle)
+                .child(content),
+        };
+        Some(dock.flex_none().pin(dock_pin(position)).into_any_element())
+    }
+
+    fn render_panel_tab(
+        &self,
+        position: DockPosition,
+        index: usize,
+        panel: PanelId,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        // In a narrow dock inactive tabs shrink (their titles truncate)
+        // before the active one does.
+        div()
+            .id(SharedString::from(format!("panel-tab-{}", panel.title())))
+            .h_full()
+            .px(px(6.))
+            .min_w_0()
+            .when(active, |tab| tab.flex_none())
+            .flex()
+            .items_center()
+            .text_sm()
+            .cursor_pointer()
+            .text_color(if active {
+                theme::text()
+            } else {
+                theme::muted()
+            })
+            .when(active, |tab| tab.border_b_2().border_color(theme::accent()))
+            .hover(|style| style.text_color(theme::text()))
+            .child(div().min_w_0().truncate().child(panel.title()))
+            .children(self.panel_badge(panel, cx))
+            .on_click(cx.listener(move |this, _, _, cx| this.show_panel(panel, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.panel_menu = Some(PanelMenu {
+                        panel,
+                        position: event.position,
+                    });
+                    cx.notify();
+                }),
+            )
+            .on_drag(DraggedPanel(panel), |dragged, _, _, cx| {
+                cx.new(|_| DragPreview(dragged.0.title().into()))
+            })
+            // Dropping on a tab inserts before it.
+            .drag_over::<DraggedPanel>(|style, _, _, _| {
+                style.border_l_2().border_color(theme::accent())
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedPanel, _, cx| {
+                this.move_panel(dragged.0, position, Some(index), cx);
+            }))
+            .pin(format!("tab:{}", panel.key()))
+            .label(panel.title())
+    }
+
+    /// A collapsed dock: one button per panel; also a drop target.
+    fn render_strip(&self, position: DockPosition, cx: &mut Context<Self>) -> AnyElement {
+        let dock = self.layout.dock(position);
+        let vertical = position != DockPosition::Bottom;
+        let buttons = dock.panels.iter().map(|&panel| {
+            let label = if vertical {
+                &panel.title()[..1]
+            } else {
+                panel.title()
+            };
+            div()
+                .id(SharedString::from(format!("strip-{}", panel.title())))
+                .px_1()
+                .py(px(2.))
+                .rounded_sm()
+                .text_xs()
+                .text_color(theme::muted())
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::hover_row()).text_color(theme::text()))
+                .flex()
+                .when(vertical, |button| button.flex_col())
+                .items_center()
+                .child(label)
+                .children(self.panel_badge(panel, cx))
+                .on_click(cx.listener(move |this, _, _, cx| this.show_panel(panel, cx)))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.panel_menu = Some(PanelMenu {
+                            panel,
+                            position: event.position,
+                        });
+                        cx.notify();
+                    }),
+                )
+                .pin(format!("tab:{}", panel.key()))
+                .label(panel.title())
+        });
+        let strip = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .bg(theme::panel())
+            .border_color(theme::border())
+            .drag_over::<DraggedPanel>(|style, _, _, _| style.bg(theme::active_row()))
+            .on_drop(cx.listener(move |this, dragged: &DraggedPanel, _, cx| {
+                this.move_panel(dragged.0, position, None, cx);
+            }))
+            .children(buttons);
+        match position {
+            DockPosition::Left => strip
+                .w(px(STRIP_SIZE))
+                .h_full()
+                .flex_col()
+                .pt_2()
+                .border_r_1(),
+            DockPosition::Right => strip
+                .w(px(STRIP_SIZE))
+                .h_full()
+                .flex_col()
+                .pt_2()
+                .border_l_1(),
+            DockPosition::Bottom => strip.h(px(STRIP_SIZE)).w_full().px_2().border_t_1(),
+        }
+        .pin("dock-tabs")
+        .pin(dock_pin(position))
+        .into_any_element()
+    }
+
+    fn render_resize_handle(
+        &self,
+        position: DockPosition,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let active = self.resizing == Some(position);
+        let handle = div()
+            .flex_none()
+            .bg(if active {
+                theme::accent()
+            } else {
+                theme::border()
+            })
+            .hover(|style| style.bg(theme::accent()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.resizing = Some(position);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+        match position {
+            DockPosition::Left | DockPosition::Right => handle
+                .w(px(HANDLE_SIZE))
+                .h_full()
+                .cursor(CursorStyle::ResizeLeftRight),
+            DockPosition::Bottom => handle
+                .h(px(HANDLE_SIZE))
+                .w_full()
+                .cursor(CursorStyle::ResizeUpDown),
+        }
+        .pin("resize-handle")
+        .label("Resize dock")
+    }
+
+    /// The right-click menu of a panel tab or strip button.
+    pub(super) fn render_panel_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let menu = self.panel_menu.as_ref()?;
+        let panel = menu.panel;
+        let current = self.layout.position_of(panel);
+        let item = |id: SharedString, label: SharedString| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::active_row()))
+                .child(label)
+        };
+        let moves = DockPosition::ALL
+            .into_iter()
+            .filter(|&position| Some(position) != current)
+            .map(|position| {
+                item(
+                    format!("move-{}", position.label()).into(),
+                    format!("Move to {}", position.label()).into(),
+                )
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.move_panel(panel, position, None, cx)),
+                )
+                .pin(format!("item:move-to-{}", position.label().to_lowercase()))
+                .label(format!("Move to {}", position.label()))
+            });
+        Some(deferred(
+            anchored().position(menu.position).child(
+                div()
+                    .id("panel-menu")
+                    .occlude()
+                    .min_w(px(200.))
+                    .p_1()
+                    .flex()
+                    .flex_col()
+                    .text_sm()
+                    .text_color(theme::text())
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::border())
+                    .rounded_md()
+                    .shadow_lg()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.panel_menu = None;
+                        cx.notify();
+                    }))
+                    .children(moves)
+                    .child(div().my_1().h(px(1.)).bg(theme::border()))
+                    .child(
+                        item("save-default".into(), "Save layout as default".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_layout_as_default(&SaveLayoutAsDefault, window, cx)
+                            }))
+                            .pin("item:save-layout-as-default")
+                            .label("Save layout as default"),
+                    )
+                    .child(
+                        item("reset-layout".into(), "Reset layout".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_layout(&ResetLayout, window, cx)
+                            }))
+                            .pin("item:reset-layout")
+                            .label("Reset layout"),
+                    )
+                    .pin("panel-menu")
+                    .label(format!("{} tab menu", panel.title())),
+            ),
+        ))
+    }
+}

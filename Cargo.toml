@@ -1,0 +1,178 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "grammars/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+alacritty_terminal = "0.26"
+anyhow = "1"
+dap = { path = "crates/dap" }
+dirs = "7"
+futures = "0.3"
+gpui = "=0.2.2"
+devcontainer = { path = "crates/devcontainer" }
+notebook = { path = "crates/notebook" }
+# Already in the tree (gpui): notebook image outputs.
+base64 = "0.22"
+# CommonMark for notebook Markdown cells/outputs (no default features: no CLI).
+pulldown-cmark = { version = "0.13", default-features = false }
+grep-matcher = "0.1.9"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4"
+instance = { path = "crates/instance" }
+git = { path = "crates/git" }
+grammar_abi = { path = "crates/grammar_abi" }
+language = { path = "crates/language" }
+lsp = { path = "crates/lsp" }
+libc = "0.2"
+# Already in the tree (gpui): the grammar libraries, loaded on first use.
+libloading = "0.8"
+lsp-types = "0.97"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+nucleo-matcher = "0.3"
+notify = "8"
+python = { path = "crates/python" }
+parking_lot = "0.12"
+notes = { path = "crates/notes" }
+percent-encoding = "2"
+pinpoint_cli = { path = "crates/pinpoint_cli" }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+proto = { path = "crates/proto" }
+# Already in the tree via grep-regex: find/replace in the editor.
+regex = "1"
+# YAML events with positions: workflow files (`crates/workflow/src/yaml.rs`).
+saphyr-parser = "0.2.2"
+# Tests only: workflow files checked against their JSON Schema (no HTTP/file resolving).
+jsonschema = { version = "0.59", default-features = false }
+remote = { path = "crates/remote" }
+# Already in the tree (gpui's usvg/fontconfig): pytest's JUnit XML reports.
+roxmltree = "0.20"
+# LF-only line indexing; CR before LF is handled by `text::Buffer`.
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
+run = { path = "crates/run" }
+search = { path = "crates/search" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+spell = { path = "crates/spell" }
+# Hunspell-compatible spell checking (MPL-2.0; its hashbrown/foldhash are already in the tree).
+spellbook = "0.4"
+syntax = { path = "crates/syntax" }
+text = { path = "crates/text" }
+terminal = { path = "crates/terminal" }
+tree-sitter = "0.27"
+tree-sitter-bash = "0.25.1"
+tree-sitter-c = "0.24"
+tree-sitter-containerfile = "0.9.2"
+tree-sitter-cpp = "0.23"
+tree-sitter-css = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-html = "0.23.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-md = "0.5.3"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-sequel = "0.3"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-yaml = "0.7.2"
+unicode-segmentation = "1"
+# Already in the tree (alacritty_terminal): screen columns for word wrap.
+unicode-width = "0.2"
+url = "2"
+watcher = { path = "crates/watcher" }
+workflow = { path = "crates/workflow" }
+workflow_lsp = { path = "crates/workflow_lsp" }
+worktree = { path = "crates/worktree" }
+
+# gpui 0.2.2 with startup changes (see vendor/gpui/NEXT_CODE_PATCHES.md).
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
+
+[profile.release]
+# A smaller executable starts faster: on machines whose endpoint security
+# scans every image load, each MB costs milliseconds per launch.
+panic = "abort"
+lto = "thin"
+
+# The installed build (`scripts/install.ps1 -Profile dist`): ~8 % smaller
+# again with fat LTO and one codegen unit, at four times the build time
+# (~20 min for a full build here).
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+# Cold code (loaded once, run rarely) optimized for size, ~1.1 MB less;
+# the editor's hot paths (text, layout, rendering, parsing, search) keep
+# opt-level 3.
+[profile.release.package."lsp-types"]
+opt-level = "s"
+[profile.release.package.windows]
+opt-level = "s"
+[profile.release.package."windows-core"]
+opt-level = "s"
+[profile.release.package.notebook]
+opt-level = "s"
+[profile.release.package.workflow]
+opt-level = "s"
+[profile.release.package.workflow_lsp]
+opt-level = "s"
+[profile.release.package.dap]
+opt-level = "s"
+[profile.release.package.devcontainer]
+opt-level = "s"
+[profile.release.package.python]
+opt-level = "s"
+[profile.release.package.run]
+opt-level = "s"
+[profile.release.package.git]
+opt-level = "s"
+[profile.release.package.remote]
+opt-level = "s"
+[profile.release.package.proto]
+opt-level = "s"
+[profile.release.package.usvg]
+opt-level = "s"
+[profile.release.package.resvg]
+opt-level = "s"
+[profile.release.package."tiny-skia"]
+opt-level = "s"
+[profile.release.package."tiny-skia-path"]
+opt-level = "s"
+[profile.release.package.image]
+opt-level = "s"
+[profile.release.package.png]
+opt-level = "s"
+[profile.release.package."zune-jpeg"]
+opt-level = "s"
+[profile.release.package.gif]
+opt-level = "s"
+[profile.release.package."image-webp"]
+opt-level = "s"
+[profile.release.package."regex-syntax"]
+opt-level = "s"
+[profile.release.package."saphyr-parser"]
+opt-level = "s"
+[profile.release.package."pulldown-cmark"]
+opt-level = "s"
+[profile.release.package.toml]
+opt-level = "s"
+[profile.release.package.toml_edit]
+opt-level = "s"
+[profile.release.package.toml_parser]
+opt-level = "s"
+[profile.release.package.url]
+opt-level = "s"
+[profile.release.package.notify]
+opt-level = "s"
+[profile.release.package.rand]
+opt-level = "s"
+[profile.release.package.serde_json_lenient]
+opt-level = "s"

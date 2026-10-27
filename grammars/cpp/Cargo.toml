@@ -1,0 +1,15 @@
+[package]
+name = "grammar_cpp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Loaded by the editor on first use (see crates/grammar_abi).
+[lib]
+name = "nc_grammar_cpp"
+crate-type = ["cdylib"]
+
+[dependencies]
+grammar_abi.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-cpp.workspace = true

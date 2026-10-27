@@ -1,0 +1,9 @@
+[package]
+name = "text"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ropey.workspace = true
+unicode-segmentation.workspace = true

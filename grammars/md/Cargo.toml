@@ -1,0 +1,14 @@
+[package]
+name = "grammar_md"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Loaded by the editor on first use (see crates/grammar_abi).
+[lib]
+name = "nc_grammar_md"
+crate-type = ["cdylib"]
+
+[dependencies]
+grammar_abi.workspace = true
+tree-sitter-md.workspace = true

@@ -1,0 +1,101 @@
+[package]
+name = "next_code"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The editor. Users run `next_code` (`crates/launcher`), which starts this
+# or hands its command line to the running one.
+[[bin]]
+name = "next_code_editor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+instance.workspace = true
+dap.workspace = true
+dirs.workspace = true
+futures.workspace = true
+gpui.workspace = true
+ignore.workspace = true
+language.workspace = true
+lsp.workspace = true
+# The workflow files' language server, run in-process.
+workflow_lsp.workspace = true
+nucleo-matcher.workspace = true
+parking_lot.workspace = true
+pinpoint_cli.workspace = true
+notes.workspace = true
+regex.workspace = true
+serde.workspace = true
+search.workspace = true
+serde_json.workspace = true
+# Already in the tree (git): minimal edits for formatter output.
+similar.workspace = true
+spell.workspace = true
+syntax.workspace = true
+terminal.workspace = true
+# The grammar libraries the editor loads on demand (`grammars/`): depended
+# on so they are built with it (into `deps`), never linked.
+grammar_bash = { path = "../../grammars/bash" }
+grammar_c = { path = "../../grammars/c" }
+grammar_containerfile = { path = "../../grammars/containerfile" }
+grammar_cpp = { path = "../../grammars/cpp" }
+grammar_css = { path = "../../grammars/css" }
+grammar_go = { path = "../../grammars/go" }
+grammar_html = { path = "../../grammars/html" }
+grammar_javascript = { path = "../../grammars/javascript" }
+grammar_json = { path = "../../grammars/json" }
+grammar_md = { path = "../../grammars/md" }
+grammar_python = { path = "../../grammars/python" }
+grammar_rust = { path = "../../grammars/rust" }
+grammar_sequel = { path = "../../grammars/sequel" }
+grammar_toml = { path = "../../grammars/toml" }
+grammar_typescript = { path = "../../grammars/typescript" }
+grammar_yaml = { path = "../../grammars/yaml" }
+text.workspace = true
+unicode-width.workspace = true
+watcher.workspace = true
+remote.workspace = true
+worktree.workspace = true
+git.workspace = true
+devcontainer.workspace = true
+python.workspace = true
+run.workspace = true
+workflow.workspace = true
+notebook.workspace = true
+# Already in the tree (gpui): notebook image outputs are base64.
+base64.workspace = true
+# Markdown cells and `text/markdown` outputs.
+pulldown-cmark.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+# Port forwarding tests relay through an in-process agent.
+next_code_agent = { path = "../agent" }
+
+[build-dependencies]
+# Same version gpui uses: icon and version info (`build.rs`).
+embed-resource = "3.0"
+
+[target.'cfg(windows)'.dependencies]
+# The version gpui uses (no second copy): the taskbar identity
+# (`startup::set_app_id`), Recycle Bin deletes (`project::trash_local`).
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    # Child processes die with the editor (`project::process_tree`).
+    "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# Already in the tree (alacritty_terminal): clean exit on SIGTERM/SIGINT.
+signal-hook = "0.4"
+# Already in the tree: process groups of child processes (`project::process_tree`).
+libc.workspace = true
