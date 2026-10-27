@@ -1,0 +1,3 @@
+# Byte-exact fixtures: the round-trip tests compare them unchanged, so no
+# CRLF conversion on Windows checkouts.
+crates/notebook/tests/fixtures/** -text

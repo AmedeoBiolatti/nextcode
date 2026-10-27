@@ -64,7 +64,9 @@ jobs:
       matrix:
         include:
           - { name: Linux, os: ubuntu-latest }
-          - { name: Windows, os: windows-latest }
+          # The runner's LLVM puts an lldb-dap on PATH that never answers, so the
+          # LLDB end-to-end test (which skips without an adapter) is left out.
+          - { name: Windows, os: windows-latest, skip: --skip headless_mode_debugs_a_cargo_binary_with_lldb }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -72,5 +74,8 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The headless tests drive a real rust-analyzer.
+          components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo test --workspace --locked --no-fail-fast -- ${{ matrix.skip }}
