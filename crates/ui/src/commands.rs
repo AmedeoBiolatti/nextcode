@@ -29,6 +29,7 @@ const LABELS: &[(&str, &str)] = &[
     ("app::SelectTheme", "Select Theme…"),
     ("app::CustomizeTheme", "Customize Theme…"),
     ("app::Quit", "Exit"),
+    ("app::CheckForUpdates", "Check for Updates…"),
     ("app::About", "About next_code"),
     ("extensions::ManageExtensions", "Manage Extensions…"),
     (

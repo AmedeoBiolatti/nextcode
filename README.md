@@ -63,8 +63,9 @@ irm https://raw.githubusercontent.com/AmedeoBiolatti/nextcode/main/scripts/insta
 Installs into `%LOCALAPPDATA%\next_code\bin`, adds that folder to your
 `PATH` and adds next_code to the Start menu.
 
-Run the command again to update. Both scripts check the download against
-the release's `SHA256SUMS`. For a specific release, pipe into
+Run the command again, or use **Help > Check for Updates…** in the editor,
+to update. Both scripts check the download against the release's
+`SHA256SUMS`. For a specific release, pipe into
 `NEXT_CODE_VERSION=v0.1.0 sh` instead of `sh`, or run
 `$env:NEXT_CODE_VERSION = "v0.1.0"` in PowerShell first.
 
