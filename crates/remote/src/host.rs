@@ -80,6 +80,10 @@ impl Git {
     /// `git credential <fill|approve|reject>` for `operation`.
     pub fn credential_command(&self, operation: Operation) -> Command {
         let mut command = self.command();
+        // The container preserves Azure's organisation path, but the host's
+        // git would otherwise strip it again before invoking its helper.
+        // Scope this to this command and Azure; never rewrite host config.
+        command.args(["-c", "credential.https://dev.azure.com.useHttpPath=true"]);
         command.args(["credential", operation.git_command()]);
         command
     }
@@ -493,7 +497,15 @@ mod tests {
         ] {
             let command = git.credential_command(operation);
             assert_eq!(command.get_program(), "git");
-            assert_eq!(args(&command), ["credential", verb]);
+            assert_eq!(
+                args(&command),
+                [
+                    "-c",
+                    "credential.https://dev.azure.com.useHttpPath=true",
+                    "credential",
+                    verb
+                ]
+            );
             let envs: Vec<_> = command
                 .get_envs()
                 .map(|(key, value)| (key.to_owned(), value.map(|v| v.to_owned())))
@@ -509,7 +521,14 @@ mod tests {
         assert_eq!(command.get_program(), r"C:\Program Files\Git\cmd\git.exe");
         assert_eq!(
             args(&command),
-            ["-c", "credential.helper=manager", "credential", "fill"]
+            [
+                "-c",
+                "credential.helper=manager",
+                "-c",
+                "credential.https://dev.azure.com.useHttpPath=true",
+                "credential",
+                "fill"
+            ]
         );
         assert_eq!(
             args(&git.config_command("user.name")),
@@ -596,6 +615,44 @@ mod tests {
         }
         let answer = host.credential(Operation::Get, "protocol=https\nhost=github.com\n");
         assert!(String::from_utf8_lossy(&answer).contains("password=leak"));
+    }
+
+    #[test]
+    fn azure_path_survives_the_host_git_credential_call() {
+        let dir = std::env::temp_dir().join(format!("next_code_host_azure_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("credentials");
+        std::fs::write(&store,
+            "https://Contoso:wrong@dev.azure.com/OtherOrg/Analytics/_git/repo\nhttps://Contoso:correct@dev.azure.com/Contoso/Analytics/_git/repo\n").unwrap();
+        let host = Host::new(
+            Git {
+                program: "git".into(),
+                args: vec![
+                    "-c".into(),
+                    "credential.helper=".into(),
+                    "-c".into(),
+                    format!(
+                        "credential.helper=store --file='{}'",
+                        store.to_string_lossy().replace('\'', "'\\''")
+                    ),
+                    // Reproduce a host whose default would discard the path.
+                    "-c".into(),
+                    "credential.https://dev.azure.com.useHttpPath=false".into(),
+                ],
+            },
+            None,
+        )
+        .allow_hosts(["dev.azure.com".into()]);
+        let request = "protocol=https\nhost=dev.azure.com\nusername=Contoso\npath=Contoso/Analytics/_git/repo\n";
+        let answer = host.credential(Operation::Get, request);
+        let answer = Credential::parse(std::str::from_utf8(&answer).unwrap());
+        assert_eq!(answer.get("password"), Some("correct"));
+        assert_eq!(answer.get("path"), Some("Contoso/Analytics/_git/repo"));
+        host.credential(Operation::Erase, request);
+        let remaining = std::fs::read_to_string(&store).unwrap();
+        assert!(remaining.contains("OtherOrg"));
+        assert!(!remaining.contains("Contoso/Analytics"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

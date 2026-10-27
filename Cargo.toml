@@ -11,6 +11,8 @@ publish = false
 alacritty_terminal = "0.26"
 anyhow = "1"
 dap = { path = "crates/dap" }
+extension_api = { path = "crates/extension_api" }
+extensions = { path = "crates/extensions" }
 dirs = "7"
 futures = "0.3"
 gpui = "=0.2.2"

@@ -31,11 +31,10 @@ actions!(
         ToggleTerminal,
         ToggleCommit,
         ToggleGitLog,
-        TogglePython,
         ToggleProblems,
-        ToggleNotes,
         TogglePorts,
         ToggleCallHierarchy,
+        ToggleExtensions,
         ToggleOutline,
         ToggleBottomDock,
         SaveLayoutAsDefault,
@@ -103,25 +102,42 @@ impl Workspace {
         match panel {
             PanelId::Files => Some(self.file_tree.clone().into()),
             PanelId::Problems => Some(self.problems.clone().into()),
-            PanelId::Notes => Some(self.notes_panel.clone().into()),
             PanelId::Ports => Some(self.ports_panel.clone().into()),
             PanelId::Terminal => Some(self.terminal.clone().into()),
             PanelId::Search => Some(self.search.clone().into()),
             PanelId::Commit => Some(self.commit.clone().into()),
             PanelId::GitLog => Some(self.git_log.clone().into()),
-            PanelId::Python => Some(self.python.clone().into()),
             PanelId::Outline => Some(self.outline.clone().into()),
             PanelId::CallHierarchy => Some(self.call_hierarchy.clone().into()),
             PanelId::Debug => Some(self.debug.panel.clone().into()),
             PanelId::DebugConsole => Some(self.debug.console.clone().into()),
             PanelId::Tests => Some(self.runs.tests.clone().into()),
+            PanelId::Extensions => None,
+            PanelId::Builtin(key) => self.builtin_panel_view(key).map(|panel| panel.view()),
         }
     }
 
-    /// A count beside a panel's title: notes waiting for the person.
+    /// The panels a dock shows: those of built-in extensions that are off
+    /// stay in the layout (and keep their place) but are left out here.
+    pub(super) fn shown_dock(&self, position: DockPosition) -> crate::layout::DockLayout {
+        let mut dock = self.layout.dock(position).clone();
+        dock.panels.retain(|&panel| match panel {
+            PanelId::Builtin(key) => self.builtin_panel_view(key).is_some(),
+            _ => true,
+        });
+        if dock
+            .active
+            .is_none_or(|active| !dock.panels.contains(&active))
+        {
+            dock.active = dock.panels.first().copied();
+        }
+        dock
+    }
+
+    /// A count beside a panel's title: things waiting for the person.
     fn panel_badge(&self, panel: PanelId, cx: &App) -> Option<impl IntoElement + use<>> {
         let count = match panel {
-            PanelId::Notes => self.notes_badge(cx),
+            PanelId::Builtin(key) => self.builtin_panel_badge(key, cx),
             _ => 0,
         };
         (count > 0).then(|| {
@@ -147,7 +163,7 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(super) fn show_panel(&mut self, panel: PanelId, cx: &mut Context<Self>) {
+    pub(crate) fn show_panel(&mut self, panel: PanelId, cx: &mut Context<Self>) {
         self.layout.activate(panel);
         if panel == PanelId::Commit {
             self.refresh_git_status(cx);
@@ -155,6 +171,7 @@ impl Workspace {
         self.layout_changed(cx);
     }
 
+    /// Moves `panel` to `to`, before the panel shown at `index` there.
     pub(super) fn move_panel(
         &mut self,
         panel: PanelId,
@@ -163,11 +180,20 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.panel_menu = None;
+        // Shown and laid-out positions differ by the hidden panels.
+        let index = index.and_then(|index| {
+            let target = self.shown_dock(to).panels.get(index).copied()?;
+            self.layout
+                .dock(to)
+                .panels
+                .iter()
+                .position(|&panel| panel == target)
+        });
         self.layout.move_panel(panel, to, index);
         self.layout_changed(cx);
     }
 
-    pub(super) fn toggle_panel(&mut self, panel: PanelId, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_panel(&mut self, panel: PanelId, cx: &mut Context<Self>) {
         self.layout.toggle_panel(panel);
         self.layout_changed(cx);
     }
@@ -263,6 +289,15 @@ impl Workspace {
         self.toggle_panel(PanelId::Ports, cx);
     }
 
+    pub(super) fn toggle_extensions(
+        &mut self,
+        _: &ToggleExtensions,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_panel(PanelId::Extensions, cx);
+    }
+
     /// Shows `view` in the Terminal panel (a workflow step's terminal).
     pub(crate) fn show_terminal_view(
         &mut self,
@@ -296,15 +331,6 @@ impl Workspace {
         self.show_panel(PanelId::Ports, cx);
         self.ports_panel
             .update(cx, |panel, cx| panel.start_forward(window, cx));
-    }
-
-    pub(super) fn toggle_python(
-        &mut self,
-        _: &TogglePython,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.toggle_panel(PanelId::Python, cx);
     }
 
     pub(super) fn toggle_call_hierarchy(
@@ -430,7 +456,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let dock = self.layout.dock(position);
+        let dock = self.shown_dock(position);
         if dock.panels.is_empty() {
             return cx
                 .has_active_drag()
@@ -479,19 +505,23 @@ impl Workspace {
             .pin("dock-tabs");
         let active = dock.active;
         let body = div().flex_1().min_h_0().min_w_0().children(
-            match dock.active.and_then(|panel| self.panel_view(panel)) {
-                Some(view) => Some(view.into_any_element()),
-                None => Some(
-                    div()
-                        .p_3()
-                        .text_sm()
-                        .text_color(theme::muted())
-                        .child(crate::selectable::selectable(
-                            "empty",
-                            "This panel is not available yet.",
-                        ))
-                        .into_any_element(),
-                ),
+            if dock.active == Some(PanelId::Extensions) {
+                Some(self.render_extension_dock(cx))
+            } else {
+                match dock.active.and_then(|panel| self.panel_view(panel)) {
+                    Some(view) => Some(view.into_any_element()),
+                    None => Some(
+                        div()
+                            .p_3()
+                            .text_sm()
+                            .text_color(theme::muted())
+                            .child(crate::selectable::selectable(
+                                "empty",
+                                "This panel is not available yet.",
+                            ))
+                            .into_any_element(),
+                    ),
+                }
             },
         );
         // The panel's owner pins its content inside this wrapper.
@@ -590,7 +620,7 @@ impl Workspace {
 
     /// A collapsed dock: one button per panel; also a drop target.
     fn render_strip(&self, position: DockPosition, cx: &mut Context<Self>) -> AnyElement {
-        let dock = self.layout.dock(position);
+        let dock = self.shown_dock(position);
         let vertical = position != DockPosition::Bottom;
         let buttons = dock.panels.iter().map(|&panel| {
             let label = if vertical {

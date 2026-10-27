@@ -5,7 +5,11 @@ use gpui::{Action, FocusHandle, KeybindingKeystroke, Modifiers, Window};
 
 /// Display labels where the action's name alone reads poorly.
 const LABELS: &[(&str, &str)] = &[
+    ("markdown::ShowSource", "Markdown: Source Only"),
+    ("markdown::ShowPreview", "Markdown: Preview Only"),
+    ("markdown::ShowSplit", "Markdown: Source and Preview"),
     ("pinpoint::CopyContextForAgent", "Copy Context for Agent"),
+    ("app::NewProject", "New Project…"),
     ("app::OpenProject", "Open Project…"),
     ("app::OpenProjectInNewWindow", "Open Project in New Window…"),
     ("app::OpenRecent", "Open Recent…"),
@@ -20,11 +24,17 @@ const LABELS: &[(&str, &str)] = &[
     ("app::PreviousProject", "Previous Project Tab"),
     ("app::ShowCommandPalette", "Command Palette…"),
     ("app::CustomizeMenus", "Customize Menus…"),
-    ("app::OpenSettings", "Open Settings"),
+    ("app::OpenSettings", "Settings…"),
+    ("app::OpenSettingsJson", "Open Settings (JSON)"),
     ("app::SelectTheme", "Select Theme…"),
     ("app::CustomizeTheme", "Customize Theme…"),
     ("app::Quit", "Exit"),
     ("app::About", "About next_code"),
+    ("extensions::ManageExtensions", "Manage Extensions…"),
+    (
+        "extensions::InstallExtension",
+        "Install Extension from Folder…",
+    ),
     ("workspace::CloseTab", "Close Tab"),
     ("workspace::ToggleFileFinder", "Go to File…"),
     (
@@ -39,24 +49,14 @@ const LABELS: &[(&str, &str)] = &[
     ("workspace::ReplaceInFiles", "Replace in Files"),
     ("search::ReplaceAll", "Replace All in Files"),
     ("workspace::ToggleTerminal", "Terminal Panel"),
-    ("workflows::OpenWorkflow", "Open Workflow…"),
-    ("workflows::OpenWorkflowFile", "Open Workflow File…"),
-    ("workflows::AddWorkflowFolder", "Add Workflow Folder…"),
-    ("workflows::NewWorkflow", "New Workflow…"),
-    ("workflows::RunAll", "Workflow: Run All"),
-    ("workflows::StopAll", "Workflow: Stop All"),
-    ("workflows::RetryFailed", "Workflow: Retry Failed"),
     ("workspace::ToggleCommit", "Commit Tool Window"),
     ("workspace::ToggleGitLog", "Git Tool Window"),
     ("workspace::ToggleProblems", "Problems Panel"),
-    ("workspace::ToggleNotes", "Notes Panel"),
-    ("notes::AddNote", "Add Note"),
-    ("notes::ToggleResolvedNotes", "Show/Hide Resolved Notes"),
+    ("workspace::ToggleExtensions", "Extensions Panel"),
     ("workspace::TogglePorts", "Ports Panel"),
     ("ports::ForwardPort", "Forward a Port…"),
     ("workspace::ToggleCallHierarchy", "Call Hierarchy Panel"),
     ("workspace::ToggleOutline", "Outline Panel"),
-    ("workspace::TogglePython", "Python Panel"),
     ("workspace::ToggleBottomDock", "Toggle Bottom Dock"),
     ("workspace::SaveLayoutAsDefault", "Save Layout as Default"),
     ("workspace::ResetLayout", "Reset Layout"),
@@ -92,56 +92,6 @@ const LABELS: &[(&str, &str)] = &[
     ("git::Pull", "Pull"),
     ("git::Push", "Push…"),
     ("git::Refresh", "Refresh Status"),
-    ("python::Sync", "Sync Environment (uv sync)"),
-    ("python::Lock", "Update Lock File (uv lock)"),
-    ("python::RunFile", "Run Current Python File"),
-    ("python::RunTests", "Run Python Tests (pytest)"),
-    ("python::RunTestFile", "Run Tests in Current File"),
-    ("python::RunTestAtCursor", "Run Test at Cursor"),
-    ("notebook::RunCell", "Run Cell"),
-    (
-        "notebook::RunCellAndSelectNext",
-        "Run Cell and Select Below",
-    ),
-    (
-        "notebook::RunCellAndInsertBelow",
-        "Run Cell and Insert Below",
-    ),
-    ("notebook::RunAll", "Run All Cells"),
-    ("notebook::RunAbove", "Run All Above Selected Cell"),
-    ("notebook::RunBelow", "Run Selected Cell and All Below"),
-    ("notebook::Interrupt", "Interrupt Kernel"),
-    ("notebook::Restart", "Restart Kernel"),
-    ("notebook::RestartAndRunAll", "Restart Kernel and Run All"),
-    ("notebook::ClearOutputs", "Clear All Outputs"),
-    ("notebook::Save", "Save Notebook"),
-    ("notebook::InsertAbove", "Insert Cell Above"),
-    ("notebook::InsertBelow", "Insert Cell Below"),
-    ("notebook::DeleteCells", "Delete Cells"),
-    ("notebook::UndoCells", "Undo Cell Operation"),
-    ("notebook::RedoCells", "Redo Cell Operation"),
-    ("notebook::ToCode", "Change Cell to Code"),
-    ("notebook::ToMarkdown", "Change Cell to Markdown"),
-    ("notebook::ToRaw", "Change Cell to Raw"),
-    ("notebook::CopyCells", "Copy Cells"),
-    ("notebook::CutCells", "Cut Cells"),
-    ("notebook::PasteBelow", "Paste Cells Below"),
-    ("notebook::PasteAbove", "Paste Cells Above"),
-    ("notebook::SplitCell", "Split Cell at Cursor"),
-    ("notebook::MoveCellsUp", "Move Cells Up"),
-    ("notebook::MoveCellsDown", "Move Cells Down"),
-    ("notebook::ToggleOutputs", "Collapse/Expand Outputs"),
-    ("notebook::ToggleSource", "Collapse/Expand Cell Source"),
-    ("notebook::ShowHelp", "Show Kernel Help at Cursor"),
-    ("notebook::FormatCell", "Format Cell"),
-    ("notebook::FormatNotebook", "Format Notebook"),
-    (
-        "notebook::ChooseInterpreter",
-        "Choose Notebook Interpreter…",
-    ),
-    ("notebook::OpenInMarimo", "Open in marimo"),
-    ("notebook::OpenAsText", "Open Notebook as Text"),
-    ("notebook::OpenAsNotebook", "Open as Notebook"),
     ("run::RunConfiguration", "Run Selected Configuration"),
     ("run::DebugConfiguration", "Debug Selected Configuration"),
     ("run::SelectConfiguration", "Select Configuration…"),
@@ -220,6 +170,7 @@ const HIDDEN_NAMESPACES: &[&str] = &[
     "file_finder",
     "location_picker",
     "project_picker",
+    "new_project",
     "command_palette",
     "theme_picker",
     "configuration_picker",
@@ -229,10 +180,13 @@ const HIDDEN_NAMESPACES: &[&str] = &[
     "interpreter_picker",
     // Escape on selected static text.
     "selectable",
+    // Enter in a form control's text field.
+    "controls",
 ];
 
 /// Building blocks of typing and list navigation, not commands.
 const HIDDEN: &[&str] = &[
+    "extensions::OpenExtensionPanel",
     "editor::Backspace",
     "editor::Delete",
     "editor::DeleteWordLeft",
@@ -285,8 +239,6 @@ const HIDDEN: &[&str] = &[
     "editor::ConfirmBreakpointEdit",
     "editor::CancelBreakpointEdit",
     "editor::NextBreakpointField",
-    "notes::SubmitNote",
-    "notes::CancelNote",
     "debugger::AddWatch",
     "debugger::SubmitConsoleInput",
     "debugger::PreviousConsoleInput",
@@ -296,8 +248,8 @@ const HIDDEN: &[&str] = &[
     "ports::ConfirmInput",
     "ports::CancelInput",
     "app::OpenRecentProject",
-    // Listed once per workflow as "Run Workflow: <name>".
-    "workflows::RunWorkflow",
+    "extensions::Dismiss",
+    "extensions::RunExtensionCommand",
     // Files tree navigation and its inline name editor.
     "file_tree::SelectPrevious",
     "file_tree::SelectNext",
@@ -317,28 +269,25 @@ const HIDDEN: &[&str] = &[
     "file_tree::TypeDown",
     "file_tree::ChooseType",
     "file_tree::CloseTypes",
-    // Notebook selection and modes.
-    "notebook::CommandMode",
-    "notebook::EditMode",
-    "notebook::SelectPrevious",
-    "notebook::SelectNext",
-    "notebook::ExtendSelectionUp",
-    "notebook::ExtendSelectionDown",
-    "notebook::SelectFirst",
-    "notebook::SelectLast",
 ];
 
 /// Whether the command palette lists the action.
 pub fn in_palette(name: &str) -> bool {
     let namespace = name.split_once("::").map_or("", |(namespace, _)| namespace);
-    !HIDDEN.contains(&name) && !HIDDEN_NAMESPACES.contains(&namespace) && name != "zed::NoAction"
+    !HIDDEN.contains(&name)
+        && !HIDDEN_NAMESPACES.contains(&namespace)
+        && !crate::builtins::unlisted(name)
+        && name != "zed::NoAction"
 }
 
 /// What menus and the palette call the action.
 pub fn label(name: &str) -> String {
     match LABELS.iter().find(|(known, _)| *known == name) {
         Some((_, label)) => (*label).to_owned(),
-        None => humanize(name.rsplit("::").next().unwrap_or(name)),
+        None => match crate::builtins::label(name) {
+            Some(label) => label.to_owned(),
+            None => humanize(name.rsplit("::").next().unwrap_or(name)),
+        },
     }
 }
 

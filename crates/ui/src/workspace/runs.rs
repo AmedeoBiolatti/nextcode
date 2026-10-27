@@ -1,13 +1,14 @@
 //! Run configurations and tests in the workspace: the selected
 //! configuration (picker, persisted per project), Run in a terminal tab,
-//! Debug through [`Workspace::start_debugging`], Edit Configurations, the
-//! Tests panel's events, and the Python panel's run/test buttons routed
-//! through the same paths.
+//! Debug through [`Workspace::start_debugging`], Edit Configurations and the
+//! Tests panel's events. The Python built-in extension's run and test
+//! commands go through the same paths (`run_in_terminal`,
+//! `show_tests_and_run`).
 
 use std::{collections::HashMap, sync::Arc};
 
 use gpui::{App, Subscription};
-use run::{Configuration, PythonTarget, Source};
+use run::Configuration;
 
 use super::*;
 use crate::{
@@ -148,7 +149,7 @@ impl Workspace {
         }
     }
 
-    fn report(&mut self, message: String, cx: &mut Context<Self>) {
+    pub(crate) fn report(&mut self, message: String, cx: &mut Context<Self>) {
         // Long errors (compiler output) keep their first lines.
         let mut lines: Vec<&str> = message.lines().take(8).collect();
         if message.lines().count() > 8 {
@@ -208,7 +209,7 @@ impl Workspace {
     /// Runs `config` (of folder `folder`) in a terminal tab named after it
     /// (a rerun replaces the tab), started in that folder where the
     /// project lives.
-    fn run_in_terminal(
+    pub(crate) fn run_in_terminal(
         &mut self,
         config: Configuration,
         folder: usize,
@@ -349,7 +350,8 @@ impl Workspace {
     fn edit_configurations_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let folder = self
             .active_tab()
-            .and_then(|tab| self.project.root_index_of(&tab.path))
+            .and_then(Tab::file_path)
+            .and_then(|path| self.project.root_index_of(path))
             .unwrap_or(0);
         let path = self.project.resolve_in(folder, run::config::RUN_JSON);
         if matches!(self.project.kind(&path), Ok(None)) {
@@ -455,89 +457,6 @@ impl Workspace {
         self.hand_to_debugger(name, task, window, cx);
     }
 
-    /// The Python panel's run buttons: scripts (of the first folder, whose
-    /// project the panel shows) and the current file (in its folder) run
-    /// as configurations in terminal tabs; tests run in the Tests panel.
-    pub(super) fn run_python(
-        &mut self,
-        request: RunRequest,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let active = self.active_tab().and_then(|tab| {
-            let editor = tab.editor()?.read(cx);
-            let line = editor.buffer().line_of(editor.cursor());
-            Some((tab.path.clone(), line, editor.text()))
-        });
-        let folder = active
-            .as_ref()
-            .and_then(|(path, _, _)| self.project.root_index_of(path))
-            .unwrap_or(0);
-        // Relative to its folder, as pytest and the interpreter there take it.
-        let file = active
-            .as_ref()
-            .map(|(path, _, _)| crate::python_panel::project_relative(&self.project, path));
-        let need_file = || "Open a Python file first".to_owned();
-        let configuration = |name: String, kind: run::Kind| Configuration {
-            name,
-            source: Source::Automatic,
-            kind,
-            cwd: None,
-            env: Default::default(),
-            disabled: None,
-            notes: Vec::new(),
-            debug_options: Default::default(),
-        };
-        match request {
-            RunRequest::Script(name) => self.run_in_terminal(
-                configuration(
-                    format!("uv run {name}"),
-                    run::Kind::UvScript {
-                        script: name,
-                        args: Vec::new(),
-                    },
-                ),
-                0,
-                window,
-                cx,
-            ),
-            RunRequest::CurrentFile => match (file, &active) {
-                (Some(file), Some((path, _, _))) => self.run_in_terminal(
-                    configuration(
-                        format!("Run {}", self.project.display_path(path)),
-                        run::Kind::Python {
-                            target: PythonTarget::Script(file),
-                            args: Vec::new(),
-                            interpreter: None,
-                        },
-                    ),
-                    folder,
-                    window,
-                    cx,
-                ),
-                _ => self.report(need_file(), cx),
-            },
-            RunRequest::Tests => self.show_tests_and_run(RunTarget::Pytest, cx),
-            RunRequest::TestFile => match file {
-                Some(file) => {
-                    let id = engine::test_id(&self.project, folder, &file);
-                    self.show_tests_and_run(RunTarget::Ids(vec![id]), cx)
-                }
-                None => self.report(need_file(), cx),
-            },
-            RunRequest::TestAtCursor => match (&active, &file) {
-                (Some((_, line, text)), Some(file)) => match python::test_at(text, *line) {
-                    Some(node) => {
-                        let id = engine::test_id(&self.project, folder, &format!("{file}::{node}"));
-                        self.show_tests_and_run(RunTarget::Ids(vec![id]), cx)
-                    }
-                    None => self.report("The cursor is not in a test function or class".into(), cx),
-                },
-                _ => self.report(need_file(), cx),
-            },
-        }
-    }
-
     /// ▶ in the gutter of `editor` (showing `path`) at each discovered
     /// test, parametrized function and test class.
     pub(super) fn set_test_markers(
@@ -637,6 +556,7 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, WindowHandle};
+    use run::Source;
     use serde_json::json;
 
     use super::*;

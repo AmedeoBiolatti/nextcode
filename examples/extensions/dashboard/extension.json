@@ -1,0 +1,13 @@
+{
+  "id": "dashboard",
+  "name": "Generated Data Dashboard",
+  "version": "0.1.0",
+  "api_version": 2,
+  "module": "dashboard.wasm",
+  "commands": [],
+  "panels": [
+    {"id":"dashboard","title":"Generated Dashboard","placement":"dock"},
+    {"id":"report","title":"Generated Report","placement":"editor"}
+  ],
+  "permissions": []
+}

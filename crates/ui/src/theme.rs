@@ -736,9 +736,24 @@ pub fn problem() -> Option<String> {
 pub fn select(name: &str, cx: &mut App) -> Result<(), String> {
     let path = settings_path().ok_or("no config directory")?;
     settings::write_theme(&path, name)?;
+    reload(cx);
+    Ok(())
+}
+
+/// Sets (or, for `None`, resets) the dotted `key` in `settings.json` and
+/// applies the settings at once (see `settings::write_value`).
+pub fn write_setting(key: &str, value: Option<Value>, cx: &mut App) -> Result<(), String> {
+    let path = settings_path().ok_or("no config directory")?;
+    settings::write_value(&path, key, value)?;
+    reload(cx);
+    Ok(())
+}
+
+/// Re-reads settings and theme even if their files' stamps look unchanged
+/// (a write within the stamp's resolution).
+fn reload(cx: &mut App) {
     *LOADED.lock() = None;
     refresh(cx);
-    Ok(())
 }
 
 /// The file to edit to customize the current theme: the current theme's
@@ -796,6 +811,41 @@ fn customization(base: &Theme, name: &str) -> String {
         python = python.id(),
         python_keyword = hex(color(Some(python))),
     )
+}
+
+/// Relative luminance (WCAG).
+pub fn luminance(color: Hsla) -> f32 {
+    let rgba = color.to_rgb();
+    let channel = |c: f32| {
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
+}
+
+/// Contrast ratio (WCAG), from 1 to 21.
+pub fn contrast(a: Hsla, b: Hsla) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// The text colour on `background`: the theme's when it reads, else black
+/// or white (HTML assumes a white page; the theme may be dark).
+pub fn text_on(background: Option<Hsla>) -> Hsla {
+    let text = text();
+    match background {
+        Some(background) if background.a > 0.3 && contrast(text, background) < 3. => {
+            if luminance(background) > 0.4 {
+                gpui::black()
+            } else {
+                gpui::white()
+            }
+        }
+        _ => text,
+    }
 }
 
 #[cfg(test)]

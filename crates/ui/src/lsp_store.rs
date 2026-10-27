@@ -6,12 +6,12 @@ use std::{
     fs::File,
     io::{LineWriter, Write},
     path::{Path, PathBuf},
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::Arc,
 };
 
 use futures::StreamExt;
-use gpui::{AppContext, Context, EventEmitter, SharedString, Task};
+use gpui::{App, AppContext, Context, EventEmitter, SharedString, Task};
 use lsp::{
     Incoming, LanguageServer, LogKind, Logger, path_to_uri,
     types::{
@@ -30,10 +30,44 @@ use text::Encoding;
 
 use crate::{
     editor::semantic,
-    notebook::lsp::{Registered, VirtualDocument},
     project::{Project, Root},
     settings::{self, ServerConfig, Settings},
 };
+
+/// A document language servers see that no file holds: a notebook's code
+/// cells as one Python document (`builtins::notebook::lsp`), in parts (its
+/// cells). Its owner registers it (`LspStore::register_virtual`);
+/// diagnostics, Problems, location lists and workspace edits on its path
+/// go through it.
+pub trait VirtualDocument {
+    /// Its path (never on disk).
+    fn path(&self) -> &Path;
+    /// The file the person sees it as (the notebook).
+    fn shown_path(&self) -> &Path;
+    fn version(&self) -> i32;
+    fn text(&self) -> String;
+    /// Line `line`'s text as the server sees it, when it is in a part.
+    fn line_text(&self, line: u32) -> Option<&str>;
+    /// The part holding `position` (1-based, as shown: "cell 3") and the
+    /// position in that part.
+    fn part_at(&self, position: lsp::types::Position) -> Option<(usize, lsp::types::Position)>;
+    /// The server's diagnostics that apply (not artefacts of joining the
+    /// parts).
+    fn filter_diagnostics(
+        &self,
+        diagnostics: Vec<lsp::types::Diagnostic>,
+    ) -> Vec<lsp::types::Diagnostic>;
+    /// Applies a server's edits to the parts.
+    fn apply_edits(
+        &self,
+        edits: &[lsp::types::TextEdit],
+        encoding: Encoding,
+        cx: &mut App,
+    ) -> Result<(), String>;
+}
+
+/// Held weakly: a closed document's entry is dead.
+type Registered = Weak<RefCell<dyn VirtualDocument>>;
 
 /// Restarts allowed per server before giving up for the session.
 const MAX_RESTARTS: u32 = 3;
@@ -174,8 +208,8 @@ pub struct LspStore {
     settings: Arc<Settings>,
     slots: HashMap<SlotKey, Slot>,
     diagnostics: HashMap<PathBuf, Vec<lsp::types::Diagnostic>>,
-    /// Open notebooks' virtual documents by their (virtual) path.
-    notebooks: HashMap<PathBuf, Registered>,
+    /// Open virtual documents by their path.
+    virtual_documents: HashMap<PathBuf, Registered>,
 }
 
 impl EventEmitter<LspStoreEvent> for LspStore {}
@@ -187,7 +221,7 @@ impl LspStore {
             settings,
             slots: HashMap::new(),
             diagnostics: HashMap::new(),
-            notebooks: HashMap::new(),
+            virtual_documents: HashMap::new(),
         }
     }
 
@@ -252,19 +286,21 @@ impl LspStore {
         self.diagnostics.get(path).map_or(&[], Vec::as_slice)
     }
 
-    /// Registers a notebook's virtual document: its diagnostics are
-    /// filtered (see `VirtualDocument::filter_diagnostics`), and workspace
-    /// edits, navigation and Problems map its positions to cells.
-    pub fn register_notebook(&mut self, document: &Rc<RefCell<VirtualDocument>>) {
-        self.notebooks.retain(|_, entry| entry.strong_count() > 0);
+    /// Registers a virtual document while it is open: its diagnostics are
+    /// filtered (`VirtualDocument::filter_diagnostics`), and workspace
+    /// edits, navigation and Problems map its positions to its parts.
+    pub fn register_virtual(&mut self, document: Rc<RefCell<dyn VirtualDocument>>) {
+        self.virtual_documents
+            .retain(|_, entry| entry.strong_count() > 0);
         let path = document.borrow().path().to_path_buf();
         self.diagnostics.remove(&path);
-        self.notebooks.insert(path, Rc::downgrade(document));
+        self.virtual_documents
+            .insert(path, Rc::downgrade(&document));
     }
 
-    /// The open notebook whose virtual document is `path`.
-    pub fn notebook(&self, path: &Path) -> Option<Rc<RefCell<VirtualDocument>>> {
-        self.notebooks.get(path)?.upgrade()
+    /// The open virtual document at `path`.
+    pub fn virtual_document(&self, path: &Path) -> Option<Rc<RefCell<dyn VirtualDocument>>> {
+        self.virtual_documents.get(path)?.upgrade()
     }
 
     /// Tells every running server about files changed outside the editor.
@@ -360,13 +396,13 @@ impl LspStore {
         .detach();
     }
 
-    /// Every file's diagnostics, in no particular order (closed notebooks'
-    /// left out).
+    /// Every file's diagnostics, in no particular order (closed virtual
+    /// documents' left out).
     pub fn all_diagnostics(&self) -> impl Iterator<Item = (&Path, &[lsp::types::Diagnostic])> {
         self.diagnostics
             .iter()
             .filter(|(path, _)| {
-                self.notebooks
+                self.virtual_documents
                     .get(*path)
                     .is_none_or(|entry| entry.strong_count() > 0)
             })
@@ -726,18 +762,18 @@ impl LspStore {
                         return;
                     };
                     if let Some(path) = uri_to_path(&published.uri) {
-                        let diagnostics = match self.notebook(&path) {
-                            Some(notebook) => {
-                                let notebook = notebook.borrow();
+                        let diagnostics = match self.virtual_document(&path) {
+                            Some(document) => {
+                                let document = document.borrow();
                                 // Positions of an older text may now be
-                                // in another cell; the latest text's come.
+                                // in another part; the latest text's come.
                                 if published
                                     .version
-                                    .is_some_and(|version| version != notebook.version())
+                                    .is_some_and(|version| version != document.version())
                                 {
                                     return;
                                 }
-                                notebook.filter_diagnostics(published.diagnostics)
+                                document.filter_diagnostics(published.diagnostics)
                             }
                             None => published.diagnostics,
                         };

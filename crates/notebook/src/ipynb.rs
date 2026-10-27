@@ -84,10 +84,9 @@ fn parse_cell(cell: Value) -> Result<Cell, String> {
         return Err("not an object".into());
     };
     let kind = match cell.remove("cell_type").as_ref().and_then(Value::as_str) {
-        Some("code") => CellKind::Code,
-        Some("markdown") => CellKind::Markdown,
-        Some("raw") => CellKind::Raw,
-        Some(other) => return Err(format!("unknown cell type `{other}`")),
+        Some(name) => {
+            CellKind::from_name(name).ok_or_else(|| format!("unknown cell type `{name}`"))?
+        }
         None => return Err("missing `cell_type`".into()),
     };
     let source = join_text(cell.remove("source"));
@@ -196,12 +195,7 @@ pub fn to_text(info: &IpynbInfo, cells: &[Cell]) -> String {
 
 fn cell_json(info: &IpynbInfo, cell: &Cell) -> Value {
     let mut map = cell.extra.clone();
-    let kind = match cell.kind {
-        CellKind::Code => "code",
-        CellKind::Markdown => "markdown",
-        CellKind::Raw => "raw",
-    };
-    map.insert("cell_type".into(), kind.into());
+    map.insert("cell_type".into(), cell.kind.name().into());
     match (&cell.id, info.nbformat_minor >= 5) {
         (Some(id), _) => {
             map.insert("id".into(), id.clone().into());

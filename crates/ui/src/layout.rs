@@ -5,16 +5,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelId {
     Files,
     Search,
     /// PyCharm's Commit tool window. Saved layouts from before it was
     /// renamed call it `git`.
-    #[serde(alias = "git")]
     Commit,
-    Python,
     Terminal,
     Problems,
     /// PyCharm's Git tool window (the Log).
@@ -25,16 +22,18 @@ pub enum PanelId {
     Debug,
     DebugConsole,
     Tests,
-    /// Sticky notes of the project.
-    Notes,
+    Extensions,
+    /// A built-in extension's panel, by its key (`builtins::Panel`). Layouts
+    /// keep it while the extension is off; docks show it while it is on.
+    Builtin(&'static str),
 }
 
 impl PanelId {
-    pub const ALL: [Self; 14] = [
+    /// The editor's own panels.
+    const CORE: [Self; 13] = [
         Self::Files,
         Self::Search,
         Self::Commit,
-        Self::Python,
         Self::Terminal,
         Self::Problems,
         Self::GitLog,
@@ -44,15 +43,21 @@ impl PanelId {
         Self::Debug,
         Self::DebugConsole,
         Self::Tests,
-        Self::Notes,
+        Self::Extensions,
     ];
+
+    /// Every panel: the editor's, then the built-in extensions'.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Self::CORE
+            .into_iter()
+            .chain(crate::builtins::panels().map(|panel| Self::Builtin(panel.key)))
+    }
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Files => "Files",
             Self::Search => "Search",
             Self::Commit => "Commit",
-            Self::Python => "Python",
             Self::Terminal => "Terminal",
             Self::Problems => "Problems",
             Self::GitLog => "Git",
@@ -62,7 +67,8 @@ impl PanelId {
             Self::Debug => "Debug",
             Self::DebugConsole => "Debug Console",
             Self::Tests => "Tests",
-            Self::Notes => "Notes",
+            Self::Extensions => "Extensions",
+            Self::Builtin(key) => crate::builtins::panel(key).map_or(key, |panel| panel.title),
         }
     }
 
@@ -72,7 +78,6 @@ impl PanelId {
             Self::Files => "files",
             Self::Search => "search",
             Self::Commit => "commit",
-            Self::Python => "python",
             Self::Terminal => "terminal",
             Self::Problems => "problems",
             Self::GitLog => "git-log",
@@ -82,24 +87,57 @@ impl PanelId {
             Self::Debug => "debug",
             Self::DebugConsole => "debug-console",
             Self::Tests => "tests",
-            Self::Notes => "notes",
+            Self::Extensions => "extensions",
+            Self::Builtin(key) => key,
         }
+    }
+
+    /// Its name in saved layouts.
+    fn saved_name(self) -> &'static str {
+        match self {
+            Self::GitLog => "git_log",
+            Self::CallHierarchy => "call_hierarchy",
+            Self::DebugConsole => "debug_console",
+            other => other.key(),
+        }
+    }
+
+    fn from_saved_name(name: &str) -> Option<Self> {
+        if name == "git" {
+            return Some(Self::Commit);
+        }
+        Self::all().find(|panel| panel.saved_name() == name)
     }
 
     fn default_position(self) -> DockPosition {
         match self {
-            Self::Files | Self::Search | Self::Commit | Self::Python | Self::Tests => {
-                DockPosition::Left
-            }
+            Self::Files | Self::Search | Self::Commit | Self::Tests => DockPosition::Left,
             Self::Outline | Self::Debug => DockPosition::Right,
             Self::Terminal
             | Self::Problems
             | Self::Ports
             | Self::GitLog
             | Self::CallHierarchy
-            | Self::Notes
+            | Self::Extensions
             | Self::DebugConsole => DockPosition::Bottom,
+            Self::Builtin(key) => {
+                crate::builtins::panel(key).map_or(DockPosition::Bottom, |panel| panel.position)
+            }
         }
+    }
+}
+
+impl Serialize for PanelId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.saved_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for PanelId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::from_saved_name(&name)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown panel `{name}`")))
     }
 }
 
@@ -192,13 +230,12 @@ pub struct Layout {
 
 impl Default for Layout {
     fn default() -> Self {
-        Self {
+        let mut layout = Self {
             left: DockLayout {
                 panels: vec![
                     PanelId::Files,
                     PanelId::Search,
                     PanelId::Commit,
-                    PanelId::Python,
                     PanelId::Tests,
                 ],
                 active: Some(PanelId::Files),
@@ -219,13 +256,24 @@ impl Default for Layout {
                     PanelId::Ports,
                     PanelId::CallHierarchy,
                     PanelId::DebugConsole,
-                    PanelId::Notes,
+                    PanelId::Extensions,
                 ],
                 active: Some(PanelId::Terminal),
                 size: 260.,
                 open: false,
             },
+        };
+        // Built-in extensions' panels, after the panel each names.
+        for panel in crate::builtins::panels() {
+            let dock = layout.dock_mut(panel.position);
+            let at = dock
+                .panels
+                .iter()
+                .position(|existing| existing.key() == panel.after)
+                .map_or(dock.panels.len(), |index| index + 1);
+            dock.panels.insert(at, PanelId::Builtin(panel.key));
         }
+        layout
     }
 }
 
@@ -325,7 +373,7 @@ impl Layout {
                 first
             });
         }
-        for panel in PanelId::ALL {
+        for panel in PanelId::all() {
             if !seen.contains(&panel) {
                 self.dock_mut(panel.default_position()).panels.push(panel);
             }
@@ -427,43 +475,21 @@ mod tests {
         let mut layout = Layout::default();
         layout.move_panel(PanelId::Files, DockPosition::Right, None);
 
-        assert_eq!(
-            layout.right.panels,
-            [PanelId::Outline, PanelId::Debug, PanelId::Files]
-        );
+        assert_eq!(layout.right.panels.last(), Some(&PanelId::Files));
+        assert!(!layout.left.panels.contains(&PanelId::Files));
         assert_eq!(
             (layout.right.active, layout.right.open),
             (Some(PanelId::Files), true)
         );
         // The left dock falls back to a remaining panel and stays open.
-        assert_eq!(
-            layout.left.panels,
-            [
-                PanelId::Search,
-                PanelId::Commit,
-                PanelId::Python,
-                PanelId::Tests
-            ]
-        );
         assert_eq!(layout.left.active, Some(PanelId::Search));
 
         layout.move_panel(PanelId::Search, DockPosition::Bottom, Some(0));
-        assert_eq!(
-            layout.bottom.panels,
-            [
-                PanelId::Search,
-                PanelId::Terminal,
-                PanelId::Problems,
-                PanelId::GitLog,
-                PanelId::Ports,
-                PanelId::CallHierarchy,
-                PanelId::DebugConsole,
-                PanelId::Notes
-            ]
-        );
+        assert_eq!(layout.bottom.panels.first(), Some(&PanelId::Search));
+        assert!(!layout.left.panels.contains(&PanelId::Search));
         assert_eq!(layout.left.active, Some(PanelId::Commit));
         layout.move_panel(PanelId::Commit, DockPosition::Right, None);
-        layout.move_panel(PanelId::Python, DockPosition::Right, None);
+        layout.move_panel(PanelId::Builtin("python"), DockPosition::Right, None);
         layout.move_panel(PanelId::Tests, DockPosition::Right, None);
         assert!(!layout.left.open, "an emptied dock closes");
         assert_eq!(layout.left.active, None);
@@ -473,31 +499,19 @@ mod tests {
     fn reordering_within_a_dock_keeps_the_panel_once() {
         let mut layout = Layout::default();
         layout.move_panel(PanelId::Problems, DockPosition::Bottom, Some(0));
-        assert_eq!(
-            layout.bottom.panels,
-            [
-                PanelId::Problems,
-                PanelId::Terminal,
-                PanelId::GitLog,
-                PanelId::Ports,
-                PanelId::CallHierarchy,
-                PanelId::DebugConsole,
-                PanelId::Notes
-            ]
-        );
+        let count = |layout: &Layout| {
+            layout
+                .bottom
+                .panels
+                .iter()
+                .filter(|&&panel| panel == PanelId::Problems)
+                .count()
+        };
+        assert_eq!(layout.bottom.panels.first(), Some(&PanelId::Problems));
+        assert_eq!(count(&layout), 1);
         layout.move_panel(PanelId::Problems, DockPosition::Bottom, Some(99));
-        assert_eq!(
-            layout.bottom.panels,
-            [
-                PanelId::Terminal,
-                PanelId::GitLog,
-                PanelId::Ports,
-                PanelId::CallHierarchy,
-                PanelId::DebugConsole,
-                PanelId::Notes,
-                PanelId::Problems
-            ]
-        );
+        assert_eq!(layout.bottom.panels.last(), Some(&PanelId::Problems));
+        assert_eq!(count(&layout), 1);
     }
 
     #[test]
@@ -536,27 +550,54 @@ mod tests {
         // Python and Tests for layouts saved before they existed; `git` is
         // the Commit window's old name.
         assert_eq!(
-            layout.left.panels,
-            [
-                PanelId::Files,
-                PanelId::Terminal,
-                PanelId::Commit,
-                PanelId::Search,
-                PanelId::Python,
-                PanelId::Tests
-            ]
+            &layout.left.panels[..3],
+            &[PanelId::Files, PanelId::Terminal, PanelId::Commit]
+        );
+        assert_eq!(
+            layout.position_of(PanelId::Search),
+            Some(DockPosition::Left)
         );
         assert_eq!(layout.left.active, Some(PanelId::Files));
         assert_eq!(layout.left.size, MIN_DOCK_SIZE);
         // The duplicate terminal is dropped; the Outline and Debug panels
         // return to their default (right) dock, as panels missing from
         // older layouts do.
-        assert_eq!(layout.right.panels, [PanelId::Outline, PanelId::Debug]);
+        assert!(!layout.right.panels.contains(&PanelId::Terminal));
         // Missing panels return to their default docks.
         assert_eq!(
             layout.position_of(PanelId::Problems),
             Some(DockPosition::Bottom)
         );
+    }
+
+    #[test]
+    fn built_in_panels_start_after_their_anchor_and_keep_their_saved_names() {
+        let python = PanelId::Builtin("python");
+        assert_eq!(
+            Layout::default().left.panels,
+            [
+                PanelId::Files,
+                PanelId::Search,
+                PanelId::Commit,
+                python,
+                PanelId::Tests
+            ]
+        );
+        // Layouts saved while Python was one of the editor's own panels.
+        let mut layout: Layout = serde_json::from_str(
+            r#"{ "left": { "panels": ["files", "search", "commit", "tests"], "active": "files", "size": 280, "open": true },
+                 "right": { "panels": ["outline", "python"], "active": "python", "size": 300, "open": true } }"#,
+        )
+        .unwrap();
+        layout.normalize();
+        assert_eq!(
+            layout.right.panels,
+            [PanelId::Outline, python, PanelId::Debug]
+        );
+        assert_eq!(layout.right.active, Some(python));
+        let saved = serde_json::to_string(&layout).unwrap();
+        assert!(saved.contains(r#""active":"python""#), "{saved}");
+        assert_eq!(serde_json::from_str::<Layout>(&saved).unwrap(), layout);
     }
 
     #[test]
@@ -607,5 +648,22 @@ mod tests {
             global_layout
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extension_host_keeps_its_moved_dock_and_size_on_restore() {
+        let mut layout = Layout::default();
+        layout.move_panel(PanelId::Extensions, DockPosition::Right, Some(0));
+        layout.right.size = 412.;
+        let saved = serde_json::to_string(&layout).unwrap();
+        let mut restored: Layout = serde_json::from_str(&saved).unwrap();
+        restored.normalize();
+        assert_eq!(restored, layout);
+        assert_eq!(
+            restored.position_of(PanelId::Extensions),
+            Some(DockPosition::Right)
+        );
+        assert_eq!(restored.right.panels.first(), Some(&PanelId::Extensions));
+        assert!(!restored.bottom.panels.contains(&PanelId::Extensions));
     }
 }

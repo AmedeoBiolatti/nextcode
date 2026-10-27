@@ -224,13 +224,13 @@ impl ProblemsPanel {
         }
         // A notebook's virtual document lists its problems per cell.
         let cell_of = |path: &Path, position: lsp::types::Position| {
-            let notebook = store.notebook(path)?;
-            let notebook = notebook.borrow();
-            let target = notebook.cell_position(position)?;
+            let document = store.virtual_document(path)?;
+            let document = document.borrow();
+            let (number, at) = document.part_at(position)?;
             Some(CellLabel {
-                notebook: notebook.notebook_path().to_path_buf(),
-                number: target.number,
-                first_line: position.line - target.position.line,
+                notebook: document.shown_path().to_path_buf(),
+                number,
+                first_line: position.line - at.line,
             })
         };
         self.rows = rows(&self.project, by_path, cell_of);

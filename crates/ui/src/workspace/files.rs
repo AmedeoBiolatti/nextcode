@@ -79,7 +79,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.show_panel(PanelId::Files, cx);
-        let near = self.active_tab().map(|tab| tab.path.clone());
+        let near = self
+            .active_tab()
+            .and_then(Tab::file_path)
+            .map(Path::to_path_buf);
         self.file_tree.update(cx, |tree, cx| {
             tree.start_new_file(near, file_type, window, cx)
         });

@@ -250,21 +250,23 @@ impl Editor {
         self.edit_selections(edits, cx);
     }
 
-    /// Backspace: also removes the closer of an empty pair (`(|)`).
-    pub(super) fn backspace_range(&self, head: usize) -> Range<usize> {
-        let start = self.buffer.prev_grapheme(head);
-        if theme::auto_close_brackets()
-            && !self.single_line
-            && let Some(before) = self.buffer.slice(start..head).chars().next()
-            && start + before.len_utf8() == head
-            && let Some(after) = self.char_at(head)
-            && auto_close_pairs(self.language())
-                .iter()
-                .any(|&(open, close)| open == before && close == after)
+    /// Ctrl+Backspace joins a blank line to the previous line's last
+    /// non-space character; otherwise it deletes the preceding word.
+    pub(super) fn delete_word_left_range(&self, head: usize) -> Range<usize> {
+        let row = self.buffer.line_of(head);
+        if !self.single_line
+            && row > 0
+            && self
+                .buffer
+                .line_text(row)
+                .chars()
+                .all(|c| matches!(c, ' ' | '\t'))
         {
-            return start..head + after.len_utf8();
+            let previous = self.buffer.line_text(row - 1);
+            let end = previous.trim_end_matches([' ', '\t']).len();
+            return self.buffer.line_start(row - 1) + end..head;
         }
-        start..head
+        self.buffer.prev_word_start(head)..head
     }
 
     pub(super) fn char_at(&self, offset: usize) -> Option<char> {

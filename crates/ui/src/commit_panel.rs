@@ -32,6 +32,7 @@ use crate::{
     debugger::panel::Tooltip,
     diff_view::DiffSource,
     editor::{self, Editor},
+    file_icons,
     pinpoint::{self, Pin},
     project::Project,
     selectable::{SelectableText, selectable},
@@ -774,14 +775,14 @@ pub(crate) fn checkbox(check: Check) -> gpui::Div {
         .border_1()
         .border_color(if on { theme::accent() } else { theme::muted() })
         .when(on, |boxed| boxed.bg(theme::accent()))
-        .text_color(theme::on_accent())
-        .text_size(px(10.))
-        .line_height(px(10.))
-        .child(match check {
-            Check::Checked => "✓",
-            Check::Partial => "–",
-            Check::Unchecked => "",
-        })
+        .children(
+            match check {
+                Check::Checked => Some("check"),
+                Check::Partial => Some("minus"),
+                Check::Unchecked => None,
+            }
+            .map(|icon| file_icons::icon(icon, theme::on_accent()).size(px(11.))),
+        )
 }
 
 impl CommitPanel {
@@ -2008,30 +2009,35 @@ impl CommitPanel {
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let button = |id: &'static str, glyph: &'static str, title: &'static str, active: bool| {
+        let selected_file = self
+            .selected
+            .is_some_and(|row| matches!(self.rows.get(row), Some((_, Row::File { .. }))));
+        let button = |id: &'static str, icon: &'static str, title: &'static str, active: bool| {
+            let enabled = id != "commit-show-diff" || selected_file;
             div()
                 .id(id)
                 .flex_none()
-                .w(px(24.))
-                .h(px(22.))
+                .size(px(24.))
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded_sm()
-                .text_sm()
-                .text_color(theme::text())
+                .rounded_md()
                 .when(active, |button| button.bg(theme::active_row()))
                 .cursor_pointer()
                 .hover(|style| style.bg(theme::hover_row()))
                 .tooltip(move |window, cx| Tooltip::view(title, window, cx))
-                .child(glyph)
+                .child(file_icons::icon(
+                    icon,
+                    if enabled {
+                        theme::text()
+                    } else {
+                        theme::muted().opacity(0.6)
+                    },
+                ))
         };
-        let selected_file = self
-            .selected
-            .is_some_and(|row| matches!(self.rows.get(row), Some((_, Row::File { .. }))));
         div()
-            .h(px(28.))
-            .px_1()
+            .h(px(32.))
+            .px_1p5()
             .flex()
             .flex_none()
             .items_center()
@@ -2039,13 +2045,13 @@ impl CommitPanel {
             .border_b_1()
             .border_color(theme::border())
             .child(
-                button("commit-refresh", "⟳", "Refresh", false)
+                button("commit-refresh", "refresh", "Refresh", false)
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
                     .pin("refresh")
                     .label("Refresh"),
             )
             .child(
-                button("commit-rollback", "↶", "Rollback…", false)
+                button("commit-rollback", "rollback", "Rollback…", false)
                     .on_click(
                         cx.listener(|this, _, window, cx| this.rollback_selection(window, cx)),
                     )
@@ -2053,8 +2059,7 @@ impl CommitPanel {
                     .label("Rollback…"),
             )
             .child(
-                button("commit-show-diff", "⇄", "Show Diff (Ctrl+D)", false)
-                    .when(!selected_file, |button| button.text_color(theme::muted()))
+                button("commit-show-diff", "diff", "Show Diff (Ctrl+D)", false)
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(row) = this.selected {
                             this.show_diff(row, cx)
@@ -2065,13 +2070,13 @@ impl CommitPanel {
             )
             .child(div().w(px(1.)).h(px(16.)).mx_1().bg(theme::border()))
             .child(
-                button("commit-expand-all", "⊞", "Expand All", false)
+                button("commit-expand-all", "expand_all", "Expand All", false)
                     .on_click(cx.listener(|this, _, _, cx| this.expand_all(cx)))
                     .pin("expand-all")
                     .label("Expand All"),
             )
             .child(
-                button("commit-collapse-all", "⊟", "Collapse All", false)
+                button("commit-collapse-all", "collapse_all", "Collapse All", false)
                     .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx)))
                     .pin("collapse-all")
                     .label("Collapse All"),
@@ -2079,7 +2084,7 @@ impl CommitPanel {
             .child(
                 button(
                     "commit-group-by-directory",
-                    "▤",
+                    "group_dirs",
                     "Group By Directory",
                     self.by_directory,
                 )
@@ -2155,9 +2160,19 @@ impl CommitPanel {
                 .id(("commit-chevron", index))
                 .w(px(12.))
                 .flex_none()
-                .text_xs()
-                .text_color(theme::muted())
-                .child(if collapsed { "▸" } else { "▾" })
+                .flex()
+                .items_center()
+                .child(
+                    file_icons::icon(
+                        if collapsed {
+                            "chevron_right"
+                        } else {
+                            "chevron_down"
+                        },
+                        theme::muted(),
+                    )
+                    .size(px(12.)),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.toggle_collapsed(index, cx)
@@ -2195,7 +2210,7 @@ impl CommitPanel {
             return base
                 .child(chevron(*collapsed))
                 .children(checkbox)
-                .child(div().flex_none().text_color(theme::muted()).child("⎇"))
+                .child(file_icons::icon("branch", theme::muted()).size(px(14.)))
                 .child(
                     div()
                         .flex_none()
@@ -2257,7 +2272,11 @@ impl CommitPanel {
             } => base
                 .child(chevron(*collapsed))
                 .children(checkbox)
-                .child(div().flex_none().text_color(theme::muted()).child("▱"))
+                .child(file_icons::folder(
+                    label.rsplit('/').next().unwrap_or(label),
+                    !*collapsed,
+                    false,
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -2285,6 +2304,7 @@ impl CommitPanel {
                 }
                 base.child(div().w(px(12.)).flex_none())
                     .children(checkbox)
+                    .child(file_icons::file(name))
                     .child(
                         div()
                             .flex_1()
@@ -2309,6 +2329,15 @@ impl CommitPanel {
                             ),
                     )
                     .children(actions)
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(12.))
+                            .text_xs()
+                            .font_family(theme::MONO_FONT)
+                            .text_color(change_color(*change))
+                            .child(change.letter().to_string()),
+                    )
                     .pin(pin)
                     .label(pin_label)
                     .interactive(true)
@@ -2327,22 +2356,25 @@ impl CommitPanel {
     ) -> Option<impl IntoElement + use<>> {
         let (glyph, title, pin, stage): (&'static str, &'static str, &'static str, bool) =
             match group {
-                Group::Staged => ("−", "Unstage", "unstage", false),
-                Group::Unstaged => ("+", "Stage", "stage", true),
-                Group::Unversioned if self.staging => ("+", "Stage", "stage", true),
-                Group::Conflicts => ("✓", "Mark Resolved", "mark-resolved", true),
+                Group::Staged => ("minus", "Unstage", "unstage", false),
+                Group::Unstaged => ("plus", "Stage", "stage", true),
+                Group::Unversioned if self.staging => ("plus", "Stage", "stage", true),
+                Group::Conflicts => ("check", "Mark Resolved", "mark-resolved", true),
                 _ => return None,
             };
         Some(
             div()
                 .id(("commit-row-action", index))
-                .px_1()
+                .size(px(18.))
+                .flex()
                 .flex_none()
-                .text_color(theme::muted())
-                .hover(|style| style.text_color(theme::text()))
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .hover(|style| style.bg(theme::border()))
                 .cursor_pointer()
                 .tooltip(move |window, cx| Tooltip::view(title, window, cx))
-                .child(glyph)
+                .child(file_icons::icon(glyph, theme::text()).size(px(12.)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     let Some(&(repo, _)) = this.rows.get(index) else {

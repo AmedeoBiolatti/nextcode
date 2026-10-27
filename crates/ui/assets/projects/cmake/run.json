@@ -1,0 +1,21 @@
+{
+  "configurations": [
+    {
+      "name": "Build and Run",
+      "type": "shell",
+      "command": "cmake -DRUN_APP=ON -P cmake/Run.cmake"
+    },
+    {
+      "name": "Build",
+      "type": "shell",
+      "command": "cmake -DRUN_APP=OFF -P cmake/Run.cmake"
+    },
+    {
+      "name": "Debug (build first)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/bin/app@EXE_SUFFIX@",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

@@ -44,13 +44,18 @@ bar shows it.
 JavaScript/TypeScript, Go, shell, SQL, Markdown; no `'` in Rust or
 Markdown) inserts the closer; quotes don't pair right after a letter,
 digit or backslash, and nothing pairs before a word. Typing the closer
-steps over an inserted one, Backspace between an empty pair deletes both,
-and an opener typed over a selection wraps it. `"auto_close_brackets":
+steps over an inserted one, and an opener typed over a selection wraps it. `"auto_close_brackets":
 false` in `settings.json` turns all of this off. Enter keeps the line's
 indentation, adds a level after `{`, `(`, `[` (and Python's `:`), and puts
 the closer of `{|}` on its own line. The bracket pair at the cursor is
 highlighted (from the syntax tree; brackets in strings and comments don't
 match).
+
+**Deleting.** Backspace removes one character at a time, including spaces,
+line breaks and an opening bracket inside an empty pair. Ctrl+Backspace
+(Option+Backspace on macOS) deletes the preceding word; on a blank indented
+line it removes the indentation, line break and trailing spaces from the
+previous line, stopping after that line's last non-space character.
 
 **Find and replace.** `Ctrl+F` opens the find bar above the text, seeded
 with the selection or the word at the cursor; `Ctrl+H` also shows the

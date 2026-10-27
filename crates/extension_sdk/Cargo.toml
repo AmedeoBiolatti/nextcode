@@ -1,0 +1,9 @@
+[package]
+name = "extension_sdk"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+extension_api = { path = "../extension_api" }
+serde_json = "1"

@@ -1,7 +1,7 @@
 # Sticky notes
 
 Notes between the person and agents, pinned to lines of a file like a sticky
-note on a page. They live in `<project>/.next_code/notes.json` (local: the
+note on a page (a [built-in extension](built-in-extensions.md), on by default). They live in `<project>/.next_code/notes.json` (local: the
 first note adds `/.next_code/notes.json*` to `.git/info/exclude`, never to
 `.gitignore`), one per project root, and follow the code: a note found at
 its lines is exact; else the nearest copy of its text (lines inserted above),

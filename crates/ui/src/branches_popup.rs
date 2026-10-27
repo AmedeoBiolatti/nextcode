@@ -7,13 +7,14 @@
 
 use git::{BranchTracking, Ref, RefKind, Repository};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton, ScrollHandle,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, ScrollHandle,
     SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 
 use crate::{
     commit_panel::repository_name,
     editor::{self, Editor, EditorEvent},
+    file_icons,
     pinpoint::{Pin, kebab},
     project_picker,
     selectable::selectable,
@@ -21,6 +22,10 @@ use crate::{
 };
 
 const ROW_HEIGHT: f32 = 24.;
+/// Width of the list; the submenu opens beside it.
+const POPUP_WIDTH: f32 = 380.;
+/// Fixed, so the submenu's side does not depend on the branch's name.
+const SUBMENU_WIDTH: f32 = 300.;
 /// The repository buttons' row (several repositories only).
 const REPOSITORIES_HEIGHT: f32 = 30.;
 const RECENT: usize = 5;
@@ -223,6 +228,9 @@ pub struct BranchesPopup {
     /// The branch row whose submenu is open, and its highlighted entry.
     submenu: Option<(usize, Option<usize>)>,
     error: Option<SharedString>,
+    /// Window x the popup is anchored at (it opens rightwards from
+    /// there when it fits), to open the submenu on the side with room.
+    anchor_x: Option<Pixels>,
     scroll: ScrollHandle,
     _load: Task<()>,
     _subscription: Subscription,
@@ -256,6 +264,7 @@ impl BranchesPopup {
             selected: 0,
             submenu: None,
             error: None,
+            anchor_x: None,
             scroll: ScrollHandle::new(),
             _load: Task::ready(()),
             _subscription: subscription,
@@ -263,6 +272,11 @@ impl BranchesPopup {
         popup.filter(cx);
         popup.load(cx);
         popup
+    }
+
+    /// The popup is shown anchored at window x `x`.
+    pub fn set_anchor_x(&mut self, x: Pixels) {
+        self.anchor_x = Some(x);
     }
 
     /// Lists repository `index`'s branches.
@@ -508,12 +522,12 @@ impl BranchesPopup {
             }))
             .on_click(cx.listener(move |this, _, _, cx| this.activate(index, cx)))
             .child(
-                div()
-                    .w(px(12.))
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme::accent_text())
-                    .child(if branch.head { "★" } else { "" }),
+                match (branch.head, branch.kind) {
+                    (true, _) => file_icons::icon("star", theme::accent_text()),
+                    (false, RefKind::Remote) => file_icons::icon("cloud", theme::muted()),
+                    (false, _) => file_icons::icon("branch", theme::muted()),
+                }
+                .size(px(14.)),
             )
             .child(
                 div()
@@ -530,8 +544,11 @@ impl BranchesPopup {
                     div()
                         .flex_none()
                         .text_xs()
+                        .flex()
+                        .items_center()
                         .text_color(theme::git_added())
-                        .child(selectable("ahead", format!("↑{ahead}"))),
+                        .child(file_icons::icon("arrow_up", theme::git_added()).size(px(11.)))
+                        .child(selectable("ahead", ahead.to_string())),
                 )
             })
             .when(behind > 0, |row| {
@@ -539,8 +556,11 @@ impl BranchesPopup {
                     div()
                         .flex_none()
                         .text_xs()
+                        .flex()
+                        .items_center()
                         .text_color(theme::accent_text())
-                        .child(selectable("behind", format!("↓{behind}"))),
+                        .child(file_icons::icon("arrow_down", theme::accent_text()).size(px(11.)))
+                        .child(selectable("behind", behind.to_string())),
                 )
             })
             .child(
@@ -553,32 +573,52 @@ impl BranchesPopup {
                     .text_color(theme::muted())
                     .child(selectable("upstream", upstream.unwrap_or_default())),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child("›"),
-            )
+            .child(file_icons::icon("chevron_right", theme::muted()).size(px(12.)))
             .pin(format!("{kind}:{}", branch.name))
             .label(branch.name.clone())
             .into_any_element()
     }
 
-    fn render_submenu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+    fn render_submenu(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
         let (row, highlighted) = self.submenu?;
         let commands = self.commands(row);
         // Line the submenu up with its row (header, repositories and
-        // search box above).
+        // search box above). Absolute, beside the list: the popup's
+        // anchored size stays the list's, so a wider or narrower submenu
+        // (labels name the branch) never moves the popup.
         let scroll = self.scroll.offset().y;
         let top = px(42. + self.repositories_height() + ROW_HEIGHT * row as f32) + scroll;
+        // Where the list lands: anchored rightwards from `anchor_x`, or
+        // leftwards when only that fits (gpui's anchored element).
+        let viewport = window.viewport_size().width;
+        let list = px(POPUP_WIDTH);
+        let list_x = self.anchor_x.map_or(px(8.), |x| {
+            if x + list > viewport && x >= list {
+                x - list
+            } else {
+                x
+            }
+        });
+        let gap = px(4.);
+        let submenu = px(SUBMENU_WIDTH);
+        let room_right = viewport - (list_x + list + gap);
+        let left = if room_right < submenu && list_x - gap > room_right {
+            -(submenu + gap)
+        } else {
+            list + gap
+        };
         Some(
             div()
                 .id("branch-submenu")
                 .occlude()
-                .mt(top.max(px(0.)))
-                .ml_1()
-                .min_w(px(260.))
+                .absolute()
+                .top(top.max(px(0.)))
+                .left(left)
+                .w(submenu)
                 .p_1()
                 .flex()
                 .flex_col()
@@ -608,7 +648,7 @@ impl BranchesPopup {
                             item.bg(theme::active_row())
                         })
                         .hover(|style| style.bg(theme::hover_row()))
-                        .child(label)
+                        .child(div().min_w_0().truncate().child(label))
                         .on_click(cx.listener(move |this, _, _, cx| this.run(command.clone(), cx)))
                         .pin(id)
                         .into_any_element()
@@ -625,7 +665,7 @@ impl Focusable for BranchesPopup {
 }
 
 impl Render for BranchesPopup {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut section = String::new();
         let rows: Vec<gpui::AnyElement> = self
             .items
@@ -647,14 +687,22 @@ impl Render for BranchesPopup {
                         .into_any_element()
                 }
                 Item::Action(label, command) => {
+                    let icon = match command {
+                        PopupCommand::UpdateProject => "fetch",
+                        PopupCommand::Commit => "commit",
+                        PopupCommand::Push(_) => "arrow_up",
+                        PopupCommand::NewBranch(_) => "plus",
+                        _ => "tag",
+                    };
                     let command = command.clone();
                     div()
                         .id(("branch-action", index))
                         .h(px(ROW_HEIGHT))
                         .px_2()
-                        .pl(px(26.))
                         .flex()
                         .items_center()
+                        .gap_1p5()
+                        .child(file_icons::icon(icon, theme::muted()).size(px(14.)))
                         .rounded_sm()
                         .cursor_pointer()
                         .when(self.selected == index, |row| row.bg(theme::active_row()))
@@ -682,8 +730,11 @@ impl Render for BranchesPopup {
                 }
             })
             .collect();
+        // Occluding: the wheel scrolls the list, not the editor below.
         let main = div()
-            .w(px(380.))
+            .id("branch-list")
+            .occlude()
+            .w(px(POPUP_WIDTH))
             .flex()
             .flex_col()
             .bg(theme::panel())
@@ -719,6 +770,13 @@ impl Render for BranchesPopup {
                     .max_h(px(520.))
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
+                    // The submenu's row scrolls away from it: close it, the
+                    // next mouse move opens the one under the pointer.
+                    .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                        if this.submenu.take().is_some() {
+                            cx.notify();
+                        }
+                    }))
                     .p_1()
                     .flex()
                     .flex_col()
@@ -744,12 +802,11 @@ impl Render for BranchesPopup {
                 this.submenu = None;
             }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .flex()
-            .items_start()
+            .relative()
             .text_sm()
             .text_color(theme::text())
             .child(main)
-            .children(self.render_submenu(cx))
+            .children(self.render_submenu(window, cx))
             .pin("branches-popup")
             .label("Branches")
     }

@@ -6,6 +6,26 @@ fn args<const N: usize>(fixed: [&str; N]) -> Vec<String> {
     fixed.map(str::to_owned).to_vec()
 }
 
+/// Initializes a standalone application. The caller supplies its destination
+/// as the final argument. No parent workspace, VCS or Python installation changes.
+pub fn init(name: &str) -> Vec<String> {
+    args([
+        "init",
+        "--app",
+        "--no-package",
+        "--name",
+        name,
+        "--vcs",
+        "none",
+        "--no-workspace",
+        "--no-config",
+        "--offline",
+        "--no-python-downloads",
+        "--color",
+        "never",
+    ])
+}
+
 /// Installs the locked environment (`.venv`).
 pub fn sync() -> Vec<String> {
     args(["sync"])

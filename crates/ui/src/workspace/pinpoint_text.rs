@@ -37,14 +37,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        // The notebook view or editor of a tab showing `path`.
+        // The file tab (a notebook) or editor of a tab showing `path`.
         let shown = |this: &Self| {
             this.panes
                 .iter()
                 .find_map(|pane| pane.active_tab().filter(|tab| tab.path == path))
-                .map(|tab| (tab.notebook().cloned(), tab.editor().cloned()))
+                .map(|tab| (tab.file_tab().cloned(), tab.editor().cloned()))
         };
-        let (notebook, editor) = match shown(self) {
+        let (file, editor) = match shown(self) {
             Some(views) => views,
             None => {
                 let open = self.panes.iter().find_map(|pane| {
@@ -68,9 +68,9 @@ impl Workspace {
                 shown(self).ok_or_else(|| format!("{} did not open", path.display()))?
             }
         };
-        if let Some(view) = notebook {
+        if let Some(file) = file {
             if let Some(cell) = cell
-                && !view.update(cx, |view, cx| view.reveal_pinned_cell(cell, cx))
+                && file.reveal_part(cell, cx) != Some(true)
             {
                 return Err(format!("{} has no cell {cell}", path.display()));
             }
@@ -132,7 +132,8 @@ impl Workspace {
     }
 }
 
-/// Tabs pinpoint can scroll: editors and notebooks (not diffs).
+/// Tabs pinpoint can scroll: editors and file tabs (notebooks; not
+/// diffs).
 fn pinpoint_view(tab: &Tab) -> bool {
-    tab.editor().is_some() || tab.notebook().is_some()
+    tab.editor().is_some() || tab.file_tab().is_some()
 }
