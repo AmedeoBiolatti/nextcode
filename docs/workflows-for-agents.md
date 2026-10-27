@@ -971,7 +971,8 @@ Rules of thumb:
   picks, Escape closes it); Enter (or Run All again) runs once every value
   is valid (Run is disabled before), Escape or Cancel closes the form
   without running. Workflows without inputs run at once.
-- Agents with UI automation (`next_code --automation`, see README) can use
+- Agents with UI automation (`next_code --automation`, see
+  [Headless mode](headless-mode.md)) can use
   the same: the command palette (`Ctrl+Shift+P`) and clicks.
 
 ---
