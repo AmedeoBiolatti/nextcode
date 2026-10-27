@@ -38,7 +38,8 @@ trap 'rm -rf -- "$download"' 0
 printf 'Downloading %s\n' "$url/$archive"
 curl -fsSL -o "$download/$archive" "$url/$archive"
 curl -fsSL -o "$download/SHA256SUMS" "$url/SHA256SUMS"
-expected=$(grep "  $archive\$" "$download/SHA256SUMS" | cut -d ' ' -f 1 || true)
+# `hash  name`, or `hash *name` for a sum taken in binary mode.
+expected=$(grep -E "^[0-9a-f]{64} [ *]$archive\$" "$download/SHA256SUMS" | cut -c 1-64 || true)
 actual=$(sha256sum "$download/$archive" | cut -d ' ' -f 1)
 if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
     printf '%s does not match the release'\''s SHA256SUMS\n' "$archive" >&2

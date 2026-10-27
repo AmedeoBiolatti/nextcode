@@ -37,7 +37,8 @@
         $expected = $null
         foreach ($line in Get-Content $sums) {
             $hash, $name = $line -split "\s+", 2
-            if ($name -eq $archive) { $expected = $hash }
+            # `*name` marks a sum taken in binary mode (Git Bash's default).
+            if ($name -and $name.TrimStart("*") -eq $archive) { $expected = $hash }
         }
         if (-not $expected -or $expected -ne (Get-FileHash $zip -Algorithm SHA256).Hash) {
             throw "$archive does not match the release's SHA256SUMS"
