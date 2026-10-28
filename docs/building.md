@@ -153,7 +153,7 @@ final **CI** check verifies change detection and every applicable job, so a
 failed detector cannot turn into a successful documentation-only run.
 
 The test jobs use pinned prebuilt cargo-nextest binaries to run tests across
-crates concurrently. `.config/nextest.toml` limits concurrency to four tests,
+crates concurrently. `.config/nextest.toml` limits concurrency to eight tests,
 and to two for headless/project-process tests. Ignored tests remain ignored;
 Windows retains its existing LLDB exclusion. Doctests run separately with
 `cargo test --workspace --locked --doc`, even if the main test run fails.
@@ -165,7 +165,15 @@ cargo nextest run --workspace --locked --profile ci
 cargo test --workspace --locked --doc
 ```
 
-Clippy and tests have separate caches per platform and Rust toolchain, with
-workspace artifacts included. A new lockfile or toolchain can require a cold
-build. Compare both cold and warm CI runs when changing cache settings; cache
-transfer and cleanup are part of the elapsed time, not just Cargo's timing.
+Clippy and tests have separate caches per platform, Rust compiler and build
+configuration, containing the complete build outputs and Cargo registry.
+Caches are saved per revision and fall back to previous builds. A source
+manifest travels with the build outputs: only files whose SHA-256 matches
+get their recorded timestamps restored. Changed or new files get fresh
+timestamps, so Cargo rebuilds them even if checkout happened before the
+cached build. Missing metadata falls back to a normal build. The source-cache
+tests include a real Cargo fixture proving reuse and invalidation.
+
+A new Rust compiler can require a cold build. Compare both cold and warm CI
+runs when changing cache settings; cache transfer and upload are part of the
+elapsed time, not just Cargo's timing.

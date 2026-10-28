@@ -36,6 +36,8 @@ jobs:
       code: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
+      - name: Verify source cache invalidation
+        run: python -m unittest discover -s scripts/tests -p test_ci_source_cache.py
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -76,16 +78,17 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
       - uses: dtolnay/rust-toolchain@stable
+        id: rust
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
-          # Separate from the old dependency-only cache; job/OS/toolchain
-          # remain part of the key. Keep workspace libraries between runs.
-          key: workspace-v1
-          cache-workspace-crates: true
+          kind: clippy
+          toolchain: ${{ steps.rust.outputs.cachekey }}
       # `-D warnings` reaches workspace members only; vendor/gpui keeps its warnings.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Record source timestamps for the build cache
+        run: python scripts/ci_source_cache.py snapshot
 
   test:
     name: Test (${{ matrix.name }})
@@ -106,13 +109,14 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
       - uses: dtolnay/rust-toolchain@stable
+        id: rust
         with:
           # The headless tests drive a real rust-analyzer.
           components: rust-analyzer
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
         with:
-          key: workspace-v1
-          cache-workspace-crates: true
+          kind: test
+          toolchain: ${{ steps.rust.outputs.cachekey }}
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.150
@@ -122,6 +126,8 @@ jobs:
       - name: Documentation tests
         if: ${{ !cancelled() }}
         run: cargo test --workspace --locked --doc
+      - name: Record source timestamps for the build cache
+        run: python scripts/ci_source_cache.py snapshot
 
   ci:
     name: CI
