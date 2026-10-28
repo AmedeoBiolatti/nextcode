@@ -452,6 +452,13 @@ impl AgentClient {
         }
     }
 
+    pub fn browse_folders(&self, path: &str) -> io::Result<proto::FolderListing> {
+        match self.request(Request::BrowseFolders { path: path.into() })? {
+            Response::Folders(listing) => Ok(listing),
+            other => Err(unexpected(other)),
+        }
+    }
+
     pub fn list_files(&self, root: &str) -> io::Result<Vec<String>> {
         match self.request(Request::ListFiles { root: root.into() })? {
             Response::Files(files) => Ok(files),

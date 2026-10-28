@@ -66,6 +66,14 @@ next_code ssh://me@10.0.0.5:2222/srv/app  # user, port, absolute path
 next_code ssh://box.tail1234.ts.net/~/app # a Tailscale machine
 ```
 
+Once connected, **File > Open Project…** browses folders on that remote
+machine. Use the parent and home buttons, enter an absolute or relative path
+(including `~/`), or show hidden folders, then choose **Open Folder**.
+Opening another folder keeps the SSH host: files, terminals, git and language
+servers continue to run there. **Local Computer…** opens the local folder
+dialog explicitly. The same folder browser is used for WSL projects and
+when opening a project in a new window.
+
 The host is passed to `ssh` as written, so aliases, `User`, `IdentityFile`,
 `ProxyJump`, `ProxyCommand` and the rest of `~/.ssh/config` apply. There is
 no terminal to answer prompts (`BatchMode=yes`): sign-in must work without

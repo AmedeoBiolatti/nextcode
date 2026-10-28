@@ -23,6 +23,7 @@ mod file_icons;
 mod file_ops;
 mod file_tree;
 mod file_types;
+mod folder_picker;
 mod git_dialogs;
 mod git_log;
 mod headless;
@@ -196,6 +197,7 @@ fn run() -> anyhow::Result<()> {
         outline_panel::bind_keys(cx);
         symbol_picker::bind_keys(cx);
         project_picker::bind_keys(cx);
+        folder_picker::bind_keys(cx);
         new_project::bind_keys(cx);
         theme_picker::bind_keys(cx);
         settings_page::bind_keys(cx);

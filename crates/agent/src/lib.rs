@@ -342,6 +342,9 @@ impl Agent {
             Request::ReadDir { path } => {
                 worktree::read_dir(Path::new(&path)).map(Response::Entries)
             }
+            Request::BrowseFolders { path } => {
+                worktree::browse_folders(Path::new(&path)).map(Response::Folders)
+            }
             Request::ListFiles { root } => {
                 Ok(Response::Files(worktree::list_files(Path::new(&root))))
             }
