@@ -224,6 +224,7 @@ fn handle(request: Request) -> Response {
     ];
     children.extend(charts.into_iter().map(|(id, title, chart)| Widget::Chart {
         legend: false,
+        width: None,
         id: id.into(),
         title: title.into(),
         chart,

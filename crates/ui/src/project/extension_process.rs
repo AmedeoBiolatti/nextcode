@@ -156,6 +156,8 @@ impl Project {
         if let Ok(path) = std::env::join_paths(paths) {
             command.env("PATH", path);
         }
+        // Lets a declared tool adapt its output to this host (optional fields added after API 3).
+        command.env("NEXT_CODE_VERSION", env!("CARGO_PKG_VERSION"));
         remote::launch::no_window(&mut command);
         let mut spawned = Tree::spawn(&mut command)?;
         let child = spawned.child.as_mut().unwrap();

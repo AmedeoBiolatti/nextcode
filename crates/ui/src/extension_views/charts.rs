@@ -1,5 +1,5 @@
 use super::ExtensionView;
-use crate::{controls, pinpoint::Pin, theme};
+use crate::{pinpoint::Pin, theme};
 use extension_api::{ChartSpec, UiEvent, UiEventKind};
 use gpui::{
     AnyElement, Bounds, Context, Hsla, MouseButton, PathBuilder, Pixels, Point, SharedString,
@@ -344,7 +344,7 @@ fn draw(
     stroke(window, at(0., 0.), at(0., 1.), theme::text(), 1.);
     stroke(window, at(0., 1.), at(1., 1.), theme::text(), 1.);
     let mut previous: Option<&Datum> = None;
-    for datum in &geometry.points {
+    for (position, datum) in geometry.points.iter().enumerate() {
         let x = zoom.fraction(datum.x);
         let y = 1. - geometry.y.fraction(datum.y);
         let selected = selected == Some((datum.series, datum.index))
@@ -380,7 +380,14 @@ fn draw(
                     stroke(window, at(a.0, a.1), at(b.0, b.1), color, 1.5);
                 }
             }
-            if (0.0..=1.0).contains(&x) {
+            // A line shows its points as the line itself: a marker only where there is no segment to show
+            // (a point alone in its series, or between gaps), and for the point hovered or selected.
+            let joined = |other: Option<&Datum>| {
+                other.is_some_and(|other| other.series == datum.series && other.bar.is_none())
+            };
+            let isolated =
+                !geometry.line || !(joined(previous) || joined(geometry.points.get(position + 1)));
+            if (0.0..=1.0).contains(&x) && (isolated || selected) {
                 let center = at(x, y);
                 let radius = if selected { 4. } else { 2.5 };
                 window.paint_quad(fill(
@@ -477,6 +484,7 @@ impl ExtensionView {
         title: &str,
         height: u16,
         legend: bool,
+        width: Option<u16>,
         cx: &Context<Self>,
     ) -> AnyElement {
         let Some(chart) = self.charts.get(id) else {
@@ -563,29 +571,44 @@ impl ExtensionView {
             )
             .pin("plot")
             .label("Chart plot");
-        let controls = [("+", Some(0.5)), ("−", Some(2.)), ("Reset", None)]
-            .into_iter()
-            .map(|(label, factor)| {
-                let weak = weak.clone();
-                let id = id.to_owned();
-                controls::button(
-                    SharedString::from(format!("{id}-zoom-{label}")),
-                    label,
-                    false,
-                    None,
-                    self.busy,
-                    Rc::new(move |_, cx| {
-                        weak.update(cx, |view, cx| view.zoom_chart(&id, factor, cx))
-                            .ok();
-                    }),
-                )
+        // Small icon buttons in the title row's right corner: a chart's chrome stays a thin line above its plot.
+        let controls = [
+            ("+", "Zoom in", Some(0.5)),
+            ("−", "Zoom out", Some(2.)),
+            ("↺", "Reset zoom", None),
+        ]
+        .into_iter()
+        .map(|(icon, label, factor)| {
+            let weak = weak.clone();
+            let id = id.to_owned();
+            let busy = self.busy;
+            div()
+                .id(SharedString::from(format!("{id}-zoom-{label}")))
+                .flex_none()
+                .size(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .text_xs()
+                .text_color(theme::muted())
+                .when(!busy, |button| {
+                    button
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::hover_row()).text_color(theme::text()))
+                        .on_click(move |_, _, cx| {
+                            weak.update(cx, |view, cx| view.zoom_chart(&id, factor, cx))
+                                .ok();
+                        })
+                })
+                .child(icon)
                 .pin(match factor {
                     Some(value) if value < 1. => "zoom-in",
                     Some(_) => "zoom-out",
                     None => "reset",
                 })
                 .label(label)
-            });
+        });
         let info = chart
             .hover
             .or(chart.selected)
@@ -618,15 +641,24 @@ impl ExtensionView {
             .flex()
             .flex_col()
             .gap_1()
-            .w_full()
-            .min_w(px(180.))
+            .map(|control| match width {
+                Some(width) => control.w(px(f32::from(width))).flex_none(),
+                None => control.w_full().min_w(px(180.)),
+            })
             .child(
                 div()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .gap_2()
-                    .child(SharedString::from(title.to_owned()))
-                    .children(controls),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(SharedString::from(title.to_owned())),
+                    )
+                    .child(div().flex().flex_none().gap(px(2.)).children(controls)),
             )
             .child(
                 div()
@@ -703,7 +735,7 @@ impl ExtensionView {
                 )
             })
             .when_some(info, |view, info| view.child(div().text_xs().child(info)));
-        self.focusable_control(id, false, control.into_any_element())
+        self.focusable_control(id, false, true, control.into_any_element())
     }
 }
 fn number(value: f64) -> String {

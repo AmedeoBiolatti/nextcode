@@ -225,10 +225,15 @@ impl<'a> Bounds<'a> {
                 title,
                 chart,
                 height,
+                width,
                 ..
             } => {
                 self.text(title)?;
                 ensure!((120..=500).contains(height), "invalid chart height");
+                ensure!(
+                    width.is_none_or(|width| (180..=1600).contains(&width)),
+                    "invalid chart width: expected 180..1600"
+                );
                 self.chart(chart)?;
             }
         }

@@ -83,6 +83,7 @@ jobs:
           install -m 755 agent/next_code_agent next_code/
           cp crates/ui/assets/next_code-64.png next_code/next_code.png
           cp LICENSE-MIT LICENSE-APACHE next_code/
+          cp scripts/sagemaker.py next_code/
           test "$(ls next_code/libnc_grammar_*.so | wc -l)" -eq "$(ls -d grammars/*/ | wc -l)"
           tar -czf ${{ matrix.archive }} next_code
       - name: Package
@@ -91,6 +92,7 @@ jobs:
         run: |
           New-Item -ItemType Directory next_code | Out-Null
           Copy-Item target/dist/next_code.exe, target/dist/next_code_editor.exe, target/dist/nc_grammar_*.dll, agent/next_code_agent, LICENSE-MIT, LICENSE-APACHE next_code/
+          Copy-Item scripts/sagemaker.py next_code/
           $grammars = @(Get-ChildItem next_code -Filter nc_grammar_*.dll).Count
           $expected = @(Get-ChildItem grammars -Directory).Count
           if ($grammars -ne $expected) { throw "$grammars grammar libraries, expected $expected" }

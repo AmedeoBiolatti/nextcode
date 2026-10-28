@@ -124,6 +124,108 @@ NEXT_CODE_WSL_AGENT=$PWD/target/debug/next_code_agent \
 cargo test -p remote --lib tailscale -- --ignored   # lists your tailnet
 ```
 
+## SageMaker Spaces (classic Studio and Unified Studio)
+
+SageMaker Spaces use the same Remote - SSH connection above, with an
+SSH-over-SSM proxy. `scripts/sagemaker.py` (also shipped as `sagemaker.py`
+beside the installed editor) prints an SSH configuration for either kind of
+Space. It needs Python 3.8+, a current AWS CLI v2, OpenSSH and the
+[Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+on the local machine's PATH. No Python packages are required.
+
+First enable **Remote Access** and start the Space in AWS. The helper connects
+to running Spaces; it does not start, restart, resize or change permissions on
+them. The Space needs x86_64 Linux and the compatible Linux agent described
+above. All files, terminals, language servers and notebooks run on the Space.
+
+### Classic SageMaker AI Studio
+
+Print the configuration, review it, then add it to `~/.ssh/config` (Windows:
+`%USERPROFILE%\.ssh\config`). Use an absolute path to the helper; its generated
+configuration records that path and the Python executable, so keep both there:
+
+```sh
+python3 /path/to/sagemaker.py config training \
+  --space-arn arn:aws:sagemaker:eu-west-1:123456789012:space/d-example/my-space \
+  --profile my-aws-profile
+```
+
+The profile needs `sagemaker:StartSession` on that Space ARN. Omit `--profile`
+to use the normal AWS credential chain. Complete interactive AWS/SSO login in
+a terminal before connecting; Nextcode's SSH connection cannot answer prompts.
+This follows AWS's [terminal connection method](https://docs.aws.amazon.com/sagemaker/latest/dg/remote-access-local-ide-setup.html).
+
+### SageMaker Unified Studio
+
+Unified Studio requires **project-scoped credentials**; ordinary account
+credentials passed directly to `sagemaker start-session` are not a substitute.
+There are two ways to supply them:
+
+- With a profile authorized to access the DataZone domain's IAM connections,
+  pass its **DataZone domain ID** and project ID. These are separate from the
+  SageMaker domain ID in the Space ARN. The helper lists the project's IAM
+  connections, prefers `project.iam` over `default.iam`, retrieves connection
+  credentials and uses those for `StartSession`. Your profile needs DataZone
+  `ListConnections` and `GetConnection` with secrets access; the returned
+  project role needs `sagemaker:StartSession` for the Space.
+
+  ```sh
+  python3 /path/to/sagemaker.py config unified-training \
+    --space-arn arn:aws:sagemaker:eu-west-1:123456789012:space/d-example/my-space \
+    --profile my-domain-profile --domain-id dzd_example --project-id project123
+  ```
+
+- For an existing AWS Toolkit Unified Studio sign-in (including Identity
+  Center), connect to the Space once in the Toolkit and use `--toolkit`:
+
+  ```sh
+  python3 /path/to/sagemaker.py config unified-training \
+    --space-arn arn:aws:sagemaker:eu-west-1:123456789012:space/d-example/my-space \
+    --toolkit
+  ```
+
+  This explicitly reads the matching project's credentials from the Toolkit's
+  `~/.aws/.sagemaker-space-profiles` cache; it does not use its detached server.
+  Keep the Toolkit signed in so it refreshes credentials for new connections.
+  This cache is an AWS Toolkit implementation detail and may change. Native
+  Identity Center browser sign-in/token refresh is not implemented by this
+  helper. Reconnect in Toolkit if credentials expire or the mapping is missing.
+
+The project credential exchange matches the
+[AWS Toolkit implementation](https://github.com/aws/aws-toolkit-vscode/blob/master/packages/core/src/sagemakerunifiedstudio/shared/client/datazoneClient.ts).
+See also the [Unified Studio prerequisites](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/adminguide/configuring-sagemaker-unified-studio-remote-access.html),
+including network connectivity and project profile restrictions.
+
+For either kind of Space, after saving the printed SSH entry, open
+**File > Remote > Connect to SSH Host…**, choose its alias, and open
+`/home/sagemaker-user` (or your project folder):
+
+```sh
+next_code ssh://training/home/sagemaker-user
+next_code ssh://unified-training/home/sagemaker-user
+```
+
+The proxy obtains a fresh session for each SSH invocation, retains credentials
+only in memory and prints no AWS responses or tokens. Errors appear on the
+connecting page. To diagnose without opening Nextcode, run
+`ssh -T training 'printf connected'`. A successful live connection still depends
+on your domain's permissions, remote access policy and network configuration.
+
+### Uploading local files
+
+Drag files or folders from your computer's file manager into the **Files**
+tree to copy them into the open project, including SageMaker, SSH, WSL and
+container projects. A folder row receives the files; a file row uses its
+parent folder. Empty space or the header uses the project root. In multi-folder
+workspaces, drop onto a specific folder row. Copies run in the background and
+are selected when complete; errors appear as notices. Original local files
+are kept. Existing names receive ` copy`, ` copy 2`, etc., without replacing
+the existing entry. Folders include hidden files and empty subfolders.
+
+Symlinks and special files are refused. Remote uploads currently buffer one
+file at a time and allow files up to 128 MiB each; larger files need a separate
+transfer tool. A failed batch can leave files that were already copied.
+
 ## Dev containers
 
 A folder with `.devcontainer/devcontainer.json` (or `.devcontainer.json`,
