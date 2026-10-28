@@ -1,0 +1,26 @@
+[package]
+name = "extensions"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+cap-std = "3.4.4"
+cap-fs-ext = "3.4.4"
+extension_api = { path = "../extension_api" }
+semver = "1"
+serde = "1"
+serde_json = "1"
+wasmi = { version = "2.0.0", default-features = false, features = ["stable", "std", "validate", "auto-dispatch"] }
+wasmparser = { version = "0.228.0", default-features = false, features = ["std"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+wat = "1"

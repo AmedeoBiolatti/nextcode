@@ -1,12 +1,13 @@
-//! The window: the menu bar (on Windows also the title bar, with drag
+//! The window: the menu bar (on Windows and Linux also the title bar, with drag
 //! areas and caption buttons) with the command bar in it, the tabs, and
 //! the active tab. Every window's root is a [`Shell`]; a project tab holds
-//! a `Workspace`, or `Connecting` while a remote project opens; a workflow
-//! tab holds a [`WorkflowView`] (the file and its graph).
+//! a `Workspace`, or `Connecting` while a remote project opens; a file tab
+//! holds a built-in extension's view (`builtins::WindowTab`, e.g. a
+//! workflow).
 
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock},
 };
@@ -21,29 +22,32 @@ use gpui::{
 
 use crate::{
     app_state::{self, AppState, SavedBounds, SavedWindow, TabTarget},
+    builtins::WindowTab,
     command_palette::{Command, CommandPalette, CommandPaletteEvent},
     commands,
     connecting::{Connecting, ConnectingEvent},
     menus::{self, Item, List, MenuBar, SEPARATOR},
+    new_project::{NewProject as NewProjectDialog, NewProjectEvent},
     pinpoint::{self, Pin},
     project::{Location, Project},
     project_picker::{ProjectPicker, ProjectPickerEvent},
     recent,
     selectable::{self, selectable},
     settings::Settings,
-    terminal_panel::TerminalView,
+    settings_page::{SettingsPage, SettingsPageEvent},
     theme::{self, Theme},
     theme_picker::{ThemePicker, ThemePickerEvent},
-    workflows::{
-        self, AddWorkflowFolder, NewWorkflow, OpenWorkflow, OpenWorkflowFile, RunWorkflow, Source,
-        WorkflowPicker, WorkflowPickerEvent, WorkflowView, WorkflowViewEvent, Workflows,
-    },
     workspace::{Preload, Workspace, WorkspaceEvent},
 };
+
+mod builtins;
+mod extensions;
+mod window_chrome;
 
 actions!(
     app,
     [
+        NewProject,
         OpenProject,
         OpenProjectInNewWindow,
         OpenWorkspace,
@@ -54,6 +58,7 @@ actions!(
         ShowCommandPalette,
         CustomizeMenus,
         OpenSettings,
+        OpenSettingsJson,
         SelectTheme,
         CustomizeTheme,
         Quit,
@@ -69,9 +74,10 @@ pub struct OpenRecentProject {
 }
 
 const CONTEXT: &str = "Shell";
-/// Windows gets no system title bar: the menu bar takes its place.
-const CUSTOM_TITLE_BAR: bool = cfg!(windows);
+/// Use the menu bar as the title bar on Windows and Linux.
+const CUSTOM_TITLE_BAR: bool = cfg!(any(windows, target_os = "linux"));
 const MENU_BAR_HEIGHT: f32 = 36.;
+const COMPACT_MENU: usize = usize::MAX;
 
 static APP_ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
     Arc::new(Image::from_bytes(
@@ -86,10 +92,12 @@ const RECENT_IN_MENU: usize = 15;
 pub fn bind_keys(cx: &mut App) {
     let ctx = Some(CONTEXT);
     cx.bind_keys([
+        KeyBinding::new("secondary-alt-n", NewProject, ctx),
         KeyBinding::new("secondary-o", OpenProject, ctx),
         KeyBinding::new("secondary-r", OpenRecent, ctx),
         // The last binding is the one shown.
         KeyBinding::new("f1", ShowCommandPalette, ctx),
+        KeyBinding::new("secondary-,", OpenSettings, ctx),
         KeyBinding::new("secondary-shift-p", ShowCommandPalette, ctx),
         // JetBrains' next/previous project window.
         KeyBinding::new("ctrl-alt-]", NextProject, ctx),
@@ -102,11 +110,12 @@ enum Content {
     /// Restored from the last session and not shown yet: the project opens
     /// when the tab is first activated, so background tabs cost nothing at
     /// startup (no connection, watcher, git status or language servers).
-    /// A workflow tab also waits here while its remote project opens.
+    /// A file tab also waits here while its remote project opens.
     Unloaded,
     Connecting(Entity<Connecting>),
     Workspace(Entity<Workspace>),
-    Workflow(Entity<WorkflowView>),
+    /// A file tab's view.
+    Builtin(WindowTab),
 }
 
 impl Content {
@@ -115,7 +124,7 @@ impl Content {
             Self::Unloaded => None,
             Self::Connecting(view) => Some(view.entity_id()),
             Self::Workspace(view) => Some(view.entity_id()),
-            Self::Workflow(view) => Some(view.entity_id()),
+            Self::Builtin(tab) => Some(tab.entity_id()),
         }
     }
 
@@ -124,7 +133,7 @@ impl Content {
             Self::Unloaded => None,
             Self::Connecting(view) => Some(view.clone().into()),
             Self::Workspace(view) => Some(view.clone().into()),
-            Self::Workflow(view) => Some(view.clone().into()),
+            Self::Builtin(tab) => Some(tab.view()),
         }
     }
 }
@@ -159,7 +168,7 @@ impl Tab {
     fn dirty_count(&self, cx: &App) -> usize {
         match &self.content {
             Content::Workspace(workspace) => workspace.read(cx).dirty_count(cx),
-            Content::Workflow(view) => usize::from(view.read(cx).is_dirty(cx)),
+            Content::Builtin(tab) => usize::from(tab.is_dirty(cx)),
             Content::Unloaded | Content::Connecting(_) => 0,
         }
     }
@@ -167,18 +176,18 @@ impl Tab {
     /// What the tab bar shows.
     fn title(&self, cx: &App) -> String {
         match (&self.target, &self.content) {
-            (_, Content::Workflow(view)) => view.read(cx).name(),
+            (_, Content::Builtin(tab)) => tab.title(cx),
             (TabTarget::Project(location), _) => tab_title(location),
-            (TabTarget::Workflow { workflow, .. }, _) => workflows::file_stem(workflow),
+            (TabTarget::File { path, .. }, _) => file_stem(path),
         }
     }
 
     /// Its stable pinpoint key (`tab:<key>`): the project's name, or the
-    /// workflow's file name (also its content's `workflow:<key>`).
+    /// file's name (also its content's `<kind>:<key>`).
     fn pin_key(&self) -> String {
         match &self.target {
             TabTarget::Project(location) => tab_title(location),
-            TabTarget::Workflow { workflow, .. } => workflow
+            TabTarget::File { path, .. } => path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -187,11 +196,28 @@ impl Tab {
 
     /// What the window title names.
     fn subject(&self, cx: &App) -> String {
-        match &self.target {
-            TabTarget::Project(location) => location.to_string(),
-            TabTarget::Workflow { .. } => format!("{} (workflow)", self.title(cx)),
-        }
+        subject(&self.target, self.title(cx))
     }
+}
+
+/// What the window title names for a tab titled `title`.
+fn subject(target: &TabTarget, title: String) -> String {
+    match target {
+        TabTarget::Project(location) => location.to_string(),
+        TabTarget::File { kind, .. } => format!("{title} ({kind})"),
+    }
+}
+
+/// What marks the tabs of file tab kind `kind`.
+fn icon(kind: &str) -> &'static str {
+    crate::builtins::window_tab(kind).map_or("", |(_, kind)| kind.icon)
+}
+
+/// A file's name without its extension.
+fn file_stem(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// A menu row, resolved when its menu opens.
@@ -225,8 +251,17 @@ pub struct Shell {
     /// The palette, and the focus to run its command with.
     palette: Option<(Entity<CommandPalette>, Subscription, Option<FocusHandle>)>,
     picker: Option<(Entity<ProjectPicker>, Subscription)>,
+    new_project: Option<(Entity<NewProjectDialog>, Subscription)>,
     theme_picker: Option<(Entity<ThemePicker>, Subscription)>,
-    workflow_picker: Option<(Entity<WorkflowPicker>, Subscription)>,
+    settings_page: Option<(Entity<SettingsPage>, Subscription, Option<FocusHandle>)>,
+    extensions: Entity<crate::extensions::Extensions>,
+    /// The built-in extensions that are on here, their models and dialog.
+    builtins: builtins::Builtins,
+    extension_panel: Option<(
+        Entity<crate::extensions::ExtensionPanel>,
+        Subscription,
+        Option<FocusHandle>,
+    )>,
     notice: Option<SharedString>,
     /// The theme last drawn, and what is wrong with it (dismissable).
     theme: Arc<Theme>,
@@ -236,11 +271,9 @@ pub struct Shell {
     /// Windows' icon font for the caption buttons (Segoe Fluent Icons on
     /// Windows 11, Segoe MDL2 Assets on 10; same code points).
     caption_font: SharedString,
-    /// The window's workflows (they open project tabs here; their tabs
-    /// show them).
-    workflows: Entity<Workflows>,
     _activation: Subscription,
     _bounds: Subscription,
+    _extensions: Subscription,
 }
 
 /// A short name for a project tab.
@@ -258,6 +291,7 @@ pub(crate) fn tab_title(location: &Location) -> String {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.display().to_string()),
         Location::Wsl { distro, path } => format!("{} [{distro}]", linux_name(path)),
+        Location::Remote { host, path, .. } => format!("{} [{host}]", linux_name(path)),
         Location::DevContainer { folder, .. } => match folder.as_ref() {
             Location::Wsl { distro, path } => {
                 format!("{} [{distro}, Container]", linux_name(path))
@@ -339,12 +373,20 @@ pub fn restore(state: AppState, mut preload: Option<Preload>, cx: &mut App) {
         let tabs = saved
             .tabs
             .into_iter()
-            .map(|tab| match tab {
-                TabTarget::Project(location) => TabTarget::Project(location.absolute()),
-                TabTarget::Workflow { workflow, project } => TabTarget::Workflow {
-                    workflow,
-                    project: project.map(Location::absolute),
-                },
+            .filter_map(|tab| match tab {
+                TabTarget::Project(location) => Some(TabTarget::Project(location.absolute())),
+                // Not the tabs of built-in extensions turned off since.
+                TabTarget::File {
+                    kind,
+                    path,
+                    project,
+                } => crate::builtins::window_tab(&kind)
+                    .filter(|(builtin, _)| crate::builtins::enabled(builtin, cx))
+                    .map(|_| TabTarget::File {
+                        kind,
+                        path,
+                        project: project.map(Location::absolute),
+                    }),
             })
             .collect();
         handles.push(open_with(tabs, saved.active, bounds, preload, cx));
@@ -378,10 +420,8 @@ fn open_with(
     cx: &mut App,
 ) -> WindowHandle<Shell> {
     let subject = tabs.get(active).map(|tab| match tab {
-        TabTarget::Project(location) => location.to_string(),
-        TabTarget::Workflow { workflow, .. } => {
-            format!("{} (workflow)", workflows::file_stem(workflow))
-        }
+        TabTarget::Project(_) => subject(tab, String::new()),
+        TabTarget::File { path, .. } => subject(tab, file_stem(path)),
     });
     let options = WindowOptions {
         window_bounds: Some(bounds),
@@ -390,6 +430,8 @@ fn open_with(
             appears_transparent: CUSTOM_TITLE_BAR,
             ..Default::default()
         }),
+        app_id: cfg!(target_os = "linux").then(|| "next_code".into()),
+        window_decorations: cfg!(target_os = "linux").then_some(gpui::WindowDecorations::Client),
         ..Default::default()
     };
     cx.open_window(options, |window, cx| {
@@ -489,7 +531,11 @@ impl Shell {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
         theme::refresh(cx);
-        let workflows = workflows::for_window(window, cx);
+        let extensions = crate::extensions::shared(cx);
+        // Built-in extensions turned on or off (here or in another window).
+        let extensions_changed = cx.observe_in(&extensions, window, |this, _, window, cx| {
+            this.sync_builtins(window, cx)
+        });
         let mut shell = Self {
             focus_handle,
             tabs: Vec::new(),
@@ -498,8 +544,12 @@ impl Shell {
             menu: None,
             palette: None,
             picker: None,
+            new_project: None,
             theme_picker: None,
-            workflow_picker: None,
+            settings_page: None,
+            extensions,
+            builtins: builtins::Builtins::default(),
+            extension_panel: None,
             notice: None,
             theme: theme::current(),
             theme_notice: theme::problem().map(Into::into),
@@ -516,9 +566,10 @@ impl Shell {
             },
             _activation: activation,
             _bounds: bounds,
-            workflows,
+            _extensions: extensions_changed,
         };
         shell.refresh_menus(cx);
+        shell.sync_builtins(window, cx);
         shell
     }
 
@@ -584,8 +635,8 @@ impl Shell {
     }
 
     /// Opens what tab `index` shows (`preload` is a project's head start).
-    /// A workflow tab stays unloaded while its remote project opens, or
-    /// when its file cannot be read (a notice says why).
+    /// A file tab stays unloaded while its remote project opens, or when
+    /// it cannot open (a notice says why).
     fn load(
         &mut self,
         index: usize,
@@ -625,88 +676,20 @@ impl Shell {
                 };
                 Content::Connecting(cx.new(|cx| Connecting::new(remote, pending, window, cx)))
             }
-            TabTarget::Workflow { workflow, project } => {
-                match self.workflow_view(&workflow, project.as_ref(), window, cx) {
-                    Ok(Some(view)) => Content::Workflow(view),
-                    Ok(None) => return,
-                    Err(error) => {
-                        self.notice = Some(error.into());
-                        return cx.notify();
-                    }
-                }
-            }
+            TabTarget::File {
+                kind,
+                path,
+                project,
+            } => match self.open_window_tab(&kind, &path, project.as_ref(), window, cx) {
+                Ok(Some(tab)) => Content::Builtin(tab),
+                Ok(None) => return,
+                Err(error) => return self.report(error, cx),
+            },
         };
         let subscription = self.subscribe(&content, window, cx);
         let tab = &mut self.tabs[index];
         tab.content = content;
         tab._subscription = subscription;
-    }
-
-    /// The workflow tab showing `view` shows file `to` instead (its old
-    /// file was converted to it).
-    fn workflow_converted(
-        &mut self,
-        view: gpui::EntityId,
-        to: &std::path::Path,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.content.id() == Some(view))
-        else {
-            return;
-        };
-        if let TabTarget::Workflow { workflow, .. } = &mut self.tabs[index].target {
-            *workflow = to.to_path_buf();
-        }
-        self.load(index, None, window, cx);
-        self.activate(index, window, cx);
-    }
-
-    /// The view of a workflow file: a user one (`project: None`) read from
-    /// disk, a project one through its project (`Ok(None)` while a remote
-    /// project still opens, in a background tab).
-    fn workflow_view(
-        &mut self,
-        path: &std::path::Path,
-        project: Option<&Location>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<Option<Entity<WorkflowView>>, String> {
-        let (source, file_project) = match project {
-            None => {
-                let dir = path.parent().map(std::path::Path::to_path_buf);
-                // A file outside the user's folder (Open Workflow File…, a
-                // restored tab) is listed too.
-                if dir.as_deref() != self.workflows.read(cx).user_dir() {
-                    let file = path.to_path_buf();
-                    self.workflows
-                        .update(cx, |workflows, cx| workflows.open_file(file, cx).detach());
-                }
-                (Source::User, Project::local(dir.unwrap_or_default()))
-            }
-            Some(location) => {
-                let opened = match (self.workspace_at(location), location) {
-                    (Some((_, workspace)), _) => workspace.read(cx).project().clone(),
-                    (None, Location::Local(root)) => Project::local(root.clone()),
-                    (None, _) => match self.workflow_project(location, window, cx)? {
-                        Some(project) => project,
-                        None => return Ok(None),
-                    },
-                };
-                (Source::Project(location.clone()), opened)
-            }
-        };
-        let text = file_project
-            .read_text(path)
-            .map_err(|err| format!("Cannot open {}: {err}", path.display()))?;
-        let workflows = self.workflows.clone();
-        let path = path.to_path_buf();
-        Ok(Some(cx.new(|cx| {
-            WorkflowView::new(workflows, source, path, file_project, &text, window, cx)
-        })))
     }
 
     fn subscribe(
@@ -715,34 +698,18 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Subscription> {
-        // A project tab is ready: its `.next_code/workflows` join the list
-        // (and the palette's "Run Workflow:" entries). Later, not now: a
-        // running workflow opens tabs while it is being updated itself.
+        // A project tab is ready. Later, not now: a built-in extension may
+        // be opening it while it is being updated itself (a workflow).
         if let Content::Workspace(_) = content {
-            let workflows = self.workflows.clone();
-            cx.spawn(async move |_, cx| {
-                workflows
-                    .update(cx, |workflows, cx| workflows.refresh(cx).detach())
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| this.builtins_project_opened(cx))
                     .ok();
             })
             .detach();
         }
         Some(match content {
-            Content::Unloaded => return None,
-            // The tab bar shows its name and state; a converted file's
-            // tab shows the new file.
-            Content::Workflow(view) => Subscription::join(
-                cx.observe(view, |_, _, cx| cx.notify()),
-                cx.subscribe_in(
-                    view,
-                    window,
-                    |this, view, event: &WorkflowViewEvent, window, cx| match event {
-                        WorkflowViewEvent::Converted { to, .. } => {
-                            this.workflow_converted(view.entity_id(), to, window, cx);
-                        }
-                    },
-                ),
-            ),
+            // A file tab's view connects itself (`WindowTab::new`).
+            Content::Unloaded | Content::Builtin(_) => return None,
             Content::Connecting(connecting) => cx.subscribe_in(
                 connecting,
                 window,
@@ -775,6 +742,15 @@ impl Shell {
                     WorkspaceEvent::Reopen(location) => {
                         let id = workspace.entity_id();
                         this.reopen(id, location.clone(), window, cx);
+                    }
+                    WorkspaceEvent::ExtensionUi { view, event } => {
+                        this.run_extension_ui(
+                            workspace.clone(),
+                            view.clone(),
+                            event.clone(),
+                            window,
+                            cx,
+                        );
                     }
                 },
             ),
@@ -827,10 +803,10 @@ impl Shell {
             content,
             _subscription: subscription,
         };
-        // The active tab may be a workflow of that project, waiting for it.
+        // The active tab may be a file of that project, waiting for it.
         let waiting = self.tabs.get(self.active).is_some_and(|tab| {
             matches!(tab.content, Content::Unloaded)
-                && matches!(&tab.target, TabTarget::Workflow { project: Some(of), .. }
+                && matches!(&tab.target, TabTarget::File { project: Some(of), .. }
                     if of.opens_same(&location))
         });
         if index == self.active || waiting {
@@ -855,7 +831,7 @@ impl Shell {
                 workspace.refresh_git_status(cx);
                 workspace.focus_active(window, cx);
             }),
-            Content::Workflow(view) => window.focus(&view.focus_handle(cx)),
+            Content::Builtin(tab) => window.focus(&tab.focus_handle(cx)),
             Content::Unloaded | Content::Connecting(_) => window.focus(&self.focus_handle),
         }
         self.remember(window, cx);
@@ -977,6 +953,14 @@ impl Shell {
         false
     }
 
+    /// Custom caption buttons must use the same unsaved-changes prompt as
+    /// the platform's close request.
+    fn close_from_caption(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.should_close(window, cx) {
+            window.remove_window();
+        }
+    }
+
     /// Asks for a folder; `\\wsl.localhost\...` folders open as WSL
     /// projects.
     fn prompt_for_project(
@@ -1017,6 +1001,36 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+
+    fn new_project(&mut self, _: &NewProject, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((dialog, _)) = &self.new_project {
+            window.focus(&dialog.focus_handle(cx));
+            return;
+        }
+        self.menu = None;
+        let previous = window.focused(cx);
+        let parent = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| match &tab.target {
+                TabTarget::Project(Location::Local(root)) => root.parent().map(PathBuf::from),
+                _ => None,
+            })
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let dialog = cx.new(|cx| NewProjectDialog::new(parent, cx));
+        let subscription = cx.subscribe_in(&dialog, window, move |this, _, event, window, cx| {
+            this.new_project = None;
+            window.focus(previous.as_ref().unwrap_or(&this.focus_handle));
+            if let NewProjectEvent::Created(location) = event {
+                this.open(location.clone(), window, cx);
+            }
+            cx.notify();
+        });
+        window.focus(&dialog.focus_handle(cx));
+        self.new_project = Some((dialog, subscription));
+        cx.notify();
     }
 
     fn open_project(&mut self, _: &OpenProject, window: &mut Window, cx: &mut Context<Self>) {
@@ -1079,9 +1093,19 @@ impl Shell {
 
     /// `Ctrl+R`: recent projects, or a typed location.
     fn open_recent(&mut self, _: &OpenRecent, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_project_picker("", window, cx);
+    }
+
+    /// Open Recent with `query` typed (`ssh://` lists SSH hosts).
+    pub(crate) fn show_project_picker(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.menu = None;
         let previous = window.focused(cx);
-        let picker = cx.new(ProjectPicker::new);
+        let picker = cx.new(|cx| ProjectPicker::new(query, cx));
         let subscription = cx.subscribe_in(&picker, window, move |this, _, event, window, cx| {
             this.picker = None;
             match &previous {
@@ -1146,18 +1170,47 @@ impl Shell {
                 Command::new(action, keys)
             })
             .collect();
-        // One entry per workflow found (as last read).
-        commands.extend(self.workflows.read(cx).discovered().iter().map(|found| {
-            Command::labeled(
-                Box::new(RunWorkflow {
-                    id: found.id.clone(),
+        for builtin in crate::builtins::on(cx) {
+            commands.extend((builtin.palette)(self, cx));
+        }
+        commands.extend(
+            self.extensions
+                .read(cx)
+                .entries
+                .iter()
+                .filter(|entry| entry.enabled)
+                .flat_map(|entry| {
+                    entry.extension.manifest.commands.iter().map(|command| {
+                        Command::labeled(
+                            Box::new(crate::extensions::RunExtensionCommand {
+                                extension: entry.extension.manifest.id.clone(),
+                                command: command.id.clone(),
+                            }),
+                            format!("{}: {}", entry.extension.manifest.name, command.title),
+                            "Extensions",
+                        )
+                    })
                 }),
-                format!("Run Workflow: {}", found.name),
-                "Workflows",
-            )
-        }));
-        self.workflows
-            .update(cx, |workflows, cx| workflows.refresh(cx).detach());
+        );
+        commands.extend(
+            self.extensions
+                .read(cx)
+                .entries
+                .iter()
+                .filter(|entry| entry.enabled)
+                .flat_map(|entry| {
+                    entry.extension.manifest.panels.iter().map(|panel| {
+                        Command::labeled(
+                            Box::new(crate::extensions::OpenExtensionPanel {
+                                extension: entry.extension.manifest.id.clone(),
+                                panel: panel.id.clone(),
+                            }),
+                            format!("Open {}: {}", entry.extension.manifest.name, panel.title),
+                            "Extensions",
+                        )
+                    })
+                }),
+        );
         let palette = cx.new(|cx| CommandPalette::new(commands, cx));
         let subscription = cx.subscribe_in(&palette, window, |this, _, event, window, cx| {
             let focus = this.palette.take().and_then(|(_, _, focus)| focus);
@@ -1200,7 +1253,34 @@ impl Shell {
         }
     }
 
+    /// Shows the Settings page (or brings it back to the keyboard).
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        if let Some((page, _, _)) = &self.settings_page {
+            window.focus(&page.focus_handle(cx));
+            return;
+        }
+        // Before the page takes the keyboard: focus returns here on close.
+        let focus = window.focused(cx);
+        let page = cx.new(|cx| SettingsPage::new(window, cx));
+        let subscription = cx.subscribe_in(&page, window, |this, _, event, window, cx| {
+            let focus = this.settings_page.take().and_then(|(_, _, focus)| focus);
+            window.focus(focus.as_ref().unwrap_or(&this.focus_handle));
+            if let SettingsPageEvent::OpenJson = event {
+                this.open_settings_json(&OpenSettingsJson, window, cx);
+            }
+            cx.notify();
+        });
+        self.settings_page = Some((page, subscription, focus));
+        cx.notify();
+    }
+
+    fn open_settings_json(
+        &mut self,
+        _: &OpenSettingsJson,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let created = Settings::path()
             .ok_or_else(|| std::io::Error::other("no config directory"))
             .and_then(|path| {
@@ -1307,188 +1387,9 @@ impl Shell {
             .detach();
     }
 
-    /// Run Workflow: <name> (palette): opens its tab and runs it.
-    fn run_workflow(&mut self, action: &RunWorkflow, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(found) = self.workflows.read(cx).find(&action.id).cloned() else {
-            self.notice = Some(format!("No workflow `{}`", action.id).into());
-            return cx.notify();
-        };
-        if let Some(view) = self.open_workflow(&found.source, &found.path, window, cx) {
-            view.update(cx, |view, cx| view.run_all(cx));
-        }
-    }
-
-    /// Open Workflow…: a picker over the workflows found (user and open
-    /// projects' ones).
-    fn open_workflow_picker(
-        &mut self,
-        _: &OpenWorkflow,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.menu = None;
-        let previous = window.focused(cx);
-        let workflows = self.workflows.clone();
-        let picker = cx.new(|cx| WorkflowPicker::new(workflows, cx));
-        let subscription = cx.subscribe_in(&picker, window, move |this, _, event, window, cx| {
-            this.workflow_picker = None;
-            match &previous {
-                Some(focus) => window.focus(focus),
-                None => window.focus(&this.focus_handle),
-            }
-            if let WorkflowPickerEvent::Open { source, path } = event {
-                this.open_workflow(source, path, window, cx);
-            }
-            cx.notify();
-        });
-        window.focus(&picker.focus_handle(cx));
-        self.workflow_picker = Some((picker, subscription));
-        cx.notify();
-    }
-
-    /// Open Workflow File…: any workflow file on this machine, opened in
-    /// its tab and listed (palette, picker, headless) for the session.
-    fn open_workflow_file(
-        &mut self,
-        _: &OpenWorkflowFile,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.menu = None;
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Open Workflow".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            this.update_in(cx, |this, window, cx| {
-                this.open_workflow(&Source::Folder(path.parent().map(std::path::Path::to_path_buf).unwrap_or_default()), &path, window, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Add Workflow Folder…: a folder whose workflows are listed from now
-    /// on, saved in the settings' `"workflows": {"folders": […]}`.
-    fn add_workflow_folder(
-        &mut self,
-        _: &AddWorkflowFolder,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.menu = None;
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Add Workflow Folder".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            let Some(folder) = paths.into_iter().next() else {
-                return;
-            };
-            this.update_in(cx, |this, _, cx| {
-                let saved = crate::settings::Settings::path()
-                    .ok_or_else(|| "no config directory".to_owned())
-                    .and_then(|path| {
-                        crate::settings::add_workflow_folder(&path, &folder.to_string_lossy())
-                    });
-                this.notice = Some(match saved {
-                    Ok(true) => format!("Workflows in {} are listed now", folder.display()),
-                    Ok(false) => format!("{} is listed already", folder.display()),
-                    Err(err) => format!("Could not add the folder: {err}"),
-                }.into());
-                this.workflows
-                    .update(cx, |workflows, cx| workflows.refresh(cx).detach());
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// New Workflow…: a commented template in the user's workflows folder,
-    /// opened in its tab.
-    fn new_workflow(&mut self, _: &NewWorkflow, window: &mut Window, cx: &mut Context<Self>) {
-        let created = self
-            .workflows
-            .read(cx)
-            .user_dir()
-            .ok_or_else(|| std::io::Error::other("no config directory"))
-            .and_then(workflows::create_template);
-        match created {
-            Ok(path) => {
-                self.open_workflow(&Source::User, &path, window, cx);
-                self.workflows
-                    .update(cx, |workflows, cx| workflows.refresh(cx).detach());
-            }
-            Err(err) => {
-                self.notice = Some(format!("Could not create a workflow file: {err}").into());
-                cx.notify();
-            }
-        }
-    }
-
-    /// Shows the tab of workflow file `path` (from `source`), opening one
-    /// if this window has none. `None` when the file cannot be read (a
-    /// notice says why) or its remote project is still opening.
-    pub(crate) fn open_workflow(
-        &mut self,
-        source: &Source,
-        path: &std::path::Path,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<WorkflowView>> {
-        let project = match source {
-            Source::User | Source::Folder(_) => None,
-            Source::Project(location) => Some(location.clone()),
-        };
-        let target = TabTarget::Workflow {
-            workflow: path.to_path_buf(),
-            project: project.clone(),
-        };
-        let index = match self.tabs.iter().position(|tab| tab.target == target) {
-            Some(index) => index,
-            None => {
-                let content = match self.workflow_view(path, project.as_ref(), window, cx) {
-                    Ok(Some(view)) => Content::Workflow(view),
-                    Ok(None) => Content::Unloaded,
-                    Err(error) => {
-                        self.notice = Some(error.into());
-                        cx.notify();
-                        return None;
-                    }
-                };
-                let subscription = self.subscribe(&content, window, cx);
-                self.tabs.push(Tab {
-                    target,
-                    content,
-                    _subscription: subscription,
-                });
-                self.tabs.len() - 1
-            }
-        };
-        self.activate(index, window, cx);
-        match &self.tabs[index].content {
-            Content::Workflow(view) => Some(view.clone()),
-            _ => None,
-        }
-    }
-
-    /// The project at `location` for a workflow step: its tab here, else a
-    /// new background tab (`Ok(None)` while it connects).
-    pub(crate) fn workflow_project(
+    /// The project at `location`: its tab here, else a new background tab
+    /// (`Ok(None)` while it connects). Focus stays where it is.
+    pub(crate) fn project_tab(
         &mut self,
         location: &Location,
         window: &mut Window,
@@ -1531,12 +1432,12 @@ impl Shell {
                 Some(error) => Err(error.to_string()),
                 None => Ok(None),
             },
-            Content::Unloaded | Content::Workflow(_) => Ok(None),
+            Content::Unloaded | Content::Builtin(_) => Ok(None),
         }
     }
 
     /// The projects open in this window's tabs.
-    pub(crate) fn workflow_projects(&self, cx: &App) -> Vec<(Location, Project)> {
+    pub(crate) fn projects(&self, cx: &App) -> Vec<(Location, Project)> {
         self.tabs
             .iter()
             .filter_map(|tab| match &tab.content {
@@ -1549,7 +1450,8 @@ impl Shell {
             .collect()
     }
 
-    fn workspace_at(&self, location: &Location) -> Option<(usize, Entity<Workspace>)> {
+    /// The tab and workspace of the project at `location`, when loaded.
+    pub(crate) fn workspace_at(&self, location: &Location) -> Option<(usize, Entity<Workspace>)> {
         let index = self.position_of(location)?;
         match &self.tabs[index].content {
             Content::Workspace(workspace) => Some((index, workspace.clone())),
@@ -1565,92 +1467,24 @@ impl Shell {
         }
     }
 
-    /// The shown workflow tab (`next_code context`).
-    pub(crate) fn active_workflow(&self) -> Option<Entity<WorkflowView>> {
-        match &self.tabs.get(self.active)?.content {
-            Content::Workflow(view) => Some(view.clone()),
-            _ => None,
-        }
-    }
-
-    /// Starts a workflow step's command in a terminal tab of the project at
-    /// `location`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn workflow_terminal(
+    /// Shows the tab of the project at `location` and brings the window
+    /// forward; its workspace, when loaded.
+    pub(crate) fn show_project(
         &mut self,
         location: &Location,
-        title: &str,
-        program: &str,
-        args: &[String],
-        tap: terminal::OutputTap,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<Entity<TerminalView>, String> {
-        let (_, workspace) = self
-            .workspace_at(location)
-            .ok_or_else(|| format!("{location} is not open"))?;
-        let terminal = workspace.read(cx).terminal_panel();
-        terminal.update(cx, |terminal, cx| {
-            terminal.run_program(title, program, args, Some(tap), window, cx)
-        })
-    }
-
-    /// Show Terminal: the step's project tab, its Terminal panel and tab.
-    pub(crate) fn workflow_show(
-        &mut self,
-        location: &Location,
-        view: &Entity<TerminalView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((index, workspace)) = self.workspace_at(location) else {
-            return;
-        };
+    ) -> Option<Entity<Workspace>> {
+        let (index, workspace) = self.workspace_at(location)?;
         self.activate(index, window, cx);
         window.activate_window();
-        workspace.update(cx, |workspace, cx| {
-            workspace.show_terminal_view(view, window, cx)
-        });
+        Some(workspace)
     }
 
-    /// Opens a workflow step's artifact `path` in an editor tab of the
-    /// project at `location` (opened if needed), and shows that tab.
-    /// `None` (a step on this machine): the local project tab holding the
-    /// file, else the file's folder as a new project tab.
-    pub(crate) fn workflow_open_file(
-        &mut self,
-        location: Option<&Location>,
-        path: &std::path::Path,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let location = match location {
-            Some(location) => location.clone(),
-            None => {
-                let holding = self
-                    .workflow_projects(cx)
-                    .into_iter()
-                    .filter(|(_, project)| !project.is_remote() && path.starts_with(project.root()))
-                    .max_by_key(|(_, project)| project.root().components().count());
-                match holding {
-                    Some((location, _)) => location,
-                    None => match path.parent() {
-                        Some(folder) => Location::Local(folder.to_path_buf()),
-                        None => return,
-                    },
-                }
-            }
-        };
-        if !matches!(self.workflow_project(&location, window, cx), Ok(Some(_))) {
-            self.notice = Some(format!("Could not open {} in {location}", path.display()).into());
-            return cx.notify();
-        }
-        let Some((index, workspace)) = self.workspace_at(&location) else {
-            return;
-        };
-        self.activate(index, window, cx);
-        window.activate_window();
-        workspace.update(cx, |workspace, cx| workspace.open(path, window, cx));
+    /// Shows `notice` below the tabs until clicked.
+    pub(crate) fn report(&mut self, notice: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.notice = Some(notice.into());
+        cx.notify();
     }
 
     /// The workspaces of loaded tabs, in tab order (tests).
@@ -1665,16 +1499,16 @@ impl Shell {
             .collect()
     }
 
-    /// Tab titles (workflow tabs marked with their icon) and the active tab
-    /// (tests).
+    /// Tab titles (file tabs marked with their kind's icon) and the active
+    /// tab (tests).
     #[cfg(test)]
     pub(crate) fn tab_summary(&self, cx: &App) -> (Vec<String>, usize) {
         let titles = self
             .tabs
             .iter()
-            .map(|tab| match tab.target {
+            .map(|tab| match &tab.target {
                 TabTarget::Project(_) => tab.title(cx),
-                TabTarget::Workflow { .. } => format!("{} {}", workflows::TAB_ICON, tab.title(cx)),
+                TabTarget::File { kind, .. } => format!("{} {}", icon(kind), tab.title(cx)),
             })
             .collect();
         (titles, self.active)
@@ -1684,15 +1518,24 @@ impl Shell {
     fn open_menu(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_menus(cx);
         theme::refresh(cx);
-        let Some(menu) = self.menus.menus.get(index) else {
-            self.menu = None;
-            return cx.notify();
-        };
-        let items = menu.items.clone();
         let focus = window
             .focused(cx)
             .unwrap_or_else(|| self.focus_handle.clone());
-        let rows = resolve(&items, &focus, window, cx);
+        let rows = if index == COMPACT_MENU {
+            self.menus
+                .menus
+                .iter()
+                .map(|menu| Row::Submenu {
+                    label: menu.label.clone().into(),
+                    rows: resolve(&menu.items, &focus, window, cx),
+                })
+                .collect()
+        } else if let Some(menu) = self.menus.menus.get(index) {
+            resolve(&menu.items, &focus, window, cx)
+        } else {
+            self.menu = None;
+            return cx.notify();
+        };
         self.menu = Some(OpenMenu {
             menu: index,
             rows,
@@ -1719,6 +1562,10 @@ impl Shell {
     }
 
     fn render_menu_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let custom_title_bar = window_chrome::custom_title_bar(window);
+        let width = window.viewport_size().width;
+        let full_menus = width >= px(1150.);
+        let compact_search = width < px(520.);
         let palette_keys =
             commands::key_text(window, &ShowCommandPalette, Some(&self.focus_handle))
                 .unwrap_or_default();
@@ -1728,45 +1575,63 @@ impl Shell {
             div()
                 .id(id)
                 .flex_1()
-                .min_w(px(24.))
+                .min_w(px(12.))
                 .h_full()
-                .when(CUSTOM_TITLE_BAR, |area| {
+                .when(cfg!(windows), |area| {
                     area.window_control_area(WindowControlArea::Drag)
                 })
+                .when(custom_title_bar && cfg!(target_os = "linux"), |area| {
+                    area.on_mouse_down(MouseButton::Left, |event, window, cx| {
+                        cx.stop_propagation();
+                        if event.click_count == 2 {
+                            window.zoom_window();
+                        } else {
+                            window.start_window_move();
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Right, |event, window, cx| {
+                        cx.stop_propagation();
+                        window.show_window_menu(event.position);
+                    })
+                })
         };
-        div()
+        // The content may shrink or clip, but never takes space reserved for
+        // the caption buttons. Deferred menu popups still draw outside this row.
+        let content = div()
+            .id("title-content")
             .flex()
-            .flex_none()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
             .items_center()
-            .h(px(MENU_BAR_HEIGHT))
+            .h_full()
             .pl_2()
             .gap_0p5()
-            .bg(theme::panel())
-            .border_b_1()
-            .border_color(theme::border())
-            .text_sm()
-            // Clicks on the bar keep focus where it is (the window would
-            // otherwise take it): menu commands and the palette act there.
-            // Occluding rather than handling the press leaves drag areas and
-            // caption buttons to the system (gpui hands it unhandled presses).
-            .id("menu-bar")
-            .occlude()
             .child(img(APP_ICON.clone()).size(px(18.)).flex_none().mr_1p5())
-            .children(
-                self.menus
-                    .menus
-                    .iter()
-                    .enumerate()
-                    .map(|(index, menu)| self.render_menu_title(index, menu.label.clone(), cx)),
-            )
-            .children(self.render_branch_widget(cx))
+            .when(full_menus, |bar| {
+                bar.children(
+                    self.menus
+                        .menus
+                        .iter()
+                        .enumerate()
+                        .map(|(index, menu)| self.render_menu_title(index, menu.label.clone(), cx)),
+                )
+            })
+            .when(!full_menus, |bar| {
+                bar.child(self.render_menu_title(COMPACT_MENU, "Menu".into(), cx))
+            })
+            .when(width >= px(1000.), |bar| {
+                bar.children(self.render_branch_widget(cx))
+            })
             .child(drag_area("title-drag-left"))
             .child(
                 div()
                     .id("command-bar")
                     .flex_shrink()
                     .w(px(440.))
-                    .min_w(px(160.))
+                    .min_w(px(48.))
+                    .overflow_hidden()
+                    .when(compact_search, |search| search.w(px(28.)).min_w(px(28.)))
                     .h(px(24.))
                     .px_2()
                     .flex()
@@ -1786,16 +1651,36 @@ impl Shell {
                             this.show_command_palette(&ShowCommandPalette, window, cx)
                         }),
                     )
-                    .child(div().text_xs().child("⌕"))
-                    .child(div().flex_1().truncate().child("Search commands"))
-                    .child(div().text_xs().child(palette_keys))
+                    .child(div().flex_none().text_xs().child("⌕"))
+                    .when(!compact_search, |search| {
+                        search.child(div().flex_1().min_w_0().truncate().child("Search commands"))
+                    })
+                    .when(width >= px(1450.), |search| {
+                        search.child(div().flex_none().text_xs().child(palette_keys))
+                    })
                     .pin("search-commands")
                     .label("Search commands"),
             )
             .child(drag_area("title-drag-right"))
-            .children(self.render_run_selector(cx))
-            .when(CUSTOM_TITLE_BAR, |bar| {
-                bar.child(self.render_caption_buttons(window))
+            .when(width >= px(760.), |bar| {
+                bar.children(self.render_run_selector(cx))
+            });
+        div()
+            .id("menu-bar")
+            .occlude()
+            .flex()
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .h(px(MENU_BAR_HEIGHT))
+            .items_center()
+            .bg(theme::panel())
+            .border_b_1()
+            .border_color(theme::border())
+            .text_sm()
+            .child(content)
+            .when(custom_title_bar, |bar| {
+                bar.child(self.render_caption_buttons(window, cx))
             })
             .pin("menu-bar")
     }
@@ -1815,10 +1700,11 @@ impl Shell {
                 .h(px(24.))
                 .px_2()
                 .flex()
-                .flex_none()
+                .flex_shrink()
+                .min_w_0()
                 .items_center()
                 .gap_1()
-                .max_w(px(260.))
+                .max_w(px(200.))
                 .rounded_md()
                 .text_color(theme::text())
                 .cursor_pointer()
@@ -1833,15 +1719,25 @@ impl Shell {
                         });
                     }),
                 )
-                .child(div().flex_none().text_color(theme::muted()).child("⎇"))
-                .child(div().min_w_0().truncate().child(branch.label))
+                .child(
+                    crate::file_icons::icon("branch", theme::muted())
+                        .size(px(14.))
+                        .flex_none(),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(branch.label))
                 .when(branch.ahead > 0, |widget| {
                     widget.child(
                         div()
                             .flex_none()
                             .text_xs()
+                            .flex()
+                            .items_center()
                             .text_color(theme::git_added())
-                            .child(format!("↑{}", branch.ahead)),
+                            .child(
+                                crate::file_icons::icon("arrow_up", theme::git_added())
+                                    .size(px(11.)),
+                            )
+                            .child(branch.ahead.to_string()),
                     )
                 })
                 .when(branch.behind > 0, |widget| {
@@ -1849,8 +1745,14 @@ impl Shell {
                         div()
                             .flex_none()
                             .text_xs()
+                            .flex()
+                            .items_center()
                             .text_color(theme::accent_text())
-                            .child(format!("↓{}", branch.behind)),
+                            .child(
+                                crate::file_icons::icon("arrow_down", theme::accent_text())
+                                    .size(px(11.)),
+                            )
+                            .child(branch.behind.to_string()),
                     )
                 })
                 .children(branch.operation.map(|operation| {
@@ -1860,13 +1762,7 @@ impl Shell {
                         .text_color(theme::warning())
                         .child(operation)
                 }))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme::muted())
-                        .child("▾"),
-                )
+                .child(crate::file_icons::icon("chevron_down", theme::muted()).size(px(12.)))
                 .pin("branch")
                 .label("Git branch"),
         )
@@ -1896,12 +1792,16 @@ impl Shell {
         Some(
             div()
                 .flex()
-                .flex_none()
+                .flex_shrink()
+                .min_w_0()
+                .max_w(px(340.))
                 .items_center()
                 .gap_0p5()
                 .mr_2()
                 .child(
                     button("run-config-selector")
+                        .flex_shrink()
+                        .min_w_0()
                         .max_w(px(240.))
                         .border_1()
                         .border_color(theme::border())
@@ -1921,6 +1821,7 @@ impl Shell {
                         )
                         .child(
                             div()
+                                .flex_1()
                                 .min_w_0()
                                 .truncate()
                                 .child(name.unwrap_or_else(|| "Add Configuration…".into())),
@@ -1963,34 +1864,52 @@ impl Shell {
         )
     }
 
-    /// Minimize, maximize/restore and close, drawn like Windows 11's (the
-    /// system acts on them through their window control areas).
-    fn render_caption_buttons(&self, window: &Window) -> impl IntoElement {
-        let button = |id: &'static str, area: WindowControlArea, glyph: &'static str| {
-            div()
-                .id(id)
-                .w(px(46.))
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .font_family(self.caption_font.clone())
-                .text_size(px(10.))
-                .text_color(theme::text())
-                .window_control_area(area)
-                .child(glyph)
-        };
+    /// Windows uses native caption hit testing; Linux calls the compositor
+    /// explicitly and uses SVG icons rather than Windows-only icon fonts.
+    fn render_caption_buttons(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let controls = window.window_controls();
+        let button =
+            |id: &'static str, area: WindowControlArea, glyph: &'static str, icon: &str| {
+                div()
+                    .id(id)
+                    .flex_none()
+                    .w(px(46.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .font_family(self.caption_font.clone())
+                    .text_size(px(10.))
+                    .text_color(theme::text())
+                    .when(cfg!(windows), |button| button.window_control_area(area))
+                    .when(cfg!(target_os = "linux"), |button| {
+                        button.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    })
+                    .child(if cfg!(windows) {
+                        div().child(glyph).into_any_element()
+                    } else {
+                        crate::file_icons::icon(icon, theme::text())
+                            .size(px(14.))
+                            .into_any_element()
+                    })
+            };
         div()
             .flex()
             .h_full()
             .flex_none()
-            .child(
-                button("caption-min", WindowControlArea::Min, "\u{E921}")
+            .children(controls.minimize.then(|| {
+                button("caption-min", WindowControlArea::Min, "\u{E921}", "minus")
                     .hover(|style| style.bg(theme::hover_row()))
+                    .when(cfg!(target_os = "linux"), |button| {
+                        button.on_click(|_, window, cx| {
+                            cx.stop_propagation();
+                            window.minimize_window();
+                        })
+                    })
                     .pin("minimize")
-                    .label("Minimize"),
-            )
-            .child(
+                    .label("Minimize")
+            }))
+            .children(controls.maximize.then(|| {
                 button(
                     "caption-max",
                     WindowControlArea::Max,
@@ -1999,20 +1918,42 @@ impl Shell {
                     } else {
                         "\u{E922}"
                     },
+                    if window.is_maximized() {
+                        "restore"
+                    } else {
+                        "maximize"
+                    },
                 )
                 .hover(|style| style.bg(theme::hover_row()))
+                .when(cfg!(target_os = "linux"), |button| {
+                    button.on_click(|_, window, cx| {
+                        cx.stop_propagation();
+                        window.zoom_window();
+                    })
+                })
                 .pin("maximize")
                 .label(if window.is_maximized() {
                     "Restore"
                 } else {
                     "Maximize"
-                }),
-            )
+                })
+            }))
             .child(
-                button("caption-close", WindowControlArea::Close, "\u{E8BB}")
-                    .hover(|style| style.bg(theme::error()).text_color(theme::on_accent()))
-                    .pin("close-window")
-                    .label("Close window"),
+                button(
+                    "caption-close",
+                    WindowControlArea::Close,
+                    "\u{E8BB}",
+                    "close",
+                )
+                .hover(|style| style.bg(theme::error()).text_color(theme::on_accent()))
+                .when(cfg!(target_os = "linux"), |button| {
+                    button.on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_from_caption(window, cx);
+                    }))
+                })
+                .pin("close-window")
+                .label("Close window"),
             )
     }
 
@@ -2230,19 +2171,17 @@ impl Shell {
                     )
                     .children(match &tab.target {
                         TabTarget::Project(_) => None,
-                        TabTarget::Workflow { .. } => {
+                        TabTarget::File { kind, .. } => {
                             let color = match &tab.content {
-                                Content::Workflow(view) => {
-                                    workflows::outcome_color(view.read(cx).outcome(cx))
-                                }
+                                Content::Builtin(tab) => tab.icon_color(cx),
                                 _ => theme::muted(),
                             };
-                            Some(div().text_color(color).child(workflows::TAB_ICON))
+                            Some(div().text_color(color).child(icon(kind)))
                         }
                     })
                     .child(match (&tab.content, &tab.target) {
                         (Content::Connecting(_), _)
-                        | (Content::Unloaded, TabTarget::Workflow { .. }) => {
+                        | (Content::Unloaded, TabTarget::File { .. }) => {
                             format!("{title} …").into()
                         }
                         _ => title.clone(),
@@ -2339,6 +2278,16 @@ impl Shell {
                     .child(selectable("welcome-title", "No project open")),
             )
             .child(
+                link("welcome-new", with_keys("New Project…", &NewProject))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.new_project(&NewProject, window, cx)
+                        }),
+                    )
+                    .pin("new-project")
+                    .label("New Project…"),
+            )
+            .child(
                 link("welcome-open", with_keys("Open Project…", &OpenProject))
                     .on_click(
                         cx.listener(|this, _, window, cx| {
@@ -2428,10 +2377,19 @@ fn menu_row(
 }
 
 /// Menu items as rows: commands built and checked against where `focus`
-/// is, lists filled in.
+/// is, lists filled in, those of built-in extensions that are off left out.
 fn resolve(items: &[Item], focus: &FocusHandle, window: &mut Window, cx: &mut App) -> Vec<Row> {
-    items
+    let shown: Vec<&Item> = items
         .iter()
+        .filter(|item| match item {
+            Item::Plain(command) | Item::Command { command, .. } => {
+                !crate::builtins::hidden(command, cx)
+            }
+            Item::Submenu { .. } | Item::List { .. } => true,
+        })
+        .collect();
+    let mut rows: Vec<Row> = shown
+        .into_iter()
         .map(|item| match item {
             Item::Plain(command) if command == SEPARATOR => Row::Separator,
             Item::Plain(command) => command_row(command, None, focus, window, cx),
@@ -2469,7 +2427,16 @@ fn resolve(items: &[Item], focus: &FocusHandle, window: &mut Window, cx: &mut Ap
                 }
             }
         })
-        .collect()
+        .collect();
+    // Left-out items can leave separators side by side or at an end.
+    rows.dedup_by(|a, b| matches!((a, b), (Row::Separator, Row::Separator)));
+    if matches!(rows.first(), Some(Row::Separator)) {
+        rows.remove(0);
+    }
+    if matches!(rows.last(), Some(Row::Separator)) {
+        rows.pop();
+    }
+    rows
 }
 
 fn command_row(
@@ -2507,23 +2474,25 @@ impl Render for Shell {
             self.theme_notice = theme::problem().map(Into::into);
         }
         let content = match self.tabs.get(self.active) {
-            // The active tab is loaded (see `activate`), or a workflow tab
-            // waits for its project.
-            Some(tab) => match tab.content.view() {
-                // The workflow view pins its content inside this wrapper.
-                Some(view) if matches!(tab.content, Content::Workflow(_)) => view
-                    .pin(format!("workflow:{}", tab.pin_key()))
+            // The active tab is loaded (see `activate`), or a file tab waits
+            // for its project.
+            Some(tab) => match (tab.content.view(), &tab.target) {
+                // A file tab's view pins its content inside this wrapper.
+                (Some(view), TabTarget::File { kind, .. }) => view
+                    .pin(format!("{kind}:{}", tab.pin_key()))
                     .label(tab.title(cx))
                     .into_any_element(),
-                Some(view) => view.into_any_element(),
-                None => div()
+                (Some(view), TabTarget::Project(_)) => view.into_any_element(),
+                (None, target) => div()
                     .size_full()
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_color(theme::muted())
-                    .child(match tab.target {
-                        TabTarget::Workflow { .. } => "Opening the workflow's project…",
+                    .child(match target {
+                        TabTarget::File { kind, .. } => {
+                            crate::builtins::window_tab(kind).map_or("", |(_, kind)| kind.waiting)
+                        }
                         TabTarget::Project(_) => "",
                     })
                     .into_any_element(),
@@ -2543,6 +2512,7 @@ impl Render for Shell {
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::new_project))
             .on_action(cx.listener(Self::open_project))
             .on_action(cx.listener(Self::open_project_in_new_window))
             .on_action(cx.listener(Self::open_workspace))
@@ -2552,17 +2522,18 @@ impl Render for Shell {
             .on_action(cx.listener(Self::next_project))
             .on_action(cx.listener(Self::previous_project))
             .on_action(cx.listener(Self::show_command_palette))
+            .on_action(cx.listener(Self::manage_extensions))
+            .on_action(cx.listener(Self::install_extension))
+            .on_action(cx.listener(Self::run_extension_command))
+            .on_action(cx.listener(Self::open_extension_panel))
             .on_action(cx.listener(Self::customize_menus))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::open_settings_json))
             .on_action(cx.listener(Self::select_theme))
             .on_action(cx.listener(Self::customize_theme))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::about))
-            .on_action(cx.listener(Self::run_workflow))
-            .on_action(cx.listener(Self::new_workflow))
-            .on_action(cx.listener(Self::open_workflow_file))
-            .on_action(cx.listener(Self::add_workflow_folder))
-            .on_action(cx.listener(Self::open_workflow_picker))
+            .map(|element| crate::builtins::window_actions(element, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if this.menu.is_some() && event.keystroke.key == "escape" {
                     this.close_menu(cx);
@@ -2648,18 +2619,40 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(picker, _)| modal(picker.clone().into())),
             )
+            .children(self.new_project.as_ref().map(|(dialog, _)| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .occlude()
+                    .bg(gpui::black().opacity(0.35))
+                    .pt(px(MENU_BAR_HEIGHT + 40.))
+                    .px_3()
+                    .flex()
+                    .items_start()
+                    .justify_center()
+                    .child(dialog.clone())
+            }))
             .children(
                 self.theme_picker
                     .as_ref()
                     .map(|(picker, _)| modal(picker.clone().into())),
             )
+            .children(self.builtins.modal().map(modal))
             .children(
-                self.workflow_picker
+                self.extension_panel
                     .as_ref()
-                    .map(|(picker, _)| modal(picker.clone().into())),
+                    .map(|(panel, _, _)| modal(panel.clone().into())),
+            )
+            .children(
+                self.settings_page
+                    .as_ref()
+                    .map(|(page, _, _)| modal(page.clone().into())),
             )
             .children(selectable::context_menu(window, cx))
             .child(crate::pinpoint::layer())
+            .children(window_chrome::resize_handles(window))
     }
 }
 
@@ -2707,7 +2700,7 @@ mod tests {
         cx.windows()[0].downcast::<Shell>().unwrap()
     }
 
-    /// Tab titles (workflow tabs marked with their icon) and the active tab.
+    /// Tab titles (file tabs marked with their icon) and the active tab.
     fn tabs(
         window: gpui::WindowHandle<Shell>,
         cx: &mut gpui::TestAppContext,
@@ -2721,9 +2714,7 @@ mod tests {
     fn saved(state: &AppState) -> Vec<(Vec<String>, usize)> {
         let title = |tab: &TabTarget| match tab {
             TabTarget::Project(location) => tab_title(location),
-            TabTarget::Workflow { workflow, .. } => {
-                format!("{} {}", workflows::TAB_ICON, workflows::file_stem(workflow))
-            }
+            TabTarget::File { kind, path, .. } => format!("{} {}", icon(kind), file_stem(path)),
         };
         state
             .windows
@@ -2860,8 +2851,9 @@ mod tests {
                     distro: "NotStarted".into(),
                     path: "/unloaded".into(),
                 });
-                let workflow = TabTarget::Workflow {
-                    workflow: root.join("build.yaml"),
+                let workflow = TabTarget::File {
+                    kind: "workflow".into(),
+                    path: root.join("build.yaml"),
                     project: None,
                 };
                 shell.tabs.push(Tab::unloaded(remote.clone()));
@@ -3011,7 +3003,7 @@ mod tests {
                     .read_with(cx, |shell, cx| match &shell.tabs[tab].content {
                         Content::Workspace(workspace) => Some(workspace.read(cx).tab_paths()),
                         Content::Unloaded => None,
-                        Content::Connecting(_) | Content::Workflow(_) => {
+                        Content::Connecting(_) | Content::Builtin(_) => {
                             panic!("local projects open at once")
                         }
                     })
@@ -3360,6 +3352,85 @@ mod tests {
         cleanup(root);
     }
 
+    #[gpui::test]
+    fn extension_completion_releases_shared_state_after_its_window_closes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, alpha, beta) = two_projects("extension-window-close");
+        let package = root.join("extension");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("extension.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "lifecycle", "name": "Lifecycle", "version": "1.0.0",
+                "api_version": extension_api::API_VERSION, "module": "extension.wasm",
+                "commands": [{"id": "run", "title": "Run"}], "panels": [], "permissions": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("extension.wasm"),
+            wat::parse_str(
+                r#"(module
+            (memory (export "memory") 1)
+            (data (i32.const 1024) "{}")
+            (func (export "nextcode_alloc") (param i32) (result i32) i32.const 4096)
+            (func (export "nextcode_run") (param i32 i32) (result i64) i64.const 8589935616)
+        )"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let extension = ::extensions::Extension::load(&package).unwrap();
+        let first = open_shell(alpha, cx);
+        cx.update(|cx| open_window(beta, None, cx));
+        cx.run_until_parked();
+        let second = *shells(cx).iter().find(|window| **window != first).unwrap();
+        let store = cx.update(crate::extensions::shared);
+        store.update(cx, |store, _| {
+            store.entries.push(crate::extensions::Entry {
+                extension,
+                enabled: true,
+            });
+        });
+        let action = crate::extensions::RunExtensionCommand {
+            extension: "lifecycle".into(),
+            command: "run".into(),
+        };
+        first
+            .update(cx, |shell, window, cx| {
+                shell.run_extension_command(&action, window, cx);
+                assert!(store.read(cx).running.is_some());
+                // Close before the foreground completion callback can be polled.
+                window.remove_window();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            store.read_with(cx, |store, _| store.running.is_none()),
+            "closing a window must not leave every other window permanently busy"
+        );
+        second
+            .update(cx, |shell, window, cx| {
+                shell.notice = Some("A previous command failed".into());
+                shell.run_extension_command(&action, window, cx);
+                assert!(
+                    store.read(cx).running.is_some(),
+                    "another window can run a command"
+                );
+                assert!(
+                    shell.notice.is_none(),
+                    "a new invocation must not display a stale failure"
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.running.is_none()));
+        close_window(second, cx);
+        cleanup(root);
+    }
+
     #[test]
     fn project_tabs_are_named_after_the_folder_and_where_it_lives() {
         let local = Location::Local(PathBuf::from(if cfg!(windows) {
@@ -3384,5 +3455,102 @@ mod tests {
         };
         assert_eq!(tab_title(&container(local)), "next_code [Container]");
         assert_eq!(tab_title(&container(wsl)), "app [Ubuntu, Container]");
+    }
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn extension_process_stdout_renders_and_refreshes_through_the_shell(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, alpha, _) = two_projects("extension-process-stdout");
+        let package = root.join("extension");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("extension.json"), serde_json::to_vec(&serde_json::json!({
+            "id":"process.test", "name":"Process", "version":"1.0.0", "api_version":3, "module":"x.wasm",
+            "commands":[], "panels":[{"id":"overview","title":"Overview","placement":"editor"}],
+            "permissions":["run-process"], "processes":[{"program":"printf"}]
+        })).unwrap()).unwrap();
+        let panel = serde_json::json!({"panels":[{"id":"overview","refresh_ms":1000,
+            "state":{"ready":true}, "root":{"type":"label","id":"result","text":"project status"}}]}).to_string();
+        // A constant module is intentional: successful stdout must become the
+        // response directly, rather than invoking this module and spawning again.
+        let reply = serde_json::json!({"processes":[{"id":"status","program":"printf","args":[panel],"response":"stdout"}]}).to_string();
+        let data: String = reply
+            .as_bytes()
+            .iter()
+            .map(|b| format!("\\{b:02x}"))
+            .collect();
+        let packed = ((reply.len() as u64) << 32) | 1024;
+        let wasm = wat::parse_str(format!(
+            r#"(module
+            (memory (export "memory") 64)
+            (data (i32.const 1024) "{data}")
+            (func (export "nextcode_alloc") (param i32) (result i32) i32.const 2097152)
+            (func (export "nextcode_run") (param i32 i32) (result i64) i64.const {packed}))"#
+        ))
+        .unwrap();
+        std::fs::write(package.join("x.wasm"), wasm).unwrap();
+        let extension = ::extensions::Extension::load(&package).unwrap();
+        let window = open_shell(alpha, cx);
+        let store = cx.update(crate::extensions::shared);
+        store.update(cx, |store, cx| {
+            store.entries.push(crate::extensions::Entry {
+                extension,
+                enabled: true,
+            });
+            cx.notify();
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                shell.open_extension_panel(
+                    &crate::extensions::OpenExtensionPanel {
+                        extension: "process.test".into(),
+                        panel: "overview".into(),
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        let revision = |cx: &mut gpui::TestAppContext| {
+            window
+                .read_with(cx, |shell, cx| {
+                    let Content::Workspace(workspace) = &shell.tabs[shell.active].content else {
+                        panic!("project must be open")
+                    };
+                    workspace
+                        .read(cx)
+                        .extension_panel("process.test", "overview")
+                        .and_then(|view| {
+                            view.read(cx)
+                                .model()
+                                .filter(|m| {
+                                    m.state.get("ready").and_then(serde_json::Value::as_bool)
+                                        == Some(true)
+                                })
+                                .map(|_| view.read(cx).revision())
+                        })
+                        .unwrap_or(0)
+                })
+                .unwrap()
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while revision(cx) == 0 && std::time::Instant::now() < until {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let first = revision(cx);
+        assert!(first > 0);
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while revision(cx) <= first && std::time::Instant::now() < until {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(revision(cx) > first);
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.running.is_none()));
+        close_window(window, cx);
+        cleanup(root);
     }
 }

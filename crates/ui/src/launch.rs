@@ -12,7 +12,7 @@ use anyhow::Context as _;
 
 use crate::project::Location;
 
-pub const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code [--headless] --workspace <FILE>\n       next_code --automation [--port PORT] [--width PX] [--height PX] [--state-dir DIR] -- [PROJECT_DIR]\n       next_code pinpoint <COMMAND> [OPTIONS]\n       next_code --quit\n\nWithout a project, the windows open when next_code last closed reopen (else the welcome screen;\n\"restore_windows\": false in settings.json always shows it). PROJECT_DIR . is the current directory,\nwhich --headless and --devcontainer also use when no project is given.\nA launch opens its project in the editor already running; --new-instance starts a separate editor\ninstead, and --quit asks the running one to exit.\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).\n--workspace opens a multi-root workspace file (local, or <DISTRO>:/path in WSL); PROJECT_DIR\nnaming a *.next_code-workspace or VS Code *.code-workspace file opens it too.\npinpoint lists and highlights parts of the running editor for agents (next_code pinpoint --help).";
+pub const USAGE: &str = "usage: next_code [--headless] [--devcontainer] [PROJECT_DIR]\n       next_code [--headless] [--devcontainer] --wsl <DISTRO> <LINUX_PATH>\n       next_code [--headless] --workspace <FILE>\n       next_code --automation [--port PORT] [--width PX] [--height PX] [--state-dir DIR] -- [PROJECT_DIR]\n       next_code pinpoint <COMMAND> [OPTIONS]\n       next_code --quit\n\nWithout a project, the windows open when next_code last closed reopen (else the welcome screen;\n\"restore_windows\": false in settings.json always shows it). PROJECT_DIR . is the current directory,\nwhich --headless and --devcontainer also use when no project is given.\nA launch opens its project in the editor already running; --new-instance starts a separate editor\ninstead, and --quit asks the running one to exit.\n--automation exposes the GUI on a private Linux display over authenticated HTTP.\n--headless serves JSON-line commands on stdin instead of opening a window.\n--devcontainer opens the folder inside its dev container (.devcontainer/devcontainer.json).\n--workspace opens a multi-root workspace file (local, or <DISTRO>:/path in WSL); PROJECT_DIR\nnaming a *.next_code-workspace or VS Code *.code-workspace file opens it too.\nPROJECT_DIR ssh://[USER@]HOST[:PORT]/PATH (or /~/PATH) opens a folder over SSH (Remote - SSH).\npinpoint lists and highlights parts of the running editor for agents (next_code pinpoint --help).";
 
 /// Reads the command line: a local directory (`.` is the current one), a
 /// `\\wsl.localhost\<distro>\...` path, or `--wsl <distro> <linux path>`,
@@ -98,8 +98,8 @@ pub fn checked(location: Location, base: Option<&Path>) -> anyhow::Result<Locati
             file: Some(file),
             folders,
         } => {
-            let file = absolute(Path::new(&file), base)
-                .with_context(|| format!("resolving {file}"))?;
+            let file =
+                absolute(Path::new(&file), base).with_context(|| format!("resolving {file}"))?;
             anyhow::ensure!(file.is_file(), "{} is not a file", file.display());
             Location::Workspace {
                 distro: None,
@@ -186,13 +186,24 @@ mod tests {
         );
         // Absolute paths ignore the base; WSL locations have no local path.
         assert_eq!(
-            resolve(&args(&[&canonical.join("sub").to_string_lossy()]), Some(Path::new("/elsewhere")))
-                .unwrap(),
+            resolve(
+                &args(&[&canonical.join("sub").to_string_lossy()]),
+                Some(Path::new("/elsewhere"))
+            )
+            .unwrap(),
             Some(Location::Local(canonical.join("sub")))
         );
         assert_eq!(
             resolve(&args(&["Ubuntu:~/p"]), Some(&base)).unwrap(),
             Some(wsl("Ubuntu", "~/p"))
+        );
+        assert_eq!(
+            resolve(&args(&["ssh://me@box/~/p"]), Some(&base)).unwrap(),
+            Some(Location::Remote {
+                scheme: "ssh".into(),
+                host: "me@box".into(),
+                path: "~/p".into(),
+            })
         );
         assert!(resolve(&args(&["missing"]), Some(&base)).is_err());
         assert_eq!(resolve(&[], Some(&base)).unwrap(), None);

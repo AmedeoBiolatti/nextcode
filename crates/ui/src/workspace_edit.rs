@@ -505,7 +505,7 @@ fn shown(project: &Project, path: &Path) -> String {
     let notebook;
     let path = match path.file_name().and_then(|name| {
         name.to_str()?
-            .strip_suffix(crate::notebook::lsp::VIRTUAL_SUFFIX)
+            .strip_suffix(crate::builtins::notebook::lsp::VIRTUAL_SUFFIX)
     }) {
         Some(name) => {
             notebook = path.with_file_name(name);

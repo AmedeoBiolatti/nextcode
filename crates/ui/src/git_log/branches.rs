@@ -5,7 +5,7 @@ use git::{Ref, RefKind};
 use gpui::{ClickEvent, Context, div, prelude::*, px};
 
 use super::GitLogPanel;
-use crate::{pinpoint::Pin, selectable::selectable, theme};
+use crate::{file_icons, pinpoint::Pin, selectable::selectable, theme};
 
 pub(super) const LOCAL: &str = "local";
 pub(super) const REMOTE: &str = "remote";
@@ -210,7 +210,7 @@ impl GitLogPanel {
             match row {
                 BranchRow::Head { label } => base
                     .pl(px(8.))
-                    .child(div().text_color(theme::accent_text()).child("◉"))
+                    .child(file_icons::icon("commit", theme::accent_text()).size(px(14.)))
                     .child(
                         div()
                             .min_w_0()
@@ -226,7 +226,17 @@ impl GitLogPanel {
                 } => base
                     .pl(px(8. + 14. * *depth as f32))
                     .text_color(theme::muted())
-                    .child(if *collapsed { "▸" } else { "▾" })
+                    .child(
+                        file_icons::icon(
+                            if *collapsed {
+                                "chevron_right"
+                            } else {
+                                "chevron_down"
+                            },
+                            theme::muted(),
+                        )
+                        .size(px(12.)),
+                    )
                     .child(selectable("label", label.clone()).double_click_through()),
                 BranchRow::Ref {
                     label,
@@ -236,12 +246,13 @@ impl GitLogPanel {
                     ..
                 } => {
                     let (icon, color) = match kind {
-                        RefKind::Tag => ("◆", theme::tag()),
-                        _ if *current => ("★", theme::accent_text()),
-                        _ => ("⎇", theme::muted()),
+                        RefKind::Tag => ("tag", theme::warning()),
+                        _ if *current => ("star", theme::accent_text()),
+                        RefKind::Remote => ("cloud", theme::muted()),
+                        _ => ("branch", theme::muted()),
                     };
                     base.pl(px(8. + 14. * *depth as f32))
-                        .child(div().w(px(14.)).flex_none().text_color(color).child(icon))
+                        .child(file_icons::icon(icon, color).size(px(14.)))
                         .child(
                             div()
                                 .min_w_0()

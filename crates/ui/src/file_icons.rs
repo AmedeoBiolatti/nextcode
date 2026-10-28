@@ -70,32 +70,58 @@ file_type_icons![
     "yaml",
 ];
 
-const ICONS: &[(&str, &[u8])] = &[
-    (
-        "icons/folder.svg",
-        include_bytes!("../assets/icons/folder.svg"),
-    ),
-    (
-        "icons/folder_open.svg",
-        include_bytes!("../assets/icons/folder_open.svg"),
-    ),
-    ("icons/file.svg", include_bytes!("../assets/icons/file.svg")),
-    (
-        "icons/folder_package.svg",
-        include_bytes!("../assets/icons/folder_package.svg"),
-    ),
-    (
-        "icons/folder_package_open.svg",
-        include_bytes!("../assets/icons/folder_package_open.svg"),
-    ),
-    (
-        "icons/package_dot.svg",
-        include_bytes!("../assets/icons/package_dot.svg"),
-    ),
-    (
-        "icons/person.svg",
-        include_bytes!("../assets/icons/person.svg"),
-    ),
+/// Embeds `assets/icons/<name>.svg` as `icons/<name>.svg`.
+macro_rules! glyph_icons {
+    ($($name:literal),* $(,)?) => {
+        const ICONS: &[(&str, &[u8])] = &[$((
+            concat!("icons/", $name, ".svg"),
+            include_bytes!(concat!("../assets/icons/", $name, ".svg")),
+        )),*];
+    };
+}
+
+glyph_icons![
+    "folder",
+    "folder_open",
+    "file",
+    "folder_package",
+    "folder_package_open",
+    "package_dot",
+    "person",
+    "arrow_down",
+    "arrow_up",
+    "branch",
+    "check",
+    "chevron_down",
+    "chevron_right",
+    "cloud",
+    "collapse_all",
+    "commit",
+    "compare",
+    "diff",
+    "expand_all",
+    "fetch",
+    "group_dirs",
+    "history",
+    "minus",
+    "maximize",
+    "restore",
+    "plus",
+    "refresh",
+    "rollback",
+    "star",
+    "tag",
+    "worktree",
+    "book",
+    "close",
+    "code",
+    "flask",
+    "gear",
+    "keyboard",
+    "palette",
+    "search",
+    "window",
+    "workflow",
 ];
 
 fn all_icons() -> impl Iterator<Item = &'static (&'static str, &'static [u8])> {
@@ -255,6 +281,16 @@ pub fn may_be_package(name: &str) -> bool {
     chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
         && chars.all(|c| c == '_' || c.is_alphanumeric())
         && folder_role(name) != FolderRole::Generated
+}
+
+/// The one-color glyph `assets/icons/<name>.svg` at icon size. An svg
+/// takes no inherited text color: without `color` it is not drawn.
+pub fn icon(name: &str, color: Hsla) -> gpui::Svg {
+    svg()
+        .flex_none()
+        .size(px(SIZE))
+        .path(SharedString::from(format!("icons/{name}.svg")))
+        .text_color(color)
 }
 
 /// The icon of a file: its type's pictogram, or a plain page.

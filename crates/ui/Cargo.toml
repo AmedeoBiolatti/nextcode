@@ -14,6 +14,8 @@ path = "src/main.rs"
 anyhow.workspace = true
 instance.workspace = true
 dap.workspace = true
+extension_api.workspace = true
+extensions.workspace = true
 dirs.workspace = true
 futures.workspace = true
 gpui.workspace = true
@@ -57,6 +59,7 @@ text.workspace = true
 unicode-width.workspace = true
 watcher.workspace = true
 remote.workspace = true
+proto.workspace = true
 worktree.workspace = true
 git.workspace = true
 devcontainer.workspace = true
@@ -71,6 +74,7 @@ pulldown-cmark.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+wat = "1"
 # Port forwarding tests relay through an in-process agent.
 next_code_agent = { path = "../agent" }
 

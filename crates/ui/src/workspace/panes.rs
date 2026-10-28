@@ -81,11 +81,11 @@ impl Pane {
             .position(|tab| tab.path == path && tab.editor().is_some())
     }
 
-    /// The notebook tab of `path` in this pane.
-    pub(super) fn notebook_index(&self, path: &Path) -> Option<usize> {
-        self.tabs
-            .iter()
-            .position(|tab| tab.path == path && tab.notebook().is_some())
+    /// The built-in extension's tab of `path` of kind `kind` in this pane.
+    pub(super) fn file_tab_index(&self, path: &Path, kind: &str) -> Option<usize> {
+        self.tabs.iter().position(|tab| {
+            tab.path == path && tab.file_tab().is_some_and(|tab| tab.kind() == kind)
+        })
     }
 
     fn index_of(&self, view: EntityId) -> Option<usize> {
@@ -313,7 +313,7 @@ impl Workspace {
 
     /// Removes empty panes, keeping at least one; the active pane moves to
     /// the one before a removed active pane.
-    fn prune_empty_panes(&mut self) {
+    pub(super) fn prune_empty_panes(&mut self) {
         while self.panes.len() > 1 {
             let Some(index) = self.panes.iter().position(|pane| pane.tabs.is_empty()) else {
                 break;
@@ -339,11 +339,10 @@ impl Workspace {
     }
 
     /// Follows keyboard focus: the pane whose active tab has it is active.
-    pub(super) fn sync_active_pane(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn sync_active_pane(&mut self, window: &Window, cx: &mut Context<Self>) {
         let focused = self.panes.iter().find_map(|pane| {
             pane.active_tab()?
-                .focus_handle(cx)
-                .contains_focused(window, cx)
+                .contains_focus(window, cx)
                 .then_some(pane.id)
         });
         if let Some(pane) = focused {
@@ -394,7 +393,7 @@ impl Workspace {
 
     /// Takes tab `index` out of `pane`, keeping the pane's active tab
     /// where it was (or on a neighbor).
-    fn take_tab(&mut self, pane: PaneId, index: usize) -> Option<Tab> {
+    pub(super) fn take_tab(&mut self, pane: PaneId, index: usize) -> Option<Tab> {
         let pane = self.pane_mut(pane)?;
         if index >= pane.tabs.len() {
             return None;
@@ -408,8 +407,9 @@ impl Workspace {
 
     /// Closes tab `index` of `pane` without asking. The language server
     /// document moves to another view of the file, or is closed with the
-    /// last one; a notebook's kernel stops with its last view. A pane left
-    /// empty goes away (unless it is the only one).
+    /// last one; a built-in extension's file tab is released with its last
+    /// view (a notebook's kernel stops). A pane left empty goes away
+    /// (unless it is the only one).
     pub(super) fn remove_tab(
         &mut self,
         pane: PaneId,
@@ -420,11 +420,13 @@ impl Workspace {
         let Some(tab) = self.take_tab(pane, index) else {
             return;
         };
-        if let Some(view) = tab.notebook()
+        if matches!(tab.content, TabContent::Extension(_)) {
+            self.forget_extension_view(tab.entity_id());
+        }
+        if let Some(file) = tab.file_tab()
             && !self.has_other_view(&tab)
         {
-            let document = view.read(cx).document().clone();
-            document.update(cx, |document, cx| document.shutdown(cx));
+            file.release(cx);
         }
         if let Some(editor) = tab.editor() {
             let heir = self.panes.iter().find_map(|pane| {
@@ -481,9 +483,11 @@ impl Workspace {
         let Some(tab) = self.pane(from).and_then(|pane| pane.tabs.get(index)) else {
             return;
         };
-        let existing = self.pane(to).and_then(|pane| match tab.content {
+        let existing = self.pane(to).and_then(|pane| match &tab.content {
             TabContent::Editor(_) => pane.editor_index(&tab.path),
-            TabContent::Notebook(_) => pane.notebook_index(&tab.path),
+            TabContent::Builtin(file) if file.is_file() => {
+                pane.file_tab_index(&tab.path, file.kind())
+            }
             _ => None,
         });
         if from != to
@@ -543,7 +547,7 @@ impl Workspace {
         };
         let state = match &tab.content {
             TabContent::Editor(source) => Some(source.read(cx).state()),
-            TabContent::Notebook(_) => None,
+            TabContent::Builtin(tab) if tab.is_file() => None,
             _ => {
                 self.notice = Some("Only file tabs can be split".into());
                 return cx.notify();
@@ -780,8 +784,12 @@ impl Workspace {
     /// same kind (views of one buffer, or of one notebook document).
     pub(super) fn has_other_view(&self, tab: &Tab) -> bool {
         let same = |other: &Tab| match (&tab.content, &other.content) {
-            (TabContent::Editor(_), TabContent::Editor(_))
-            | (TabContent::Notebook(_), TabContent::Notebook(_)) => other.path == tab.path,
+            (TabContent::Editor(_), TabContent::Editor(_)) => other.path == tab.path,
+            (TabContent::Builtin(file), TabContent::Builtin(other_file))
+                if file.is_file() && other_file.is_file() =>
+            {
+                other.path == tab.path && file.kind() == other_file.kind()
+            }
             _ => false,
         };
         let others = self.all_tabs().filter(|other| same(other)).count();
@@ -1042,6 +1050,25 @@ impl Workspace {
                         this.drop_tab(dragged, target, window, cx);
                     }))
                     .child(tab.title.clone())
+                    .when(
+                        matches!(tab.content, TabContent::Extension(_)),
+                        |tab_element| {
+                            let id = tab.entity_id();
+                            tab_element.child(
+                                div()
+                                    .id(("extension-to-dock", index))
+                                    .px_1()
+                                    .text_xs()
+                                    .child("Move to Dock")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.move_extension_to_dock(id, window, cx);
+                                    }))
+                                    .pin("move-to-dock")
+                                    .label("Move extension panel to dock"),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .id(("close", index))

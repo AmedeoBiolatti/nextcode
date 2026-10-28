@@ -704,6 +704,14 @@ pub fn without_commands(layer: &Value) -> Value {
 /// Sets `"theme"` in the settings file at `path`, keeping everything else;
 /// creates the file if missing.
 pub fn write_theme(path: &Path, name: &str) -> Result<(), String> {
+    write_value(path, "theme", Some(name.into()))
+}
+
+/// Sets the dotted `key` (`"git.staging_area"`) in the settings file at
+/// `path` to `value`, or removes it for `None` (back to the default) along
+/// with the objects that removal leaves empty. Everything else is kept;
+/// the file is created if missing.
+pub fn write_value(path: &Path, key: &str, value: Option<Value>) -> Result<(), String> {
     let fail = |err: &dyn std::fmt::Display| format!("{}: {err}", path.display());
     let mut settings = match std::fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => json!({}),
@@ -711,15 +719,54 @@ pub fn write_theme(path: &Path, name: &str) -> Result<(), String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(err) => return Err(fail(&err)),
     };
-    let Some(object) = settings.as_object_mut() else {
+    if !settings.is_object() {
         return Err(fail(&"not a JSON object"));
-    };
-    object.insert("theme".into(), name.into());
+    }
+    set_dotted(&mut settings, key, value).map_err(|err| fail(&err))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|err| fail(&err))?;
     }
     let text = serde_json::to_string_pretty(&settings).map_err(|err| fail(&err))?;
     worktree::write_atomic(path, (text + "\n").as_bytes()).map_err(|err| fail(&err))
+}
+
+/// [`write_value`] on a JSON object in memory.
+fn set_dotted(object: &mut Value, key: &str, value: Option<Value>) -> Result<(), String> {
+    let (first, rest) = match key.split_once('.') {
+        Some((first, rest)) => (first, Some(rest)),
+        None => (key, None),
+    };
+    let Some(map) = object.as_object_mut() else {
+        return Err(format!("`{first}`'s parent is not an object"));
+    };
+    match (rest, value) {
+        (None, Some(value)) => {
+            map.insert(first.to_owned(), value);
+        }
+        (None, None) => {
+            map.remove(first);
+        }
+        (Some(rest), Some(value)) => {
+            let child = map.entry(first).or_insert_with(|| json!({}));
+            if !child.is_object() {
+                return Err(format!("`{first}` is not an object"));
+            }
+            set_dotted(child, rest, Some(value))?;
+        }
+        (Some(rest), None) => {
+            let Some(child) = map.get_mut(first) else {
+                return Ok(());
+            };
+            if !child.is_object() {
+                return Ok(());
+            }
+            set_dotted(child, rest, None)?;
+            if child.as_object().is_some_and(serde_json::Map::is_empty) {
+                map.remove(first);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Adds `folder` to `"workflows": {"folders": […]}` in the settings file
@@ -772,6 +819,28 @@ pub fn section(settings: &Value, section: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dotted_values_are_set_and_reset_keeping_the_rest() {
+        let mut settings = json!({ "theme": "Light", "git": { "inline_blame": true } });
+        set_dotted(&mut settings, "git.staging_area", Some(true.into())).unwrap();
+        set_dotted(&mut settings, "editor.minimap.side", Some("left".into())).unwrap();
+        assert_eq!(
+            settings,
+            json!({ "theme": "Light",
+                "git": { "inline_blame": true, "staging_area": true },
+                "editor": { "minimap": { "side": "left" } } })
+        );
+        // Resetting removes the key and the objects it leaves empty.
+        set_dotted(&mut settings, "editor.minimap.side", None).unwrap();
+        set_dotted(&mut settings, "git.staging_area", None).unwrap();
+        set_dotted(&mut settings, "never.set", None).unwrap();
+        assert_eq!(
+            settings,
+            json!({ "theme": "Light", "git": { "inline_blame": true } })
+        );
+        assert!(set_dotted(&mut settings, "theme.inner", Some(1.into())).is_err());
+    }
 
     #[test]
     fn untrusted_layers_keep_everything_but_programs() {

@@ -33,6 +33,7 @@ use crate::{
     compare_view::render_change_node,
     diff_view::DiffSource,
     editor::{self, Editor, EditorEvent},
+    file_icons,
     pinpoint::Pin,
     project::Project,
     selectable::selectable,
@@ -42,7 +43,7 @@ use crate::{
 use branches::BranchRow;
 
 const ROW_HEIGHT: f32 = 24.;
-const LANE_WIDTH: f32 = 14.;
+const LANE_WIDTH: f32 = 16.;
 /// Lanes beyond this are drawn clipped; real histories rarely need more.
 const MAX_LANES: usize = 16;
 /// Commits per `git log` run; the next page loads when the list scrolls
@@ -268,8 +269,19 @@ pub(crate) fn absolute_time(time: i64) -> String {
     )
 }
 
-/// The lanes and node of one commit.
-fn graph_cell(row: &GraphRow, head: bool) -> impl IntoElement {
+/// How a commit's node is drawn.
+#[derive(Clone, Copy, PartialEq)]
+enum GraphNode {
+    Commit,
+    /// A merge commit: a ring.
+    Merge,
+    /// HEAD: a dot in a wider ring.
+    Head,
+}
+
+/// The lanes and node of one commit. `background` is the row's, for the
+/// inside of rings.
+fn graph_cell(row: &GraphRow, node: GraphNode, background: Hsla) -> impl IntoElement {
     let row = row.clone();
     let lanes = row.width.min(MAX_LANES);
     canvas(
@@ -279,13 +291,22 @@ fn graph_cell(row: &GraphRow, head: bool) -> impl IntoElement {
             let top = bounds.origin.y;
             let middle = top + bounds.size.height / 2.;
             let bottom = top + bounds.size.height;
+            // Lanes changing column bend in an S, leaving and joining
+            // vertically.
             let mut line = |from: (usize, Pixels), to: (usize, Pixels), color: Hsla| {
                 if from.0 >= MAX_LANES || to.0 >= MAX_LANES {
                     return;
                 }
-                let mut path = PathBuilder::stroke(px(1.5));
-                path.move_to(point(x(from.0), from.1));
-                path.line_to(point(x(to.0), to.1));
+                let start = point(x(from.0), from.1);
+                let end = point(x(to.0), to.1);
+                let mut path = PathBuilder::stroke(px(2.));
+                path.move_to(start);
+                if from.0 == to.0 {
+                    path.line_to(end);
+                } else {
+                    let bend = (from.1 + to.1) / 2.;
+                    path.cubic_bezier_to(end, point(start.x, bend), point(end.x, bend));
+                }
                 if let Ok(path) = path.build() {
                     window.paint_path(path, color);
                 }
@@ -299,15 +320,31 @@ fn graph_cell(row: &GraphRow, head: bool) -> impl IntoElement {
             if row.column < MAX_LANES {
                 let color = theme::graph_lane(row.column);
                 let center = point(x(row.column), middle);
-                if head {
-                    // HEAD: a ring around the node.
-                    let ring = Bounds::centered_at(center, size(px(12.), px(12.)));
-                    window.paint_quad(fill(ring, color).corner_radii(px(6.)));
-                    let hole = Bounds::centered_at(center, size(px(8.), px(8.)));
-                    window.paint_quad(fill(hole, theme::background()).corner_radii(px(4.)));
+                let ring = |diameter: f32| {
+                    gpui::quad(
+                        Bounds::centered_at(center, size(px(diameter), px(diameter))),
+                        px(diameter / 2.),
+                        background,
+                        px(2.),
+                        color,
+                        gpui::BorderStyle::Solid,
+                    )
+                };
+                let dot = |diameter: f32| {
+                    fill(
+                        Bounds::centered_at(center, size(px(diameter), px(diameter))),
+                        color,
+                    )
+                    .corner_radii(px(diameter / 2.))
+                };
+                match node {
+                    GraphNode::Commit => window.paint_quad(dot(8.)),
+                    GraphNode::Merge => window.paint_quad(ring(10.)),
+                    GraphNode::Head => {
+                        window.paint_quad(ring(14.));
+                        window.paint_quad(dot(6.));
+                    }
                 }
-                let node = Bounds::centered_at(center, size(px(6.), px(6.)));
-                window.paint_quad(fill(node, color).corner_radii(px(3.)));
             }
         },
     )
@@ -316,53 +353,72 @@ fn graph_cell(row: &GraphRow, head: bool) -> impl IntoElement {
     .h(px(ROW_HEIGHT))
 }
 
-/// A branch or tag label in a commit row; `remote` outlines remote branches.
-fn ref_label(index: usize, name: &str, remote: bool) -> impl IntoElement {
-    let (label, background, border, text) = if let Some(branch) = name.strip_prefix("HEAD -> ") {
-        (
-            format!("HEAD → {branch}"),
-            theme::accent(),
-            theme::accent(),
-            theme::on_accent(),
-        )
-    } else if name == "HEAD" {
-        (
-            "HEAD".to_owned(),
-            theme::accent(),
-            theme::accent(),
-            theme::on_accent(),
-        )
-    } else if let Some(tag) = name.strip_prefix("tag: ") {
-        (
-            format!("◆ {tag}"),
-            theme::tag(),
-            theme::tag(),
-            theme::on_accent(),
-        )
-    } else if remote {
-        (
-            name.to_owned(),
-            gpui::transparent_black(),
-            theme::branch(),
-            theme::muted(),
-        )
-    } else {
-        (
-            name.to_owned(),
-            theme::branch(),
-            theme::branch(),
-            theme::on_accent(),
-        )
-    };
+/// A branch or tag label in a commit row: HEAD's branch filled with the
+/// accent, other local branches tinted with the commit's `lane` color,
+/// remote branches outlined, tags in the tag color.
+fn ref_label(index: usize, name: &str, remote: bool, lane: Hsla) -> impl IntoElement {
+    let (label, icon, background, border, text, icon_color) =
+        if let Some(branch) = name.strip_prefix("HEAD -> ") {
+            (
+                format!("HEAD → {branch}"),
+                "branch",
+                theme::accent(),
+                theme::accent(),
+                theme::on_accent(),
+                theme::on_accent(),
+            )
+        } else if name == "HEAD" {
+            (
+                "HEAD".to_owned(),
+                "commit",
+                theme::accent(),
+                theme::accent(),
+                theme::on_accent(),
+                theme::on_accent(),
+            )
+        } else if let Some(tag) = name.strip_prefix("tag: ") {
+            (
+                tag.to_owned(),
+                "tag",
+                theme::tag().opacity(0.25),
+                theme::tag().opacity(0.7),
+                theme::text(),
+                theme::warning(),
+            )
+        } else if remote {
+            (
+                name.to_owned(),
+                "cloud",
+                gpui::transparent_black(),
+                theme::branch(),
+                theme::muted(),
+                theme::muted(),
+            )
+        } else {
+            (
+                name.to_owned(),
+                "branch",
+                lane.opacity(0.18),
+                lane.opacity(0.55),
+                theme::text(),
+                lane,
+            )
+        };
     div()
         .flex_none()
-        .px_1()
-        .rounded_sm()
+        .h(px(18.))
+        .pl_1()
+        .pr_1p5()
+        .flex()
+        .items_center()
+        .gap_1()
+        .rounded_full()
         .border_1()
         .border_color(border)
         .bg(background)
         .text_xs()
         .text_color(text)
+        .child(file_icons::icon(icon, icon_color).size(px(11.)))
         .child(selectable(("ref", index), label).right_click_through())
 }
 
@@ -908,6 +964,7 @@ impl GitLogPanel {
         let commit = &self.commits[index];
         let selected = self.selected.binary_search(&index).is_ok();
         let head = self.head.as_ref().is_some_and(|head| head.id == commit.id);
+        let lane = theme::graph_lane(self.graph[index].column);
         div()
             .id(("commit", index))
             .w_full()
@@ -934,7 +991,21 @@ impl GitLogPanel {
                     this.open_menu(index, event.position, cx);
                 }),
             )
-            .child(graph_cell(&self.graph[index], head))
+            .child(graph_cell(
+                &self.graph[index],
+                if head {
+                    GraphNode::Head
+                } else if commit.parents.len() > 1 {
+                    GraphNode::Merge
+                } else {
+                    GraphNode::Commit
+                },
+                if selected {
+                    theme::active_row()
+                } else {
+                    theme::background()
+                },
+            ))
             .child(
                 div()
                     .flex_1()
@@ -958,7 +1029,7 @@ impl GitLogPanel {
                             .refs
                             .iter()
                             .any(|r| r.kind == git::RefKind::Remote && r.name == *name);
-                        ref_label(i, name, remote)
+                        ref_label(i, name, remote, lane)
                     })),
             )
             .child(
@@ -1413,21 +1484,25 @@ impl GitLogPanel {
                     .message
                     .clone()
                     .unwrap_or_else(|| commit.subject.clone());
+                let (subject, body) = match message.split_once('\n') {
+                    Some((subject, body)) => (subject.to_owned(), body.trim().to_owned()),
+                    None => (message.clone(), String::new()),
+                };
                 let branches = details.branches.as_ref().map(|branches| {
-                    let shown: Vec<&str> = branches.iter().take(8).map(String::as_str).collect();
+                    let shown: Vec<String> = branches.iter().take(8).cloned().collect();
                     let more = branches.len().saturating_sub(shown.len());
-                    format!(
-                        "In {} branch{}: {}{}",
-                        branches.len(),
-                        if branches.len() == 1 { "" } else { "es" },
-                        shown.join(", "),
-                        if more > 0 {
-                            format!(" and {more} more")
-                        } else {
-                            String::new()
-                        }
-                    )
+                    (shown, more)
                 });
+                let initial = commit
+                    .author
+                    .chars()
+                    .next()
+                    .map_or_else(String::new, |c| c.to_uppercase().collect());
+                // One color per author, stable across sessions.
+                let author_color =
+                    theme::graph_lane(commit.email.bytes().fold(0usize, |hash, b| {
+                        hash.wrapping_mul(31).wrapping_add(usize::from(b))
+                    }));
                 div()
                     .id("log-commit-info")
                     .flex_1()
@@ -1436,49 +1511,113 @@ impl GitLogPanel {
                     .p_3()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_2()
                     .text_sm()
                     .child(
                         div()
-                            .text_color(theme::text())
-                            .child(selectable("message", message))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_color(theme::text())
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(selectable("message", subject)),
+                            )
+                            .when(!body.is_empty(), |message| {
+                                message.child(
+                                    div()
+                                        .text_color(theme::text())
+                                        .child(selectable("message-body", body)),
+                                )
+                            })
                             .pin("message")
                             .label("Commit message")
                             .interactive(false),
                     )
                     .child(
                         div()
-                            .mt_2()
-                            .font_family(theme::MONO_FONT)
-                            .text_xs()
-                            .text_color(theme::muted())
-                            .child(selectable("hash", commit.id.clone()))
-                            .pin("hash")
-                            .label("Commit hash")
-                            .interactive(false),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::muted())
-                            .child(selectable(
-                                "author",
-                                format!(
-                                    "{} <{}> on {}",
-                                    commit.author,
-                                    commit.email,
-                                    absolute_time(commit.time)
-                                ),
-                            ))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(26.))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(author_color.opacity(0.25))
+                                    .text_color(author_color)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(initial),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().truncate().text_color(theme::text()).child(
+                                        selectable(
+                                            "author",
+                                            format!("{} <{}>", commit.author, commit.email),
+                                        ),
+                                    ))
+                                    .child(div().text_xs().text_color(theme::muted()).child(
+                                        selectable(
+                                            "date",
+                                            format!(
+                                                "{} · {}",
+                                                absolute_time(commit.time),
+                                                relative_time(commit.time)
+                                            ),
+                                        ),
+                                    )),
+                            )
                             .pin("author")
                             .label("Author")
                             .interactive(false),
                     )
-                    .children(branches.map(|branches| {
+                    .child(
                         div()
+                            .flex()
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .rounded_sm()
+                                    .bg(theme::panel())
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .font_family(theme::MONO_FONT)
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child(selectable("hash", commit.id.clone())),
+                            )
+                            .pin("hash")
+                            .label("Commit hash")
+                            .interactive(false),
+                    )
+                    .children(branches.map(|(shown, more)| {
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(selectable("branches", branches))
+                            .child(file_icons::icon("branch", theme::muted()).size(px(12.)))
+                            .children(shown.into_iter().enumerate().map(|(index, branch)| {
+                                div()
+                                    .px_1p5()
+                                    .rounded_full()
+                                    .bg(theme::hover_row())
+                                    .text_color(theme::text())
+                                    .child(selectable(("branch", index), branch))
+                            }))
+                            .when(more > 0, |row| {
+                                row.child(selectable("more", format!("and {more} more")))
+                            })
                             .pin("branches")
                             .label("Branches")
                             .interactive(false)

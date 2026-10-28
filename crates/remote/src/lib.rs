@@ -1,10 +1,13 @@
 //! Editor side of remote projects: a client for `next_code_agent` and the
-//! bootstraps that start it inside WSL or a container.
+//! bootstraps that start it inside WSL, a container or over SSH (Tailscale
+//! peers included).
 
 mod client;
 pub mod container;
 pub mod host;
 pub mod launch;
+pub mod ssh;
+pub mod tailscale;
 pub mod wsl;
 
 pub use client::{

@@ -1,0 +1,15 @@
+{
+  "id": "uppercase",
+  "name": "Uppercase Selection",
+  "version": "0.1.0",
+  "api_version": 3,
+  "module": "uppercase.wasm",
+  "commands": [
+    {
+      "id": "uppercase-selection",
+      "title": "Uppercase Selection"
+    }
+  ],
+  "panels": [],
+  "permissions": ["read-document", "edit-document"]
+}

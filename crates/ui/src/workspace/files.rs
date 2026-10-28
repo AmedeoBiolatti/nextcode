@@ -79,7 +79,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.show_panel(PanelId::Files, cx);
-        let near = self.active_tab().map(|tab| tab.path.clone());
+        let near = self
+            .active_tab()
+            .and_then(Tab::file_path)
+            .map(Path::to_path_buf);
         self.file_tree.update(cx, |tree, cx| {
             tree.start_new_file(near, file_type, window, cx)
         });
@@ -292,7 +295,7 @@ impl Workspace {
             if trash {
                 "You can restore it from the Recycle Bin."
             } else if self.project.is_remote() {
-                "This cannot be undone (no Recycle Bin\nin WSL and dev containers)."
+                "This cannot be undone (no Recycle Bin\nin WSL, dev containers and remote machines)."
             } else {
                 "This cannot be undone."
             }

@@ -16,8 +16,8 @@ use workflow::{Artifact, ArtifactTarget, Input, InputKind, Ready, Status, StepNo
 
 use super::*;
 use crate::{
+    builtins::workflows::{Host, Workflows, WorkflowsEvent},
     terminal_panel::{self, TerminalView},
-    workflows::{Host, Workflows, WorkflowsEvent},
 };
 
 /// A project being opened on a thread for a step.
@@ -160,7 +160,6 @@ pub(super) fn forward(out: &Out, event: &WorkflowsEvent) {
             "workflow_event",
             json!({ "type": "url", "run": run, "workflow": workflow, "step": step, "url": url }),
         ),
-        WorkflowsEvent::Discovered => {}
     }
 }
 
@@ -263,7 +262,8 @@ fn node_json(nodes: &[StepNode], at: usize) -> Value {
     let node = &nodes[at];
     let step = &node.step;
     let project = step.project.as_ref().map(|spec| {
-        crate::workflows::location_of(spec).map_or_else(|err| err, |location| location.to_string())
+        crate::builtins::workflows::location_of(spec)
+            .map_or_else(|err| err, |location| location.to_string())
     });
     if node.is_group() {
         return json!({
@@ -459,20 +459,6 @@ impl Session {
                         "modeline": workflow::SCHEMA_MODELINE,
                     }));
                 }
-                if command == "workflow_convert" {
-                    let name = query(&request)?;
-                    let found = workflows
-                        .lookup(&name)
-                        .ok_or_else(|| format!("no workflow `{name}`"))?
-                        .id
-                        .clone();
-                    let converted = workflows.convert(&found, cx)?;
-                    return Ok(json!({
-                        "path": converted.path,
-                        "backup": converted.backup,
-                        "problems": converted.problems,
-                    }));
-                }
                 let name = query(&request)?;
                 let found = workflows
                     .lookup(&name)
@@ -487,6 +473,14 @@ impl Session {
                         .ok_or_else(|| format!("no running step `{step}`"))
                 };
                 match command.as_str() {
+                    "workflow_convert" => {
+                        let converted = workflows.convert(&found, cx)?;
+                        Ok(json!({
+                            "path": converted.path,
+                            "backup": converted.backup,
+                            "problems": converted.problems,
+                        }))
+                    }
                     "workflow_run" => {
                         let inputs = match request.get("inputs") {
                             None | Some(Value::Null) => Default::default(),

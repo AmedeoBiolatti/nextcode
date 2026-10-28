@@ -1,5 +1,6 @@
 //! The open project and where its files live: on this machine, or inside a
-//! WSL distro behind `next_code_agent`.
+//! WSL distro, a dev container or on a machine a built-in extension reaches
+//! (SSH), behind `next_code_agent`.
 //!
 //! Paths of a WSL project are the distro's POSIX paths (`/home/me/p/x.rs`),
 //! held in `PathBuf`s. They never reach `std::fs` here, and are extended with
@@ -32,6 +33,7 @@ use crate::{
     workspace_file::{self, Folder},
 };
 
+mod extension_process;
 mod pinpoint;
 mod process_tree;
 
@@ -67,6 +69,16 @@ pub enum Location {
         /// ones read from `file` otherwise.
         folders: Vec<Folder>,
     },
+    /// A path on a machine a built-in extension's connector reaches
+    /// (`builtins::Connector`), typed `<scheme>://<host>/<path>`.
+    Remote {
+        /// The connector's scheme (`ssh`).
+        scheme: String,
+        /// The machine, as the connector takes it (`me@box:2222`).
+        host: String,
+        /// An absolute POSIX path, or one starting with `~`.
+        path: String,
+    },
 }
 
 impl fmt::Display for Location {
@@ -95,6 +107,11 @@ impl fmt::Display for Location {
                     None => Ok(()),
                 }
             }
+            Self::Remote { scheme, host, path } => {
+                // `~/p` follows the host's `/`; absolute paths have their own.
+                let slash = if path.starts_with('/') { "" } else { "/" };
+                write!(f, "{scheme}://{host}{slash}{path}")
+            }
         }
     }
 }
@@ -108,7 +125,9 @@ const FOLDER_SETTINGS_DIR: &str = ".next_code";
 impl Location {
     /// Reads a typed location: `\\wsl.localhost\<distro>\path` (or
     /// `\\wsl$\...`), `<distro>:/linux/path` (or `<distro>:~/...`),
-    /// `devcontainer:<one of those or a local path>`, else a local path.
+    /// `<scheme>://<host>/path` for a built-in extension's connector
+    /// (`ssh://box/~/p`), `devcontainer:<one of those or a local path>`,
+    /// else a local path.
     /// Paths of workspace files (`*.next_code-workspace`,
     /// `*.code-workspace`) are workspaces.
     pub fn parse(input: &str) -> Option<Self> {
@@ -124,6 +143,12 @@ impl Location {
         }
         if let Some(wsl) = wsl_unc_path(input) {
             return Some(wsl.workspace_file_as_workspace());
+        }
+        // Before `<distro>:/path`, which `ssh://box/p` also looks like.
+        if let Some((scheme, _)) = input.split_once("://")
+            && crate::builtins::connector(scheme).is_some()
+        {
+            return remote_url(input);
         }
         // One-letter prefixes are Windows drives (`C:/dev`).
         if let Some((distro, path)) = input.split_once(':')
@@ -320,6 +345,33 @@ pub fn root_label(root: &str, relative: &str) -> String {
     format!("{root} › {relative}")
 }
 
+/// `<scheme>://<host>[/<path>]` for a connector's scheme: `/~` and `/~/…`
+/// are in the home folder, other paths are absolute, and no path at all is
+/// the home folder.
+fn remote_url(input: &str) -> Option<Location> {
+    let (scheme, rest) = input.split_once("://")?;
+    crate::builtins::connector(scheme)?;
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if host.is_empty() {
+        return None;
+    }
+    let path = match path.strip_prefix('/') {
+        None => "~",
+        Some(home @ ("~" | "~/")) => home,
+        Some(in_home) if in_home.starts_with("~/") => in_home,
+        Some(_) => path,
+    };
+    let path = match path.trim_end_matches('/') {
+        "" => "/",
+        trimmed => trimmed,
+    };
+    Some(Location::Remote {
+        scheme: scheme.to_owned(),
+        host: host.to_owned(),
+        path: path.to_owned(),
+    })
+}
+
 /// `\\wsl.localhost\Ubuntu\home\me` (or `\\wsl$\...`) names a WSL project;
 /// it is opened through the agent rather than Windows' network share.
 fn wsl_unc_path(path: &str) -> Option<Location> {
@@ -405,8 +457,15 @@ enum Backend {
 }
 
 enum RemoteHost {
-    Wsl { distro: String },
+    Wsl {
+        distro: String,
+    },
     Container(Box<ContainerHost>),
+    /// A machine a built-in extension's connector reached.
+    Connector {
+        scheme: String,
+        host: String,
+    },
 }
 
 /// A dev container and what is needed to stop it.
@@ -605,11 +664,7 @@ fn serve_host(
             let policy = remote::host::Policy {
                 root: project.root().to_string_lossy().into_owned(),
                 credential_hosts: user.git.credential_hosts.clone(),
-                ssh_agent: enabled
-                    && project
-                        .settings_for(None)
-                        .devcontainer
-                        .ssh_agent_forwarding,
+                ssh_agent: enabled && project.settings_for(None).devcontainer.ssh_agent_forwarding,
             };
             drop(project);
             match remote::host::serve(&client, enabled, &policy) {
@@ -707,7 +762,52 @@ impl Project {
                 file,
                 folders,
             } => Self::open_workspace(distro.as_deref(), file.as_deref(), folders, progress),
+            Location::Remote { scheme, host, path } => {
+                Self::connect_remote(scheme, host, path, progress)
+            }
         }
+    }
+
+    /// Opens `path` on `host` through the connector of `scheme`, when the
+    /// built-in extension declaring it is on.
+    fn connect_remote(
+        scheme: &str,
+        host: &str,
+        path: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> io::Result<Self> {
+        let Some((builtin, connector)) = crate::builtins::connector(scheme) else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Nothing opens {scheme}:// locations"),
+            ));
+        };
+        if !crate::extensions::saved_builtin_enabled(builtin) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{} is turned off: turn it on in Manage Extensions to open {}",
+                    builtin.name,
+                    (connector.describe)(host)
+                ),
+            ));
+        }
+        let connection = (connector.connect)(host, path, progress)?;
+        Ok(Self::build(
+            vec![root_of_path(
+                PathBuf::from(connection.info.root),
+                None,
+                true,
+            )],
+            None,
+            Backend::Remote {
+                client: connection.client,
+                host: RemoteHost::Connector {
+                    scheme: scheme.to_owned(),
+                    host: host.to_owned(),
+                },
+            },
+        ))
     }
 
     /// Opens a multi-root workspace: reads its file (where it lives) when
@@ -807,6 +907,12 @@ impl Project {
                      reopen one of its folders in the container",
                 ));
             }
+            Location::Remote { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("{folder} cannot be opened in a dev container yet"),
+                ));
+            }
         };
         let host = FolderHost(host_project.clone());
         let folder_path = host_project.root().to_string_lossy().into_owned();
@@ -858,14 +964,14 @@ impl Project {
     }
 
     /// The `devcontainer.json` files of this project's folder (none for a
-    /// project already in a container, or with several folders: dev
-    /// containers open one). Blocks.
+    /// project already in a container, with several folders (dev
+    /// containers open one), or on a connector's machine). Blocks.
     pub fn devcontainer_configs(&self) -> io::Result<Vec<String>> {
         if self.is_multi_root()
             || matches!(
                 &self.0.backend,
                 Backend::Remote {
-                    host: RemoteHost::Container(_),
+                    host: RemoteHost::Container(_) | RemoteHost::Connector { .. },
                     ..
                 }
             )
@@ -1021,6 +1127,14 @@ impl Project {
                 folder: Box::new(container.folder.clone()),
                 config: Some(container.config.clone()),
             },
+            Backend::Remote {
+                host: RemoteHost::Connector { scheme, host },
+                ..
+            } => Location::Remote {
+                scheme: scheme.clone(),
+                host: host.clone(),
+                path: self.0.root.to_string_lossy().into_owned(),
+            },
         }
     }
 
@@ -1045,6 +1159,18 @@ impl Project {
             return Err("A dev container project has a single folder: \
                         open the other folder in its own project tab."
                 .into());
+        }
+        if let Backend::Remote {
+            host: RemoteHost::Connector { scheme, host },
+            ..
+        } = &self.0.backend
+        {
+            let machine = crate::builtins::connector(scheme)
+                .map_or_else(|| host.clone(), |(_, connector)| (connector.describe)(host));
+            return Err(format!(
+                "A project on {machine} has a single folder: \
+                 open the other folder in its own project tab."
+            ));
         }
         if folders.is_empty() {
             return Err("A workspace needs at least one folder.".into());
@@ -1101,6 +1227,14 @@ impl Project {
                 host: RemoteHost::Container(_),
                 ..
             } => None,
+            Backend::Remote {
+                host: RemoteHost::Connector { scheme, host },
+                ..
+            } => Some(Location::Remote {
+                scheme: scheme.clone(),
+                host: host.clone(),
+                path: path.to_owned(),
+            }),
         }
     }
 
@@ -1123,6 +1257,10 @@ impl Project {
                 container.config,
                 self.0.root.display()
             ),
+            Backend::Remote {
+                host: RemoteHost::Connector { scheme, host },
+                ..
+            } => format!("{scheme}:{host}:{}", self.0.root.display()),
         }
     }
 
@@ -1130,7 +1268,8 @@ impl Project {
         matches!(self.0.backend, Backend::Remote { .. })
     }
 
-    /// The agent serving a WSL or container project.
+    /// The agent serving a remote project (WSL, container, a connector's
+    /// machine).
     pub fn agent(&self) -> Option<Arc<AgentClient>> {
         match &self.0.backend {
             Backend::Local => None,
@@ -1749,17 +1888,19 @@ impl Project {
             safe_folder = crate::settings::without_commands(&folder);
             &safe_folder
         };
-        let layered = user.layered(&[workspace, folder_layer]).unwrap_or_else(|err| {
-            error = Some(format!("{}: {err}", file.display()));
-            // The workspace's settings alone may still be fine.
-            user.layered(&[workspace]).unwrap_or_else(|err| {
-                error = Some(format!(
-                    "{}: {err}",
-                    self.workspace_file().unwrap_or("workspace settings")
-                ));
-                (*user).clone()
-            })
-        });
+        let layered = user
+            .layered(&[workspace, folder_layer])
+            .unwrap_or_else(|err| {
+                error = Some(format!("{}: {err}", file.display()));
+                // The workspace's settings alone may still be fine.
+                user.layered(&[workspace]).unwrap_or_else(|err| {
+                    error = Some(format!(
+                        "{}: {err}",
+                        self.workspace_file().unwrap_or("workspace settings")
+                    ));
+                    (*user).clone()
+                })
+            });
         let layered = Arc::new(layered);
         self.0.folder_settings.lock()[index] = Some(FolderSettings {
             user,

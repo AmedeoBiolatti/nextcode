@@ -15,7 +15,8 @@ use gpui::{
 };
 
 use crate::{
-    commit_panel::short_revision, pinpoint::Pin, project::Project, selectable::selectable, theme,
+    commit_panel::short_revision, file_icons, pinpoint::Pin, project::Project,
+    selectable::selectable, theme,
 };
 
 mod highlight;
@@ -402,10 +403,10 @@ impl DiffView {
                 .text_color(theme::muted())
                 .child(line.map(|line| line.to_string()).unwrap_or_default())
         };
-        let (sign, background) = match kind {
-            LineKind::Context => (" ", None),
-            LineKind::Added => ("+", Some(theme::diff_added())),
-            LineKind::Removed => ("-", Some(theme::diff_removed())),
+        let (sign, background, sign_color) = match kind {
+            LineKind::Context => (" ", None, theme::muted()),
+            LineKind::Added => ("+", Some(theme::diff_added()), theme::git_added()),
+            LineKind::Removed => ("-", Some(theme::diff_removed()), theme::error()),
         };
         div()
             .h(px(ROW_HEIGHT))
@@ -415,7 +416,13 @@ impl DiffView {
             .when_some(background, |row, color| row.bg(color))
             .child(number(numbers[0]))
             .when(show_both, |row| row.child(number(numbers[1])))
-            .child(div().w(px(16.)).flex_none().child(sign))
+            .child(
+                div()
+                    .w(px(16.))
+                    .flex_none()
+                    .text_color(sign_color)
+                    .child(sign),
+            )
             .child(
                 div()
                     .min_w_0()
@@ -597,15 +604,33 @@ impl Focusable for DiffView {
 impl Render for DiffView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let summary = match &self.diff {
-            Some(diff) if diff.binary => "binary file".to_owned(),
-            Some(diff) => format!("+{} −{}", diff.added, diff.removed),
-            None => "loading…".to_owned(),
+            Some(diff) if diff.binary => div().child("binary file"),
+            Some(diff) => div()
+                .flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_color(theme::git_added())
+                        .child(format!("+{}", diff.added)),
+                )
+                .child(
+                    div()
+                        .text_color(theme::error())
+                        .child(format!("−{}", diff.removed)),
+                ),
+            None => div().child("loading…"),
         };
         let mut name = self.source.path().to_owned();
         if let Some(orig) = self.source.orig_path() {
             name = format!("{orig} → {name}");
         }
-        let header = format!("{name} · {} · {summary}", self.source.sides());
+        let file_name = self
+            .source
+            .path()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
         let options = self.options;
         let toolbar = div()
             .flex()
@@ -721,8 +746,27 @@ impl Render for DiffView {
                     .child(
                         div()
                             .min_w_0()
-                            .truncate()
-                            .child(selectable("header", header)),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(file_icons::file(&file_name))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme::text())
+                                    .child(selectable("header", name)),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px_1p5()
+                                    .rounded_sm()
+                                    .bg(theme::panel())
+                                    .text_xs()
+                                    .child(selectable("sides", self.source.sides())),
+                            )
+                            .child(summary.flex_none().text_xs().font_family(theme::MONO_FONT)),
                     )
                     .child(toolbar.pin("toolbar")),
             )

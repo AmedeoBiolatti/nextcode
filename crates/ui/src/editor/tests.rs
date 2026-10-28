@@ -93,6 +93,97 @@ fn typing_and_deleting_at_every_cursor_undo_as_one_step(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+fn ctrl_backspace_joins_indented_lines_without_deleting_previous_code(cx: &mut TestAppContext) {
+    for (before, after) in [
+        ("if (a > b) {  \n  |", "if (a > b) {|"),
+        ("if (a > b) {\n|", "if (a > b) {|"),
+        ("if (a > b) {  \r\n\t|", "if (a > b) {|"),
+        ("if (a > b) {\n  |\n}", "if (a > b) {|\n}"),
+        ("  café(); \n  |", "  café();|"),
+    ] {
+        let window = editor("a.ts", before, cx);
+        update(window, cx, |e, w, cx| {
+            e.delete_word_left(&DeleteWordLeft, w, cx)
+        });
+        assert_eq!(state(window, cx), after, "from {before:?}");
+        update(window, cx, |e, w, cx| e.undo(&Undo, w, cx));
+        assert_eq!(state(window, cx), before, "undo restores text and cursor");
+    }
+}
+
+#[gpui::test]
+fn ctrl_backspace_joins_blank_lines_at_every_cursor(cx: &mut TestAppContext) {
+    let window = editor("a.ts", "if (a > b) {  \n  |\n}\nif (b > c) {\n  |\n}", cx);
+    update(window, cx, |e, w, cx| {
+        e.delete_word_left(&DeleteWordLeft, w, cx)
+    });
+    assert_eq!(state(window, cx), "if (a > b) {|\n}\nif (b > c) {|\n}");
+    update(window, cx, |e, w, cx| e.undo(&Undo, w, cx));
+    assert_eq!(
+        state(window, cx),
+        "if (a > b) {  \n  |\n}\nif (b > c) {\n  |\n}"
+    );
+}
+
+#[gpui::test]
+fn backspace_deletes_one_character_including_indentation_newlines_and_pairs(
+    cx: &mut TestAppContext,
+) {
+    for (before, after) in [
+        ("  |", " |"),
+        ("if (a > b) {  \n  |", "if (a > b) {  \n |"),
+        ("if (a > b) {  \n|", "if (a > b) {  |"),
+        ("if (a > b) {  \r\n|", "if (a > b) {  |"),
+        ("if (a > b) {\n\t|", "if (a > b) {\n|"),
+        ("if (a > b) {\n  |work();", "if (a > b) {\n |work();"),
+        ("if (a > b) {\n  x|", "if (a > b) {\n  |"),
+        ("if (a > b) {\n«  »", "if (a > b) {\n|"),
+        ("(|)", "|)"),
+        ("[|]", "|]"),
+        ("{|}", "|}"),
+        ("\"|\"", "|\""),
+        ("cafe\u{301}|", "caf|"),
+        ("|", "|"),
+    ] {
+        let window = editor("a.ts", before, cx);
+        update(window, cx, |e, w, cx| e.backspace(&Backspace, w, cx));
+        assert_eq!(state(window, cx), after, "from {before:?}");
+    }
+}
+
+#[gpui::test]
+fn plain_and_word_backspace_use_different_key_bindings(cx: &mut TestAppContext) {
+    cx.update(bind_keys);
+    let window = editor("a.ts", "if (a > b) {  \n  |", cx);
+    update(window, cx, |editor, window, cx| {
+        window.focus(&editor.focus_handle(cx))
+    });
+    cx.simulate_keystrokes(window.into(), "backspace");
+    cx.run_until_parked();
+    assert_eq!(state(window, cx), "if (a > b) {  \n |");
+    cx.simulate_keystrokes(window.into(), &format!("{WORD}-backspace"));
+    cx.run_until_parked();
+    assert_eq!(state(window, cx), "if (a > b) {|");
+}
+
+#[gpui::test]
+fn ctrl_backspace_still_deletes_words_and_selected_text(cx: &mut TestAppContext) {
+    for (before, after) in [
+        ("one two|", "one |"),
+        ("one two   |", "one |"),
+        ("if (a > b) {\n  «x»", "if (a > b) {\n  |"),
+        ("if (a > b) {\n«  »", "if (a > b) {\n|"),
+        ("|", "|"),
+    ] {
+        let window = editor("a.ts", before, cx);
+        update(window, cx, |e, w, cx| {
+            e.delete_word_left(&DeleteWordLeft, w, cx)
+        });
+        assert_eq!(state(window, cx), after, "from {before:?}");
+    }
+}
+
+#[gpui::test]
 fn undo_restores_the_selections_of_the_edit(cx: &mut TestAppContext) {
     let window = editor("a.txt", "«one» two «three»", cx);
     update(window, cx, |e, w, cx| e.cut(&Cut, w, cx));
@@ -314,10 +405,10 @@ fn brackets_and_quotes_auto_close(cx: &mut TestAppContext) {
     assert_eq!(state(window, cx), "x = f(\"a|\")");
     type_text(window, "\")", cx);
     assert_eq!(state(window, cx), "x = f(\"a\")|", "steps over the closers");
-    // Backspace inside an empty pair removes both.
+    // Backspace inside an empty pair removes only the opening character.
     type_text(window, "[", cx);
     update(window, cx, |e, w, cx| e.backspace(&Backspace, w, cx));
-    assert_eq!(state(window, cx), "x = f(\"a\")|");
+    assert_eq!(state(window, cx), "x = f(\"a\")|]");
     // No quote pair after a word character; no bracket pair before one.
     let window = editor("a.py", "it|s |x", cx);
     type_text(window, "'(", cx);

@@ -577,12 +577,11 @@ fn collect_references(value: &Value, into: &mut Vec<String>) {
 
 /// The model an output's widget view shows.
 pub fn view_model_id(output: &Output) -> Option<&str> {
-    match output {
-        Output::DisplayData { data, .. } | Output::ExecuteResult { data, .. } => {
-            data.get(outputs::WIDGET_MIME)?.get("model_id")?.as_str()
-        }
-        _ => None,
-    }
+    output
+        .data()?
+        .get(outputs::WIDGET_MIME)?
+        .get("model_id")?
+        .as_str()
 }
 
 #[cfg(test)]

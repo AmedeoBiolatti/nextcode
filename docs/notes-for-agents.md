@@ -9,7 +9,9 @@ back work for review; the person answers in the card.
 
 NextCode never runs or prompts agents: the notes are a shared file, and every
 command works without a running NextCode (it edits the file; the editor
-watches it and shows changes live).
+watches it and shows changes live). The person can turn sticky notes off in
+the app (Manage Extensions › Built-in); the commands still work, but they
+then see no cards until they turn notes back on.
 
 ```sh
 next_code notes list                               # open notes, current lines, threads

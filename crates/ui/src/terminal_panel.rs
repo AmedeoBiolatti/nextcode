@@ -61,6 +61,7 @@ pub fn profiles(project: &Project) -> Vec<Profile> {
     if project.is_remote() {
         let name = match project.location() {
             crate::project::Location::DevContainer { .. } => "Container Shell",
+            crate::project::Location::Remote { .. } => "Remote Shell",
             _ => "WSL Shell",
         };
         return vec![Profile {

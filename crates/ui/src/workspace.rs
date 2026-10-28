@@ -10,6 +10,7 @@ use std::{
 
 use futures::StreamExt;
 
+use extension_api::{InputValue, PanelContribution, PanelUpdate};
 use gpui::{
     AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     KeyBinding, PromptLevel, SharedString, Subscription, Task, Window, actions, div, prelude::*,
@@ -21,25 +22,26 @@ use text::Buffer;
 use watcher::{Batch, ChangeKind};
 
 use crate::{
+    builtins::{BuiltinTab, FileView},
     call_hierarchy::{CallHierarchyEvent, CallHierarchyPanel},
     commit_panel::{CommitPanel, CommitPanelEvent, PreloadedRepository, SyncAction},
     compare_view::{CompareEvent, CompareView},
     connecting::PendingConnection,
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     editor::{Editor, EditorEvent, ReloadOutcome},
+    extension_views::{ExtensionView, ExtensionViewEvent},
     file_finder::{FileFinder, FileFinderEvent},
     file_tree::{FileTree, FileTreeEvent},
     git_log::GitLogPanel,
     layout::{DockPosition, Layout, PanelId},
     location_picker::{LocationPicker, LocationPickerEvent},
     lsp_store::{LspStore, LspStoreEvent, ServerStatus},
-    notebook::view::{NotebookView, NotebookViewEvent, OpenAsNotebook},
+    markdown_view::{MarkdownView, ModeChanged},
     outline_panel::OutlinePanel,
     pinpoint::{self, Pin},
     ports::{Ports, PortsEvent, panel::PortsPanel},
     problems::{ProblemsEvent, ProblemsPanel},
     project::{self, Project},
-    python_panel::{PythonPanel, PythonPanelEvent, RunRequest},
     recent,
     revision_picker::{RevisionPicker, RevisionPickerEvent},
     search_panel::{SearchPanel, SearchPanelEvent},
@@ -51,16 +53,16 @@ use crate::{
     worktree_picker::{WorktreePicker, WorktreePickerEvent},
 };
 
+mod builtins;
 mod debug;
 mod docks;
 mod edits;
+mod extensions;
 mod files;
 mod folders;
 mod git_flows;
 mod git_gutter;
 mod log_window;
-mod notebooks;
-mod notes;
 mod panes;
 mod pinpoint_text;
 mod runs;
@@ -71,6 +73,7 @@ mod symbols;
 mod tests;
 
 pub(crate) use docks::DragPreview;
+pub(crate) use extensions::ExtensionPanelOrigin;
 
 use panes::{Pane, PaneId, PaneNode};
 
@@ -104,14 +107,6 @@ pub mod git_commands {
             Push,
             Refresh
         ]
-    );
-}
-
-/// uv project commands for menus and the command palette.
-pub mod python_commands {
-    gpui::actions!(
-        python,
-        [Sync, Lock, RunFile, RunTests, RunTestFile, RunTestAtCursor]
     );
 }
 
@@ -169,7 +164,10 @@ enum TabContent {
     Editor(Entity<Editor>),
     Diff(Entity<DiffView>),
     Compare(Entity<CompareView>),
-    Notebook(Entity<NotebookView>),
+    Extension(Entity<ExtensionView>),
+    /// A built-in extension's view (`crate::builtins`), maybe of a file (a
+    /// notebook).
+    Builtin(BuiltinTab),
 }
 
 impl TabContent {
@@ -178,7 +176,8 @@ impl TabContent {
             Self::Editor(editor) => editor.entity_id(),
             Self::Diff(diff) => diff.entity_id(),
             Self::Compare(view) => view.entity_id(),
-            Self::Notebook(view) => view.entity_id(),
+            Self::Extension(view) => view.entity_id(),
+            Self::Builtin(tab) => tab.entity_id(),
         }
     }
 
@@ -187,8 +186,8 @@ impl TabContent {
     fn save(&self, cx: &mut App) -> Task<bool> {
         match self {
             Self::Editor(editor) => editor.update(cx, |editor, cx| editor.save(cx)),
-            Self::Notebook(view) => Task::ready(view.update(cx, |view, cx| view.save_document(cx))),
-            Self::Diff(_) | Self::Compare(_) => Task::ready(true),
+            Self::Builtin(tab) => Task::ready(tab.save(cx)),
+            Self::Diff(_) | Self::Compare(_) | Self::Extension(_) => Task::ready(true),
         }
     }
 }
@@ -203,6 +202,7 @@ enum RevisionPurpose {
 
 struct Tab {
     content: TabContent,
+    markdown: Option<(Entity<MarkdownView>, Subscription)>,
     /// The edited file, the file a diff is about, or the project root.
     path: PathBuf,
     title: SharedString,
@@ -220,28 +220,37 @@ impl Tab {
         }
     }
 
-    fn notebook(&self) -> Option<&Entity<NotebookView>> {
+    /// A built-in extension's tab of its file (a notebook).
+    fn file_tab(&self) -> Option<&BuiltinTab> {
         match &self.content {
-            TabContent::Notebook(view) => Some(view),
+            TabContent::Builtin(tab) if tab.is_file() => Some(tab),
             _ => None,
         }
     }
 
     fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if let Some((view, _)) = &self.markdown {
+            return view.focus_handle(cx);
+        }
         match &self.content {
             TabContent::Editor(editor) => editor.focus_handle(cx),
             TabContent::Diff(diff) => diff.focus_handle(cx),
             TabContent::Compare(view) => view.focus_handle(cx),
-            TabContent::Notebook(view) => view.focus_handle(cx),
+            TabContent::Extension(view) => view.focus_handle(cx),
+            TabContent::Builtin(tab) => tab.focus_handle(cx),
         }
     }
 
     fn view(&self) -> AnyView {
+        if let Some((view, _)) = &self.markdown {
+            return view.clone().into();
+        }
         match &self.content {
             TabContent::Editor(editor) => editor.clone().into(),
             TabContent::Diff(diff) => diff.clone().into(),
             TabContent::Compare(view) => view.clone().into(),
-            TabContent::Notebook(view) => view.clone().into(),
+            TabContent::Extension(view) => view.clone().into(),
+            TabContent::Builtin(tab) => tab.view(),
         }
     }
 
@@ -249,11 +258,18 @@ impl Tab {
         self.content.entity_id()
     }
 
+    fn contains_focus(&self, window: &Window, cx: &App) -> bool {
+        match &self.markdown {
+            Some((view, _)) => view.read(cx).contains_focus(window, cx),
+            None => self.focus_handle(cx).contains_focused(window, cx),
+        }
+    }
+
     fn is_dirty(&self, cx: &App) -> bool {
         match &self.content {
             TabContent::Editor(editor) => editor.read(cx).buffer().is_dirty(),
-            TabContent::Notebook(view) => view.read(cx).is_dirty(cx),
-            TabContent::Diff(_) | TabContent::Compare(_) => false,
+            TabContent::Builtin(tab) => tab.is_dirty(cx),
+            TabContent::Diff(_) | TabContent::Compare(_) | TabContent::Extension(_) => false,
         }
     }
 
@@ -262,9 +278,8 @@ impl Tab {
     /// diff adds which versions it compares.
     fn pin_key(&self, project: &Project, cx: &App) -> String {
         match &self.content {
-            TabContent::Editor(_) | TabContent::Notebook(_) => {
-                pinpoint::file_key(project, &self.path)
-            }
+            TabContent::Editor(_) => pinpoint::file_key(project, &self.path),
+            TabContent::Builtin(tab) if tab.is_file() => pinpoint::file_key(project, &self.path),
             TabContent::Diff(diff) => format!(
                 "{}@{}",
                 pinpoint::file_key(project, &self.path),
@@ -274,6 +289,17 @@ impl Tab {
                 "compare:{}",
                 pinpoint::kebab(self.title.trim_start_matches("Compare "))
             ),
+            TabContent::Extension(view) => {
+                let view = view.read(cx);
+                format!("extension:{}:{}", view.extension(), view.panel())
+            }
+            // One per view: a file can have several.
+            TabContent::Builtin(tab) => format!(
+                "{}:{}#{}",
+                tab.kind(),
+                pinpoint::file_key(project, &self.path),
+                tab.entity_id().as_u64()
+            ),
         }
     }
 
@@ -281,11 +307,17 @@ impl Tab {
     fn content_pin(&self, key: &str) -> String {
         match &self.content {
             TabContent::Editor(_) => format!("editor:{key}"),
-            TabContent::Notebook(_) => format!("notebook:{key}"),
+            TabContent::Builtin(tab) if tab.is_file() => format!("{}:{key}", tab.kind()),
             TabContent::Diff(_) => format!("diff:{key}"),
             // Already `compare:…`.
             TabContent::Compare(_) => key.to_owned(),
+            TabContent::Extension(_) => key.to_owned(),
+            TabContent::Builtin(_) => key.to_owned(),
         }
+    }
+
+    fn file_path(&self) -> Option<&Path> {
+        (!matches!(self.content, TabContent::Extension(_))).then_some(self.path.as_path())
     }
 }
 
@@ -299,35 +331,29 @@ struct Offer {
 pub(crate) enum OfferKind {
     /// The folder has this `devcontainer.json`.
     ReopenInContainer { config: String },
-    /// `.venv` is out of date with the lock or `pyproject.toml`.
-    PythonSync,
     /// No LLDB debug adapter: download CodeLLDB.
     DownloadCodeLldb,
     /// A forwarded port's application listens: open it in the browser.
     PortAvailable { port: u16, url: String },
-    /// The active tab shows a marimo notebook as text.
-    OpenAsNotebook { path: PathBuf },
-    /// An agent wrote to the person on this note: show it.
-    NoteMessage {
-        root: usize,
-        file: String,
-        id: String,
-    },
     /// The folder is not trusted yet: its settings run no programs (see
     /// `trust`).
     TrustFolder,
+    /// A built-in extension's suggestion: its `accept_offer` gets `key`.
+    Builtin {
+        extension: &'static str,
+        key: String,
+        action: &'static str,
+    },
 }
 
 impl OfferKind {
     fn action(&self) -> &'static str {
         match self {
             Self::ReopenInContainer { .. } => "Reopen in Container",
-            Self::PythonSync => "Sync",
             Self::DownloadCodeLldb => "Download CodeLLDB",
             Self::PortAvailable { .. } => "Open in Browser",
-            Self::OpenAsNotebook { .. } => "Open as Notebook",
-            Self::NoteMessage { .. } => "Show Note",
             Self::TrustFolder => "Trust",
+            Self::Builtin { action, .. } => action,
         }
     }
 
@@ -335,12 +361,10 @@ impl OfferKind {
     fn pin_id(&self) -> String {
         match self {
             Self::ReopenInContainer { .. } => "offer:reopen-in-container".into(),
-            Self::PythonSync => "offer:python-sync".into(),
             Self::DownloadCodeLldb => "offer:download-codelldb".into(),
             Self::PortAvailable { port, .. } => format!("offer:port-{port}"),
-            Self::OpenAsNotebook { .. } => "offer:open-as-notebook".into(),
-            Self::NoteMessage { id, .. } => format!("offer:note-{id}"),
             Self::TrustFolder => "offer:trust-folder".into(),
+            Self::Builtin { key, .. } => format!("offer:{key}"),
         }
     }
 }
@@ -350,9 +374,6 @@ pub struct Workspace {
     project: Project,
     file_tree: Entity<FileTree>,
     problems: Entity<ProblemsPanel>,
-    /// Sticky notes: the project's, and the Notes panel.
-    note_store: Entity<crate::note_store::NoteStore>,
-    notes_panel: Entity<crate::notes_panel::NotesPanel>,
     /// Forwarded ports (WSL and container projects); the panel holds the
     /// model.
     ports_panel: Entity<PortsPanel>,
@@ -362,7 +383,6 @@ pub struct Workspace {
     commit: Entity<CommitPanel>,
     /// The Git tool window (the Log).
     git_log: Entity<GitLogPanel>,
-    python: Entity<PythonPanel>,
     call_hierarchy: Entity<CallHierarchyPanel>,
     /// Follows the active editor (set while rendering).
     outline: Entity<OutlinePanel>,
@@ -405,15 +425,17 @@ pub struct Workspace {
     connection_error: Option<SharedString>,
     /// Files with an open "changed on disk" prompt, so it is asked once.
     reload_prompts: HashSet<PathBuf>,
-    /// marimo notebooks the user chose to see as text (Open as Text) this
-    /// session: they open in text editors.
-    text_notebooks: HashSet<PathBuf>,
     /// Owns the watch: dropping it stops watching.
     _watcher: Task<()>,
     _disconnects: Option<Task<()>>,
     /// Change-marker bases and blame of the open editors.
     git_gutters: git_gutter::GitGutters,
     _subscriptions: Vec<Subscription>,
+    extension_panels: Vec<extensions::ExtensionPanel>,
+    active_extension_panel: Option<gpui::EntityId>,
+    extension_generation: u64,
+    /// The built-in extensions that are on here, and their panels.
+    builtins: builtins::Builtins,
 }
 
 /// Requests for the window around the workspace.
@@ -427,6 +449,10 @@ pub enum WorkspaceEvent {
     /// workspace file): open it in this tab instead. Its session was
     /// saved for it.
     Reopen(project::Location),
+    ExtensionUi {
+        view: Entity<ExtensionView>,
+        event: ExtensionViewEvent,
+    },
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -461,8 +487,6 @@ impl Workspace {
             this.on_lsp_event(event, cx);
         });
         let problems = cx.new(|cx| ProblemsPanel::new(project.clone(), lsp_store.clone(), cx));
-        let (note_store, notes_panel, notes_subscriptions) =
-            Self::notes_setup(&project, window, cx);
         let terminal = cx.new(|cx| TerminalPanel::new(project.clone(), cx));
         let search = cx.new(|cx| SearchPanel::new(project.clone(), cx));
         let workspace = cx.entity().downgrade();
@@ -509,22 +533,6 @@ impl Workspace {
             });
         let git_log = cx.new(|cx| GitLogPanel::new(project.clone(), cx));
         let git_log_subscription = cx.subscribe_in(&git_log, window, Self::on_git_log_event);
-        let python = cx.new(|cx| PythonPanel::new(project.clone(), cx));
-        let python_subscription =
-            cx.subscribe_in(&python, window, |this, _, event, window, cx| match event {
-                PythonPanelEvent::Run(request) => this.run_python(request.clone(), window, cx),
-                PythonPanelEvent::EnvironmentChanged => this
-                    .lsp_store
-                    .update(cx, |store, cx| store.refresh_python_interpreter(cx)),
-                PythonPanelEvent::SyncNeeded(true) => this.offer(
-                    OfferKind::PythonSync,
-                    "The Python environment (.venv) is out of date with uv.lock / pyproject.toml.",
-                    cx,
-                ),
-                PythonPanelEvent::SyncNeeded(false) => {
-                    this.withdraw_offer(&OfferKind::PythonSync, cx)
-                }
-            });
         let terminal_subscription = cx.subscribe_in(
             &terminal,
             window,
@@ -655,12 +663,12 @@ impl Workspace {
         // window, or the app quits) and restored once the workspace exists.
         let release_subscription = cx.on_release(|this, cx| {
             this.save_session(cx).ok();
-            this.shutdown_notebooks(cx);
+            this.release_file_tabs(cx);
         });
         let quit_subscription = cx.on_app_quit(|this, cx| {
             this.save_session(cx).ok();
-            // No kernel outlives the app.
-            this.shutdown_notebooks(cx);
+            // No notebook kernel outlives the app.
+            this.release_file_tabs(cx);
             // Language servers get `shutdown`/`exit` and a grace to leave
             // (gpui bounds the wait; the rest are ended with the app).
             this.lsp_store
@@ -669,19 +677,23 @@ impl Workspace {
         cx.defer_in(window, |this, window, cx| this.restore_session(window, cx));
         crate::startup::mark("workspace built");
         let first_pane = PaneId(1);
-        Self {
+        let extension_model = crate::extensions::shared(cx);
+        let extension_generation = extension_model.read(cx).generation;
+        let extension_subscription =
+            cx.observe_in(&extension_model, window, |this, model, window, cx| {
+                this.sync_extension_panels(&model, window, cx);
+                this.sync_builtins(window, cx);
+            });
+        let mut workspace = Self {
             focus_handle,
             project,
             file_tree,
             problems,
-            note_store,
-            notes_panel,
             ports_panel,
             terminal,
             search,
             commit,
             git_log,
-            python,
             call_hierarchy,
             outline: cx.new(OutlinePanel::new),
             runs,
@@ -709,10 +721,12 @@ impl Workspace {
             offers: Vec::new(),
             connection_error: None,
             reload_prompts: HashSet::new(),
-            text_notebooks: HashSet::new(),
             _watcher: watcher,
             _disconnects: disconnects,
             git_gutters: Default::default(),
+            extension_panels: Vec::new(),
+            active_extension_panel: None,
+            extension_generation,
             _subscriptions: vec![
                 tree_subscription,
                 lsp_subscription,
@@ -720,17 +734,19 @@ impl Workspace {
                 search_subscription,
                 commit_subscription,
                 git_log_subscription,
-                python_subscription,
                 call_hierarchy_subscription,
                 terminal_subscription,
                 release_subscription,
                 quit_subscription,
                 ports_subscription,
+                extension_subscription,
             ]
             .into_iter()
-            .chain(notes_subscriptions)
             .collect(),
-        }
+            builtins: Default::default(),
+        };
+        workspace.sync_builtins(window, cx);
+        workspace
     }
 
     /// Tells the user about forwarded applications (`onAutoForward`).
@@ -790,26 +806,12 @@ impl Workspace {
         // Worktree edits change status as much as commits do.
         self.commit
             .update(cx, |commit, cx| commit.schedule_refresh(cx));
-        let python_files = ["pyproject.toml", "uv.lock", ".python-version"];
-        if batch.rescan
-            || batch.events.iter().any(|event| {
-                event
-                    .path
-                    .file_name()
-                    .is_some_and(|name| python_files.iter().any(|file| name == *file))
-            })
-        {
-            self.python.update(cx, |python, cx| python.refresh(cx));
-        }
+        self.builtins_files_changed(&batch, window, cx);
         if batch.repository || batch.rescan {
             self.git_log
                 .update(cx, |log, cx| log.repository_changed(cx));
         }
         self.run_files_changed(&batch, cx);
-        self.note_store.update(cx, |store, cx| {
-            let paths = batch.events.iter().map(|event| event.path.as_path());
-            store.files_changed(paths, batch.rescan, cx)
-        });
         // An edited `.next_code/words.txt` (project dictionary).
         crate::editor::spell::files_changed(
             batch.events.iter().map(|event| event.path.as_path()),
@@ -860,7 +862,6 @@ impl Workspace {
                 self.prompt_reload(editor, path, window, cx);
             }
         }
-        self.notebooks_changed_on_disk(&batch, window, cx);
     }
 
     /// Opens (or activates) a diff tab.
@@ -921,6 +922,7 @@ impl Workspace {
         };
         tabs.push(Tab {
             content,
+            markdown: None,
             path,
             title,
             lsp_owner: false,
@@ -1118,7 +1120,7 @@ impl Workspace {
             match &tab.content {
                 TabContent::Diff(diff) => diff.update(cx, |diff, cx| diff.reload(cx)),
                 TabContent::Compare(view) => view.update(cx, |view, cx| view.reload(cx)),
-                TabContent::Editor(_) | TabContent::Notebook(_) => {}
+                TabContent::Editor(_) | TabContent::Extension(_) | TabContent::Builtin(_) => {}
             }
         }
     }
@@ -1321,8 +1323,8 @@ impl Workspace {
 
     /// Opens (or activates) `path` in the active pane and returns its
     /// editor. A file open in another pane gets a second view of the same
-    /// buffer there. Notebooks open in notebook tabs instead (`None`); one
-    /// that cannot be read as a notebook opens as text.
+    /// buffer there. Files a built-in extension shows (notebooks) open in
+    /// its tabs instead (`None`); one it cannot open opens as text.
     fn open_editor(
         &mut self,
         path: &Path,
@@ -1334,9 +1336,10 @@ impl Workspace {
             self.activate(pane, index, window, cx);
             return self.active_tab().and_then(Tab::editor).cloned();
         }
-        // Notebooks open in notebook tabs, sharing the open document.
-        if self.has_notebook_tab(path) {
-            if let Err(err) = self.open_notebook(path, None, window, cx) {
+        // A file a built-in extension shows (a notebook) opens in its tab,
+        // another view of what an open one shows.
+        if let Some(kind) = self.file_tab_kind_of(path, cx) {
+            if let Err(err) = (kind.open)(self, path, None, window, cx) {
                 self.notice = Some(err.into());
                 cx.notify();
             }
@@ -1347,7 +1350,7 @@ impl Workspace {
             .filter(|tab| tab.path == path)
             .find_map(Tab::editor)
             .cloned();
-        let mut notebook_error = None;
+        let mut open_error = None;
         let buffer = match &existing {
             Some(editor) => editor.read(cx).buffer().link(),
             None => {
@@ -1358,10 +1361,11 @@ impl Workspace {
                 let stamp = crate::editor::save::disk_stamp(&self.project, path);
                 match self.project.read_text(path) {
                     Ok(text) => {
-                        if self.opens_as_notebook(path, &text) {
-                            match self.open_notebook(path, Some(&text), window, cx) {
-                                Ok(_) => return None,
-                                Err(err) => notebook_error = Some(err),
+                        // One that cannot open there opens as text.
+                        if let Some(kind) = self.file_tab_kind_for(path, &text, cx) {
+                            match (kind.open)(self, path, Some(&text), window, cx) {
+                                Ok(()) => return None,
+                                Err(err) => open_error = Some(err),
                             }
                         }
                         let mut buffer = Buffer::with_path(&text, path.to_path_buf());
@@ -1477,16 +1481,18 @@ impl Workspace {
             });
         }
         self.debug_editor_opened(&editor, path, cx);
-        self.show_notes_in(&editor, cx);
+        self.attach_builtins(FileView::Editor(editor.clone()), cx);
         self.set_test_markers(&editor, path, cx);
         let title = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
             .into();
+        let markdown = self.markdown_view(&editor, cx);
         let tabs = &mut self.pane_mut(pane)?.tabs;
         tabs.push(Tab {
             content: TabContent::Editor(editor.clone()),
+            markdown,
             path: path.to_path_buf(),
             title,
             lsp_owner: existing.is_none(),
@@ -1495,11 +1501,26 @@ impl Workspace {
         let index = tabs.len() - 1;
         self.refresh_diagnostics(path, cx);
         self.activate(pane, index, window, cx);
-        if let Some(err) = notebook_error {
+        if let Some(err) = open_error {
             self.notice = Some(err.into());
         }
         self.refresh_git_gutters(cx);
         Some(editor)
+    }
+
+    fn markdown_view(
+        &self,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<MarkdownView>, Subscription)> {
+        if editor.read(cx).language() != Some(Language::Markdown) {
+            return None;
+        }
+        let view = cx.new(|cx| MarkdownView::new(editor.clone(), self.project.clone(), cx));
+        let subscription = cx.subscribe(&view, |this, _, _: &ModeChanged, cx| {
+            this.schedule_session_save(cx)
+        });
+        Some((view, subscription))
     }
 
     /// Brings the other views of `source`'s file up to date with its edits.
@@ -1539,18 +1560,20 @@ impl Workspace {
             return;
         };
         window.focus(&tab.focus_handle(cx));
-        let path = tab.path.clone();
+        let path = tab.file_path().map(Path::to_path_buf);
         self.active_pane = pane;
         self.notice = None;
-        self.file_tree.update(cx, |tree, cx| tree.select(&path, cx));
+        if let Some(path) = path {
+            self.file_tree.update(cx, |tree, cx| tree.select(&path, cx));
+        }
         self.claim_server(pane, index, cx);
-        self.offer_notebook_view(pane, index, cx);
+        self.builtins_tab_activated(cx);
         self.schedule_session_save(cx);
         cx.notify();
     }
 
     /// Jumps to the only location, or lets the user pick one.
-    fn navigate(
+    pub(crate) fn navigate(
         &mut self,
         locations: Vec<Location>,
         title: SharedString,
@@ -1566,17 +1589,13 @@ impl Workspace {
         let labels: Vec<Option<(String, String)>> = locations
             .iter()
             .map(|location| {
-                let notebook = store.notebook(&location.path)?;
-                let notebook = notebook.borrow();
-                let target = notebook.cell_position(location.range.start)?;
-                let name = notebook.notebook_path().file_name()?.to_string_lossy();
-                let preview = notebook.line_text(location.range.start.line);
+                let document = store.virtual_document(&location.path)?;
+                let document = document.borrow();
+                let (number, at) = document.part_at(location.range.start)?;
+                let name = document.shown_path().file_name()?.to_string_lossy();
+                let preview = document.line_text(location.range.start.line);
                 Some((
-                    format!(
-                        "{name} [cell {}]:{}",
-                        target.number,
-                        target.position.line + 1
-                    ),
+                    format!("{name} [cell {number}]:{}", at.line + 1),
                     preview.unwrap_or_default().trim().to_owned(),
                 ))
             })
@@ -1602,7 +1621,7 @@ impl Workspace {
     fn jump_to(&mut self, location: &Location, window: &mut Window, cx: &mut Context<Self>) {
         self.record_position(cx);
         self.forward.clear();
-        if self.jump_to_notebook(location, window, cx) {
+        if self.builtins_navigate(location, window, cx) {
             return;
         }
         if let Some(editor) = self.open_editor(&location.path, window, cx) {
@@ -1684,14 +1703,12 @@ impl Workspace {
     fn accept_offer(&mut self, kind: OfferKind, window: &mut Window, cx: &mut Context<Self>) {
         self.withdraw_offer(&kind, cx);
         match kind {
-            OfferKind::PythonSync => self.python.update(cx, |python, cx| python.sync(cx)),
+            OfferKind::Builtin { extension, key, .. } => {
+                self.accept_builtin_offer(extension, &key, window, cx)
+            }
             OfferKind::ReopenInContainer { config } => self.reopen_in(config, cx),
             OfferKind::DownloadCodeLldb => self.download_codelldb(window, cx),
             OfferKind::PortAvailable { url, .. } => cx.open_url(&url),
-            OfferKind::OpenAsNotebook { path } => self.reopen_as_notebook(&path, window, cx),
-            OfferKind::NoteMessage { root, file, id } => {
-                self.open_note(root, &file, &id, window, cx)
-            }
             OfferKind::TrustFolder => {
                 if let Err(err) = crate::trust::grant(&self.project) {
                     self.notice = Some(format!("Cannot save the trusted folders: {err}").into());
@@ -1765,7 +1782,10 @@ impl Workspace {
 
     fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
         self.show_panel(PanelId::Terminal, cx);
-        let near = self.active_tab().map(|tab| tab.path.clone());
+        let near = self
+            .active_tab()
+            .and_then(Tab::file_path)
+            .map(Path::to_path_buf);
         self.terminal.update(cx, |terminal, cx| {
             terminal.new_terminal(near.as_deref(), window, cx)
         });
@@ -1836,52 +1856,6 @@ impl Workspace {
 
     fn git_refresh(&mut self, _: &git_commands::Refresh, _: &mut Window, cx: &mut Context<Self>) {
         self.commit.update(cx, |commit, cx| commit.refresh(cx));
-    }
-
-    fn python_sync(&mut self, _: &python_commands::Sync, _: &mut Window, cx: &mut Context<Self>) {
-        self.show_panel(PanelId::Python, cx);
-        self.python.update(cx, |python, cx| python.sync(cx));
-    }
-
-    fn python_lock(&mut self, _: &python_commands::Lock, _: &mut Window, cx: &mut Context<Self>) {
-        self.show_panel(PanelId::Python, cx);
-        self.python.update(cx, |python, cx| python.lock(cx));
-    }
-
-    fn run_file(
-        &mut self,
-        _: &python_commands::RunFile,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_python(RunRequest::CurrentFile, window, cx);
-    }
-
-    fn run_tests(
-        &mut self,
-        _: &python_commands::RunTests,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_python(RunRequest::Tests, window, cx);
-    }
-
-    fn run_test_file(
-        &mut self,
-        _: &python_commands::RunTestFile,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_python(RunRequest::TestFile, window, cx);
-    }
-
-    fn run_test_at_cursor(
-        &mut self,
-        _: &python_commands::RunTestAtCursor,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.run_python(RunRequest::TestAtCursor, window, cx);
     }
 
     fn render_offers(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -1955,7 +1929,10 @@ impl Workspace {
     /// The files of every tab, pane by pane.
     #[cfg(test)]
     pub(crate) fn tab_paths(&self) -> Vec<PathBuf> {
-        self.all_tabs().map(|tab| tab.path.clone()).collect()
+        self.all_tabs()
+            .filter_map(Tab::file_path)
+            .map(Path::to_path_buf)
+            .collect()
     }
 
     fn toggle_file_finder(
@@ -2070,11 +2047,12 @@ impl Workspace {
             .map(|tab| TabPart {
                 path: tab.path.clone(),
                 title: tab.title.to_string(),
-                kind: match tab.content {
+                kind: match &tab.content {
                     TabContent::Editor(_) => "editor",
-                    TabContent::Notebook(_) => "notebook",
                     TabContent::Diff(_) => "diff",
                     TabContent::Compare(_) => "compare",
+                    TabContent::Extension(_) => "extension",
+                    TabContent::Builtin(tab) => tab.kind(),
                 },
                 dirty: tab.is_dirty(cx),
                 active: Some(tab.entity_id()) == active_id,
@@ -2082,11 +2060,15 @@ impl Workspace {
             .collect();
         let active = self.active_tab().map(|tab| match &tab.content {
             TabContent::Editor(editor) => ActiveView::Editor(editor.clone()),
-            TabContent::Notebook(view) => ActiveView::Notebook(view.clone()),
-            TabContent::Diff(_) | TabContent::Compare(_) => ActiveView::Other,
+            TabContent::Builtin(tab) if tab.is_file() => ActiveView::File(tab.clone()),
+            TabContent::Diff(_)
+            | TabContent::Compare(_)
+            | TabContent::Extension(_)
+            | TabContent::Builtin(_) => ActiveView::Other,
         });
-        let open_panels: Vec<PanelId> = [&self.layout.left, &self.layout.right, &self.layout.bottom]
+        let open_panels: Vec<PanelId> = DockPosition::ALL
             .into_iter()
+            .map(|position| self.shown_dock(position))
             .filter(|dock| dock.open)
             .filter_map(|dock| dock.active)
             .collect();
@@ -2094,7 +2076,7 @@ impl Workspace {
         // own focus handle (Problems) never does.
         let focused = if self
             .active_tab()
-            .is_some_and(|tab| tab.focus_handle(cx).contains_focused(window, cx))
+            .is_some_and(|tab| tab.contains_focus(window, cx))
         {
             Some("editor".to_owned())
         } else {
@@ -2106,7 +2088,6 @@ impl Workspace {
                         PanelId::Files => self.file_tree.focus_handle(cx),
                         PanelId::Search => self.search.focus_handle(cx),
                         PanelId::Commit => self.commit.focus_handle(cx),
-                        PanelId::Python => self.python.focus_handle(cx),
                         PanelId::Terminal => {
                             let (view, _) = self.terminal.read(cx).active_view();
                             match view {
@@ -2114,7 +2095,7 @@ impl Workspace {
                                 None => self.terminal.focus_handle(cx),
                             }
                         }
-                        PanelId::Problems | PanelId::Notes => return false,
+                        PanelId::Problems => return false,
                         PanelId::GitLog => self.git_log.focus_handle(cx),
                         PanelId::Ports => self.ports_panel.focus_handle(cx),
                         PanelId::Outline => self.outline.focus_handle(cx),
@@ -2122,6 +2103,19 @@ impl Workspace {
                         PanelId::Debug => self.debug.panel.focus_handle(cx),
                         PanelId::DebugConsole => self.debug.console.focus_handle(cx),
                         PanelId::Tests => self.runs.tests.focus_handle(cx),
+                        PanelId::Extensions => match self.active_docked_extension() {
+                            Some(view) => view.focus_handle(cx),
+                            None => return false,
+                        },
+                        PanelId::Builtin(key) => {
+                            match self
+                                .builtin_panel_view(key)
+                                .and_then(|panel| panel.focus_handle(cx))
+                            {
+                                Some(handle) => handle,
+                                None => return false,
+                            }
+                        }
                     };
                     handle.contains_focused(window, cx)
                 })
@@ -2186,13 +2180,6 @@ impl Render for Workspace {
             .map(|element| self.on_git_actions(element, cx))
             .map(|element| self.on_log_actions(element, cx))
             .map(|element| self.on_stash_actions(element, cx))
-            .on_action(cx.listener(Self::python_sync))
-            .on_action(cx.listener(Self::python_lock))
-            .on_action(cx.listener(Self::run_file))
-            .on_action(cx.listener(Self::run_tests))
-            .on_action(cx.listener(Self::run_test_file))
-            .on_action(cx.listener(Self::run_test_at_cursor))
-            .on_action(cx.listener(Self::open_as_notebook))
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
             .on_action(cx.listener(Self::toggle_files))
@@ -2200,10 +2187,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::replace_in_files))
             .on_action(cx.listener(Self::toggle_commit))
             .on_action(cx.listener(Self::toggle_terminal))
-            .on_action(cx.listener(Self::toggle_python))
             .on_action(cx.listener(Self::toggle_problems))
-            .on_action(cx.listener(Self::toggle_notes))
             .on_action(cx.listener(Self::toggle_ports))
+            .on_action(cx.listener(Self::toggle_extensions))
             .on_action(cx.listener(Self::forward_port))
             .on_action(cx.listener(Self::toggle_call_hierarchy))
             .on_action(cx.listener(Self::toggle_outline))
@@ -2229,6 +2215,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::run_failed_tests))
             .on_action(cx.listener(Self::toggle_tests))
             .map(|element| self.on_debug_actions(element, cx))
+            .map(|element| crate::builtins::workspace_actions(element, cx))
             .on_mouse_move(cx.listener(Self::on_resize_move))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(Self::on_resize_end))
             .relative()

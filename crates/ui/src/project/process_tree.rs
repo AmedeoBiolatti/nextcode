@@ -52,6 +52,10 @@ impl CancelToken {
         Self::default()
     }
 
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::SeqCst)
     }
@@ -141,6 +145,25 @@ impl Tree {
             child: Some(child),
             killer,
         })
+    }
+
+    /// Ends every member, including descendants retaining pipes after the leader exits.
+    pub(super) fn kill_remaining(&mut self) {
+        self.ended = true;
+        #[cfg(unix)]
+        // SAFETY: signal only the process group created for this tree.
+        unsafe {
+            libc::kill(-self.killer.pid, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.killer.job {
+            job.terminate();
+        }
+        // If Windows could not make a job, terminate only a still-live leader.
+        #[cfg(windows)]
+        if self.killer.job.is_none() && matches!(*self.exit.state.lock(), State::Running) {
+            self.killer.kill();
+        }
     }
 
     /// Waits for the exit until `deadline`, or until `cancel` is cancelled.
