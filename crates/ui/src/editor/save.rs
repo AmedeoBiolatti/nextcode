@@ -308,7 +308,7 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert!(cx.executor().block_test(task));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "yxone\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "xyone\n");
         fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

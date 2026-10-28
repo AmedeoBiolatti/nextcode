@@ -690,7 +690,12 @@ mod tests {
         let events = collect(&mut rx, |events| {
             events.iter().any(|e| e.path == keep) && events.iter().any(|e| e.path == top)
         });
-        let mut paths: Vec<&Path> = events.iter().map(|e| e.path.as_path()).collect();
+        // Files only: Windows also reports `sub` itself as its entries change.
+        let mut paths: Vec<&Path> = events
+            .iter()
+            .map(|e| e.path.as_path())
+            .filter(|path| !path.is_dir())
+            .collect();
         paths.sort();
         // The nested rule hides `sub/build/x.o` only.
         assert_eq!(paths, [top.as_path(), keep.as_path()]);

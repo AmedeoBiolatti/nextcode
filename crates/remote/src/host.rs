@@ -623,7 +623,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("credentials");
         std::fs::write(&store,
-            "https://MiXTelematics:wrong@dev.azure.com/OtherOrg/Analytics/_git/repo\nhttps://MiXTelematics:correct@dev.azure.com/MiXTelematics/Analytics/_git/repo\n").unwrap();
+            "https://Contoso:wrong@dev.azure.com/OtherOrg/Analytics/_git/repo\nhttps://Contoso:correct@dev.azure.com/Contoso/Analytics/_git/repo\n").unwrap();
         let host = Host::new(
             Git {
                 program: "git".into(),
@@ -643,18 +643,15 @@ mod tests {
             None,
         )
         .allow_hosts(["dev.azure.com".into()]);
-        let request = "protocol=https\nhost=dev.azure.com\nusername=MiXTelematics\npath=MiXTelematics/Analytics/_git/repo\n";
+        let request = "protocol=https\nhost=dev.azure.com\nusername=Contoso\npath=Contoso/Analytics/_git/repo\n";
         let answer = host.credential(Operation::Get, request);
         let answer = Credential::parse(std::str::from_utf8(&answer).unwrap());
         assert_eq!(answer.get("password"), Some("correct"));
-        assert_eq!(
-            answer.get("path"),
-            Some("MiXTelematics/Analytics/_git/repo")
-        );
+        assert_eq!(answer.get("path"), Some("Contoso/Analytics/_git/repo"));
         host.credential(Operation::Erase, request);
         let remaining = std::fs::read_to_string(&store).unwrap();
         assert!(remaining.contains("OtherOrg"));
-        assert!(!remaining.contains("MiXTelematics/Analytics"));
+        assert!(!remaining.contains("Contoso/Analytics"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

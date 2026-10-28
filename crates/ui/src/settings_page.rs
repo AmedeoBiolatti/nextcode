@@ -161,7 +161,7 @@ impl SettingsPage {
             Control::Number { min, max } => {
                 match text.parse::<u64>() {
                     Ok(number) if (*min..=*max).contains(&number) => {
-                        if Value::from(number) != current {
+                        if current != number {
                             self.write(&setting, Some(number.into()), cx);
                         } else {
                             self.errors.remove(key);

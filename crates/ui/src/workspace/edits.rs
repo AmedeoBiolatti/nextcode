@@ -125,8 +125,10 @@ impl Workspace {
                 .find(|tab| tab.editor() == Some(&editor))
                 .and_then(|tab| tab.markdown.as_ref())
                 .map(|(view, _)| view.clone());
-            if language == Some(Language::Markdown) && markdown.is_some() {
-                markdown.unwrap().update(cx, |_, cx| cx.notify());
+            if language == Some(Language::Markdown)
+                && let Some(markdown) = markdown
+            {
+                markdown.update(cx, |_, cx| cx.notify());
             } else {
                 let markdown = self.markdown_view(&editor, cx);
                 for tab in self.panes.iter_mut().flat_map(|pane| &mut pane.tabs) {

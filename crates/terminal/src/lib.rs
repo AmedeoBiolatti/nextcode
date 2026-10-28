@@ -583,6 +583,8 @@ impl Terminal {
             .or_insert_with(|| "xterm-256color".into());
         env.entry("COLORTERM".into())
             .or_insert_with(|| "truecolor".into());
+        // Windows adds `escape_args`, which the default fills in.
+        #[cfg_attr(not(windows), allow(clippy::needless_update))]
         let pty_options = tty::Options {
             shell: Some(Shell::new(options.program, options.args)),
             working_directory: options.cwd,

@@ -3818,6 +3818,7 @@ dependencies = [
  "parking_lot",
  "pinpoint_cli",
  "pulldown-cmark",
+ "proto",
  "python",
  "regex",
  "remote",

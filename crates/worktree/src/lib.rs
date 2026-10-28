@@ -434,6 +434,8 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
         }
         Err(err) => return Err(err),
     };
+    // Only Unix copies permissions; elsewhere the closure is a plain `Ok`.
+    #[cfg_attr(not(unix), allow(clippy::bind_instead_of_map))]
     let written = fill(&mut file, data).and_then(|()| {
         #[cfg(unix)]
         if let Ok(meta) = fs::metadata(path) {
