@@ -2648,6 +2648,7 @@ fn resolve(items: &[Item], focus: &FocusHandle, window: &mut Window, cx: &mut Ap
             }
         })
         .collect();
+    rows.retain(|row| !matches!(row, Row::Submenu { rows, .. } if rows.is_empty()));
     // Left-out items can leave separators side by side or at an end.
     rows.dedup_by(|a, b| matches!((a, b), (Row::Separator, Row::Separator)));
     if matches!(rows.first(), Some(Row::Separator)) {
@@ -3492,6 +3493,31 @@ mod tests {
     }
 
     #[gpui::test]
+    fn disabled_extensions_leave_no_empty_submenus(cx: &mut gpui::TestAppContext) {
+        let (root, alpha, _) = two_projects("empty-extension-menus");
+        let window = open_shell(alpha, cx);
+        let store = cx.update(crate::extensions::shared);
+        store.update(cx, |store, cx| {
+            store.set_builtin_enabled("python", false, cx)
+        });
+        cx.run_until_parked();
+        window.update(cx, |shell, window, cx| {
+            let run = menus::MenuBar::default().menus.into_iter().find(|menu| menu.label == "Run").unwrap();
+            let rows = resolve(&run.items, &shell.focus_handle, window, cx);
+            assert!(!rows.iter().any(|row| matches!(row, Row::Submenu { label, .. } if label == "Python")));
+            assert!(rows.iter().any(|row| matches!(row, Row::Submenu { label, rows } if label == "Notebooks" && !rows.is_empty())));
+        }).unwrap();
+        store.update(cx, |store, cx| {
+            store.set_builtin_enabled("python", true, cx)
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cleanup(root);
+    }
+
+    #[gpui::test]
     fn menus_and_the_palette_run_commands_where_focus_is(cx: &mut gpui::TestAppContext) {
         let (root, alpha, beta) = two_projects("menus");
         let window = open_shell(alpha, cx);
@@ -3515,7 +3541,7 @@ mod tests {
                 let recent: Vec<String> = rows
                     .iter()
                     .find_map(|row| match row {
-                        Row::Submenu { label, rows } if label == "Recent Projects" => Some(
+                        Row::Submenu { label, rows } if label == "Open Recent" => Some(
                             rows.iter()
                                 .filter_map(|row| match row {
                                     Row::Command { label, .. } => Some(label.to_string()),

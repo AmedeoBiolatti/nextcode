@@ -3,7 +3,7 @@
 Through the file's language server (the server runs where the project
 lives: locally, in WSL or in the dev container).
 
-| Command (Refactor menu) | Keys |
+| Command (Edit > Code Actions) | Keys |
 |---|---|
 | Rename Symbol… | `F2`, `Shift+F6` |
 | Quick Fix… (code actions at the cursor or selection) | `Ctrl+.`, `Alt+Enter` |

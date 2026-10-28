@@ -83,7 +83,7 @@ opens it in a project tab. Typing a branch name adds a worktree for it
 `<repository>-<branch>` and opens it; `×` removes one (asks; its branch is
 kept).
 
-The **Git** tool window (`Alt+9`, View > Git, Git > Show Git Log; bottom
+The **Git** tool window (`Alt+9`, View > Panels > Git, Git > Show Git Log; bottom
 dock) is PyCharm's Log tab. On the left, the **branches tree**: HEAD (the
 current branch), Local, Remote (per remote) and Tags; double-clicking a row
 filters the log to it. In the middle, a filter bar — text (subject, author

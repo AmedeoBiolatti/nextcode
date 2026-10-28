@@ -49,7 +49,7 @@ pub const BUILTIN: Builtin = Builtin {
             items: &[Entry::Command("notes::AddNote")],
         },
         MenuItem {
-            menu: "View",
+            menu: "View/Panels",
             after: "workspace::ToggleProblems",
             items: &[Entry::Labeled("notes::TogglePanel", "Notes")],
         },
@@ -260,7 +260,7 @@ mod tests {
     use crate::menus::{Item, MenuBar};
 
     #[test]
-    fn menus_read_as_before_notes_were_an_extension() {
+    fn notes_stay_with_editor_actions_and_other_panels() {
         let bar = MenuBar::default();
         let items = |label: &str| {
             bar.menus
@@ -277,6 +277,13 @@ mod tests {
             .unwrap();
         assert_eq!(edit[reference + 1], Item::Plain("notes::AddNote".into()));
         let view = items("View");
+        let Item::Submenu { items: view, .. } = view
+            .iter()
+            .find(|item| matches!(item, Item::Submenu { label, .. } if label == "Panels"))
+            .unwrap()
+        else {
+            panic!("panels submenu")
+        };
         let problems = view
             .iter()
             .position(|item| *item == Item::Plain("workspace::ToggleProblems".into()))

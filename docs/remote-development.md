@@ -52,7 +52,7 @@ and the git credential / ssh-agent lending below all go through
 `next_code_agent`, which is installed to `~/.local/share/next_code/` on the
 machine and started through a login shell over one `ssh` connection.
 
-**File > Connect to SSH Host…** opens Open Recent at `ssh://`, listing the
+**File > Remote > Connect to SSH Host…** opens Open Recent at `ssh://`, listing the
 hosts of `~/.ssh/config` (and the files it `Include`s; patterns left out)
 and the Linux machines of your tailnet from `tailscale status --json`
 (online first; by MagicDNS name, else by Tailscale address; marked when they
@@ -159,8 +159,8 @@ started are stopped as `shutdownAction` says when its project tab closes.
 ## Port forwarding (dev containers and WSL)
 
 Like VS Code's Ports view: a server running where the project lives is
-reachable on `localhost` here. The **Ports** panel (bottom dock, View >
-Ports; Run > Forward a Port…) lists forwarded ports: Port (with its
+reachable on `localhost` here. The **Ports** panel (bottom dock, View > Panels >
+Ports; Run > Tools > Forward a Port…) lists forwarded ports: Port (with its
 `portsAttributes` label), Forwarded Address (`localhost:NNNN`, click to open
 it in the browser), Running Process, Origin (Auto Forwarded, User Forwarded,
 devcontainer.json) and open connections, with Open, Copy (the local

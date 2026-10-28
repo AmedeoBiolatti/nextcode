@@ -1,7 +1,7 @@
 # Built-in extensions
 
 Some features are built-in extensions: part of next_code, turned on and off
-in **File > Manage Extensions…** under **Built-in**. One that is off has no
+in **File > Preferences > Manage Extensions…** under **Built-in**. One that is off has no
 menu items (also when `menus.json` lists them), commands, panels or
 suggestions, and turning it off closes its tabs (a tab with unsaved
 changes stays until closed; a notebook tab shows its file as text). Its
@@ -12,12 +12,12 @@ turns them all back to their defaults.
 
 | Extension | Default | Contributes |
 |---|---|---|
-| [Assembly Inspection](assembly-inspection.md) | off | Run > Inspect Assembly, assembly tabs |
-| [Workflows](workflows.md) | on | workflow tabs, Run > Open Workflow… / Open Workflow File… / Add Workflow Folder… / New Workflow…, the palette's *Run Workflow:* entries |
-| [Notebooks](notebooks.md) | on | notebook tabs for `.ipynb` and marimo files, the `notebook::*` commands, Run > Run Cell / Run All Cells / Interrupt / Restart, the *Open as Notebook* suggestion |
+| [Assembly Inspection](assembly-inspection.md) | off | Run > Tools > Inspect Assembly, assembly tabs |
+| [Workflows](workflows.md) | on | workflow tabs, Run > Workflows > Open Workflow… / Open Workflow File… / Add Workflow Folder… / New Workflow…, the palette's *Run Workflow:* entries |
+| [Notebooks](notebooks.md) | on | notebook tabs for `.ipynb` and marimo files, the `notebook::*` commands, Run > Notebooks > Run Cell / Run All Cells / Interrupt / Restart, the *Open as Notebook* suggestion |
 | [Python](python.md) | on | the Python panel, the `python::*` commands (Sync, Lock, Run File, Run Tests…) and the *out of date* Sync suggestion |
 | [Sticky Notes](sticky-notes.md) | on | note cards and markers in editors and notebook cells, Add Note, the Notes panel and its count, the *left you a note* suggestion |
-| [Remote - SSH](remote-development.md#ssh-and-tailscale-machines) | on | `ssh://` project locations, File > Connect to SSH Host…, SSH hosts and Tailscale machines in Open Recent |
+| [Remote - SSH](remote-development.md#ssh-and-tailscale-machines) | on | `ssh://` project locations, File > Remote > Connect to SSH Host…, SSH hosts and Tailscale machines in Open Recent |
 
 With Python off, Python files still get their language server, run
 configurations, debugging, notebooks and the Tests panel's pytest tests.
@@ -34,7 +34,8 @@ Notebooks off, `.ipynb` and marimo files open as text. Headless mode's
 For contributors: a built-in extension is a module under
 `crates/ui/src/builtins/` with a `Builtin` in `builtins::ALL`. It declares
 its commands' labels, the commands the palette leaves out, and menu items
-(after a named command, separators included). In each window it may
+(a slash-separated menu path such as `Run/Python`, after a named command,
+or at the end when the anchor is empty; separators included). In each window it may
 install command handlers, keep a model, add palette entries, hear that a
 project tab opened, and open window tabs (`WindowTabKind`: a file of a
 project or of this machine beside the project tabs, saved with the window

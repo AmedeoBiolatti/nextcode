@@ -74,7 +74,7 @@ Regular expressions use Rust's `regex` syntax (`^`/`$` match at lines);
 replacements expand `$1`, `${name}`. Without regex the replacement is
 literal.
 
-**Word wrap.** `Alt+Z` (View > Word Wrap) wraps long lines at the editor's
+**Word wrap.** `Alt+Z` (View > Appearance > Word Wrap) wraps long lines at the editor's
 width for that editor; `"word_wrap": true` in `settings.json` makes it the
 default, and `"languages": { "<id>": { "word_wrap": … } }` overrides it per
 language (Markdown wraps by default). Rows break after spaces (long words

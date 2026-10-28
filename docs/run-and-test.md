@@ -64,7 +64,7 @@ build` / `cargo test --no-run` with `--message-format=json`, taking the one
 executable) and hands the request to the debugger: debugpy for Python and
 pytest (`module: pytest`), LLDB for Rust and native programs.
 
-The **Tests** panel (left dock; View > Tests) finds tests when first shown
+The **Tests** panel (left dock; View > Panels > Tests) finds tests when first shown
 and after a test file is saved (`test_*.py`, `*_test.py`, `conftest.py`,
 `.rs`; debounced):
 

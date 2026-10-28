@@ -1,8 +1,8 @@
 # Assembly inspection
 
 A [built-in extension](built-in-extensions.md), off until turned on in
-**File > Manage Extensions…** under **Built-in**. Then open a C, C++ or
-Rust source file and choose **Run > Inspect Assembly**
+**File > Preferences > Manage Extensions…** under **Built-in**. Then open a C, C++ or
+Rust source file and choose **Run > Tools > Inspect Assembly**
 (also available in the command palette). A separate assembly tab offers
 compiler/target selection, **O0–O3** optimization, extra compiler flags,
 search, **Copy Assembly**, and the complete compiler command and diagnostics

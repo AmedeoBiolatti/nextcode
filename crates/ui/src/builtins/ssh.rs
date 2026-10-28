@@ -23,8 +23,8 @@ pub const BUILTIN: Builtin = Builtin {
     default_enabled: true,
     labels: &[("ssh::ConnectToHost", "Connect to SSH Host…")],
     menu_items: &[MenuItem {
-        menu: "File",
-        after: "app::OpenRecent",
+        menu: "File/Remote",
+        after: "",
         items: &[Entry::Command("ssh::ConnectToHost")],
     }],
     window_actions,

@@ -29,11 +29,11 @@ project's own.
 
 **Starting.** `F5` debugs the selected run configuration (see above; Rust
 configurations are built first), or with no configuration support the
-current Python file (**Debug > Debug Current File**). One session runs at a
+current Python file (**Run > Debugging > Debug Current File**). One session runs at a
 time: starting another (or Restart) stops the running one first.
 
 **Breakpoints.** Click the gutter left of the line numbers, or press `F9` /
-`Ctrl+F8` on the cursor line. Right-click the gutter (or **Debug > Edit
+`Ctrl+F8` on the cursor line. Right-click the gutter (or **Run > Breakpoints > Edit
 Breakpoint…**) for a condition, a hit count (the adapter's syntax, e.g.
 `5`, `>= 3`) or a log message (`{expression}` interpolated; a logpoint logs
 instead of stopping), and to disable or remove it. Dots: filled red =
@@ -48,7 +48,7 @@ file as they change while a session runs.
 **While paused** the line is highlighted with an arrow in the gutter, its
 file opened (stepping into code without a file selects the nearest frame
 that has one). Hovering an identifier shows its value (`self.items` for
-`items` after a dot). The **Debug** panel (right dock, View > Debug) has a
+`items` after a dot). The **Debug** panel (right dock, View > Panels > Debug) has a
 toolbar and sections:
 
 - **Call Stack**: threads (when several) and frames; click a frame to show
@@ -78,7 +78,7 @@ state with the same toolbar.
 | Stop | `Shift+F5` |
 | Restart | `Ctrl+Shift+F5` |
 | Toggle Breakpoint | `F9`, `Ctrl+F8` |
-| Edit Breakpoint…, Enable/Disable All, Remove All | Debug menu, palette |
+| Edit Breakpoint…, Enable/Disable All, Remove All | Run > Breakpoints, palette |
 
 Limits: no `runInTerminal` (program input from a terminal) and no child
 sessions (`startDebugging`, e.g. debugpy's multiprocess); both are declined

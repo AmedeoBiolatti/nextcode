@@ -296,8 +296,8 @@ old command still stops start once it is gone).
 
 UI: each workflow opens as its own tab in the window's tab row (marked ◈,
 colored by the run's state; opening the same file again shows its tab;
-restored with the window). Run > Open Workflow… picks one (user and open
-projects' workflows); Run > New Workflow… writes a commented template to
+restored with the window). Run > Workflows > Open Workflow… picks one (user and open
+projects' workflows); Run > Workflows > New Workflow… writes a commented template to
 the user folder and opens its tab; the command palette's "Run Workflow:
 <name>" opens the tab and runs it. The tab has the file in an editor on
 the left (Ctrl+S saves; drag the divider to resize) and a graph on the

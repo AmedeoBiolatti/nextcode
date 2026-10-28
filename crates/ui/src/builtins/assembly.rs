@@ -29,12 +29,12 @@ gpui::actions!(assembly, [InspectAssembly]);
 pub const BUILTIN: Builtin = Builtin {
     id: "assembly",
     name: "Assembly Inspection",
-    description: "Compiler output for C, C++ and Rust sources: Run > Inspect Assembly.",
+    description: "Compiler output for C, C++ and Rust sources: Run > Tools > Inspect Assembly.",
     default_enabled: false,
     labels: &[("assembly::InspectAssembly", "Inspect Assembly")],
     menu_items: &[MenuItem {
-        menu: "Run",
-        after: "run::EditConfigurations",
+        menu: "Run/Tools",
+        after: "ports::ForwardPort",
         items: &[Entry::Command("assembly::InspectAssembly")],
     }],
     workspace_actions,

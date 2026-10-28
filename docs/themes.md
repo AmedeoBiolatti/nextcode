@@ -7,10 +7,10 @@ Windows, `~/.config/next_code/themes` on Linux), named by their `"name"`
 (else the file name; built-in names are reserved). `"theme": "<name>"` in
 `settings.json` picks one.
 
-- **File > Select Theme…** lists the built-in and user themes; choosing one
+- **File > Preferences > Select Theme…** lists the built-in and user themes; choosing one
   writes `"theme"` into `settings.json` (keeping the other settings) and
   applies it.
-- **File > Customize Theme…** creates `themes/<Name> (custom).json`
+- **File > Preferences > Customize Theme…** creates `themes/<Name> (custom).json`
   extending the current built-in theme, with one example per section,
   selects it and opens it; on a user theme it just opens its file.
 
