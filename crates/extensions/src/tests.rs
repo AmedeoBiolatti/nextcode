@@ -654,6 +654,7 @@ fn panel_fixture() -> extension_api::PanelUpdate {
             gap: 8,
             children: vec![
                 Widget::TextInput {
+                    label_inline: false,
                     id: "text".into(),
                     label: "Text".into(),
                     value: "abc".into(),
@@ -661,12 +662,14 @@ fn panel_fixture() -> extension_api::PanelUpdate {
                     disabled: false,
                 },
                 Widget::Checkbox {
+                    color: None,
                     id: "check".into(),
                     label: "Check".into(),
                     value: false,
                     disabled: false,
                 },
                 Widget::Select {
+                    label_inline: false,
                     id: "select".into(),
                     label: "Select".into(),
                     value: "a".into(),
@@ -692,11 +695,13 @@ fn panel_fixture() -> extension_api::PanelUpdate {
                     rows: vec![vec!["Cell".into()]],
                 },
                 Widget::Chart {
+                    legend: true,
                     id: "chart".into(),
                     title: "Chart".into(),
                     height: 120,
                     chart: ChartSpec::Line {
                         series: vec![ChartSeries {
+                            color: None,
                             name: "Series".into(),
                             points: vec![ChartPoint { x: 0.0, y: 1.0 }],
                         }],
@@ -796,6 +801,7 @@ fn panel_bounds_and_error_atomicity_apply_without_document_edits() {
             value: f64::NAN,
         },
         Widget::TextInput {
+            label_inline: false,
             id: "t".into(),
             label: "".into(),
             value: "x".repeat(4097),
@@ -820,6 +826,7 @@ fn panel_bounds_and_error_atomicity_apply_without_document_edits() {
             }],
         },
         Widget::Chart {
+            legend: true,
             id: "c".into(),
             title: "".into(),
             height: 120,
@@ -903,6 +910,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
     for chart in [
         ChartSpec::Scatter {
             series: vec![ChartSeries {
+                color: None,
                 name: "s".into(),
                 points: vec![ChartPoint { x: 2.0, y: 3.0 }],
             }],
@@ -912,6 +920,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
         ChartSpec::Bar {
             labels: vec!["a".into()],
             series: vec![BarSeries {
+                color: None,
                 name: "s".into(),
                 values: vec![1.0],
             }],
@@ -926,6 +935,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
         },
     ] {
         panel.root = Widget::Chart {
+            legend: true,
             id: "c".into(),
             title: "Chart".into(),
             chart,
@@ -941,6 +951,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
         },
         ChartSpec::Scatter {
             series: vec![ChartSeries {
+                color: None,
                 name: "s".into(),
                 points: vec![ChartPoint {
                     x: f64::INFINITY,
@@ -953,6 +964,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
         ChartSpec::Bar {
             labels: vec!["a".into()],
             series: vec![BarSeries {
+                color: None,
                 name: "s".into(),
                 values: vec![1.0, 2.0],
             }],
@@ -973,6 +985,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
         },
     ] {
         panel.root = Widget::Chart {
+            legend: true,
             id: "c".into(),
             title: "".into(),
             chart,
@@ -1004,6 +1017,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
     }
     assert!(validate_panel_update(&panel).is_err());
     panel.root = Widget::Select {
+        label_inline: false,
         id: "s".into(),
         label: "".into(),
         value: "a".into(),
@@ -1173,6 +1187,7 @@ fn valid_large_select_values_reach_the_guest_but_text_fields_stay_bounded() {
             gap: 0,
             children: vec![
                 Widget::Select {
+                    label_inline: false,
                     id: "choice".into(),
                     label: "Choice".into(),
                     value: value.clone(),
@@ -1332,4 +1347,60 @@ fn api_two_packages_still_run_but_cannot_acquire_processes_or_timers() {
     assert!(validate_panel_update(&panel).is_err());
     panel.refresh_ms = Some(1000);
     validate_panel_update(&panel).unwrap();
+}
+
+#[test]
+fn compact_widgets_accept_legacy_defaults_and_validate_shared_colors() {
+    use extension_api::*;
+    let fixture = panel_fixture();
+    let mut legacy = serde_json::to_value(&fixture).unwrap();
+    fn strip(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for key in ["color", "label_inline", "legend"] {
+                    fields.remove(key);
+                }
+                for value in fields.values_mut() {
+                    strip(value);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    strip(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    strip(&mut legacy);
+    let old: PanelUpdate = serde_json::from_value(legacy).unwrap();
+    assert_eq!(old, fixture);
+    validate_panel_update(&old).unwrap();
+    let mut compact = serde_json::to_value(&fixture).unwrap();
+    let children = compact["root"]["children"].as_array_mut().unwrap();
+    children[0]["label"] = serde_json::json!("");
+    children[0]["label_inline"] = serde_json::json!(true);
+    children[1]["color"] = serde_json::json!(11);
+    children[2]["label_inline"] = serde_json::json!(true);
+    children[6]["legend"] = serde_json::json!(false);
+    children[6]["chart"]["series"][0]["color"] = serde_json::json!(11);
+    let panel: PanelUpdate = serde_json::from_value(compact.clone()).unwrap();
+    validate_panel_update(&panel).unwrap();
+    assert!(
+        matches!(&panel.root, Widget::Column { children, .. } if matches!(children[6], Widget::Chart { legend: false, .. }))
+    );
+    for pointer in [
+        "/root/children/1/color",
+        "/root/children/6/chart/series/0/color",
+    ] {
+        let mut invalid = compact.clone();
+        *invalid.pointer_mut(pointer).unwrap() = serde_json::json!(12);
+        let invalid: PanelUpdate = serde_json::from_value(invalid).unwrap();
+        assert!(
+            validate_panel_update(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("color")
+        );
+    }
 }

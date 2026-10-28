@@ -77,6 +77,10 @@ impl<'a> Bounds<'a> {
                 );
                 for series in series {
                     self.text(&series.name)?;
+                    ensure!(
+                        series.color.is_none_or(|color| color < 12),
+                        "invalid chart color: expected 0..11"
+                    );
                     ensure!(!series.points.is_empty(), "empty chart series");
                     // Each point is one datum; both coordinates are validated.
                     for point in &series.points {
@@ -106,6 +110,10 @@ impl<'a> Bounds<'a> {
                 }
                 for series in series {
                     self.text(&series.name)?;
+                    ensure!(
+                        series.color.is_none_or(|color| color < 12),
+                        "invalid chart color: expected 0..11"
+                    );
                     ensure!(series.values.len() == labels.len(), "bar width mismatch");
                     self.numbers(series.values.iter().copied())?;
                 }
@@ -159,7 +167,13 @@ impl<'a> Bounds<'a> {
                 self.text(value)?;
                 self.text(placeholder)?;
             }
-            Widget::Checkbox { label, .. } => self.text(label)?,
+            Widget::Checkbox { label, color, .. } => {
+                self.text(label)?;
+                ensure!(
+                    color.is_none_or(|color| color < 12),
+                    "invalid checkbox color: expected 0..11"
+                );
+            }
             Widget::Select {
                 label,
                 value,

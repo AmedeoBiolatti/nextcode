@@ -249,6 +249,8 @@ pub enum Widget {
     TextInput {
         id: String,
         label: String,
+        #[serde(default)]
+        label_inline: bool,
         value: String,
         placeholder: String,
         disabled: bool,
@@ -258,10 +260,14 @@ pub enum Widget {
         label: String,
         value: bool,
         disabled: bool,
+        #[serde(default)]
+        color: Option<u8>,
     },
     Select {
         id: String,
         label: String,
+        #[serde(default)]
+        label_inline: bool,
         value: String,
         options: Vec<SelectOption>,
         disabled: bool,
@@ -281,7 +287,13 @@ pub enum Widget {
         title: String,
         chart: ChartSpec,
         height: u16,
+        #[serde(default = "show_legend")]
+        legend: bool,
     },
+}
+
+fn show_legend() -> bool {
+    true
 }
 
 impl Widget {
@@ -341,6 +353,9 @@ pub enum ChartSpec {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChartSeries {
+    /// Palette index 0..11; omitted uses this series' position.
+    #[serde(default)]
+    pub color: Option<u8>,
     pub name: String,
     pub points: Vec<ChartPoint>,
 }
@@ -353,6 +368,9 @@ pub struct ChartPoint {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BarSeries {
+    /// Palette index 0..11; omitted uses this series' position.
+    #[serde(default)]
+    pub color: Option<u8>,
     pub name: String,
     pub values: Vec<f64>,
 }

@@ -83,6 +83,7 @@ impl Workspace {
             });
         });
         let docked = matches!(contribution.placement, PanelPlacement::Dock);
+        view.update(cx, |view, cx| view.set_docked(docked, cx));
         self.extension_panels.push(ExtensionPanel {
             extension: extension.to_owned(),
             panel: contribution.id.clone(),
@@ -253,6 +254,7 @@ impl Workspace {
             .find(|entry| entry.view.entity_id() == id)
         {
             entry.docked = true;
+            entry.view.update(cx, |view, cx| view.set_docked(true, cx));
         }
         self.active_extension_panel = Some(id);
         self.show_panel(PanelId::Extensions, cx);
@@ -276,6 +278,7 @@ impl Workspace {
             return;
         };
         entry.docked = false;
+        entry.view.update(cx, |view, cx| view.set_docked(false, cx));
         let view = entry.view.clone();
         self.active_extension_panel = self
             .extension_panels

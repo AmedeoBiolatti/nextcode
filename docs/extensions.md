@@ -111,6 +111,33 @@ is a working Rust authoring example using every widget and chart kind.
 Markdown is resource-free formatted text: image/HTML/link destinations
 cannot load files or network resources.
 
+Compact dashboard controls use optional API 3 fields:
+
+- Charts accept `"legend": false` to hide the legend; omitted means `true`.
+  Keyboard zoom and selection still work; the repeated keyboard hint is
+  no longer printed under each chart.
+- Line, scatter and bar series accept `"color": 0` through `11`. Omitted
+  colors use the series index. Checkbox widgets accept the same palette
+  index and draw a swatch between the box and label, so a run list can act
+  as a shared legend without placeholder series.
+- Text inputs and selects with `"label": ""` draw only the field. With a
+  nonempty label, `"label_inline": true` places `Label: value` inside the
+  field instead of reserving a separate label row. The default remains
+  a label above the field.
+- Editor panels omit the extra manifest-title row because the editor tab
+  already names the panel. Moving a panel to the dock restores its header;
+  loading, running and error indicators remain available.
+
+```json
+{"type":"chart","id":"loss","title":"val/loss","height":140,"legend":false,
+ "chart":{"kind":"line","x_label":"step","y_label":"loss",
+          "series":[{"name":"r0958","color":2,"points":[{"x":1,"y":0.5}]}]}}
+```
+
+These additions do not change event indices, shortcuts or existing API 3
+JSON defaults. Rust SDK users set the new optional fields explicitly when
+constructing widgets and series.
+
 Dock panels live in the movable/resizable **Extensions** dock, with
 internal tabs for each view. **Move to Editor** and **Move to Dock** move
 the same view without losing its state. Dock placement/size is remembered;
