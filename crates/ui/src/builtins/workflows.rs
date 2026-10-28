@@ -14,7 +14,7 @@
 //!
 //! Each workflow file opens as a window tab, a [`WorkflowView`]: the file
 //! in an editor beside a live graph of its steps (`view`), with Run All,
-//! Stop All and per-step actions. Run > Open Workflow… picks one
+//! Stop All and per-step actions. Run > Workflows > Open Workflow… picks one
 //! ([`WorkflowPicker`]); `window` has the window's commands and tabs. A workflow with `inputs` asks for them first in a
 //! form over the graph (`form`); a run keeps its values (Retry and
 //! Restart reuse them).
@@ -80,7 +80,7 @@ pub struct RunWorkflow {
 pub const BUILTIN: Builtin = Builtin {
     id: "workflows",
     name: "Workflows",
-    description: "Multi-project development environments from YAML files, each in a window tab with a live graph of its steps (Run > Open Workflow…).",
+    description: "Multi-project development environments from YAML files, each in a window tab with a live graph of its steps (Run > Workflows > Open Workflow…).",
     default_enabled: true,
     labels: &[
         ("workflows::OpenWorkflow", "Open Workflow…"),
@@ -94,10 +94,9 @@ pub const BUILTIN: Builtin = Builtin {
     // Listed once per workflow as "Run Workflow: <name>".
     unlisted: &["workflows::RunWorkflow"],
     menu_items: &[MenuItem {
-        menu: "Run",
-        after: "workspace::ToggleTests",
+        menu: "Run/Workflows",
+        after: "",
         items: &[
-            Entry::Separator,
             Entry::Command("workflows::OpenWorkflow"),
             Entry::Command("workflows::OpenWorkflowFile"),
             Entry::Command("workflows::AddWorkflowFolder"),

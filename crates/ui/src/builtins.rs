@@ -222,7 +222,7 @@ pub fn file_tab(kind: &str) -> Option<(&'static Builtin, &'static FileTabKind)> 
     })
 }
 
-/// `items` in the built-in menu `menu`, after the item that runs `after`
+/// `items` in the slash-separated built-in menu path `menu`, after the item that runs `after`
 /// (last when the menu has no such item).
 pub struct MenuItem {
     pub menu: &'static str,
@@ -726,16 +726,36 @@ mod tests {
             _ => None,
         };
         for item in ALL.iter().flat_map(|builtin| builtin.menu_items) {
-            let menu = bar
+            let mut path = item.menu.split('/');
+            let root = path.next().unwrap();
+            let mut items = &bar
                 .menus
                 .iter()
-                .find(|menu| menu.label == item.menu)
-                .unwrap();
-            let commands: Vec<String> = menu.items.iter().filter_map(command).collect();
-            let after = commands
-                .iter()
-                .position(|existing| existing == item.after)
-                .unwrap_or_else(|| panic!("{} is not in {}", item.after, item.menu));
+                .find(|menu| menu.label == root)
+                .unwrap()
+                .items;
+            for label in path {
+                let Item::Submenu {
+                    items: children, ..
+                } = items
+                    .iter()
+                    .find(|item| matches!(item, Item::Submenu { label: own, .. } if own == label))
+                    .unwrap()
+                else {
+                    panic!("missing submenu {label}")
+                };
+                items = children;
+            }
+            let commands: Vec<String> = items.iter().filter_map(command).collect();
+            let after = if item.after.is_empty() {
+                0
+            } else {
+                commands
+                    .iter()
+                    .position(|existing| existing == item.after)
+                    .unwrap_or_else(|| panic!("{} is not in {}", item.after, item.menu))
+                    + 1
+            };
             let expected: Vec<&str> = item
                 .items
                 .iter()
@@ -746,8 +766,7 @@ mod tests {
                 .position(|entry| *entry != crate::menus::SEPARATOR);
             let first = first.unwrap_or_default();
             let start = after
-                + 1
-                + commands[after + 1..]
+                + commands[after..]
                     .iter()
                     .position(|existing| existing == expected[first])
                     .unwrap_or_else(|| panic!("{} is not in {}", expected[first], item.menu))
@@ -765,7 +784,10 @@ mod tests {
                 .flat_map(|item| item.items)
                 .filter_map(Entry::command)
                 .collect();
-            for between in &commands[after + 1..start] {
+            for between in &commands[after..start] {
+                if item.after.is_empty() {
+                    continue;
+                }
                 assert!(
                     between == crate::menus::SEPARATOR || builtin_items.contains(&between.as_str()),
                     "{between} is between {} and its items",

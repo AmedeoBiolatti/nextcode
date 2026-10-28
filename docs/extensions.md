@@ -11,7 +11,7 @@ a package after rebuilding it.
 
 ## Install and run
 
-1. Open **File > Manage Extensions…**, or search for **Manage Extensions**
+1. Open **File > Preferences > Manage Extensions…**, or search for **Manage Extensions**
    in the command palette (`Ctrl+Shift+P`).
 2. Enter a local package folder and choose **Install path**, or **Browse…**
    to select it. A package contains `extension.json` and its `.wasm` file.

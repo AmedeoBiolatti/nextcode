@@ -1,6 +1,6 @@
 # Window, menus and commands
 
-Top to bottom, a window has the menu bar (File, Edit, Selection, View, Go,
+Top to bottom, a window has the menu bar (File, Edit, View, Go,
 Run, Git, Help) with the command bar in it, the project tabs, and the active
 project. On Windows, and on Linux when the compositor leaves decorations
 to the window (GNOME does), the menu bar is also the title bar: the
@@ -13,11 +13,12 @@ asks about unsaved files first.
 - **File > Open Project…** (`Ctrl+O`) picks a folder (a
   `\\wsl.localhost\...` folder opens through WSL) and opens it in a new
   tab; **Open Project in New Window…** does the same in its own window.
-- **File > Recent Projects** lists recent projects and workspaces; **Open
-  Recent…** (`Ctrl+R`) also accepts a typed location such as
+- **File > Open Recent** lists recent projects and workspaces;
+  the **Open Recent…** command (`Ctrl+R`) also accepts a typed location such as
   `Ubuntu:~/project`, `devcontainer:C:\src\app` or a workspace file.
-- **File > Open Workspace from File…**, **Add Folder to Workspace…** and
-  **Save Workspace As…**: see [multi-root workspaces](multi-root-workspaces.md).
+- **File > Workspace** contains **Open Workspace from File…**,
+  **Add Folder to Workspace…** and **Save Workspace As…**: see
+  [multi-root workspaces](multi-root-workspaces.md).
 - Opening a project that is already open (in any window) switches to its
   tab. `Ctrl+Alt+]` / `Ctrl+Alt+[` cycle the tabs.
 - Drag project or workflow tabs left/right to reorder them, just like file
@@ -53,8 +54,16 @@ The state is `windows.json` next to `recent.json`
 Linux); `"restore_windows": false` in `settings.json` shows the welcome
 screen instead.
 
+Common commands stay at the top level. **Edit** groups line editing,
+multiple cursors and code actions; **View** groups panels, editor layout and
+appearance. **Run** contains debugging, breakpoints, tests and extension
+commands under **Notebooks**, **Python**, **Workflows** and **Tools**.
+Empty extension groups disappear when their extensions are disabled.
+Shortcuts and command-palette names are unchanged. Existing custom
+`menus.json` files keep their own structure.
+
 Every menu item is a command, the same ones the palette runs. Menus are
-customizable: **File > Customize Menus…** writes the built-in menus to
+customizable: **File > Preferences > Customize Menus…** writes the built-in menus to
 `menus.json` in the config dir (`%APPDATA%\next_code` on Windows,
 `~/.config/next_code` on Linux) and opens it; the file then replaces the
 built-in menus, and edits apply when a menu is next opened:

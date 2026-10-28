@@ -102,10 +102,9 @@ pub const BUILTIN: Builtin = Builtin {
         "notebook::SelectLast",
     ],
     menu_items: &[MenuItem {
-        menu: "Run",
-        after: "workspace::ToggleTests",
+        menu: "Run/Notebooks",
+        after: "",
         items: &[
-            Entry::Separator,
             Entry::Command("notebook::RunCell"),
             Entry::Command("notebook::RunAll"),
             Entry::Command("notebook::Interrupt"),

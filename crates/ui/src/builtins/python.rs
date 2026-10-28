@@ -50,12 +50,12 @@ pub const BUILTIN: Builtin = Builtin {
     ],
     menu_items: &[
         MenuItem {
-            menu: "View",
+            menu: "View/Panels",
             after: "workspace::ToggleGitLog",
             items: &[Entry::Command("python::TogglePanel")],
         },
         MenuItem {
-            menu: "Run",
+            menu: "Run/Tests",
             after: "run::RunFailedTests",
             items: &[
                 Entry::Command("python::RunTestFile"),
@@ -63,14 +63,10 @@ pub const BUILTIN: Builtin = Builtin {
             ],
         },
         MenuItem {
-            menu: "Run",
-            after: "workspace::ToggleTests",
-            items: &[Entry::Separator, Entry::Command("python::RunFile")],
-        },
-        MenuItem {
-            menu: "Run",
-            after: "notebook::Restart",
+            menu: "Run/Python",
+            after: "",
             items: &[
+                Entry::Command("python::RunFile"),
                 Entry::Separator,
                 Entry::Command("python::Sync"),
                 Entry::Command("python::Lock"),
@@ -284,10 +280,29 @@ fn run(
 mod tests {
     use crate::menus::{Item, MenuBar};
 
-    fn commands(menu: &str) -> Vec<String> {
+    fn commands(path: &str) -> Vec<String> {
         let bar = MenuBar::default();
-        let menu = bar.menus.iter().find(|item| item.label == menu).unwrap();
-        menu.items
+        let mut path = path.split('/');
+        let root = path.next().unwrap();
+        let mut items = &bar
+            .menus
+            .iter()
+            .find(|menu| menu.label == root)
+            .unwrap()
+            .items;
+        for label in path {
+            let Item::Submenu {
+                items: children, ..
+            } = items
+                .iter()
+                .find(|item| matches!(item, Item::Submenu { label: own, .. } if own == label))
+                .unwrap()
+            else {
+                panic!("submenu")
+            };
+            items = children;
+        }
+        items
             .iter()
             .filter_map(|item| match item {
                 Item::Plain(command) | Item::Command { command, .. } => Some(command.clone()),
@@ -297,57 +312,27 @@ mod tests {
     }
 
     #[test]
-    fn menus_read_as_before_python_was_an_extension() {
-        let run = commands("Run");
+    fn python_commands_are_grouped_without_losing_test_actions() {
         assert_eq!(
-            run[..run
-                .iter()
-                .position(|item| item == "ports::ForwardPort")
-                .unwrap()
-                + 1],
+            commands("Run/Python"),
+            ["python::RunFile", "-", "python::Sync", "python::Lock"]
+        );
+        assert_eq!(
+            commands("Run/Tests"),
             [
-                "run::RunConfiguration",
-                "run::DebugConfiguration",
-                "run::SelectConfiguration",
-                "run::EditConfigurations",
-                "assembly::InspectAssembly",
-                "-",
                 "run::RunAllTests",
                 "run::RunFailedTests",
                 "python::RunTestFile",
-                "python::RunTestAtCursor",
-                "workspace::ToggleTests",
-                "-",
-                "python::RunFile",
-                "-",
-                "notebook::RunCell",
-                "notebook::RunAll",
-                "notebook::Interrupt",
-                "notebook::Restart",
-                "-",
-                "python::Sync",
-                "python::Lock",
-                "-",
-                "workflows::OpenWorkflow",
-                "workflows::OpenWorkflowFile",
-                "workflows::AddWorkflowFolder",
-                "workflows::NewWorkflow",
-                "-",
-                "workspace::NewTerminal",
-                "ports::ForwardPort",
+                "python::RunTestAtCursor"
             ]
         );
-        let view = commands("View");
-        let git = view
+        let panels = commands("View/Panels");
+        let git = panels
             .iter()
             .position(|item| item == "workspace::ToggleGitLog")
             .unwrap();
-        assert_eq!(
-            view[git + 1..git + 3],
-            ["python::TogglePanel", "workspace::ToggleProblems"]
-        );
+        assert_eq!(panels[git + 1], "python::TogglePanel");
     }
-
     #[gpui::test]
     fn the_panel_command_keeps_its_old_name(cx: &mut gpui::TestAppContext) {
         let action = cx

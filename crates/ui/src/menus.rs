@@ -82,6 +82,13 @@ fn menu(label: &str, items: Vec<Item>) -> Menu {
     }
 }
 
+fn submenu(label: &str, items: Vec<Item>) -> Item {
+    Item::Submenu {
+        label: label.into(),
+        items,
+    }
+}
+
 impl Default for MenuBar {
     fn default() -> Self {
         let separator = || plain(SEPARATOR);
@@ -95,17 +102,19 @@ impl Default for MenuBar {
                         separator(),
                         plain("app::OpenProject"),
                         plain("app::OpenProjectInNewWindow"),
-                        plain("app::OpenRecent"),
                         Item::List {
-                            label: "Recent Projects".into(),
+                            label: "Open Recent".into(),
                             list: List::RecentProjects,
                         },
-                        separator(),
-                        plain("app::OpenWorkspace"),
-                        plain("workspace::AddFolderToWorkspace"),
-                        plain("workspace::SaveWorkspaceAs"),
-                        separator(),
-                        plain("workspace::ReopenInContainer"),
+                        submenu(
+                            "Workspace",
+                            vec![
+                                plain("app::OpenWorkspace"),
+                                plain("workspace::AddFolderToWorkspace"),
+                                plain("workspace::SaveWorkspaceAs"),
+                            ],
+                        ),
+                        submenu("Remote", vec![plain("workspace::ReopenInContainer")]),
                         separator(),
                         plain("editor::Save"),
                         plain("workspace::SaveAll"),
@@ -113,12 +122,18 @@ impl Default for MenuBar {
                         plain("workspace::CloseTab"),
                         plain("app::CloseProject"),
                         separator(),
-                        plain("app::OpenSettings"),
-                        plain("app::OpenSettingsJson"),
-                        plain("app::CustomizeMenus"),
-                        plain("app::SelectTheme"),
-                        plain("app::CustomizeTheme"),
-                        plain("extensions::ManageExtensions"),
+                        submenu(
+                            "Preferences",
+                            vec![
+                                plain("app::OpenSettings"),
+                                plain("app::OpenSettingsJson"),
+                                plain("extensions::ManageExtensions"),
+                                separator(),
+                                plain("app::SelectTheme"),
+                                plain("app::CustomizeTheme"),
+                                plain("app::CustomizeMenus"),
+                            ],
+                        ),
                         separator(),
                         plain("app::Quit"),
                     ],
@@ -133,37 +148,50 @@ impl Default for MenuBar {
                         plain("editor::Copy"),
                         plain("editor::Paste"),
                         plain("editor::CopyReference"),
+                        plain("editor::SelectAll"),
                         separator(),
                         plain("editor::Find"),
                         plain("editor::FindReplace"),
-                        plain("workspace::ToggleSearch"),
+                        labeled("workspace::ToggleSearch", "Find in Files…"),
                         plain("workspace::ReplaceInFiles"),
                         separator(),
-                        plain("editor::ToggleLineComment"),
-                        plain("editor::ToggleBlockComment"),
-                        plain("editor::Indent"),
-                        plain("editor::Outdent"),
-                        separator(),
-                        plain("editor::ShowCompletions"),
-                    ],
-                ),
-                menu(
-                    "Selection",
-                    vec![
-                        plain("editor::SelectAll"),
-                        separator(),
-                        plain("editor::CopyLineUp"),
-                        plain("editor::CopyLineDown"),
-                        plain("editor::MoveLineUp"),
-                        plain("editor::MoveLineDown"),
-                        plain("editor::DeleteLine"),
-                        plain("editor::InsertLineAbove"),
-                        plain("editor::InsertLineBelow"),
-                        separator(),
-                        plain("editor::AddCursorAbove"),
-                        plain("editor::AddCursorBelow"),
-                        plain("editor::SelectNextOccurrence"),
-                        plain("editor::SelectAllOccurrences"),
+                        submenu(
+                            "Lines",
+                            vec![
+                                plain("editor::CopyLineUp"),
+                                plain("editor::CopyLineDown"),
+                                plain("editor::MoveLineUp"),
+                                plain("editor::MoveLineDown"),
+                                plain("editor::DeleteLine"),
+                                plain("editor::InsertLineAbove"),
+                                plain("editor::InsertLineBelow"),
+                                separator(),
+                                plain("editor::Indent"),
+                                plain("editor::Outdent"),
+                                plain("editor::ToggleLineComment"),
+                                plain("editor::ToggleBlockComment"),
+                            ],
+                        ),
+                        submenu(
+                            "Multiple Cursors",
+                            vec![
+                                plain("editor::AddCursorAbove"),
+                                plain("editor::AddCursorBelow"),
+                                plain("editor::SelectNextOccurrence"),
+                                plain("editor::SelectAllOccurrences"),
+                            ],
+                        ),
+                        submenu(
+                            "Code Actions",
+                            vec![
+                                plain("editor::RenameSymbol"),
+                                plain("editor::QuickFix"),
+                                plain("editor::ShowCompletions"),
+                                separator(),
+                                plain("editor::FormatDocument"),
+                                plain("editor::FormatSelection"),
+                            ],
+                        ),
                     ],
                 ),
                 menu(
@@ -171,41 +199,56 @@ impl Default for MenuBar {
                     vec![
                         plain("app::ShowCommandPalette"),
                         separator(),
-                        plain("workspace::ToggleFiles"),
-                        labeled("workspace::ToggleSearch", "Search Panel"),
-                        labeled("workspace::ToggleCommit", "Commit"),
-                        labeled("workspace::ToggleGitLog", "Git"),
-                        plain("workspace::ToggleProblems"),
-                        labeled("workspace::TogglePorts", "Ports"),
-                        labeled("workspace::ToggleTests", "Tests"),
-                        labeled("workspace::ToggleCallHierarchy", "Call Hierarchy"),
-                        labeled("workspace::ToggleOutline", "Outline"),
-                        labeled("debugger::ToggleDebugPanel", "Debug"),
-                        labeled("debugger::ToggleDebugConsole", "Debug Console"),
-                        plain("workspace::ToggleTerminal"),
+                        submenu(
+                            "Panels",
+                            vec![
+                                plain("workspace::ToggleFiles"),
+                                labeled("workspace::ToggleGitLog", "Git"),
+                                plain("workspace::ToggleProblems"),
+                                labeled("workspace::TogglePorts", "Ports"),
+                                labeled("workspace::ToggleTests", "Tests"),
+                                labeled("workspace::ToggleCallHierarchy", "Call Hierarchy"),
+                                labeled("workspace::ToggleOutline", "Outline"),
+                                labeled("debugger::ToggleDebugPanel", "Debug"),
+                                labeled("debugger::ToggleDebugConsole", "Debug Console"),
+                                plain("workspace::ToggleTerminal"),
+                            ],
+                        ),
                         plain("workspace::ToggleBottomDock"),
+                        submenu(
+                            "Editor Layout",
+                            vec![
+                                plain("workspace::SplitRight"),
+                                plain("workspace::SplitDown"),
+                                plain("workspace::FocusNextPane"),
+                                plain("workspace::MoveTabToNextPane"),
+                                plain("workspace::MoveTabToPreviousPane"),
+                                plain("workspace::ClosePane"),
+                                separator(),
+                                plain("workspace::SaveLayoutAsDefault"),
+                                plain("workspace::ResetLayout"),
+                            ],
+                        ),
                         separator(),
-                        plain("workspace::SplitRight"),
-                        plain("workspace::SplitDown"),
-                        plain("workspace::FocusNextPane"),
-                        plain("workspace::MoveTabToNextPane"),
-                        plain("workspace::MoveTabToPreviousPane"),
-                        plain("workspace::ClosePane"),
-                        separator(),
-                        Item::Submenu {
-                            label: "Markdown".into(),
-                            items: vec![
+                        submenu(
+                            "Appearance",
+                            vec![
+                                labeled("editor::ToggleWordWrap", "Word Wrap"),
+                                labeled("editor::ToggleInlayHints", "Inlay Hints"),
+                            ],
+                        ),
+                        labeled("editor::ToggleVimMode", "Vim Mode"),
+                        submenu(
+                            "Markdown",
+                            vec![
                                 plain("markdown::ShowSource"),
                                 plain("markdown::ShowPreview"),
                                 plain("markdown::ShowSplit"),
                             ],
-                        },
-                        labeled("editor::ToggleWordWrap", "Word Wrap"),
-                        labeled("editor::ToggleInlayHints", "Inlay Hints"),
-                        labeled("editor::ToggleVimMode", "Vim Mode"),
-                        Item::Submenu {
-                            label: "Folding".into(),
-                            items: vec![
+                        ),
+                        submenu(
+                            "Folding",
+                            vec![
                                 plain("editor::Fold"),
                                 plain("editor::Unfold"),
                                 plain("editor::ToggleFold"),
@@ -215,13 +258,7 @@ impl Default for MenuBar {
                                 plain("editor::FoldAll"),
                                 plain("editor::UnfoldAll"),
                             ],
-                        },
-                        separator(),
-                        plain("workspace::SaveLayoutAsDefault"),
-                        plain("workspace::ResetLayout"),
-                        separator(),
-                        plain("app::NextProject"),
-                        plain("app::PreviousProject"),
+                        ),
                     ],
                 ),
                 menu(
@@ -230,6 +267,7 @@ impl Default for MenuBar {
                         plain("workspace::ToggleFileFinder"),
                         plain("editor::GoToSymbol"),
                         plain("workspace::GoToWorkspaceSymbol"),
+                        plain("editor::GoToLine"),
                         separator(),
                         plain("workspace::GoBack"),
                         plain("workspace::GoForward"),
@@ -240,62 +278,60 @@ impl Default for MenuBar {
                         plain("editor::GoToImplementation"),
                         plain("editor::FindReferences"),
                         plain("editor::ShowCallHierarchy"),
-                        plain("editor::GoToLine"),
                         plain("editor::JumpToBracket"),
                         separator(),
                         plain("editor::NextDiagnostic"),
                         plain("editor::PrevDiagnostic"),
                         plain("editor::NextChange"),
                         plain("editor::PreviousChange"),
-                    ],
-                ),
-                menu(
-                    "Refactor",
-                    vec![
-                        plain("editor::RenameSymbol"),
-                        plain("editor::QuickFix"),
                         separator(),
-                        plain("editor::FormatDocument"),
-                        plain("editor::FormatSelection"),
+                        plain("app::NextProject"),
+                        plain("app::PreviousProject"),
                     ],
                 ),
                 menu(
                     "Run",
                     vec![
                         labeled("run::RunConfiguration", "Run"),
-                        labeled("run::DebugConfiguration", "Debug"),
+                        plain("debugger::StartDebugging"),
                         plain("run::SelectConfiguration"),
                         plain("run::EditConfigurations"),
                         separator(),
-                        plain("run::RunAllTests"),
-                        plain("run::RunFailedTests"),
-                        labeled("workspace::ToggleTests", "Show Tests"),
+                        submenu(
+                            "Debugging",
+                            vec![
+                                plain("debugger::DebugCurrentFile"),
+                                separator(),
+                                plain("debugger::Continue"),
+                                plain("debugger::Pause"),
+                                plain("debugger::StepOver"),
+                                plain("debugger::StepInto"),
+                                plain("debugger::StepOut"),
+                                plain("debugger::Restart"),
+                                plain("debugger::Stop"),
+                            ],
+                        ),
+                        submenu(
+                            "Breakpoints",
+                            vec![
+                                plain("debugger::ToggleBreakpoint"),
+                                plain("debugger::EditBreakpoint"),
+                                plain("debugger::ToggleAllBreakpoints"),
+                                plain("debugger::RemoveAllBreakpoints"),
+                            ],
+                        ),
+                        submenu(
+                            "Tests",
+                            vec![plain("run::RunAllTests"), plain("run::RunFailedTests")],
+                        ),
+                        submenu("Notebooks", vec![]),
+                        submenu("Python", vec![]),
+                        submenu("Workflows", vec![]),
                         separator(),
-                        plain("workspace::NewTerminal"),
-                        plain("ports::ForwardPort"),
-                    ],
-                ),
-                menu(
-                    "Debug",
-                    vec![
-                        plain("debugger::StartDebugging"),
-                        plain("debugger::DebugCurrentFile"),
-                        separator(),
-                        plain("debugger::Continue"),
-                        plain("debugger::Pause"),
-                        plain("debugger::StepOver"),
-                        plain("debugger::StepInto"),
-                        plain("debugger::StepOut"),
-                        plain("debugger::Restart"),
-                        plain("debugger::Stop"),
-                        separator(),
-                        plain("debugger::ToggleBreakpoint"),
-                        plain("debugger::EditBreakpoint"),
-                        plain("debugger::ToggleAllBreakpoints"),
-                        plain("debugger::RemoveAllBreakpoints"),
-                        separator(),
-                        plain("debugger::ToggleDebugPanel"),
-                        plain("debugger::ToggleDebugConsole"),
+                        submenu(
+                            "Tools",
+                            vec![plain("workspace::NewTerminal"), plain("ports::ForwardPort")],
+                        ),
                     ],
                 ),
                 menu(
@@ -303,38 +339,48 @@ impl Default for MenuBar {
                     vec![
                         labeled("workspace::ToggleCommit", "Commit…"),
                         plain("git::Push"),
-                        plain("git::Update"),
                         plain("git::Pull"),
                         plain("git::Fetch"),
                         separator(),
-                        plain("git::Branches"),
-                        plain("git::NewBranch"),
-                        plain("git::CheckoutRevision"),
-                        plain("git::Worktrees"),
+                        submenu(
+                            "Branches",
+                            vec![
+                                plain("git::Branches"),
+                                plain("git::NewBranch"),
+                                plain("git::CheckoutRevision"),
+                                plain("git::Worktrees"),
+                            ],
+                        ),
+                        submenu(
+                            "Changes",
+                            vec![
+                                plain("git::Rollback"),
+                                plain("editor::RollbackLines"),
+                                separator(),
+                                plain("git::StashChanges"),
+                                plain("git::UnstashChanges"),
+                                separator(),
+                                plain("git::ShelveChanges"),
+                                plain("git::ShowShelf"),
+                            ],
+                        ),
+                        submenu(
+                            "History",
+                            vec![
+                                plain("git::ShowLog"),
+                                plain("git::ShowFileHistory"),
+                                plain("editor::ToggleBlame"),
+                                plain("git::Compare"),
+                            ],
+                        ),
                         separator(),
-                        plain("git::Rollback"),
-                        plain("git::StashChanges"),
-                        plain("git::UnstashChanges"),
-                        plain("git::ShelveChanges"),
-                        plain("git::ShowShelf"),
-                        separator(),
-                        plain("git::ShowLog"),
-                        plain("git::ShowFileHistory"),
-                        plain("editor::ToggleBlame"),
-                        plain("editor::RollbackLines"),
-                        plain("git::Compare"),
-                        separator(),
+                        plain("git::Update"),
                         plain("git::Refresh"),
                     ],
                 ),
                 menu(
                     "Help",
-                    vec![
-                        plain("app::ShowCommandPalette"),
-                        separator(),
-                        plain("app::CheckForUpdates"),
-                        plain("app::About"),
-                    ],
+                    vec![plain("app::CheckForUpdates"), plain("app::About")],
                 ),
             ],
         };
@@ -349,25 +395,38 @@ impl Default for MenuBar {
 }
 
 impl MenuBar {
-    /// A built-in extension's items, after the item running its `after`
-    /// command (last when there is none).
+    /// A built-in extension's items in a slash-separated menu path, after
+    /// its anchor command (last when there is none).
     fn add_builtin_item(&mut self, item: &crate::builtins::MenuItem) {
-        let Some(menu) = self.menus.iter_mut().find(|menu| menu.label == item.menu) else {
+        let mut path = item.menu.split('/');
+        let root = path.next().unwrap_or_default();
+        let Some(menu) = self.menus.iter_mut().find(|menu| menu.label == root) else {
             return;
         };
-        let at = menu
-            .items
+        let mut items = &mut menu.items;
+        for label in path {
+            let Some(Item::Submenu {
+                items: children, ..
+            }) = items
+                .iter_mut()
+                .find(|item| matches!(item, Item::Submenu { label: own, .. } if own == label))
+            else {
+                return;
+            };
+            items = children;
+        }
+        let at = items
             .iter()
             .position(|existing| {
                 matches!(existing, Item::Plain(command) | Item::Command { command, .. } if command == item.after)
             })
-            .map_or(menu.items.len(), |index| index + 1);
+            .map_or(items.len(), |index| index + 1);
         let entries = item.items.iter().map(|entry| match entry {
             crate::builtins::Entry::Command(command) => plain(command),
             crate::builtins::Entry::Labeled(command, label) => labeled(command, label),
             crate::builtins::Entry::Separator => plain(SEPARATOR),
         });
-        menu.items.splice(at..at, entries);
+        items.splice(at..at, entries);
     }
 
     /// Command names in the menus that `known` does not contain.
@@ -495,6 +554,48 @@ mod tests {
             MenuBar::default().unknown_commands(&known),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn defaults_have_seven_menus_and_each_command_has_one_home() {
+        let bar = MenuBar::default();
+        assert_eq!(
+            bar.menus
+                .iter()
+                .map(|menu| menu.label.as_str())
+                .collect::<Vec<_>>(),
+            ["File", "Edit", "View", "Go", "Run", "Git", "Help"]
+        );
+        fn visit(items: &[Item], seen: &mut std::collections::HashSet<String>) {
+            for item in items {
+                match item {
+                    Item::Plain(command) | Item::Command { command, .. }
+                        if command != SEPARATOR =>
+                    {
+                        assert!(
+                            seen.insert(command.clone()),
+                            "duplicate menu command: {command}"
+                        );
+                    }
+                    Item::Submenu { items, .. } => visit(items, seen),
+                    _ => {}
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for menu in &bar.menus {
+            visit(&menu.items, &mut seen);
+        }
+        for command in [
+            "ssh::ConnectToHost",
+            "ports::ForwardPort",
+            "editor::RenameSymbol",
+            "debugger::StepOver",
+            "notebook::RunCell",
+            "workflows::OpenWorkflow",
+        ] {
+            assert!(seen.contains(command), "missing command: {command}");
+        }
     }
 
     #[test]

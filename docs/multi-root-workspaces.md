@@ -6,17 +6,17 @@ distro (a dev container project has a single folder; adding one, saving it
 as a workspace or opening a workspace in a container is refused with a
 message).
 
-- **File > Add Folder to Workspace…** adds folders (the system folder
+- **File > Workspace > Add Folder to Workspace…** adds folders (the system folder
   dialog for local projects; a typed path for WSL projects, or where there
   is no dialog). A folder on another machine is refused. The Files tree's
   folder rows have **Add Folder to Workspace…** and **Remove Folder from
   Workspace** (disabled for the last folder; also in the command palette
   while the tree has focus).
-- **File > Save Workspace As…** writes a `*.next_code-workspace` file
+- **File > Workspace > Save Workspace As…** writes a `*.next_code-workspace` file
   (the extension is added when missing) and reopens the tab from it; the
   tab is then named after the file (`all (Workspace)`). Adding or removing
   folders later rewrites that file.
-- **File > Open Workspace from File…**, `Ctrl+R` with a typed path, a
+- **File > Workspace > Open Workspace from File…**, `Ctrl+R` with a typed path, a
   Recent entry or the command line open `*.next_code-workspace` and VS Code
   `*.code-workspace` files (`Ubuntu:/home/me/all.code-workspace` for one in
   WSL). VS Code files are read, never written: changing the folders of one

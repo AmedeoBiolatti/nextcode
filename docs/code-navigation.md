@@ -42,14 +42,14 @@ and they are never selected, copied or found. Word wrap counts their
 width. The visible lines (and a screen above and below) are asked for
 250 ms after edits and when scrolling. `"inlay_hints": false` in
 `settings.json` (or `"languages": { "<id>": { "inlay_hints": … } }`) turns
-them off, live; View > Inlay Hints (`Ctrl+Alt+I`) toggles them for every
+them off, live; View > Appearance > Inlay Hints (`Ctrl+Alt+I`) toggles them for every
 editor until the app exits. Theme keys: `inlay_hint`, `inlay_hint_background`.
 
 ## Call hierarchy
 
 **Show Call Hierarchy** (`Shift+Alt+H`, JetBrains `Ctrl+Alt+H`; Go menu)
 asks the language server about the symbol at the cursor and opens the
-**Call Hierarchy** panel (bottom dock; View > Call Hierarchy toggles it). The
+**Call Hierarchy** panel (bottom dock; View > Panels > Call Hierarchy toggles it). The
 header names the symbol and switches between **Incoming** (who calls it, the
 default) and **Outgoing** (what it calls); switching starts over from the
 symbol. Each level is fetched when it is expanded, so recursive calls can be
@@ -65,7 +65,7 @@ Each file editor asks its language server for the document's symbols when it
 opens and 300 ms after edits (until then the previous ones move with the
 text).
 
-- **Outline** panel (right dock; `Alt+7`, View > Outline): the active editor's
+- **Outline** panel (right dock; `Alt+7`, View > Panels > Outline): the active editor's
   symbol tree with kind badges, follows tab and pane switches, highlights the
   symbol around the cursor as it moves, and says when there is no language
   server or no symbols. Click a row (or `Enter`) to jump there; the chevron
