@@ -1,0 +1,33 @@
+name: Rust build cache
+description: Cache complete build artifacts with content-verified source timestamps
+inputs:
+  kind:
+    description: Separate Clippy and test build artifacts
+    required: true
+  toolchain:
+    description: Rust compiler cache key
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v6
+      id: artifacts
+      with:
+        path: |
+          target
+          .ci-cache
+          ${{ env.CARGO_HOME }}/registry
+          ${{ env.CARGO_HOME }}/git
+        key: ci-build-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.kind }}-${{ inputs.toolchain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/**', '.github/workflows/ci.yml', '.github/actions/rust-cache/action.yml', 'scripts/ci_source_cache.py') }}-${{ github.sha }}
+        restore-keys: |
+          ci-build-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.kind }}-${{ inputs.toolchain }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/**', '.github/workflows/ci.yml', '.github/actions/rust-cache/action.yml', 'scripts/ci_source_cache.py') }}-
+          ci-build-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.kind }}-${{ inputs.toolchain }}-
+    # Bootstrap from the existing dependency caches only when no full cache exists.
+    # Never overlay a restored target with a different source snapshot.
+    - uses: Swatinem/rust-cache@v2
+      if: steps.artifacts.outputs.cache-hit == ''
+      with:
+        save-if: false
+    - name: Restore timestamps of identical tracked sources
+      shell: bash
+      run: python scripts/ci_source_cache.py restore

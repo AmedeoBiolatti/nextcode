@@ -346,7 +346,14 @@ mod tests {
             let out = run(&p, &request("sleep 60 & echo $! > child; exit 0"));
             assert_eq!(out.exit_code, Some(0), "{out:?}");
             assert!(started.elapsed() < Duration::from_secs(4));
-            assert!(!alive(&p.root().join("child")));
+            // SIGKILL delivery and /proc's state transition are asynchronous.
+            // Keep asserting that the descendant dies, with the same bounded
+            // wait as the cancellation test rather than racing the scheduler.
+            let until = Instant::now() + Duration::from_secs(5);
+            while alive(&p.root().join("child")) && Instant::now() < until {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!alive(&p.root().join("child")), "remote={remote}");
         }
     }
     #[test]

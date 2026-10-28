@@ -1,0 +1,17 @@
+[profile.ci]
+fail-fast = false
+# Tests spawn editor, agent, language-server and compiler processes. Allow
+# cross-crate concurrency without flooding the small hosted runners.
+test-threads = 8
+
+[test-groups]
+project-processes = { max-threads = 2 }
+
+[[profile.ci.overrides]]
+filter = 'binary(headless) | test(project::extension_process::)'
+test-group = 'project-processes'
+
+# Start the known slow process tests early instead of leaving a long tail.
+[[profile.ci.overrides]]
+filter = 'test(builtins::assembly::compiler::) | test(terminal::) | package(terminal)'
+priority = 50

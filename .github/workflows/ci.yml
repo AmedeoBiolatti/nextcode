@@ -26,8 +26,33 @@ env:
     libx11-dev libxcb1-dev libssl-dev libvulkan-dev libzstd-dev
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify source cache invalidation
+        run: python -m unittest discover -s scripts/tests -p test_ci_source_cache.py
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!{README,HANDOFF,REQUEST,CONTRIBUTING,AGENTS,CODE_OF_CONDUCT,SECURITY,CHANGELOG}.md'
+              - '!LICENSE-*'
+
   fmt:
     name: Rustfmt
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -38,6 +63,8 @@ jobs:
 
   clippy:
     name: Clippy (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -51,14 +78,22 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
       - uses: dtolnay/rust-toolchain@stable
+        id: rust
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-cache
+        with:
+          kind: clippy
+          toolchain: ${{ steps.rust.outputs.cachekey }}
       # `-D warnings` reaches workspace members only; vendor/gpui keeps its warnings.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Record source timestamps for the build cache
+        run: python scripts/ci_source_cache.py snapshot
 
   test:
     name: Test (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -66,7 +101,7 @@ jobs:
           - { name: Linux, os: ubuntu-latest }
           # The runner's LLVM puts an lldb-dap on PATH that never answers, so the
           # LLDB end-to-end test (which skips without an adapter) is left out.
-          - { name: Windows, os: windows-latest, skip: --skip headless_mode_debugs_a_cargo_binary_with_lldb }
+          - { name: Windows, os: windows-latest, filter: '-E "not test(headless_mode_debugs_a_cargo_binary_with_lldb)"' }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -74,8 +109,46 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
       - uses: dtolnay/rust-toolchain@stable
+        id: rust
         with:
           # The headless tests drive a real rust-analyzer.
           components: rust-analyzer
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked --no-fail-fast -- ${{ matrix.skip }}
+      - uses: ./.github/actions/rust-cache
+        with:
+          kind: test
+          toolchain: ${{ steps.rust.outputs.cachekey }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.150
+      - name: Workspace tests
+        run: cargo nextest run --workspace --locked --profile ci ${{ matrix.filter }}
+      # Nextest runs unit/integration tests, but does not run doctests.
+      - name: Documentation tests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --locked --doc
+      - name: Record source timestamps for the build cache
+        run: python scripts/ci_source_cache.py snapshot
+
+  ci:
+    name: CI
+    needs: [changes, fmt, clippy, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all applicable checks
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+          FMT: ${{ needs.fmt.result }}
+          CLIPPY: ${{ needs.clippy.result }}
+          TEST: ${{ needs.test.result }}
+        run: |
+          test "$CHANGES" = success
+          case "$CODE" in
+            true) expected=success ;;
+            false) expected=skipped ;;
+            *) echo 'Change detection returned no decision'; exit 1 ;;
+          esac
+          test "$FMT" = "$expected"
+          test "$CLIPPY" = "$expected"
+          test "$TEST" = "$expected"
