@@ -70,6 +70,7 @@ pub(crate) struct ExtensionView {
     extension: String,
     panel: String,
     title: String,
+    pub(crate) show_title: bool,
     revision: u64,
     model: Option<Arc<PanelUpdate>>,
     inputs: BTreeMap<String, InputValue>,
@@ -112,6 +113,7 @@ impl ExtensionView {
             extension,
             panel,
             title,
+            show_title: true,
             revision: 0,
             model: None,
             inputs: BTreeMap::new(),
@@ -142,6 +144,11 @@ impl ExtensionView {
     pub(crate) fn panel(&self) -> &str {
         &self.panel
     }
+    pub(crate) fn set_docked(&mut self, docked: bool, cx: &mut Context<Self>) {
+        self.show_title = docked;
+        cx.notify();
+    }
+
     pub(crate) fn title(&self) -> &str {
         &self.title
     }
@@ -689,6 +696,7 @@ impl ExtensionView {
             }
             Widget::TextInput {
                 label,
+                label_inline,
                 placeholder,
                 disabled,
                 ..
@@ -704,15 +712,24 @@ impl ExtensionView {
                         .border_1()
                         .border_color(theme::border())
                         .opacity(0.6)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(*label_inline && !label.is_empty(), |field| {
+                            field.child(format!("{label}:"))
+                        })
                         .child(SharedString::from(value))
                         .into_any_element()
                 } else if let Some(editor) = self.editors.get(&id) {
                     let submit_id = id.clone();
-                    let field = controls::text_field(
+                    let field = controls::text_field_with_prefix(
                         editor,
                         px(260.),
                         false,
                         false,
+                        (*label_inline && !label.is_empty()).then(|| label.clone().into()),
+                        (editor.read(cx).buffer().is_empty() && !placeholder.is_empty())
+                            .then(|| placeholder.clone().into()),
                         Rc::new(move |_, _, cx| {
                             weak.update(cx, |view, cx| {
                                 view.emit(
@@ -728,29 +745,7 @@ impl ExtensionView {
                     );
                     div()
                         .key_context("ExtensionInput")
-                        .relative()
                         .child(field)
-                        .when(
-                            editor.read(cx).buffer().is_empty() && !placeholder.is_empty(),
-                            |field| {
-                                let focus = editor.focus_handle(cx);
-                                field.child(
-                                    div()
-                                        .absolute()
-                                        .left(px(6.))
-                                        .top(px(2.))
-                                        .text_color(theme::muted())
-                                        .child(SharedString::from(placeholder.clone()))
-                                        .on_mouse_down(
-                                            gpui::MouseButton::Left,
-                                            move |_, window, cx| {
-                                                window.focus(&focus);
-                                                cx.stop_propagation();
-                                            },
-                                        ),
-                                )
-                            },
-                        )
                         .into_any_element()
                 } else {
                     div().into_any_element()
@@ -761,20 +756,26 @@ impl ExtensionView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(SharedString::from(label.clone()))
+                    .when(!label.is_empty() && !label_inline, |view| {
+                        view.child(SharedString::from(label.clone()))
+                    })
                     .child(content)
                     .into_any_element()
             }
             Widget::Checkbox {
-                label, disabled, ..
+                label,
+                disabled,
+                color,
+                ..
             } => {
                 let checked = matches!(self.inputs.get(&id), Some(InputValue::Bool(true)));
                 let callback_id = id.clone();
-                let control = controls::checkbox(
+                let control = controls::checkbox_with_color(
                     SharedString::from(format!("{id}-checkbox")),
                     checked,
                     label,
                     *disabled || self.is_busy(),
+                    color.map(charts::color),
                     Rc::new(move |checked, _, cx| {
                         weak.update(cx, |view, cx| {
                             view.change(&callback_id, InputValue::Bool(checked), cx)
@@ -786,6 +787,7 @@ impl ExtensionView {
             }
             Widget::Select {
                 label,
+                label_inline,
                 options,
                 disabled,
                 ..
@@ -794,7 +796,7 @@ impl ExtensionView {
                 let values: Vec<String> =
                     options.iter().map(|option| option.value.clone()).collect();
                 let callback_id = id.clone();
-                let control = controls::dropdown(
+                let control = controls::dropdown_with_prefix(
                     format!("extension-{}-{id}", cx.entity().entity_id()).into(),
                     options
                         .iter()
@@ -803,6 +805,7 @@ impl ExtensionView {
                     selected,
                     *disabled || self.is_busy(),
                     px(260.),
+                    (*label_inline && !label.is_empty()).then(|| label.clone().into()),
                     Rc::new(move |index, _, cx| {
                         if let Some(value) = values.get(index) {
                             weak.update(cx, |view, cx| {
@@ -819,7 +822,9 @@ impl ExtensionView {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(SharedString::from(label.clone()))
+                        .when(!label.is_empty() && !label_inline, |view| {
+                            view.child(SharedString::from(label.clone()))
+                        })
                         .child(control)
                         .into_any_element(),
                 )
@@ -866,9 +871,9 @@ impl ExtensionView {
             Widget::Chart {
                 title,
                 height,
-                chart,
+                legend,
                 ..
-            } => self.render_chart(&id, title, *height, chart, cx),
+            } => self.render_chart(&id, title, *height, *legend, cx),
         };
         let label = match widget {
             Widget::Label { text, .. }
@@ -973,21 +978,25 @@ impl Render for ExtensionView {
                 cx.listener(|view, _: &ActivateControl, window, cx| view.activate(window, cx)),
             )
             .on_action(cx.listener(|view, _: &SubmitControl, window, cx| view.activate(window, cx)))
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .child(SharedString::from(self.title.clone()))
-                    .when(self.is_busy(), |row| {
-                        row.child(
-                            div()
-                                .text_color(theme::muted())
-                                .child("Running…")
-                                .pin("busy")
-                                .label("Running extension"),
-                        )
-                    }),
-            )
+            .when(self.show_title || self.is_busy(), |view| {
+                view.child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .when(self.show_title, |row| {
+                            row.child(SharedString::from(self.title.clone()))
+                        })
+                        .when(self.is_busy(), |row| {
+                            row.child(
+                                div()
+                                    .text_color(theme::muted())
+                                    .child("Running…")
+                                    .pin("busy")
+                                    .label("Running extension"),
+                            )
+                        }),
+                )
+            })
             .when_some(self.error.clone(), |view, error| {
                 let error: SharedString = error.into();
                 view.child(

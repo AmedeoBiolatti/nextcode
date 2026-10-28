@@ -10,9 +10,9 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, CursorStyle, DispatchPhase, ElementId, Entity, Hitbox, HitboxBehavior,
-    Hsla, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    SharedString, Window, actions, anchored, canvas, deferred, div, prelude::*, px,
+    AnyElement, App, Bounds, CursorStyle, DispatchPhase, ElementId, Entity, Focusable, Hitbox,
+    HitboxBehavior, Hsla, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, SharedString, Window, actions, anchored, canvas, deferred, div, prelude::*, px,
 };
 use serde_json::{Value, json};
 
@@ -342,6 +342,18 @@ pub fn checkbox(
     disabled: bool,
     on_toggle: Handler<bool>,
 ) -> AnyElement {
+    checkbox_with_color(id, checked, label, disabled, None, on_toggle)
+}
+
+/// A checkbox with an optional swatch between its box and label.
+pub fn checkbox_with_color(
+    id: impl Into<ElementId>,
+    checked: bool,
+    label: &str,
+    disabled: bool,
+    color: Option<Hsla>,
+    on_toggle: Handler<bool>,
+) -> AnyElement {
     div()
         .id(id)
         .flex()
@@ -371,6 +383,9 @@ pub fn checkbox(
                         .child("✓")
                 }),
         )
+        .when_some(color, |row, color| {
+            row.child(div().flex_none().size(px(8.)).bg(color))
+        })
         .when(!label.is_empty(), |row| {
             row.child(div().text_sm().child(SharedString::from(label.to_owned())))
         })
@@ -436,10 +451,24 @@ pub fn dropdown(
     width: Pixels,
     on_select: Handler<usize>,
 ) -> AnyElement {
+    dropdown_with_prefix(key, options, selected, disabled, width, None, on_select)
+}
+
+/// A dropdown whose closed field can include a label prefix.
+pub fn dropdown_with_prefix(
+    key: SharedString,
+    options: Vec<SharedString>,
+    selected: Option<usize>,
+    disabled: bool,
+    width: Pixels,
+    prefix: Option<SharedString>,
+    on_select: Handler<usize>,
+) -> AnyElement {
     let open = !disabled && OPEN.with(|open| open.borrow().as_deref() == Some(key.as_ref()));
     let label = selected
         .and_then(|index| options.get(index).cloned())
         .unwrap_or_default();
+    let label = prefix.map_or(label.clone(), |prefix| format!("{prefix}: {label}").into());
     let toggle_key = key.clone();
     let field = div()
         .id(ElementId::Name(format!("{key}-field").into()))
@@ -584,6 +613,19 @@ pub fn text_field(
     disabled: bool,
     on_submit: Handler<String>,
 ) -> AnyElement {
+    text_field_with_prefix(editor, width, multiline, disabled, None, None, on_submit)
+}
+
+/// A text field with an optional label inside its border.
+pub fn text_field_with_prefix(
+    editor: &Entity<Editor>,
+    width: Pixels,
+    multiline: bool,
+    disabled: bool,
+    prefix: Option<SharedString>,
+    placeholder: Option<SharedString>,
+    on_submit: Handler<String>,
+) -> AnyElement {
     let submit_editor = editor.clone();
     div()
         .key_context(INPUT_CONTEXT)
@@ -604,7 +646,38 @@ pub fn text_field(
         .font_family(theme::MONO_FONT)
         .text_size(px(theme::EDITOR_FONT_SIZE))
         .when(disabled, |field| field.opacity(0.6))
-        .child(editor.clone())
+        .when(prefix.is_some(), |field| {
+            field.flex().items_center().gap_2()
+        })
+        .when_some(prefix.clone(), |field, prefix| {
+            field.child(div().flex_none().text_sm().child(format!("{prefix}:")))
+        })
+        .child(if prefix.is_none() && placeholder.is_none() {
+            editor.clone().into_any_element()
+        } else {
+            div()
+                .relative()
+                .when(prefix.is_some(), |area| area.flex_1().min_w_0())
+                .child(editor.clone())
+                .when_some(placeholder, |area, placeholder| {
+                    area.child(
+                        div()
+                            .absolute()
+                            .left(px(2.))
+                            .top(px(0.))
+                            .text_color(theme::muted())
+                            .child(placeholder)
+                            .on_mouse_down(gpui::MouseButton::Left, {
+                                let editor = editor.clone();
+                                move |_, window, cx| {
+                                    window.focus(&editor.focus_handle(cx));
+                                    cx.stop_propagation();
+                                }
+                            }),
+                    )
+                })
+                .into_any_element()
+        })
         .into_any_element()
 }
 

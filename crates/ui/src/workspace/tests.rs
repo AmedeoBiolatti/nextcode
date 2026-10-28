@@ -550,11 +550,14 @@ fn extension_placement_preserves_view_and_state_but_close_rejects_late_replies(
         let view = workspace.prepare_extension_panel("test.extension", &contributions[0], window, cx);
         workspace.apply_extension_panels("test.extension", &contributions, vec![panel_update("dock", 7)], None, window, cx).unwrap();
         let revision = view.read(cx).revision();
+        assert!(view.read(cx).show_title);
         workspace.move_extension_to_editor(view.entity_id(), window, cx);
+        assert!(!view.read(cx).show_title);
         assert!(matches!(&workspace.active_tab().unwrap().content, TabContent::Extension(tab) if *tab == view));
         assert!(!workspace.active_tab().unwrap().is_dirty(cx));
         assert!(workspace.active_tab().unwrap().file_path().is_none());
         workspace.move_extension_to_dock(view.entity_id(), window, cx);
+        assert!(view.read(cx).show_title);
         assert_eq!(workspace.active_docked_extension(), Some(view.clone()));
         assert_eq!(view.read(cx).revision(), revision);
         assert_eq!(view.read(cx).snapshot(cx).unwrap().1.state, serde_json::json!({ "count": 7 }));

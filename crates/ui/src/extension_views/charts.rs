@@ -72,6 +72,7 @@ struct Datum {
 struct Geometry {
     points: Vec<Datum>,
     names: Vec<String>,
+    colors: Vec<u8>,
     labels: Vec<String>,
     x: Range,
     y: Range,
@@ -83,6 +84,7 @@ impl Geometry {
     fn new(chart: &ChartSpec) -> Self {
         let mut points = Vec::new();
         let mut names = Vec::new();
+        let mut colors = Vec::new();
         let mut labels = Vec::new();
         let mut line = false;
         let (x_label, y_label) = match chart {
@@ -99,6 +101,7 @@ impl Geometry {
                 line = matches!(chart, ChartSpec::Line { .. });
                 for (series_index, series) in series.iter().enumerate() {
                     names.push(series.name.clone());
+                    colors.push(series.color.unwrap_or(series_index as u8));
                     for (index, point) in series.points.iter().enumerate() {
                         points.push(Datum {
                             x: point.x,
@@ -121,6 +124,7 @@ impl Geometry {
                 let width = 0.8 / series.len().max(1) as f64;
                 for (series_index, series) in series.iter().enumerate() {
                     names.push(series.name.clone());
+                    colors.push(series.color.unwrap_or(series_index as u8));
                     for (index, value) in series.values.iter().enumerate() {
                         let left = index as f64 - 0.4 + series_index as f64 * width;
                         points.push(Datum {
@@ -141,6 +145,7 @@ impl Geometry {
                 y_label,
             } => {
                 names.push("Frequency".into());
+                colors.push(0);
                 let min = values.iter().copied().fold(f64::INFINITY, f64::min);
                 let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 let range = Range::new(min, max);
@@ -188,6 +193,7 @@ impl Geometry {
         Self {
             points,
             names,
+            colors,
             labels,
             x: Range::new(xmin, xmax),
             y: Range::new(ymin, ymax),
@@ -287,8 +293,8 @@ impl ChartState {
         )
     }
 }
-fn color(index: u32) -> Hsla {
-    // A fixed six-color palette, adjusted to the current theme's saturation/lightness.
+pub(super) fn color(index: u8) -> Hsla {
+    // A fixed twelve-color palette, adjusted to the current theme's saturation/lightness.
     let mut color = theme::accent();
     color.h = (color.h + index as f32 * 0.1618) % 1.;
     color
@@ -343,7 +349,7 @@ fn draw(
         let y = 1. - geometry.y.fraction(datum.y);
         let selected = selected == Some((datum.series, datum.index))
             || hover == Some((datum.series, datum.index));
-        let color = color(datum.series);
+        let color = color(geometry.colors[datum.series as usize]);
         if let Some((left, right)) = datum.bar {
             let left = zoom.fraction(left).max(0.);
             let right = zoom.fraction(right).min(1.);
@@ -470,7 +476,7 @@ impl ExtensionView {
         id: &str,
         title: &str,
         height: u16,
-        _: &ChartSpec,
+        legend: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let Some(chart) = self.charts.get(id) else {
@@ -675,30 +681,28 @@ impl ExtensionView {
                     .text_color(theme::muted())
                     .child(SharedString::from(chart.geometry.x_label.clone())),
             )
-            .child(
-                div().flex().flex_wrap().gap_2().children(
-                    chart
-                        .geometry
-                        .names
-                        .iter()
-                        .enumerate()
-                        .map(|(index, name)| {
-                            div()
-                                .flex()
-                                .gap_1()
-                                .items_center()
-                                .child(div().size(px(8.)).bg(color(index as u32)))
-                                .child(SharedString::from(name.clone()))
-                        }),
-                ),
-            )
-            .when_some(info, |view, info| view.child(div().text_xs().child(info)))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child("Focus chart: +/− zoom, 0 resets; click a point or bar to select"),
-            );
+            .when(legend, |view| {
+                view.child(
+                    div().flex().flex_wrap().gap_2().children(
+                        chart
+                            .geometry
+                            .names
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        div().size(px(8.)).bg(color(chart.geometry.colors[index])),
+                                    )
+                                    .child(SharedString::from(name.clone()))
+                            }),
+                    ),
+                )
+            })
+            .when_some(info, |view, info| view.child(div().text_xs().child(info)));
         self.focusable_control(id, false, control.into_any_element())
     }
 }
@@ -714,6 +718,41 @@ fn number(value: f64) -> String {
 mod tests {
     use super::*;
     use extension_api::{BarSeries, ChartPoint, ChartSeries};
+    #[test]
+    fn explicit_colors_survive_missing_series_and_keep_original_event_indices() {
+        let series = |name: &str, color| ChartSeries {
+            name: name.into(),
+            color,
+            points: vec![ChartPoint { x: 1., y: 2. }],
+        };
+        let spec = |series| ChartSpec::Line {
+            series,
+            x_label: String::new(),
+            y_label: String::new(),
+        };
+        let full = Geometry::new(&spec(vec![
+            series("A", Some(2)),
+            series("B", Some(11)),
+            series("C", None),
+        ]));
+        assert_eq!(full.colors, [2, 11, 2]);
+        let missing = Geometry::new(&spec(vec![series("B", Some(11))]));
+        assert_eq!(missing.colors, [11]);
+        assert_eq!(missing.points[0].series, 0);
+        assert_eq!(missing.hit(missing.x, (0.5, 0.5), 400., 200.), Some((0, 0)));
+        let bars = Geometry::new(&ChartSpec::Bar {
+            labels: vec!["x".into()],
+            series: vec![BarSeries {
+                name: "B".into(),
+                color: Some(11),
+                values: vec![2.],
+            }],
+            x_label: String::new(),
+            y_label: String::new(),
+        });
+        assert_eq!(bars.colors, [11]);
+    }
+
     #[test]
     fn zoom_is_finite_clamped_and_resettable() {
         let full = Range::new(-10., 10.);
@@ -733,6 +772,7 @@ mod tests {
     fn zoomed_hit_keeps_original_point_indices() {
         let spec = ChartSpec::Scatter {
             series: vec![ChartSeries {
+                color: None,
                 name: "A".into(),
                 points: vec![
                     ChartPoint { x: 0., y: 0. },
@@ -756,10 +796,12 @@ mod tests {
             labels: vec!["A".into(), "B".into()],
             series: vec![
                 BarSeries {
+                    color: None,
                     name: "a".into(),
                     values: vec![-2., 4.],
                 },
                 BarSeries {
+                    color: None,
                     name: "b".into(),
                     values: vec![3., -1.],
                 },
@@ -803,6 +845,7 @@ mod tests {
     fn preserved_zoom_stays_selectable_when_data_moves_to_large_magnitudes() {
         let spec = |a, b| ChartSpec::Scatter {
             series: vec![ChartSeries {
+                color: None,
                 name: "Signal".into(),
                 points: vec![ChartPoint { x: a, y: 0. }, ChartPoint { x: b, y: 1. }],
             }],

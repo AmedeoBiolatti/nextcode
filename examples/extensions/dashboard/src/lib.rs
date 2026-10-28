@@ -98,6 +98,7 @@ fn handle(request: Request) -> Response {
         .map(|(i, y)| ChartPoint { x: i as f64, y: *y })
         .collect();
     let series = vec![ChartSeries {
+        color: Some(0),
         name: "Generated signal".into(),
         points,
     }];
@@ -129,6 +130,7 @@ fn handle(request: Request) -> Response {
             ChartSpec::Bar {
                 labels: vec!["Minimum".into(), "Mean".into(), "Maximum".into()],
                 series: vec![BarSeries {
+                    color: Some(0),
                     name: "Signal".into(),
                     values: vec![minimum, mean, maximum],
                 }],
@@ -164,6 +166,7 @@ fn handle(request: Request) -> Response {
             gap: 8,
             children: vec![
                 Widget::TextInput {
+                    label_inline: true,
                     id: "samples".into(),
                     label: "Samples (8–256)".into(),
                     value: count_text.clone(),
@@ -171,12 +174,14 @@ fn handle(request: Request) -> Response {
                     disabled: false,
                 },
                 Widget::Checkbox {
+                    color: Some(0),
                     id: "smooth".into(),
                     label: "Smooth signal".into(),
                     value: smooth,
                     disabled: false,
                 },
                 Widget::Select {
+                    label_inline: true,
                     id: "scale".into(),
                     label: "Scale".into(),
                     value: scale_text.clone(),
@@ -218,6 +223,7 @@ fn handle(request: Request) -> Response {
         },
     ];
     children.extend(charts.into_iter().map(|(id, title, chart)| Widget::Chart {
+        legend: false,
         id: id.into(),
         title: title.into(),
         chart,

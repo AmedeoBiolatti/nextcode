@@ -13,6 +13,7 @@ fn panel(value: &str, include_input: bool) -> PanelUpdate {
         children.insert(
             0,
             Widget::TextInput {
+                label_inline: false,
                 id: "query".into(),
                 label: "Query".into(),
                 value: value.into(),
@@ -22,6 +23,7 @@ fn panel(value: &str, include_input: bool) -> PanelUpdate {
         );
     }
     children.push(Widget::Checkbox {
+        color: None,
         id: "enabled".into(),
         label: "Enabled".into(),
         value: true,
@@ -294,4 +296,83 @@ fn panel_timer_is_one_shot_and_waits_for_processes(cx: &mut TestAppContext) {
         .advance_clock(std::time::Duration::from_secs(3));
     cx.run_until_parked();
     assert_eq!(events.borrow().len(), 2);
+}
+
+struct SizedWidget(Entity<ExtensionView>);
+impl Render for SizedWidget {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let widget = self.0.read(cx).model.as_ref().unwrap().root.clone();
+        let control = self
+            .0
+            .update(cx, |view, cx| view.render_widget(&widget, cx));
+        div().flex().flex_col().items_start().child(
+            div()
+                .debug_selector(|| "sized-widget".into())
+                .child(control),
+        )
+    }
+}
+
+#[gpui::test]
+fn empty_and_inline_labels_remove_the_extra_row_and_legends_are_optional(cx: &mut TestAppContext) {
+    let view = view(cx);
+    let update = |root| PanelUpdate {
+        id: "panel".into(),
+        refresh_ms: None,
+        state: json!(null),
+        root,
+    };
+    let input = |kind: &str, label: &str, inline: bool| {
+        let mut widget = json!({"type":kind,"id":"field","label":label,"label_inline":inline,"value":"a","disabled":false});
+        if kind == "select" {
+            widget["options"] = json!([{"value":"a","label":"A"}]);
+        } else {
+            widget["placeholder"] = json!("type here");
+        }
+        serde_json::from_value(widget).unwrap()
+    };
+    view.update(cx, |view, cx| {
+        view.replace(update(input("select", "Axis", false)), None, cx)
+    });
+    let window = cx.add_window(|_, _| SizedWidget(view.clone()));
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    for kind in ["select", "text-input"] {
+        let mut heights = Vec::new();
+        for (label, inline) in [("Axis", false), ("", false), ("Axis", true)] {
+            view.update(&mut cx, |view, cx| {
+                view.replace(update(input(kind, label, inline)), None, cx)
+            });
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            heights.push(
+                cx.debug_bounds("sized-widget")
+                    .expect("control rendered")
+                    .size
+                    .height,
+            );
+        }
+        assert!(heights[0] > heights[1], "{kind}: {heights:?}");
+        assert_eq!(
+            heights[1], heights[2],
+            "{kind}: inline labels must not add a row"
+        );
+    }
+    let mut heights = Vec::new();
+    for legend in [true, false] {
+        let widget = serde_json::from_value(json!({"type":"chart","id":"chart","title":"Loss","height":140,"legend":legend,
+            "chart":{"kind":"line","series":[{"name":"Run","color":11,"points":[{"x":0,"y":1}]}],"x_label":"step","y_label":"loss"}})).unwrap();
+        view.update(&mut cx, |view, cx| view.replace(update(widget), None, cx));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        heights.push(
+            cx.debug_bounds("sized-widget")
+                .expect("chart rendered")
+                .size
+                .height,
+        );
+    }
+    assert!(
+        heights[0] > heights[1],
+        "legend must not reserve space when hidden: {heights:?}"
+    );
 }
