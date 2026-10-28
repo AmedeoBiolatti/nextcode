@@ -1114,6 +1114,70 @@ fn a_ready_command_that_exits_crashed_and_always_restarts_after_clean_exits() {
 }
 
 #[test]
+fn health_checks_keep_ticking_after_other_steps_finish() {
+    let t = Instant::now();
+    let mut run = run(r#"
+steps:
+  sick:
+    check: exit 0
+    healthcheck: {test: exit 1, interval: 1s, retries: 2}
+  failed: {run: exit 3}
+"#);
+    run.start(t);
+    let sick = generation(&run, 0);
+    run.check_finished(
+        0,
+        sick,
+        CheckResult::Exited {
+            code: Some(0),
+            output: String::new(),
+        },
+        t,
+    );
+    run.exited(1, generation(&run, 1), Some(3), t);
+    assert_eq!(statuses(&run), ["ready", "failed"]);
+    assert_eq!(run.outcome(), Outcome::Failed);
+    assert!(run.is_active(), "the next health check still needs a tick");
+    for at in [1, 2] {
+        run.take_effects();
+        run.tick(t + secs(at));
+        assert!(run.take_effects().contains(&Effect::RunHealthcheck {
+            step: 0,
+            generation: sick,
+        }));
+        assert!(run.is_active(), "a health check is in flight");
+        run.health_checked(0, sick, Err("exit code 1".into()), t + secs(at));
+    }
+    assert_eq!(statuses(&run), ["failed", "failed"]);
+    assert!(!run.is_active(), "no further health checks are due");
+
+    let mut stopping =
+        self::run("steps: {sick: {check: exit 0, healthcheck: {test: exit 1, interval: 1s}}}");
+    stopping.start(t);
+    let g = generation(&stopping, 0);
+    stopping.check_finished(
+        0,
+        g,
+        CheckResult::Exited {
+            code: Some(0),
+            output: String::new(),
+        },
+        t,
+    );
+    stopping.tick(t + secs(1));
+    assert!(stopping.is_active());
+    stopping.stop_all(t + secs(1));
+    assert_eq!(statuses(&stopping), ["stopped"]);
+    assert!(!stopping.is_active());
+    stopping.health_checked(0, g, Ok(()), t + secs(2));
+    assert_eq!(
+        statuses(&stopping),
+        ["stopped"],
+        "a late probe stays ignored"
+    );
+}
+
+#[test]
 fn health_checks_fail_an_unhealthy_step_and_its_policy_restarts_it() {
     let t = Instant::now();
     let mut run = run(r#"
