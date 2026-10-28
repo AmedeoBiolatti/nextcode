@@ -269,6 +269,11 @@ pub struct StepState {
 }
 
 impl StepState {
+    fn needs_ticks(&self) -> bool {
+        self.status.is_active()
+            || (self.status == Status::Ready && (self.health_busy || self.next_health.is_some()))
+    }
+
     fn new() -> Self {
         Self {
             status: Status::Pending,
@@ -451,11 +456,11 @@ impl Run {
         self.outcome
     }
 
-    /// Whether anything is waiting, starting, running or stopping.
+    /// Whether anything is working or monitoring a ready step's health.
     pub fn is_active(&self) -> bool {
         self.leaves
             .iter()
-            .any(|&index| self.steps[index].status.is_active())
+            .any(|&index| self.steps[index].needs_ticks())
     }
 
     /// Effects to perform, in order.
@@ -532,7 +537,7 @@ impl Run {
                 if kill_stopping {
                     self.kill(index, now);
                 }
-            } else if state.status.is_active()
+            } else if state.needs_ticks()
                 || (state.status == Status::Ready && state.command.is_some())
             {
                 self.stop_command(index, Then::Stopped, now);

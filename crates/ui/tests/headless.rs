@@ -333,15 +333,23 @@ fn headless_mode_renames_a_rust_module_with_the_servers_edits() {
     let open =
         headless.call(json!({ "cmd": "open", "path": "src/main.rs", "timeout_ms": 120_000 }));
     assert_eq!(open["ok"], true, "{open}");
+    // A definition can resolve while rust-analyzer is still loading the
+    // workspace. Wait for published diagnostics and idle work-done progress
+    // before asking for workspace-level file-rename edits.
+    let diagnostics = headless.call(json!({
+        "cmd": "diagnostics", "path": "src/main.rs", "wait_ms": 60_000
+    }));
+    assert_eq!(diagnostics["ok"], true, "{diagnostics}");
     // Until rust-analyzer has loaded the crate, it has no module to rename.
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         let reply = headless.call(
             json!({ "cmd": "definition", "path": "src/main.rs", "line": 3, "character": 10 }),
         );
-        if reply["result"].as_array().is_some_and(|l| !l.is_empty()) || Instant::now() >= deadline {
+        if reply["result"].as_array().is_some_and(|l| !l.is_empty()) {
             break;
         }
+        assert!(Instant::now() < deadline, "module did not resolve: {reply}");
         thread::sleep(Duration::from_millis(500));
     }
     let renamed = headless
