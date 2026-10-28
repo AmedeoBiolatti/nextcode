@@ -456,8 +456,7 @@ fn flag(map: &mut Map<String, Value>, key: &'static str) -> Result<Option<bool>,
 }
 
 fn choices(value: Value) -> Result<Vec<Choice>, String> {
-    const SHAPES: &str =
-        "`options` is a list of values or `{value: ..., label: ...}`";
+    const SHAPES: &str = "`options` is a list of values or `{value: ..., label: ...}`";
     let Value::Array(entries) = value else {
         return Err(SHAPES.into());
     };
@@ -706,7 +705,10 @@ mod tests {
     #[test]
     fn declarations_with_problems_say_what_is_wrong() {
         for (json, expected) in [
-            (json!("x"), "input `x`: an input is a mapping of its settings"),
+            (
+                json!("x"),
+                "input `x`: an input is a mapping of its settings",
+            ),
             (
                 json!({ "id": "a.b" }),
                 "input `a.b`: an input id must not contain `/`, `.`, `{`, `}`, `$` or spaces",
@@ -801,7 +803,11 @@ mod tests {
             declared(json!({ "id": "b", "type": 1 })),
             ("c".into(), Value::Null),
         ]);
-        assert_eq!(ids, ["a", "b", "c"], "every id, also of inputs with problems");
+        assert_eq!(
+            ids,
+            ["a", "b", "c"],
+            "every id, also of inputs with problems"
+        );
         assert_eq!(parsed.len(), 2, "`c:` alone is a string input");
         assert_eq!(problems.len(), 1);
         assert_eq!(problems[0].0, 1);

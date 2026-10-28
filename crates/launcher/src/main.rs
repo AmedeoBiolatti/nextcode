@@ -163,9 +163,9 @@ fn run() -> i32 {
             Ok(Reply::Error { message }) => fail(&message),
             // Nothing runs, or what runs was rebuilt and is exiting.
             Ok(Reply::Restart) | Err(SendError::NoInstance) => start_editor(&editor, &args),
-            Err(SendError::Timeout) => fail(
-                "the running editor did not answer; `next_code --new-instance` starts another",
-            ),
+            Err(SendError::Timeout) => {
+                fail("the running editor did not answer; `next_code --new-instance` starts another")
+            }
             Err(err) => fail(&err.to_string()),
         },
     }
@@ -183,7 +183,11 @@ fn deliver(args: &[OsString]) -> Result<Reply, SendError> {
             .collect(),
         cwd: std::env::current_dir().ok(),
     };
-    instance::send(&Endpoint::for_state_root(&state_root), &request, ANSWER_TIMEOUT)
+    instance::send(
+        &Endpoint::for_state_root(&state_root),
+        &request,
+        ANSWER_TIMEOUT,
+    )
 }
 
 /// Starts the editor with `args`; the editor serves later launches. An

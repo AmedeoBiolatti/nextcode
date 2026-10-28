@@ -38,6 +38,7 @@ mod pinpoint;
 mod process_tree;
 
 pub use process_tree::CancelToken;
+pub(crate) use process_tree::spawn_detached;
 use process_tree::{GRACE, Outcome, Tree};
 
 /// What the user asked to open.
@@ -577,7 +578,7 @@ fn cancelled(program: &str) -> io::Error {
 /// completion with `input` on its stdin, collecting its output. After
 /// `timeout`, or once `cancel` is cancelled, the process and whatever it
 /// started are asked to end and killed after [`GRACE`].
-fn run_local(
+pub(crate) fn run_local(
     mut command: Command,
     program: &str,
     cwd: &Path,

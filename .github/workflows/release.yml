@@ -1,0 +1,206 @@
+name: Release
+
+# A `v*` tag (matching the workspace version) builds the Linux and Windows
+# archives, installs each with its install script, and publishes them as a
+# GitHub release. Pull requests changing the packaging, and manual runs,
+# do the same without publishing.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/install-release.sh
+      - scripts/install-release.ps1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  LINUX_DEPS: >-
+    build-essential pkg-config cmake clang libclang-dev libfontconfig-dev
+    libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+    libx11-dev libxcb1-dev libssl-dev libvulkan-dev libzstd-dev
+
+jobs:
+  agent:
+    name: Agent (static Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag against the workspace version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the workspace version $version"
+            exit 1
+          fi
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      # Linked statically, so one build runs in every WSL distro and container.
+      - run: cargo build --profile dist --locked -p next_code_agent --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agent
+          path: target/x86_64-unknown-linux-musl/dist/next_code_agent
+          if-no-files-found: error
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: agent
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest runner: the Linux build needs glibc 2.35 or newer.
+          - { name: Linux, os: ubuntu-22.04, archive: next_code-x86_64-linux.tar.gz }
+          - { name: Windows, os: windows-latest, archive: next_code-x86_64-windows.zip }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
+      - uses: dtolnay/rust-toolchain@stable
+      # `--workspace` also builds the grammar libraries next to the executables.
+      - run: cargo build --profile dist --workspace --locked
+      - uses: actions/download-artifact@v8
+        with:
+          name: agent
+          path: agent
+      - name: Package
+        if: runner.os == 'Linux'
+        run: |
+          mkdir next_code
+          cp target/dist/next_code target/dist/next_code_editor target/dist/libnc_grammar_*.so next_code/
+          install -m 755 agent/next_code_agent next_code/
+          cp crates/ui/assets/next_code-64.png next_code/next_code.png
+          cp LICENSE-MIT LICENSE-APACHE next_code/
+          test "$(ls next_code/libnc_grammar_*.so | wc -l)" -eq "$(ls -d grammars/*/ | wc -l)"
+          tar -czf ${{ matrix.archive }} next_code
+      - name: Package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory next_code | Out-Null
+          Copy-Item target/dist/next_code.exe, target/dist/next_code_editor.exe, target/dist/nc_grammar_*.dll, agent/next_code_agent, LICENSE-MIT, LICENSE-APACHE next_code/
+          $grammars = @(Get-ChildItem next_code -Filter nc_grammar_*.dll).Count
+          $expected = @(Get-ChildItem grammars -Directory).Count
+          if ($grammars -ne $expected) { throw "$grammars grammar libraries, expected $expected" }
+          Compress-Archive -Path next_code -DestinationPath ${{ matrix.archive }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  # Installs each archive with its script, served the way a release serves
+  # it, then checks the editor starts and loads a grammar library.
+  install:
+    name: Install (${{ matrix.name }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux, os: ubuntu-22.04 }
+          - { name: Windows, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: next_code-*
+          path: release
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        shell: bash
+        working-directory: release
+        run: sha256sum next_code-* > SHA256SUMS
+      - name: Install system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_DEPS
+      - name: Install with scripts/install-release.sh
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m http.server 8000 --bind 127.0.0.1 --directory release >/dev/null 2>&1 &
+          sleep 2
+          cat scripts/install-release.sh | NEXT_CODE_DOWNLOAD_URL=http://127.0.0.1:8000 sh
+          test -f ~/.local/share/applications/next_code.desktop
+          echo "NEXT_CODE=$HOME/.local/bin/next_code" >> "$GITHUB_ENV"
+      # Windows PowerShell, which most `irm | iex` runs use.
+      - name: Install with scripts/install-release.ps1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Start-Process python -ArgumentList "-m", "http.server", "8000", "--bind", "127.0.0.1", "--directory", "release" -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          $env:NEXT_CODE_DOWNLOAD_URL = "http://127.0.0.1:8000"
+          Get-Content scripts/install-release.ps1 -Raw | Invoke-Expression
+          $bin = Join-Path $env:LOCALAPPDATA "next_code\bin"
+          $path = [Environment]::GetEnvironmentVariable("Path", "User")
+          if (($path -split ";") -notcontains $bin) { throw "$bin is not on the user PATH: $path" }
+          $shortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "NextCode.lnk"
+          if (-not (Test-Path $shortcut)) { throw "no Start menu shortcut" }
+          # UTF-8 without a byte order mark (Out-File here would add one).
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "NEXT_CODE=$bin\next_code.exe`n")
+      - name: Run the installed editor
+        shell: python
+        run: |
+          import json, os, subprocess, tempfile
+
+          editor = os.environ["NEXT_CODE"]
+          usage = subprocess.run([editor, "--help"], capture_output=True, text=True)
+          assert "usage: next_code" in usage.stderr + usage.stdout, usage
+          # Only the comment is prose for the Rust grammar; without its
+          # library the whole text would be checked.
+          request = {"id": 1, "cmd": "spell_check", "language": "rust",
+                     "text": "fn main() { let mispeled = 1; } // an exampel\n"}
+          headless = subprocess.Popen([editor, "--headless", tempfile.mkdtemp()],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+          headless.stdin.write(json.dumps(request) + "\n")
+          headless.stdin.flush()
+          for line in headless.stdout:
+              reply = json.loads(line)
+              if reply.get("id") == 1:
+                  break
+          headless.stdin.write(json.dumps({"id": 2, "cmd": "shutdown"}) + "\n")
+          headless.stdin.flush()
+          headless.wait(timeout=60)
+          words = [m["word"] for m in reply["result"]["misspellings"]]
+          assert words == ["exampel"], reply
+          print("spell_check:", words)
+
+  publish:
+    name: Publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, install]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: next_code-*
+          path: release
+          merge-multiple: true
+      - name: Create the release
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum next_code-* > SHA256SUMS
+          # A tag with a suffix (v0.2.0-rc.1) is a pre-release, which
+          # releases/latest (and so the install scripts) skips.
+          prerelease=$([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease || true)
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "next_code $GITHUB_REF_NAME" --generate-notes $prerelease \
+            next_code-* SHA256SUMS

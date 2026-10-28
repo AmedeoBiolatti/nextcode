@@ -2757,21 +2757,39 @@ fn headless_mode_runs_a_workflow_across_projects() {
     );
     // The format's schema, for editors and agents.
     let schema = headless.call(json!({ "cmd": "workflow_schema" }));
-    assert_eq!(schema["result"]["schema"]["title"], "next_code workflow", "{schema}");
+    assert_eq!(
+        schema["result"]["schema"]["title"], "next_code workflow",
+        "{schema}"
+    );
     assert_eq!(schema["result"]["file"], "workflow.schema.json");
     // The old file: listed with a problem until converted.
     let old = list.iter().find(|w| w["name"] == "old").unwrap();
     assert!(
-        old["error"].as_str().unwrap().contains("old JSON workflow format"),
+        old["error"]
+            .as_str()
+            .unwrap()
+            .contains("old JSON workflow format"),
         "{old}"
     );
     let converted = headless.call(json!({ "cmd": "workflow_convert", "path": "old.jsonc" }));
     let result = &converted["result"];
-    assert!(result["path"].as_str().unwrap().ends_with("old.yaml"), "{converted}");
-    assert!(result["backup"].as_str().unwrap().ends_with("old.jsonc.bak"), "{converted}");
+    assert!(
+        result["path"].as_str().unwrap().ends_with("old.yaml"),
+        "{converted}"
+    );
+    assert!(
+        result["backup"]
+            .as_str()
+            .unwrap()
+            .ends_with("old.jsonc.bak"),
+        "{converted}"
+    );
     assert_eq!(result["problems"], json!([]));
     let text = fs::read_to_string(root.join("main/.next_code/workflows/old.yaml")).unwrap();
-    assert_eq!(text, "# Old.\nname: Old\n\nsteps:\n  a: {check: exit 0, timeout: 1m}\n");
+    assert_eq!(
+        text,
+        "# Old.\nname: Old\n\nsteps:\n  a: {check: exit 0, timeout: 1m}\n"
+    );
     let list = headless.call(json!({ "cmd": "workflows_list" }));
     let old = list["result"]
         .as_array()
@@ -2784,7 +2802,10 @@ fn headless_mode_runs_a_workflow_across_projects() {
     assert_eq!(old["steps"][0]["timeout"], "1m");
     let again = headless.call(json!({ "cmd": "workflow_convert", "name": "Old" }));
     assert!(
-        again["error"].as_str().unwrap().contains("not in the old JSON format"),
+        again["error"]
+            .as_str()
+            .unwrap()
+            .contains("not in the old JSON format"),
         "{again}"
     );
 
@@ -3072,8 +3093,8 @@ fn headless_mode_reports_after_a_failed_evaluation_and_stops_with_grace() {
     }
     assert_eq!(status["steps"][1]["status"], "stopped");
     // A report after a stopped evaluation can never run.
-    let restart = headless
-        .call(json!({ "cmd": "workflow_restart", "path": "grace.yaml", "step": "report" }));
+    let restart =
+        headless.call(json!({ "cmd": "workflow_restart", "path": "grace.yaml", "step": "report" }));
     assert_eq!(restart["result"], true, "{restart}");
     let status = status_until(&mut headless, "grace.yaml", |status| {
         status["steps"][1]["status"] == "waiting"
@@ -4393,11 +4414,13 @@ fn headless_mode_serves_workflow_files_with_the_built_in_server() {
     let diagnostics =
         headless.call(json!({ "cmd": "diagnostics", "path": path, "wait_ms": 5_000 }));
     let found = &diagnostics["result"][0]["diagnostics"];
-    assert_eq!(found[0]["message"], "`api` depends on unknown step `zz`", "{diagnostics}");
-    // From `db` in api's depends_on to db's key.
-    let definition = headless.call(
-        json!({ "cmd": "definition", "path": path, "line": 2, "character": 21 }),
+    assert_eq!(
+        found[0]["message"], "`api` depends on unknown step `zz`",
+        "{diagnostics}"
     );
+    // From `db` in api's depends_on to db's key.
+    let definition =
+        headless.call(json!({ "cmd": "definition", "path": path, "line": 2, "character": 21 }));
     assert_eq!(
         definition["result"][0]["range"]["start"],
         json!({ "line": 1, "character": 2 }),
@@ -4517,7 +4540,10 @@ steps:
             && steps[5]["status"] == "ready"
     });
     let steps = status["steps"].as_array().unwrap();
-    assert_eq!(steps[0]["reason"], "failed (exit code 3) (gave up after 2 restarts)", "{status}");
+    assert_eq!(
+        steps[0]["reason"], "failed (exit code 3) (gave up after 2 restarts)",
+        "{status}"
+    );
     assert_eq!(steps[0]["restarts"], 2);
     assert_eq!(steps[2]["reason"], "unhealthy: exit code 1", "{status}");
     assert_eq!(steps[3]["status"], "skipped");
@@ -4540,7 +4566,11 @@ fn headless_mode_lists_workflow_folders_and_runs_files_by_path() {
         fs::create_dir_all(root.join(dir)).unwrap();
     }
     let root = root.canonicalize().unwrap();
-    fs::write(root.join("team/deploy.yaml"), "name: Team deploy\nsteps: {a: {check: exit 0}}\n").unwrap();
+    fs::write(
+        root.join("team/deploy.yaml"),
+        "name: Team deploy\nsteps: {a: {check: exit 0}}\n",
+    )
+    .unwrap();
     let single = root.join("elsewhere/one.yaml");
     fs::write(&single, "name: One off\nsteps: {b: {check: exit 0}}\n").unwrap();
     let mut headless = Headless::launch(
@@ -4560,7 +4590,11 @@ fn headless_mode_lists_workflow_folders_and_runs_files_by_path() {
         .find(|found| found["name"] == "Team deploy")
         .cloned()
         .unwrap_or_else(|| panic!("{list}"));
-    assert_eq!(team["source"], root.join("team").display().to_string(), "{team}");
+    assert_eq!(
+        team["source"],
+        root.join("team").display().to_string(),
+        "{team}"
+    );
     let run = headless.call(json!({ "cmd": "workflow_run", "name": "Team deploy" }));
     assert_eq!(run["ok"], true, "{run}");
     // A file anywhere, by its absolute path: listed from then on.
@@ -4572,7 +4606,11 @@ fn headless_mode_lists_workflow_folders_and_runs_files_by_path() {
     assert_eq!(status["workflow"], "One off");
     let list = headless.call(json!({ "cmd": "workflows_list" }));
     assert!(
-        list["result"].as_array().unwrap().iter().any(|found| found["name"] == "One off"),
+        list["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|found| found["name"] == "One off"),
         "{list}"
     );
     assert_eq!(headless.call(json!({ "cmd": "shutdown" }))["ok"], true);

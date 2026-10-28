@@ -35,10 +35,7 @@ pub(crate) fn entries(name: &'static str) -> Result<&'static [Loaded], String> {
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    libraries
-        .entry(name)
-        .or_insert_with(|| load(name))
-        .clone()
+    libraries.entry(name).or_insert_with(|| load(name)).clone()
 }
 
 /// Records that `language` is unavailable (printed once, for the console

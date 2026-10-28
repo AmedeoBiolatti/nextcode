@@ -643,11 +643,16 @@ fn flow(value: &Y) -> Option<String> {
             let mut parts = Vec::with_capacity(entries.len());
             for entry in entries {
                 // Groups' steps one per line.
-                let steps = entry.key == "steps" && matches!(&entry.value, Y::Map(steps, _) if !steps.is_empty());
+                let steps = entry.key == "steps"
+                    && matches!(&entry.value, Y::Map(steps, _) if !steps.is_empty());
                 if !entry.before.is_empty() || entry.trailing.is_some() || steps {
                     return None;
                 }
-                parts.push(format!("{}: {}", key(&entry.key, true), flow(&entry.value)?));
+                parts.push(format!(
+                    "{}: {}",
+                    key(&entry.key, true),
+                    flow(&entry.value)?
+                ));
             }
             Some(format!("{{{}}}", parts.join(", ")))
         }
@@ -764,7 +769,11 @@ fn emit_item(out: &mut String, item: &Item, indent: usize) {
             out.push_str(&block);
             if item.trailing.is_some() {
                 // Rare: a comment after a whole object in an array.
-                comments(out, &item.trailing.iter().cloned().collect::<Vec<_>>(), indent + 2);
+                comments(
+                    out,
+                    &item.trailing.iter().cloned().collect::<Vec<_>>(),
+                    indent + 2,
+                );
             }
         }
         value => {
@@ -970,7 +979,8 @@ x-owner: me
 
     #[test]
     fn invalid_json_says_where() {
-        let err = convert("{\n  \"steps\": [\n    { \"id\": \"a\" \"run\": \"x\" }\n  ]\n}").unwrap_err();
+        let err =
+            convert("{\n  \"steps\": [\n    { \"id\": \"a\" \"run\": \"x\" }\n  ]\n}").unwrap_err();
         assert!(err.starts_with("invalid JSON at line 3"), "{err}");
         assert!(convert("[1]").unwrap_err().contains("JSON object"));
         assert!(is_legacy("C:/w/dev.jsonc") && is_legacy("dev.json") && !is_legacy("dev.yaml"));

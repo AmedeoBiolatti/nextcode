@@ -222,10 +222,7 @@ impl<'a> Loader<'a> {
     }
 
     fn byte(&self, index: usize) -> usize {
-        self.bytes
-            .get(index)
-            .copied()
-            .unwrap_or(self.text.len())
+        self.bytes.get(index).copied().unwrap_or(self.text.len())
     }
 
     fn range(&self, span: Span) -> (usize, usize) {
@@ -240,8 +237,9 @@ impl<'a> Loader<'a> {
                 self.documents += 1;
                 if self.documents > 1 {
                     self.errors.push(Error {
-                        message: "a workflow file holds one YAML document (remove the second `---`)"
-                            .into(),
+                        message:
+                            "a workflow file holds one YAML document (remove the second `---`)"
+                                .into(),
                         offset: start,
                     });
                     return false;
@@ -303,10 +301,7 @@ impl<'a> Loader<'a> {
                     self.value(node);
                 }
             }
-            Event::StreamStart
-            | Event::StreamEnd
-            | Event::DocumentEnd
-            | Event::Nothing => {}
+            Event::StreamStart | Event::StreamEnd | Event::DocumentEnd | Event::Nothing => {}
         }
         true
     }
@@ -452,7 +447,11 @@ pub(crate) fn plain(text: &str) -> Data {
             .unwrap_or(text)
             .parse::<i64>()
             .map(Number::from)
-            .or_else(|_| text.trim_start_matches('+').parse::<u64>().map(Number::from));
+            .or_else(|_| {
+                text.trim_start_matches('+')
+                    .parse::<u64>()
+                    .map(Number::from)
+            });
         if let Ok(number) = number {
             return Data::Number(number);
         }
@@ -475,9 +474,8 @@ pub(crate) fn plain(text: &str) -> Data {
         Some((whole, fraction)) => digits(whole) && (fraction.is_empty() || digits(fraction)),
         None => digits(mantissa),
     };
-    let exponent_ok = exponent.is_none_or(|exponent| {
-        digits(exponent.strip_prefix(['-', '+']).unwrap_or(exponent))
-    });
+    let exponent_ok = exponent
+        .is_none_or(|exponent| digits(exponent.strip_prefix(['-', '+']).unwrap_or(exponent)));
     if mantissa_ok
         && exponent_ok
         && let Ok(number) = text.parse::<f64>()
@@ -512,7 +510,9 @@ mod tests {
         let node = root(text);
         assert_eq!(
             keys(&node),
-            ["zeta", "alpha", "mid", "none", "tilde", "word", "quoted", "hex", "ver", "big"]
+            [
+                "zeta", "alpha", "mid", "none", "tilde", "word", "quoted", "hex", "ver", "big"
+            ]
         );
         let value = |key: &str| node.get(key).unwrap().to_json();
         assert_eq!(value("zeta"), serde_json::json!(1));
@@ -520,7 +520,11 @@ mod tests {
         assert_eq!(value("mid"), serde_json::json!(true));
         assert_eq!(value("none"), Value::Null);
         assert_eq!(value("tilde"), Value::Null);
-        assert_eq!(value("word"), serde_json::json!("yes"), "YAML 1.2: not a boolean");
+        assert_eq!(
+            value("word"),
+            serde_json::json!("yes"),
+            "YAML 1.2: not a boolean"
+        );
         assert_eq!(value("quoted"), serde_json::json!("8"));
         assert_eq!(value("hex"), serde_json::json!(31));
         assert_eq!(value("big"), serde_json::json!(u64::MAX));
@@ -528,8 +532,19 @@ mod tests {
         assert_eq!(node.get("ver").unwrap().text(), Some("1.10"));
         assert_eq!(node.get("mid").unwrap().text(), Some("true"));
         assert_eq!(node.get("none").unwrap().text(), None);
-        for (plain_text, number) in [("1e3", true), ("+.5", true), ("1.", true), ("1.2.3", false), ("e3", false), (".inf", false)] {
-            assert_eq!(matches!(plain(plain_text), Data::Number(_)), number, "{plain_text}");
+        for (plain_text, number) in [
+            ("1e3", true),
+            ("+.5", true),
+            ("1.", true),
+            ("1.2.3", false),
+            ("e3", false),
+            (".inf", false),
+        ] {
+            assert_eq!(
+                matches!(plain(plain_text), Data::Number(_)),
+                number,
+                "{plain_text}"
+            );
         }
     }
 
@@ -544,11 +559,18 @@ mod tests {
         assert_eq!(&text[api.key_start..api.key_start + 3], "api");
         let run = api.value.get("run").unwrap();
         assert_eq!(run.as_str(), Some("uv run x\ny\n"));
-        assert_eq!(&text[run.start..run.end], "uv run x\n      y", "block scalars: the content");
+        assert_eq!(
+            &text[run.start..run.end],
+            "uv run x\n      y",
+            "block scalars: the content"
+        );
         let ready = api.value.get("ready").unwrap();
         assert_eq!(&text[ready.start..ready.end], "{port: 8000}");
         // A block mapping ends with its last value.
-        assert_eq!(&text[api.value.start..api.value.end], &text[text.find("run:").unwrap()..text.find('}').unwrap() + 1]);
+        assert_eq!(
+            &text[api.value.start..api.value.end],
+            &text[text.find("run:").unwrap()..text.find('}').unwrap() + 1]
+        );
         let web = steps.get("web").unwrap();
         assert_eq!(&text[web.start..web.end], "[a, b]");
         assert_eq!(steps.end, web.end);
@@ -561,10 +583,17 @@ mod tests {
         let steps = node.get("steps").unwrap();
         let build = steps.get("build").unwrap();
         assert_eq!(keys(build), ["run", "project", "env"]);
-        assert_eq!(build.get("project").unwrap().to_json(), serde_json::json!({"local": "C:/api"}));
+        assert_eq!(
+            build.get("project").unwrap().to_json(),
+            serde_json::json!({"local": "C:/api"})
+        );
         let serve = steps.get("serve").unwrap();
         assert_eq!(keys(serve), ["env", "run", "project", "cwd"]);
-        assert_eq!(serve.get("env").unwrap().to_json(), serde_json::json!({"B": "2"}), "explicit wins");
+        assert_eq!(
+            serve.get("env").unwrap().to_json(),
+            serde_json::json!({"B": "2"}),
+            "explicit wins"
+        );
         // An alias is located where it is used.
         let text = "a: &x [1, 2]\nb: *x\n";
         let node = root(text);
@@ -586,14 +615,26 @@ mod tests {
         let text = "steps:\n  a:\n    run: x\n  b:\n    run: [\n  c: 1\n";
         let document = load(text);
         assert_eq!(document.errors.len(), 1);
-        assert!(document.errors[0].message.starts_with("invalid YAML"), "{:?}", document.errors);
+        assert!(
+            document.errors[0].message.starts_with("invalid YAML"),
+            "{:?}",
+            document.errors
+        );
         let steps = document.root.unwrap();
         let steps = steps.get("steps").unwrap();
         assert_eq!(keys(steps), ["a", "b"]);
-        assert_eq!(steps.get("b").unwrap().end, text.len(), "open until the end");
+        assert_eq!(
+            steps.get("b").unwrap().end,
+            text.len(),
+            "open until the end"
+        );
         // Not a plain key; a second document.
         assert!(load("[a]: 1\n").errors[0].message.contains("plain value"));
-        assert!(load("a: 1\n---\nb: 2\n").errors[0].message.contains("one YAML document"));
+        assert!(
+            load("a: 1\n---\nb: 2\n").errors[0]
+                .message
+                .contains("one YAML document")
+        );
         assert_eq!(load("").root, None);
         assert_eq!(load("# only a comment\n").root, None);
     }

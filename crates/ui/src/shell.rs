@@ -37,6 +37,7 @@ use crate::{
     settings_page::{SettingsPage, SettingsPageEvent},
     theme::{self, Theme},
     theme_picker::{ThemePicker, ThemePickerEvent},
+    updates,
     workspace::{Preload, Workspace, WorkspaceEvent},
 };
 
@@ -62,6 +63,7 @@ actions!(
         SelectTheme,
         CustomizeTheme,
         Quit,
+        CheckForUpdates,
         About
     ]
 );
@@ -452,6 +454,14 @@ fn open_with(
         })
     })
     .expect("failed to open window")
+}
+
+/// A message with an OK button (no detail when `detail` is empty).
+fn tell(level: PromptLevel, title: &str, detail: &str, window: &mut Window, cx: &mut App) {
+    let detail = (!detail.is_empty()).then_some(detail);
+    let answer = window.prompt(level, title, detail, &["OK"], cx);
+    cx.background_spawn(async move { answer.await.ok() })
+        .detach();
 }
 
 fn window_title(subject: Option<&str>) -> String {
@@ -1338,6 +1348,21 @@ impl Shell {
     /// Exits after one confirmation covering every window's unsaved files;
     /// every open window reopens next time.
     fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_exit("Exit", window, cx, |_, _, cx| {
+            app_state::quit(cx);
+            cx.quit();
+        });
+    }
+
+    /// Runs `exit` once unsaved changes in every window, if any, may be
+    /// discarded (`verb` names the exit in the question).
+    fn confirm_exit(
+        &mut self,
+        verb: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        exit: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
         let this_window = window.window_handle();
         let mut dirty = self.dirty_count(cx);
         for handle in cx.windows() {
@@ -1351,10 +1376,9 @@ impl Shell {
             }
         }
         if dirty == 0 {
-            app_state::quit(cx);
-            return cx.quit();
+            return exit(self, window, cx);
         }
-        let message = format!("{dirty} file(s) have unsaved changes. Exit anyway?");
+        let message = format!("{dirty} file(s) have unsaved changes. {verb} anyway?");
         let answer = window.prompt(
             PromptLevel::Warning,
             &message,
@@ -1362,14 +1386,149 @@ impl Shell {
             &["Discard Changes", "Cancel"],
             cx,
         );
-        cx.spawn(async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if answer.await == Ok(0) {
-                cx.update(|cx| {
-                    app_state::quit(cx);
-                    cx.quit();
+                this.update_in(cx, |this, window, cx| exit(this, window, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn check_for_updates(
+        &mut self,
+        _: &CheckForUpdates,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let latest = cx.background_spawn(async { updates::latest_tag() });
+        cx.spawn_in(window, async move |this, cx| {
+            let latest = latest.await;
+            this.update_in(cx, |this, window, cx| this.offer_update(latest, window, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Answers Check for Updates: up to date, or a newer release to install
+    /// (or just to read about, for a build not run from where releases
+    /// install).
+    fn offer_update(
+        &mut self,
+        latest: Result<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = env!("CARGO_PKG_VERSION");
+        let tag = match latest {
+            Err(message) => {
+                let title = "Could not check for updates";
+                return tell(PromptLevel::Warning, title, &message, window, cx);
+            }
+            Ok(tag) if !updates::is_newer(&tag, current) => {
+                let title = format!("next_code {current} is up to date");
+                return tell(PromptLevel::Info, &title, "", window, cx);
+            }
+            Ok(tag) => tag,
+        };
+        let title = format!("next_code {tag} is available");
+        if !updates::installed() {
+            let detail = match updates::install_dir() {
+                Some(dir) => format!(
+                    "This is version {current}, not run from {}, where releases install; \
+                     install the release with the README's install command.",
+                    dir.display()
+                ),
+                None => format!(
+                    "This is version {current}. Releases are built for x86_64 Linux and Windows."
+                ),
+            };
+            let buttons = ["Release Notes", "Close"];
+            let answer = window.prompt(PromptLevel::Info, &title, Some(&detail), &buttons, cx);
+            cx.spawn(async move |_, cx| {
+                if answer.await == Ok(0) {
+                    cx.update(|cx| cx.open_url(&updates::release_page(&tag)))
+                        .ok();
+                }
+            })
+            .detach();
+            return;
+        }
+        let detail = format!(
+            "This is version {current}. Updating downloads the release and \
+             installs it beside this one; you are asked to restart when it is done."
+        );
+        let buttons = ["Update", "Release Notes", "Later"];
+        let answer = window.prompt(PromptLevel::Info, &title, Some(&detail), &buttons, cx);
+        cx.spawn_in(window, async move |this, cx| match answer.await {
+            Ok(0) => {
+                let install = {
+                    let tag = tag.clone();
+                    cx.background_spawn(async move { updates::install(&tag) })
+                };
+                let installed = install.await;
+                this.update_in(cx, |this, window, cx| {
+                    this.updated(tag, installed, window, cx)
                 })
                 .ok();
             }
+            Ok(1) => {
+                cx.update(|_, cx| cx.open_url(&updates::release_page(&tag)))
+                    .ok();
+            }
+            _ => {}
+        })
+        .detach();
+    }
+
+    /// An update was installed (or failed to): offers the restart into it.
+    fn updated(
+        &mut self,
+        tag: String,
+        installed: Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(message) = installed {
+            return tell(
+                PromptLevel::Warning,
+                "Updating failed",
+                &message,
+                window,
+                cx,
+            );
+        }
+        let title = format!("next_code {tag} is installed");
+        let detail = "Restart to use it: the open windows and tabs reopen.";
+        let answer = window.prompt(
+            PromptLevel::Info,
+            &title,
+            Some(detail),
+            &["Restart", "Later"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.confirm_exit("Restart", window, cx, |_, window, cx| {
+                    let restarted = updates::installed_launcher()
+                        .ok_or_else(|| "no installed launcher".to_owned())
+                        .and_then(|launcher| crate::instance::restart(&launcher, cx));
+                    if let Err(message) = restarted {
+                        let detail = format!("{message}. Quit and start next_code again.");
+                        tell(
+                            PromptLevel::Warning,
+                            "Restarting failed",
+                            &detail,
+                            window,
+                            cx,
+                        );
+                    }
+                });
+            })
+            .ok();
         })
         .detach();
     }
@@ -1382,9 +1541,7 @@ impl Shell {
                 .and_then(|path| path.parent().map(|dir| dir.display().to_string()))
                 .unwrap_or_default()
         );
-        let answer = window.prompt(PromptLevel::Info, "next_code", Some(&detail), &["OK"], cx);
-        cx.background_spawn(async move { answer.await.ok() })
-            .detach();
+        tell(PromptLevel::Info, "next_code", &detail, window, cx);
     }
 
     /// The project at `location`: its tab here, else a new background tab
@@ -2532,6 +2689,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::select_theme))
             .on_action(cx.listener(Self::customize_theme))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::about))
             .map(|element| crate::builtins::window_actions(element, cx))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {

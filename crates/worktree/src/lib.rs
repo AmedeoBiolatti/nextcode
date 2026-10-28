@@ -75,13 +75,8 @@ pub fn read_dir(dir: &Path) -> io::Result<Vec<DirEntry>> {
             package,
         });
     }
-    entries.sort_by_cached_key(|entry| {
-        (
-            !entry.is_dir,
-            entry.name.to_lowercase(),
-            entry.name.clone(),
-        )
-    });
+    entries
+        .sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase(), entry.name.clone()));
     Ok(entries)
 }
 
@@ -174,7 +169,11 @@ impl IgnoreChain {
         let repository = &self.rules[..self.repository];
         first_verdict(path, is_dir, self.rules.iter().map(|rules| &rules.ignore))
             .or_else(|| {
-                first_verdict(path, is_dir, repository.iter().map(|rules| &rules.gitignore))
+                first_verdict(
+                    path,
+                    is_dir,
+                    repository.iter().map(|rules| &rules.gitignore),
+                )
             })
             .or_else(|| first_verdict(path, is_dir, repository.iter().map(|rules| &rules.exclude)))
             .or_else(|| {
@@ -231,9 +230,9 @@ struct Stamp {
 impl Stamp {
     fn of(dir: &Path) -> Self {
         let git = match fs::metadata(dir.join(".git")) {
-            Ok(meta) if meta.is_dir() => Some(change_stamp(
-                &dir.join(".git").join("info").join("exclude"),
-            )),
+            Ok(meta) if meta.is_dir() => {
+                Some(change_stamp(&dir.join(".git").join("info").join("exclude")))
+            }
             Ok(meta) => Some(meta.modified().ok().map(|time| (time, meta.len()))),
             Err(_) => None,
         };
@@ -675,7 +674,11 @@ mod tests {
         ] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
-        fs::write(root.join("src").join(".gitignore"), "generated/\n!keep.log\n").unwrap();
+        fs::write(
+            root.join("src").join(".gitignore"),
+            "generated/\n!keep.log\n",
+        )
+        .unwrap();
         for file in [
             "build/out.o",
             "src/build/nested.o",

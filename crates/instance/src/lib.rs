@@ -153,7 +153,8 @@ impl std::error::Error for SendError {}
 /// giving up after `timeout`. `NoInstance` means none is running there.
 pub fn send(endpoint: &Endpoint, request: &Request, timeout: Duration) -> Result<Reply, SendError> {
     let endpoint = endpoint.clone();
-    let line = serde_json::to_string(request).map_err(|err| SendError::Protocol(err.to_string()))?;
+    let line =
+        serde_json::to_string(request).map_err(|err| SendError::Protocol(err.to_string()))?;
     let (tx, rx) = mpsc::channel();
     // The exchange runs on a thread so a stuck editor cannot hold the
     // caller past `timeout`: pipes have no read timeout of their own.
@@ -179,7 +180,9 @@ fn exchange(endpoint: &Endpoint, line: &str, timeout: Duration) -> Result<Reply,
         .read_line(&mut answer)
         .map_err(SendError::Io)?;
     if answer.trim().is_empty() {
-        return Err(SendError::Protocol("the editor closed the connection".into()));
+        return Err(SendError::Protocol(
+            "the editor closed the connection".into(),
+        ));
     }
     serde_json::from_str(&answer).map_err(|_| SendError::Protocol(answer.trim().to_owned()))
 }
@@ -312,7 +315,9 @@ fn create_pipe(name: &str, first: bool) -> Result<WindowsPipe, ServeError> {
         });
     }
     // SAFETY: the handle is valid and owned by nothing else; `File` closes it.
-    Ok(WindowsPipe(unsafe { std::fs::File::from_raw_handle(handle as _) }))
+    Ok(WindowsPipe(unsafe {
+        std::fs::File::from_raw_handle(handle as _)
+    }))
 }
 
 #[cfg(windows)]
@@ -339,7 +344,9 @@ impl WindowsPipe {
 
     fn finish(&self) {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::{Storage::FileSystem::FlushFileBuffers, System::Pipes::DisconnectNamedPipe};
+        use windows_sys::Win32::{
+            Storage::FileSystem::FlushFileBuffers, System::Pipes::DisconnectNamedPipe,
+        };
         // SAFETY: plain calls on our own handle.
         unsafe {
             FlushFileBuffers(self.0.as_raw_handle() as _);
@@ -349,7 +356,10 @@ impl WindowsPipe {
 }
 
 #[cfg(windows)]
-fn start_listening(server: &mut Server, mut handler: Handler) -> Result<thread::JoinHandle<()>, ServeError> {
+fn start_listening(
+    server: &mut Server,
+    mut handler: Handler,
+) -> Result<thread::JoinHandle<()>, ServeError> {
     let name = server.endpoint.pipe.clone();
     // The first instance is created here so "already running" is known
     // before the thread starts.
@@ -411,7 +421,10 @@ fn connect(endpoint: &Endpoint, timeout: Duration) -> Result<std::fs::File, Send
 // ------------------------------------------------------------------- Unix
 
 #[cfg(not(windows))]
-fn start_listening(server: &mut Server, mut handler: Handler) -> Result<thread::JoinHandle<()>, ServeError> {
+fn start_listening(
+    server: &mut Server,
+    mut handler: Handler,
+) -> Result<thread::JoinHandle<()>, ServeError> {
     use std::os::unix::net::UnixListener;
     let path = server.endpoint.path.clone();
     // A socket file left by an editor that died is taken over; one a
@@ -448,7 +461,10 @@ fn start_listening(server: &mut Server, mut handler: Handler) -> Result<thread::
 }
 
 #[cfg(not(windows))]
-fn connect(endpoint: &Endpoint, timeout: Duration) -> Result<std::os::unix::net::UnixStream, SendError> {
+fn connect(
+    endpoint: &Endpoint,
+    timeout: Duration,
+) -> Result<std::os::unix::net::UnixStream, SendError> {
     use std::os::unix::net::UnixStream;
     match UnixStream::connect(&endpoint.path) {
         Ok(stream) => {
@@ -457,7 +473,9 @@ fn connect(endpoint: &Endpoint, timeout: Duration) -> Result<std::os::unix::net:
             Ok(stream)
         }
         Err(err) => match err.kind() {
-            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => Err(SendError::NoInstance),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                Err(SendError::NoInstance)
+            }
             _ => Err(SendError::Io(err)),
         },
     }
@@ -546,7 +564,8 @@ mod tests {
     }
 
     fn endpoint(name: &str) -> (Endpoint, PathBuf) {
-        let root = std::env::temp_dir().join(format!("next_code-instance-{name}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("next_code-instance-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         (Endpoint::for_state_root(&root), root)
     }
@@ -555,7 +574,14 @@ mod tests {
     fn requests_reach_the_server_and_replies_come_back() {
         let (endpoint, root) = endpoint("roundtrip");
         assert!(matches!(
-            send(&endpoint, &Request { args: vec![], cwd: None }, Duration::from_secs(2)),
+            send(
+                &endpoint,
+                &Request {
+                    args: vec![],
+                    cwd: None
+                },
+                Duration::from_secs(2)
+            ),
             Err(SendError::NoInstance)
         ));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -575,7 +601,10 @@ mod tests {
             args: vec!["C:\\dev\\p".into(), "--x".into()],
             cwd: Some(PathBuf::from("/home/me")),
         };
-        assert_eq!(send(&endpoint, &request, Duration::from_secs(5)).unwrap(), Reply::Done);
+        assert_eq!(
+            send(&endpoint, &request, Duration::from_secs(5)).unwrap(),
+            Reply::Done
+        );
         assert_eq!(
             send(
                 &endpoint,
@@ -592,7 +621,10 @@ mod tests {
         );
         // Several in a row: the next pipe instance is ready each time.
         for _ in 0..3 {
-            assert_eq!(send(&endpoint, &request, Duration::from_secs(5)).unwrap(), Reply::Done);
+            assert_eq!(
+                send(&endpoint, &request, Duration::from_secs(5)).unwrap(),
+                Reply::Done
+            );
         }
         assert_eq!(seen.lock().unwrap().len(), 5);
         assert_eq!(seen.lock().unwrap()[0], request);
@@ -608,7 +640,10 @@ mod tests {
         ));
         // Listening again works once the first server is gone.
         let server = serve(&endpoint, |_| Reply::Restart).unwrap();
-        assert_eq!(send(&endpoint, &request, Duration::from_secs(5)).unwrap(), Reply::Restart);
+        assert_eq!(
+            send(&endpoint, &request, Duration::from_secs(5)).unwrap(),
+            Reply::Restart
+        );
         drop(server);
         std::fs::remove_dir_all(root).ok();
     }
@@ -623,7 +658,10 @@ mod tests {
 
     #[test]
     fn replies_serialize_as_tagged_json() {
-        assert_eq!(serde_json::to_string(&Reply::Done).unwrap(), r#"{"result":"done"}"#);
+        assert_eq!(
+            serde_json::to_string(&Reply::Done).unwrap(),
+            r#"{"result":"done"}"#
+        );
         assert_eq!(
             serde_json::from_str::<Reply>(r#"{"result":"error","message":"m"}"#).unwrap(),
             Reply::Error {

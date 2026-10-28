@@ -47,7 +47,7 @@ macro_rules! export_extension {
 #[doc(hidden)]
 #[cfg(any(target_arch = "wasm32", test))]
 pub mod __private {
-    use super::{API_VERSION, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Request, Response};
+    use super::{Request, Response, API_VERSION, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES};
     use std::io::{self, Write};
 
     fn error(message: &str) -> Vec<u8> {

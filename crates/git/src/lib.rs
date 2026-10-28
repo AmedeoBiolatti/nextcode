@@ -26,8 +26,8 @@ pub use blame::{Blame, BlameCommit};
 pub use diff::{FULL_FILE, FileDiff, LineKind, Row, SideLine, SplitRow, diff, side_by_side};
 pub use history::{Commit, GraphRow, graph};
 pub use line_changes::{
-    BaseObject, LineChange, LineChangeKind, all_added, apply_change, line_changes,
-    minimal_edit, replace_lines, revert_change,
+    BaseObject, LineChange, LineChangeKind, all_added, apply_change, line_changes, minimal_edit,
+    replace_lines, revert_change,
 };
 pub use log::{LogFilter, LogPage, SelectionChanges};
 pub use operations::Worktree;

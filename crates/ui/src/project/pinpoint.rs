@@ -342,13 +342,22 @@ mod tests {
         to_remote(&mut answer, &single);
         assert_eq!(answer["editor"]["file"], "/home/me/proj/app.py");
         assert_eq!(answer["tabs"][1]["file"], "/home/me/proj/tests/test_app.py");
-        assert_eq!(answer["problems"]["items"][0]["file"], "/home/me/proj/app.py");
+        assert_eq!(
+            answer["problems"]["items"][0]["file"],
+            "/home/me/proj/app.py"
+        );
         assert_eq!(
             answer["tests"]["failures"][0]["file"],
             "/home/me/proj/tests/test_app.py"
         );
         // Test ids are not paths.
-        assert_eq!(answer["tests"]["failures"][0]["id"], "tests/test_app.py::test_x");
-        assert_eq!(answer["debugger"]["location"]["file"], "/home/me/proj/app.py");
+        assert_eq!(
+            answer["tests"]["failures"][0]["id"],
+            "tests/test_app.py::test_x"
+        );
+        assert_eq!(
+            answer["debugger"]["location"]["file"],
+            "/home/me/proj/app.py"
+        );
     }
 }
