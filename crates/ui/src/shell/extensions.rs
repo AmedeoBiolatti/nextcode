@@ -341,7 +341,7 @@ impl Shell {
         };
         self.invoke_extension_reply(
             &id,
-            invocation,
+            (invocation, direct),
             Some(workspace),
             Some(PanelOrigin {
                 view,
@@ -349,7 +349,6 @@ impl Shell {
                 submitted_inputs: Some(inputs),
                 process_result,
             }),
-            direct,
             window,
             cx,
         );
@@ -364,16 +363,15 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.invoke_extension_reply(id, invocation, workspace, origin, None, window, cx);
+        self.invoke_extension_reply(id, (invocation, None), workspace, origin, window, cx);
     }
 
     fn invoke_extension_reply(
         &mut self,
         id: &str,
-        invocation: Invocation,
+        (invocation, direct): (Invocation, Option<String>),
         workspace: Option<Entity<Workspace>>,
         mut origin: Option<PanelOrigin>,
-        direct: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
