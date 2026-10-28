@@ -289,6 +289,9 @@ pub enum Widget {
         height: u16,
         #[serde(default = "show_legend")]
         legend: bool,
+        /// Width in px (180..=1600); omitted fills the available width (at least 180 px).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u16>,
     },
 }
 

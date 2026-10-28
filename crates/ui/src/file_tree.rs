@@ -29,10 +29,11 @@ use std::{
 };
 
 use gpui::{
-    App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    FontWeight, KeyBinding, Modifiers, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel,
-    ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
-    actions, anchored, deferred, div, point, prelude::*, px, uniform_list,
+    App, ClipboardItem, Context, Corner, Entity, EntityId, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, FontWeight, KeyBinding, Modifiers, MouseButton, MouseDownEvent, Pixels,
+    Point, PromptLevel, ScrollHandle, ScrollStrategy, SharedString, Subscription,
+    UniformListScrollHandle, Window, actions, anchored, deferred, div, point, prelude::*, px,
+    uniform_list,
 };
 
 use crate::{
@@ -1671,6 +1672,16 @@ impl FileTree {
         );
     }
 
+    fn import_local(&mut self, paths: &[PathBuf], dir: PathBuf, cx: &mut Context<Self>) {
+        let paths = paths.to_vec();
+        self.run(
+            "Could not upload files".into(),
+            move |project| file_ops::import_local(project, &paths, &dir),
+            |this, copies, cx| this.created(&copies, cx),
+            cx,
+        );
+    }
+
     fn move_into(&mut self, paths: Vec<PathBuf>, dir: PathBuf, cx: &mut Context<Self>) {
         let moves = file_ops::move_targets(&self.project, &paths, &dir);
         if !moves.is_empty() {
@@ -2084,12 +2095,15 @@ impl Render for FileTree {
         let drops_on_root = !self.root_rows;
         let accepts = move |value: &dyn Any, _: &mut Window, _: &mut App| {
             drops_on_root
-                && value
-                    .downcast_ref::<DraggedPaths>()
-                    .is_some_and(|dragged| dragged.tree == tree)
+                && (value.is::<ExternalPaths>()
+                    || value
+                        .downcast_ref::<DraggedPaths>()
+                        .is_some_and(|dragged| dragged.tree == tree))
         };
         let root_drop = root.clone();
         let header_drop = root.clone();
+        let root_upload = root.clone();
+        let header_upload = root.clone();
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
@@ -2159,6 +2173,11 @@ impl Render for FileTree {
                     )
                     .can_drop(accepts)
                     .drag_over::<DraggedPaths>(|style, _, _, _| style.bg(theme::hover_row()))
+                    .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(theme::hover_row()))
+                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                        cx.stop_propagation();
+                        this.import_local(paths.paths(), header_upload.clone(), cx)
+                    }))
                     .on_drop(
                         cx.listener(move |this, dragged: &DraggedPaths, window, cx| {
                             let paths = this.dragged_paths(dragged);
@@ -2174,6 +2193,11 @@ impl Render for FileTree {
                     .flex_1()
                     .min_h_0()
                     .can_drop(accepts)
+                    .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(theme::hover_row()))
+                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                        cx.stop_propagation();
+                        this.import_local(paths.paths(), root_upload.clone(), cx)
+                    }))
                     .on_drop(
                         cx.listener(move |this, dragged: &DraggedPaths, window, cx| {
                             let paths = this.dragged_paths(dragged);
@@ -2280,6 +2304,7 @@ impl FileTree {
             selected,
         };
         let drag_source = cx.weak_entity();
+        let upload_dir = drop_dir.clone();
         let draggable = !row.root;
         let path = row.path.clone();
         let name = row.name.clone();
@@ -2358,18 +2383,29 @@ impl FileTree {
                     })
             })
             .can_drop(move |value, _, _| {
-                value
-                    .downcast_ref::<DraggedPaths>()
-                    .is_some_and(|dragged| dragged.tree == tree)
+                value.is::<ExternalPaths>()
+                    || value
+                        .downcast_ref::<DraggedPaths>()
+                        .is_some_and(|dragged| dragged.tree == tree)
             })
             .when(row.is_dir, |row| {
-                row.drag_over::<DraggedPaths>(|style, _, _, _| {
+                row.drag_over::<ExternalPaths>(|style, _, _, _| {
+                    style
+                        .bg(theme::hover_row())
+                        .border_1()
+                        .border_color(theme::accent())
+                })
+                .drag_over::<DraggedPaths>(|style, _, _, _| {
                     style
                         .bg(theme::hover_row())
                         .border_1()
                         .border_color(theme::accent())
                 })
             })
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                cx.stop_propagation();
+                this.import_local(paths.paths(), upload_dir.clone(), cx)
+            }))
             .on_drop(
                 cx.listener(move |this, dragged: &DraggedPaths, window, cx| {
                     let paths = this.dragged_paths(dragged);
@@ -2710,6 +2746,27 @@ mod tests {
                 .as_ref()
                 .and_then(|editing| editing.error.as_ref().map(|error| error.to_string()))
         })
+    }
+
+    #[gpui::test]
+    fn external_upload_selects_copies_without_moving_sources(cx: &mut TestAppContext) {
+        let root = project_dir("upload");
+        let source = project_dir("upload-source");
+        fs::write(source.join("a.py"), "uploaded").unwrap();
+        let (tree, cx, events) = open_tree(&root, cx);
+        tree.update(cx, |tree, cx| {
+            tree.import_local(&[source.join("a.py")], root.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(selection(&tree, cx), ["a copy.py"]);
+        assert_eq!(
+            fs::read_to_string(root.join("a copy.py")).unwrap(),
+            "uploaded"
+        );
+        assert!(source.join("a.py").is_file());
+        assert!(events.borrow().is_empty());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source).unwrap();
     }
 
     #[gpui::test]

@@ -124,6 +124,18 @@ Compact dashboard controls use optional API 3 fields:
   nonempty label, `"label_inline": true` places `Label: value` inside the
   field instead of reserving a separate label row. The default remains
   a label above the field.
+- Line charts draw a marker only where a point has no segment to show (a
+  series of one point, or a point between gaps) and for the point hovered or
+  selected; scatter charts mark every point. Zoom in, zoom out and reset are
+  small icon buttons at the right end of a chart's title row.
+- A select's field is as wide as its longest option (with an inline label),
+  from 96 to 260 px. Controls other than charts show their focus border only
+  while focused.
+- Charts accept `"width"` in px (180–1600); omitted, a chart fills the
+  width available to it (at least 180 px).
+- Declared programs run with `NEXT_CODE_VERSION` set to the editor's version,
+  so a tool that draws panels can use these optional fields only on a host
+  that accepts them (older hosts refuse unknown fields).
 - Editor panels omit the extra manifest-title row because the editor tab
   already names the panel. Moving a panel to the dock restores its header;
   loading, running and error indicators remain available.

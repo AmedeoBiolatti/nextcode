@@ -38,6 +38,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Verify source cache invalidation
         run: python -m unittest discover -s scripts/tests -p test_ci_source_cache.py
+      - name: Test SageMaker proxy
+        run: python -m unittest discover -s scripts/tests -p test_sagemaker.py
       - uses: dorny/paths-filter@v4
         id: filter
         with:

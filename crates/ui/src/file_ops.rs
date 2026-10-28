@@ -187,6 +187,76 @@ fn exists_error(path: &Path) -> io::Error {
     )
 }
 
+/// Copies OS file drops from this computer into a project, including a remote
+/// project. Source paths must never be resolved through the project's backend.
+/// Links and special files are refused rather than followed outside a dropped
+/// folder. Existing entries get the same free names as tree copies.
+pub fn import_local(
+    project: &Project,
+    sources: &[PathBuf],
+    dir: &Path,
+) -> io::Result<Vec<PathBuf>> {
+    fn import(project: &Project, source: &Path, target: &Path) -> io::Result<()> {
+        let metadata = std::fs::symlink_metadata(source)?;
+        if metadata.is_dir() {
+            project.create_dir_all(target)?;
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| invalid("Dropped file names must be valid UTF-8".into()))?;
+                check_name(&name, windows_names(project)).map_err(invalid)?;
+                import(project, &entry.path(), &project.join(target, &name))?;
+            }
+            Ok(())
+        } else if metadata.is_file() {
+            // Leave room for protocol framing; reads and writes use one buffer.
+            if project.is_remote() && metadata.len() > (proto::MAX_FRAME_LEN / 2) as u64 {
+                return Err(invalid(
+                    "Dropped files on remote projects must be at most 128 MiB".into(),
+                ));
+            }
+            let data = std::fs::read(source)?;
+            project.create_file(target)?;
+            project.write(target, data)
+        } else {
+            Err(invalid(format!(
+                "Cannot import a link or special file: {}",
+                source.display()
+            )))
+        }
+    }
+
+    let mut imported = Vec::new();
+    for source in top_level(sources, cfg!(windows)) {
+        let metadata = std::fs::symlink_metadata(&source)?;
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| invalid("Dropped file names must be valid UTF-8".into()))?;
+        check_name(name, windows_names(project)).map_err(invalid)?;
+        // On local projects, canonical paths catch aliases through symlinks too.
+        if !project.is_remote()
+            && metadata.is_dir()
+            && std::fs::canonicalize(dir)?.starts_with(std::fs::canonicalize(&source)?)
+        {
+            return Err(invalid(format!("Cannot copy `{name}` into itself")));
+        }
+        let mut index = 0;
+        let target = loop {
+            let path = project.join(dir, &copy_name(name, metadata.is_dir(), index));
+            if project.kind(&path)?.is_none() {
+                break path;
+            }
+            index += 1;
+        };
+        import(project, &source, &target)?;
+        imported.push(target);
+    }
+    Ok(imported)
+}
+
 /// Creates the entry typed as `input` in `dir`; see [`new_entry_input`]
 /// and [`new_entry_parts`]. Returns the new file or folder.
 pub fn create(project: &Project, dir: &Path, input: &str, kind: NewKind) -> io::Result<PathBuf> {
@@ -551,6 +621,70 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         (root.clone(), Project::local(root))
+    }
+
+    #[test]
+    fn external_files_import_binary_folders_and_pick_free_names() {
+        let (root, project) = temp_project("import");
+        check_imports(&root, &project);
+        let err = import_local(&project, std::slice::from_ref(&root), &root).unwrap_err();
+        assert!(err.to_string().contains("into itself"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_files_upload_through_the_agent() {
+        let (root, _) = temp_project("import-remote");
+        let project = Project::test_ssh(root.clone());
+        check_imports(&root, &project);
+        // A local symlink must not walk an arbitrary tree on the local machine.
+        let link = root.join("source-link");
+        std::os::unix::fs::symlink(root.join("source"), &link).unwrap();
+        let err = import_local(&project, &[link], &root.join("destination")).unwrap_err();
+        assert!(err.to_string().contains("link or special file"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn check_imports(root: &Path, project: &Project) {
+        let source = root.join("source");
+        fs::create_dir_all(source.join("folder/empty")).unwrap();
+        fs::write(source.join("folder/data.bin"), [0, 255, 128, 10]).unwrap();
+        fs::write(source.join("notes.txt"), "original").unwrap();
+        let destination = root.join("destination");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("notes.txt"), "keep me").unwrap();
+        let imported = import_local(
+            project,
+            &[
+                source.join("folder"),
+                source.join("folder/data.bin"),
+                source.join("notes.txt"),
+            ],
+            &destination,
+        )
+        .unwrap();
+        assert_eq!(
+            imported,
+            [
+                destination.join("folder"),
+                destination.join("notes copy.txt")
+            ]
+        );
+        assert_eq!(
+            fs::read(destination.join("folder/data.bin")).unwrap(),
+            [0, 255, 128, 10]
+        );
+        assert!(destination.join("folder/empty").is_dir());
+        assert_eq!(
+            fs::read_to_string(destination.join("notes.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("notes copy.txt")).unwrap(),
+            "original"
+        );
+        assert!(source.join("notes.txt").is_file());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::{
 use crate::project::CancelToken;
 use extension_api::{InputValue, PanelUpdate, ProcessExit, UiEvent, UiEventKind, Widget};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
+    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding, Pixels,
     ScrollAnchor, ScrollHandle, SharedString, Window, actions, div, prelude::*, px,
 };
 
@@ -692,7 +692,7 @@ impl ExtensionView {
                         .ok();
                     }),
                 );
-                self.focusable_control(&id, *disabled, control)
+                self.focusable_control(&id, *disabled, false, control)
             }
             Widget::TextInput {
                 label,
@@ -783,7 +783,7 @@ impl ExtensionView {
                         .ok();
                     }),
                 );
-                self.focusable_control(&id, *disabled, control)
+                self.focusable_control(&id, *disabled, false, control)
             }
             Widget::Select {
                 label,
@@ -804,7 +804,11 @@ impl ExtensionView {
                         .collect(),
                     selected,
                     *disabled || self.is_busy(),
-                    px(260.),
+                    select_width(
+                        label,
+                        *label_inline,
+                        options.iter().map(|option| option.label.as_str()),
+                    ),
                     (*label_inline && !label.is_empty()).then(|| label.clone().into()),
                     Rc::new(move |index, _, cx| {
                         if let Some(value) = values.get(index) {
@@ -818,6 +822,7 @@ impl ExtensionView {
                 self.focusable_control(
                     &id,
                     *disabled,
+                    false,
                     div()
                         .flex()
                         .flex_col()
@@ -872,8 +877,9 @@ impl ExtensionView {
                 title,
                 height,
                 legend,
+                width,
                 ..
-            } => self.render_chart(&id, title, *height, *legend, cx),
+            } => self.render_chart(&id, title, *height, *legend, *width, cx),
         };
         let label = match widget {
             Widget::Label { text, .. }
@@ -896,7 +902,15 @@ impl ExtensionView {
             .into_any_element()
     }
 
-    fn focusable_control(&self, id: &str, disabled: bool, child: AnyElement) -> AnyElement {
+    /// A control that takes keyboard focus. `framed` controls (charts) always show their border; the others show
+    /// it only while focused, so rows of fields and checkboxes aren't each boxed twice.
+    fn focusable_control(
+        &self,
+        id: &str,
+        disabled: bool,
+        framed: bool,
+        child: AnyElement,
+    ) -> AnyElement {
         div()
             .id(SharedString::from(format!("{id}-focus")))
             .anchor_scroll(self.anchors.get(id).cloned())
@@ -911,7 +925,11 @@ impl ExtensionView {
                             window.focus(&focus)
                         })
                         .border_1()
-                        .border_color(theme::border())
+                        .border_color(if framed {
+                            theme::border()
+                        } else {
+                            gpui::transparent_black()
+                        })
                         .focus(|style| style.border_color(theme::accent()))
                 } else {
                     control
@@ -920,6 +938,22 @@ impl ExtensionView {
             .child(child)
             .into_any_element()
     }
+}
+
+/// A select's field: as wide as its longest option (with an inline label), between 96 and 260 px, so short
+/// choices make short fields and choosing doesn't change the width.
+fn select_width<'a>(label: &str, inline: bool, options: impl Iterator<Item = &'a str>) -> Pixels {
+    let prefix = if inline && !label.is_empty() {
+        label.chars().count() + 2
+    } else {
+        0
+    };
+    let longest = options
+        .map(|option| option.chars().count())
+        .max()
+        .unwrap_or(0);
+    // about 7 px a character at text_sm, plus the padding and the ▾
+    px(((prefix + longest) as f32 * 7. + 34.).clamp(96., 260.))
 }
 
 impl Render for ExtensionView {

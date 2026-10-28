@@ -696,6 +696,7 @@ fn panel_fixture() -> extension_api::PanelUpdate {
                 },
                 Widget::Chart {
                     legend: true,
+                    width: None,
                     id: "chart".into(),
                     title: "Chart".into(),
                     height: 120,
@@ -827,6 +828,7 @@ fn panel_bounds_and_error_atomicity_apply_without_document_edits() {
         },
         Widget::Chart {
             legend: true,
+            width: None,
             id: "c".into(),
             title: "".into(),
             height: 120,
@@ -936,6 +938,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
     ] {
         panel.root = Widget::Chart {
             legend: true,
+            width: None,
             id: "c".into(),
             title: "Chart".into(),
             chart,
@@ -986,12 +989,39 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
     ] {
         panel.root = Widget::Chart {
             legend: true,
+            width: None,
             id: "c".into(),
             title: "".into(),
             chart,
             height: 120,
         };
         assert!(validate_panel_update(&panel).is_err());
+    }
+    // A chart's optional width: 180..=1600 px.
+    for (width, valid) in [
+        (None, true),
+        (Some(180), true),
+        (Some(1600), true),
+        (Some(179), false),
+        (Some(1601), false),
+    ] {
+        panel.root = Widget::Chart {
+            legend: false,
+            width,
+            id: "c".into(),
+            title: "Chart".into(),
+            chart: ChartSpec::Line {
+                series: vec![ChartSeries {
+                    color: Some(1),
+                    name: "s".into(),
+                    points: vec![ChartPoint { x: 0.0, y: 1.0 }],
+                }],
+                x_label: "".into(),
+                y_label: "".into(),
+            },
+            height: 140,
+        };
+        assert_eq!(validate_panel_update(&panel).is_ok(), valid, "{width:?}");
     }
     panel.root = Widget::Column {
         id: "root".into(),
