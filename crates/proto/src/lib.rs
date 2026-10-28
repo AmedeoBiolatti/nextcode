@@ -65,10 +65,10 @@ use std::io::{self, Read, Write};
 pub use search::{SearchEvent, SearchLimits, SearchQuery};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 pub use watcher::Batch;
-pub use worktree::{DirEntry, FileKind};
+pub use worktree::{DirEntry, FileKind, FolderListing};
 
 /// Bumped on every incompatible change to the messages below.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Bytes a tunnel's sender may have in flight in each direction before the
 /// receiver grants more (see the crate docs).
@@ -226,6 +226,10 @@ pub enum Request {
     /// there, then streams [`Event::HostCall`] and
     /// [`Event::SshAgentClosed`]; never ends by itself.
     HostServices(HostServices),
+    /// A folder dialog: no ignore rules, follows directory links, expands `~`.
+    BrowseFolders {
+        path: String,
+    },
 }
 
 /// What [`Request::HostServices`] lends. Everything off removes the git
@@ -303,6 +307,7 @@ pub enum Response {
     /// The request succeeded and has nothing to return; for streaming
     /// requests, the stream started.
     Done,
+    Folders(FolderListing),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

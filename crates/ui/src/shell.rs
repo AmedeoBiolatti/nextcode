@@ -26,6 +26,7 @@ use crate::{
     command_palette::{Command, CommandPalette, CommandPaletteEvent},
     commands,
     connecting::{Connecting, ConnectingEvent},
+    folder_picker::{FolderPicker, FolderPickerEvent},
     menus::{self, Item, List, MenuBar, SEPARATOR},
     new_project::{NewProject as NewProjectDialog, NewProjectEvent},
     pinpoint::{self, Pin},
@@ -253,6 +254,7 @@ pub struct Shell {
     /// The palette, and the focus to run its command with.
     palette: Option<(Entity<CommandPalette>, Subscription, Option<FocusHandle>)>,
     picker: Option<(Entity<ProjectPicker>, Subscription)>,
+    folder_picker: Option<(Entity<FolderPicker>, Subscription)>,
     new_project: Option<(Entity<NewProjectDialog>, Subscription)>,
     theme_picker: Option<(Entity<ThemePicker>, Subscription)>,
     settings_page: Option<(Entity<SettingsPage>, Subscription, Option<FocusHandle>)>,
@@ -554,6 +556,7 @@ impl Shell {
             menu: None,
             palette: None,
             picker: None,
+            folder_picker: None,
             new_project: None,
             theme_picker: None,
             settings_page: None,
@@ -971,9 +974,79 @@ impl Shell {
         }
     }
 
-    /// Asks for a folder; `\\wsl.localhost\...` folders open as WSL
-    /// projects.
+    /// Browse on the active project's machine. Native dialogs can only
+    /// see this computer, so remote projects use the agent-backed picker.
     fn prompt_for_project(
+        &mut self,
+        new_window: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((picker, _)) = &self.folder_picker {
+            window.focus(&picker.focus_handle(cx));
+            return;
+        }
+        let project = self
+            .active_workspace()
+            .map(|workspace| workspace.read(cx).project().clone())
+            .filter(|project| {
+                project.is_remote()
+                    && project
+                        .location_of(&project.root().to_string_lossy())
+                        .is_some()
+            });
+        if let Some(project) = project {
+            self.menu = None;
+            let previous = window.focused(cx);
+            let picker = cx.new(|cx| FolderPicker::new(project.clone(), cx));
+            let subscription =
+                cx.subscribe_in(&picker, window, move |this, _, event, window, cx| {
+                    this.folder_picker = None;
+                    window.focus(previous.as_ref().unwrap_or(&this.focus_handle));
+                    match event {
+                        FolderPickerEvent::Open(path) => {
+                            if let Some(location) = project.location_of(path) {
+                                this.open_project_choice(location, new_window, window, cx);
+                            }
+                        }
+                        FolderPickerEvent::Local => {
+                            this.prompt_for_local_project(new_window, window, cx)
+                        }
+                        FolderPickerEvent::Dismissed => {}
+                    }
+                    cx.notify();
+                });
+            window.focus(&picker.focus_handle(cx));
+            self.folder_picker = Some((picker, subscription));
+            cx.notify();
+            return;
+        }
+        self.prompt_for_local_project(new_window, window, cx);
+    }
+
+    fn open_project_choice(
+        &mut self,
+        location: Location,
+        new_window: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if new_window {
+            let location = location.absolute();
+            if !activate_existing(&location, Some(window.window_handle()), cx) {
+                match self.position_of(&location) {
+                    Some(index) => self.activate(index, window, cx),
+                    None => open_window(location, None, cx),
+                }
+            }
+        } else {
+            self.open(location, window, cx);
+        }
+    }
+
+    /// The system folder dialog, also reachable explicitly from the remote
+    /// browser. WSL UNC paths still open through their distro's agent.
+    fn prompt_for_local_project(
         &mut self,
         new_window: bool,
         window: &mut Window,
@@ -996,17 +1069,7 @@ impl Shell {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                if new_window {
-                    let location = location.absolute();
-                    if !activate_existing(&location, Some(window.window_handle()), cx) {
-                        match this.position_of(&location) {
-                            Some(index) => this.activate(index, window, cx),
-                            None => open_window(location, None, cx),
-                        }
-                    }
-                } else {
-                    this.open(location, window, cx);
-                }
+                this.open_project_choice(location, new_window, window, cx);
             })
             .ok();
         })
@@ -2777,6 +2840,11 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(picker, _)| modal(picker.clone().into())),
             )
+            .children(
+                self.folder_picker
+                    .as_ref()
+                    .map(|(picker, _)| modal(picker.clone().into())),
+            )
             .children(self.new_project.as_ref().map(|(dialog, _)| {
                 div()
                     .absolute()
@@ -2850,6 +2918,7 @@ mod tests {
             crate::editor::bind_keys(cx);
             crate::workspace::bind_keys(cx);
             crate::project_picker::bind_keys(cx);
+            crate::folder_picker::bind_keys(cx);
             crate::command_palette::bind_keys(cx);
             bind_keys(cx);
             open_window(location, None, cx);
@@ -2919,6 +2988,49 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    #[cfg(unix)]
+    fn open_project_browses_the_connected_machine_instead_of_prompting_locally(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, alpha, _) = two_projects("remote-folder-dialog");
+        cx.update(app_state::init);
+        let window = open_shell(alpha, cx);
+        let project = Project::test_ssh(root.join("alpha").canonicalize().unwrap());
+        window
+            .update(cx, |shell, window, cx| {
+                let remote = cx.new(|cx| Workspace::new(project.clone(), None, window, cx));
+                let content = Content::Workspace(remote);
+                let subscription = shell.subscribe(&content, window, cx);
+                shell.tabs[0].target = TabTarget::Project(project.location());
+                shell.tabs[0].content = content;
+                shell.tabs[0]._subscription = subscription;
+                // The GPUI test platform panics if a local path dialog is used.
+                shell.prompt_for_project(false, window, cx);
+                assert!(shell.folder_picker.is_some());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let picker = shell.folder_picker.as_ref().unwrap().0.clone();
+                picker.update(cx, |_, cx| cx.emit(FolderPickerEvent::Dismissed));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, window, cx| {
+                assert!(shell.folder_picker.is_none());
+                assert_eq!(shell.tabs.len(), 1);
+                shell.prompt_for_project(true, window, cx);
+                assert!(shell.folder_picker.is_some());
+                window.remove_window();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cleanup(root);
     }
 
     #[gpui::test]

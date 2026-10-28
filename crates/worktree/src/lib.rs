@@ -37,6 +37,44 @@ pub enum FileKind {
     Dir,
 }
 
+/// A folder dialog's unfiltered listing, resolved on the machine owning it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderListing {
+    pub path: String,
+    pub folders: Vec<String>,
+}
+
+/// Browse all directories, including ignored/hidden folders and directory
+/// symlinks. Unlike the project tree, a folder dialog must not apply ignore
+/// rules. Expand only the current user's `~`, on this machine.
+pub fn browse_folders(path: &Path) -> io::Result<FolderListing> {
+    let text = path.to_string_lossy();
+    let expanded = if text == "~" || text.starts_with("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable")
+            })?
+            .join(text.strip_prefix("~/").unwrap_or(""))
+    } else {
+        path.to_path_buf()
+    };
+    let path = fs::canonicalize(expanded)?;
+    let mut folders = Vec::new();
+    for entry in fs::read_dir(&path)? {
+        let entry = entry?;
+        if fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_dir())
+            && let Ok(name) = entry.file_name().into_string()
+        {
+            folders.push(name);
+        }
+    }
+    folders.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
+    let path = path.into_os_string().into_string().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "folder path is not valid UTF-8")
+    })?;
+    Ok(FolderListing { path, folders })
+}
+
 /// Lists one directory, honoring .gitignore (inside git repos), dirs first,
 /// then case-insensitively by name. `.git` itself is hidden.
 ///

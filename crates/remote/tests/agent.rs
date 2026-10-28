@@ -73,6 +73,52 @@ fn next<T>(stream: &mut futures::channel::mpsc::UnboundedReceiver<T>) -> Option<
 }
 
 #[test]
+fn folders_are_browsed_on_the_agent_outside_the_project_without_ignore_rules() {
+    let root = temp_dir("browse");
+    for name in ["current", "ignored project", ".hidden", ".git"] {
+        fs::create_dir_all(root.join(name)).unwrap();
+    }
+    fs::write(root.join(".gitignore"), "ignored project/\n").unwrap();
+    fs::write(root.join("file.txt"), "not a folder").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("ignored project"), root.join("linked")).unwrap();
+    let (client, info, agent) = connect(&root.join("current"));
+    assert_eq!(info.root, path_str(&root.join("current")));
+    let listing = client.browse_folders(path_str(&root)).unwrap();
+    assert_eq!(listing.path, path_str(&root));
+    let expected: Vec<_> = [".git", ".hidden", "current", "ignored project"]
+        .into_iter()
+        .chain(cfg!(unix).then_some("linked"))
+        .collect();
+    assert_eq!(listing.folders, expected);
+    let parent = client
+        .browse_folders(path_str(&root.join("current/..")))
+        .unwrap();
+    assert_eq!(parent, listing);
+    let home = client.browse_folders("~").unwrap();
+    assert!(Path::new(&home.path).is_absolute());
+    #[cfg(unix)]
+    assert_eq!(Path::new(&home.path), fs::canonicalize(info.home).unwrap());
+    assert_eq!(
+        client
+            .browse_folders(path_str(&root.join("file.txt")))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotADirectory
+    );
+    assert_eq!(
+        client
+            .browse_folders(path_str(&root.join("missing")))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    drop(client);
+    agent.join().unwrap().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn files_are_listed_read_written_and_stated_through_the_agent() {
     let root = temp_dir("files");
     fs::create_dir_all(root.join(".git")).unwrap();

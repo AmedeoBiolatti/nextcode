@@ -682,6 +682,42 @@ fn serve_host(
 }
 
 impl Project {
+    /// An SSH-shaped project served by an in-process agent, without host
+    /// credential forwarding or changes to the user's agent/configuration.
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_ssh(root: PathBuf) -> Self {
+        let (reader, agent_writer) = io::pipe().unwrap();
+        let (agent_reader, writer) = io::pipe().unwrap();
+        thread::spawn(move || next_code_agent::serve(agent_reader, agent_writer).unwrap());
+        let (client, _) = AgentClient::connect(
+            remote::Transport {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                child: None,
+                stderr: None,
+            },
+            "test SSH machine",
+            root.to_str().unwrap(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        Self(Arc::new(Inner {
+            root: root.clone(),
+            roots: vec![root_of_path(root, None, true)],
+            workspace: None,
+            folder_settings: Mutex::new(vec![None]),
+            backend: Backend::Remote {
+                client,
+                host: RemoteHost::Connector {
+                    scheme: "ssh".into(),
+                    host: "test-host".into(),
+                },
+            },
+            _pinpoint: None,
+            _host: Arc::new(Mutex::new(None)),
+        }))
+    }
+
     pub fn local(root: PathBuf) -> Self {
         Self::build(vec![root_of_path(root, None, false)], None, Backend::Local)
     }
@@ -1370,6 +1406,14 @@ impl Project {
         match &self.0.backend {
             Backend::Local => worktree::read_dir(dir),
             Backend::Remote { client, .. } => client.read_dir(agent_path(dir)?),
+        }
+    }
+
+    /// A folder dialog on this project's machine, without tree ignore rules.
+    pub fn browse_folders(&self, path: &str) -> io::Result<worktree::FolderListing> {
+        match &self.0.backend {
+            Backend::Local => worktree::browse_folders(Path::new(path)),
+            Backend::Remote { client, .. } => client.browse_folders(path),
         }
     }
 

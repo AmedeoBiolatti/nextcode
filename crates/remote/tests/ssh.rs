@@ -61,6 +61,13 @@ HOME='{home}' exec /bin/sh -c "$command"
     })
     .unwrap();
     assert_eq!(connection.info.root, project.to_str().unwrap());
+    let folders = connection.client.browse_folders("~").unwrap();
+    assert_eq!(folders.path, home.to_str().unwrap());
+    let folders = connection
+        .client
+        .browse_folders(project.join("..").to_str().unwrap())
+        .unwrap();
+    assert!(folders.folders.contains(&"project".to_owned()));
     assert_eq!(
         connection
             .client
