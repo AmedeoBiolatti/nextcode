@@ -143,7 +143,7 @@ pub(super) fn validate_manifest(manifest: &Manifest) -> Result<()> {
         "extension version must be a valid semantic version, e.g. 1.0.0"
     );
     ensure!(
-        manifest.api_version == API_VERSION,
+        matches!(manifest.api_version, 2 | API_VERSION),
         "unsupported extension API version {}; host supports {}",
         manifest.api_version,
         API_VERSION
@@ -198,6 +198,30 @@ pub(super) fn validate_manifest(manifest: &Manifest) -> Result<()> {
         !permissions.contains(&Permission::EditDocument)
             || permissions.contains(&Permission::ReadDocument),
         "edit-document requires read-document permission"
+    );
+    ensure!(manifest.processes.len() <= 16, "too many declared programs");
+    let mut programs = HashSet::new();
+    for process in &manifest.processes {
+        let name = &process.program;
+        ensure!(
+            !name.is_empty()
+                && name.len() <= 128
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                && !name.starts_with('.')
+                && !is_windows_device(name),
+            "program must be a bare executable name"
+        );
+        ensure!(programs.insert(name), "duplicate declared program");
+    }
+    ensure!(
+        manifest.processes.is_empty() == !permissions.contains(&Permission::RunProcess),
+        "run-process requires declared programs, and declared programs require run-process"
+    );
+    ensure!(
+        manifest.api_version >= 3 || manifest.processes.is_empty(),
+        "processes require API 3"
     );
     Ok(())
 }

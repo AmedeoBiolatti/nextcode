@@ -10,7 +10,7 @@ use std::{
 
 use futures::StreamExt;
 
-use extension_api::{InputValue, PanelContribution, PanelUpdate, UiEvent};
+use extension_api::{InputValue, PanelContribution, PanelUpdate};
 use gpui::{
     AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     KeyBinding, PromptLevel, SharedString, Subscription, Task, Window, actions, div, prelude::*,
@@ -451,9 +451,7 @@ pub enum WorkspaceEvent {
     Reopen(project::Location),
     ExtensionUi {
         view: Entity<ExtensionView>,
-        revision: u64,
-        event: UiEvent,
-        inputs: std::collections::BTreeMap<String, InputValue>,
+        event: ExtensionViewEvent,
     },
 }
 

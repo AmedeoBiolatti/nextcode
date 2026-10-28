@@ -59,6 +59,7 @@ text.workspace = true
 unicode-width.workspace = true
 watcher.workspace = true
 remote.workspace = true
+proto.workspace = true
 worktree.workspace = true
 git.workspace = true
 devcontainer.workspace = true

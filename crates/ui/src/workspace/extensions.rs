@@ -12,11 +12,13 @@ pub(super) struct ExtensionPanel {
     view: Entity<ExtensionView>,
     docked: bool,
     _subscription: Subscription,
+    _lifetime: crate::extension_views::PanelLifetime,
 }
 
 pub(crate) struct ExtensionPanelOrigin {
     pub view: Entity<ExtensionView>,
     pub revision: u64,
+    pub process_result: bool,
     /// Only UI events have a submitted form; opening replies may also
     /// initialise other declared panels.
     pub submitted_inputs: Option<BTreeMap<String, InputValue>>,
@@ -72,19 +74,12 @@ impl Workspace {
             if !this.contains_extension_view(&view) {
                 return;
             }
-            let ExtensionViewEvent::Invoke {
-                revision,
-                event,
-                inputs,
-            } = event;
-            if view.read(cx).revision() != *revision {
+            if view.read(cx).revision() != event.revision() {
                 return;
             }
             cx.emit(WorkspaceEvent::ExtensionUi {
                 view,
-                revision: *revision,
                 event: event.clone(),
-                inputs: inputs.clone(),
             });
         });
         let docked = matches!(contribution.placement, PanelPlacement::Dock);
@@ -95,6 +90,7 @@ impl Workspace {
             title: contribution.title.clone().into(),
             docked,
             _subscription: subscription,
+            _lifetime: crate::extension_views::PanelLifetime(view.read(cx).lifetime.clone()),
         });
         let model = crate::extensions::shared(cx);
         let busy = model.read(cx).running.is_some();
@@ -158,7 +154,14 @@ impl Workspace {
                 .as_ref()
                 .filter(|origin| origin.view == view)
                 .and_then(|origin| origin.submitted_inputs.as_ref());
-            view.update(cx, |view, cx| view.replace(update, submitted, cx));
+            view.update(cx, |view, cx| {
+                view.replace_from(
+                    update,
+                    submitted,
+                    origin.as_ref().is_some_and(|o| o.process_result),
+                    cx,
+                )
+            });
         }
         cx.notify();
         Ok(())

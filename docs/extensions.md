@@ -4,8 +4,10 @@ NextCode loads local, import-free WASM extension packages. The versioned
 interface is UTF-8 JSON in WASM linear memory, not Rust's native ABI: other
 languages can implement the same interface without changing the editor.
 The supplied Rust SDK supports commands, document edits and native declarative
-UI panels. API2 replaces API1; rebuild existing extensions with the updated
-SDK and manifest (`api_version: 2`), then replace/reload or reinstall them.
+UI panels. API 3 adds declared project programs and refresh timers. API 2
+packages remain supported with their existing permissions and envelope. New
+SDK builds and the examples use `api_version: 3`; replace/reload or reinstall
+a package after rebuilding it.
 
 ## Install and run
 
@@ -25,7 +27,7 @@ packages**, cancellation, and an **Extension output** channel. Click an
 extension's name to filter its output; **Extension output (all)** restores
 all channels. Output is session-only and bounded to 1,000 entries / 4 MiB.
 Reload rereads packages and persisted grants and closes existing panels.
-Additional permissions require approval again. Installed folders are never overwritten.
+Additional permissions or declared programs require approval again. Installed folders are never overwritten.
 For development, replace your installed WASM file and use Reload packages;
 remove an installed folder manually before reinstalling its package.
 Package files and directory components must not be symlinks.
@@ -79,6 +81,9 @@ panels in `extension.json`; versions use semantic versioning. Permissions:
   primary selection. Without it, `document` is `null`.
 - `edit-document`: return edits against that snapshot; requires
   `read-document`. All edits validate before any apply.
+- `run-process` (API 3): run the executables listed in `processes`, with
+  arguments supplied by the extension, on the project’s machine. Programs
+  have that account’s file, network and environment access.
 
 Notebook cells, diff views and input fields are not extension document
 targets. WSL/container documents use their existing editor buffers; the
@@ -135,9 +140,9 @@ A UI-event response may update only its originating panel. All response
 models are validated before applying them; returning UI/edits with an
 error, duplicate widget IDs or undeclared panels is invalid.
 
-## Language-neutral ABI, version 2
+## Language-neutral ABI, versions 2 and 3
 
-The manifest's exact fields are `id`, `name`, `version`, `api_version: 2`,
+The manifest's exact fields are `id`, `name`, `version`, `api_version` (2 or 3),
 `module` (one plain `.wasm` filename), `commands` (`id`, `title`), `panels`
 (`id`, `title`, `placement`) and `permissions`. At least one command or
 panel is required. Unknown fields/capabilities, duplicate contributions and
@@ -162,7 +167,7 @@ Request:
 
 ```json
 {
-  "api_version": 2,
+  "api_version": 3,
   "invocation": {"kind": "command", "id": "uppercase-selection"},
   "document": {
     "version": 7,
@@ -237,3 +242,65 @@ finite in [0, 1]. Layout gaps/spaces are 0–48 px; scroll heights 32–600 px,
 chart heights 120–500 px. The encoded response limit includes all panels.
 JSON escaping counts toward encoded limits. Failures are shown in output
 and command errors also appear in the editor notice.
+
+## Project programs and refresh timers (API 3)
+
+A manifest declares the executable names its panel may run:
+
+```json
+{"permissions":["run-process"],"processes":[{"program":"kx"}]}
+```
+
+Enable displays these names; grants record both permissions and programs.
+Adding another program needs approval again. Names are bare executables,
+without paths or shell syntax. This limits which program starts; it does
+not sandbox that program or restrict its subcommands.
+
+A response to `open-panel`, `ui-event`, `refresh` or `process-exit` may
+start programs bound to the originating panel:
+
+```json
+{"processes":[{"id":"status","program":"kx","args":["nextcode","panel"],"timeout_ms":30000}]}
+```
+
+The host executes argv directly, without a shell or globbing, in the
+project's first root, on its local, WSL, container or SSH host. Stdin is
+closed; the process inherits the host environment. Programs must be
+installed where the project lives. Four processes may run per extension,
+and a panel may have at most four active or queued results. Process IDs
+must be unique among that panel's outstanding jobs. Timeout defaults to
+30 seconds and must be between 1 ms and 120 seconds. Each output stream
+is drained but retained only up to 256 KiB, before UTF-8 decoding and JSON
+escaping; excess output sets `truncated`. Invalid UTF-8 is replaced.
+
+Completion invokes the extension with the current panel revision, state
+and form inputs, plus:
+
+```json
+{"kind":"process-exit","panel":"overview","revision":4,"state":{},"inputs":{},"process":{"id":"status","exit_code":0,"stdout":"...","stderr":"","truncated":false,"error":null}}
+```
+
+Start errors, timeout and cancellation use a null exit code and an error
+message. Processes and descendants are ended on cancellation, panel or
+project closure, package reload and disable. Replacement by an unrelated
+panel response cancels outstanding jobs and discards their replies.
+Sibling completions are delivered serially, using the updated revision
+after each reply. Moving a panel between dock and editor preserves jobs.
+Process waits do not occupy the application's WASM invocation slot.
+Cancelling in Manage Extensions discards cancelled jobs and stops their
+timer until another panel update or a user action.
+
+`"response":"stdout"` on a process skips WASM on exit zero with complete
+output. Stdout is parsed and validated with the same manifest, permissions,
+panel scope and live-origin checks as a WASM reply. Errors still invoke
+`process-exit`. This is useful for tools that produce an entire native
+panel response and avoids reparsing nested JSON inside WASM's fuel budget.
+
+A panel update can include `"refresh_ms":10000` (1 second to 24 hours).
+It schedules one `refresh` invocation with `panel`, `revision`, `state`
+and `inputs`, with no `process` or `event`. The timer waits for that
+panel's invocation, active processes and queued completions; missed time
+produces one refresh, never a backlog. The next update must set the timer
+again to keep polling. Updating without `refresh_ms` cancels it. An empty
+response leaves the displayed panel intact. An opening response may start
+processes without a panel update; the host shows a loading placeholder.

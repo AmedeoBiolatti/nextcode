@@ -107,10 +107,9 @@ fn spawn_piped(request: SpawnRequest, sink: EventSink) -> io::Result<Arc<Piped>>
     thread::Builder::new()
         .name("agent-wait".into())
         .spawn(move || {
-            out.join().ok();
-            err.join().ok();
-            // Output closed: the process is exiting; poll so `kill` never
-            // waits behind a blocking `wait`.
+            // Reap independently of output: descendants can retain stdout
+            // after the leader exits. Poll so cancellation never waits behind
+            // a blocking wait while holding the child lock.
             let code = loop {
                 match child.lock().try_wait() {
                     Ok(Some(status)) => break status.code(),
@@ -119,6 +118,14 @@ fn spawn_piped(request: SpawnRequest, sink: EventSink) -> io::Result<Arc<Piped>>
                 }
                 thread::sleep(Duration::from_millis(20));
             };
+            #[cfg(unix)]
+            // SAFETY: this child was the leader of its own process group.
+            // End remaining members before joining their inherited pipes.
+            unsafe {
+                libc::kill(-(child.lock().id() as libc::pid_t), libc::SIGKILL);
+            }
+            out.join().ok();
+            err.join().ok();
             sink.finish(Event::Exited { code });
         })?;
     Ok(process)

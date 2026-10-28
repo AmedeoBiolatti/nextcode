@@ -526,6 +526,7 @@ fn panel_contribution(id: &str, placement: extension_api::PanelPlacement) -> Pan
 
 fn panel_update(id: &str, count: u64) -> PanelUpdate {
     PanelUpdate {
+        refresh_ms: None,
         id: id.into(),
         root: extension_api::Widget::Label {
             id: "result".into(),
@@ -563,7 +564,7 @@ fn extension_placement_preserves_view_and_state_but_close_rejects_late_replies(
         // Stale origins cannot mutate the current model or open another panel.
         workspace.apply_extension_panels("test.extension", &contributions, vec![panel_update("dock", 8)], None, window, cx).unwrap();
         assert!(workspace.apply_extension_panels("test.extension", &contributions, vec![panel_update("editor", 9)],
-            Some(ExtensionPanelOrigin { view: view.clone(), revision, submitted_inputs: Some(Default::default()) }), window, cx).is_err());
+            Some(ExtensionPanelOrigin { process_result: false, view: view.clone(), revision, submitted_inputs: Some(Default::default()) }), window, cx).is_err());
         assert!(workspace.extension_panel("test.extension", "editor").is_none());
         let revision = view.read(cx).revision();
         workspace.move_extension_to_editor(view.entity_id(), window, cx);
@@ -571,7 +572,7 @@ fn extension_placement_preserves_view_and_state_but_close_rejects_late_replies(
         workspace.close_tab(pane, index, window, cx);
         assert!(!workspace.contains_extension_view(&view));
         assert!(workspace.apply_extension_panels("test.extension", &contributions, vec![panel_update("dock", 10)],
-            Some(ExtensionPanelOrigin { view, revision, submitted_inputs: Some(Default::default()) }), window, cx).is_err());
+            Some(ExtensionPanelOrigin { process_result: false, view, revision, submitted_inputs: Some(Default::default()) }), window, cx).is_err());
     }).unwrap();
     assert!(!cx.has_pending_prompt());
     window
@@ -647,6 +648,7 @@ fn extension_open_accepts_multiple_declared_panels_atomically(cx: &mut TestAppCo
                     &contributions,
                     vec![panel_update("main", 7), panel_update("other", 9)],
                     Some(ExtensionPanelOrigin {
+                        process_result: false,
                         view: view.clone(),
                         revision,
                         submitted_inputs: None,
@@ -674,6 +676,7 @@ fn extension_open_accepts_multiple_declared_panels_atomically(cx: &mut TestAppCo
                         &contributions,
                         vec![panel_update("main", 99), panel_update("other", 99)],
                         Some(ExtensionPanelOrigin {
+                            process_result: false,
                             view: view.clone(),
                             revision,
                             submitted_inputs: Some(Default::default())
@@ -698,4 +701,23 @@ fn extension_open_accepts_multiple_declared_panels_atomically(cx: &mut TestAppCo
         .unwrap();
     cx.run_until_parked();
     cleanup(&root);
+}
+
+#[gpui::test]
+fn closing_extension_panel_cancels_its_lifetime_even_when_a_reply_retains_the_view(
+    cx: &mut TestAppContext,
+) {
+    let root = project_dir("extension-lifetime");
+    let window = open_workspace(&root, cx);
+    window
+        .update(cx, |workspace, window, cx| {
+            let contribution = panel_contribution("overview", extension_api::PanelPlacement::Dock);
+            let view =
+                workspace.prepare_extension_panel("test.extension", &contribution, window, cx);
+            let lifetime = view.read(cx).lifetime.clone();
+            workspace.close_extension_panel(view.entity_id(), window, cx);
+            assert!(lifetime.is_cancelled());
+            assert!(!workspace.contains_extension_view(&view));
+        })
+        .unwrap();
 }

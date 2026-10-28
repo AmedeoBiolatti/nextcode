@@ -753,20 +753,11 @@ impl Shell {
                         let id = workspace.entity_id();
                         this.reopen(id, location.clone(), window, cx);
                     }
-                    WorkspaceEvent::ExtensionUi {
-                        view,
-                        revision,
-                        event,
-                        inputs,
-                    } => {
+                    WorkspaceEvent::ExtensionUi { view, event } => {
                         this.run_extension_ui(
                             workspace.clone(),
                             view.clone(),
-                            crate::extension_views::ExtensionViewEvent::Invoke {
-                                revision: *revision,
-                                event: event.clone(),
-                                inputs: inputs.clone(),
-                            },
+                            event.clone(),
                             window,
                             cx,
                         );
@@ -3622,5 +3613,102 @@ mod tests {
         };
         assert_eq!(tab_title(&container(local)), "next_code [Container]");
         assert_eq!(tab_title(&container(wsl)), "app [Ubuntu, Container]");
+    }
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn extension_process_stdout_renders_and_refreshes_through_the_shell(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, alpha, _) = two_projects("extension-process-stdout");
+        let package = root.join("extension");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("extension.json"), serde_json::to_vec(&serde_json::json!({
+            "id":"process.test", "name":"Process", "version":"1.0.0", "api_version":3, "module":"x.wasm",
+            "commands":[], "panels":[{"id":"overview","title":"Overview","placement":"editor"}],
+            "permissions":["run-process"], "processes":[{"program":"printf"}]
+        })).unwrap()).unwrap();
+        let panel = serde_json::json!({"panels":[{"id":"overview","refresh_ms":1000,
+            "state":{"ready":true}, "root":{"type":"label","id":"result","text":"project status"}}]}).to_string();
+        // A constant module is intentional: successful stdout must become the
+        // response directly, rather than invoking this module and spawning again.
+        let reply = serde_json::json!({"processes":[{"id":"status","program":"printf","args":[panel],"response":"stdout"}]}).to_string();
+        let data: String = reply
+            .as_bytes()
+            .iter()
+            .map(|b| format!("\\{b:02x}"))
+            .collect();
+        let packed = ((reply.len() as u64) << 32) | 1024;
+        let wasm = wat::parse_str(format!(
+            r#"(module
+            (memory (export "memory") 64)
+            (data (i32.const 1024) "{data}")
+            (func (export "nextcode_alloc") (param i32) (result i32) i32.const 2097152)
+            (func (export "nextcode_run") (param i32 i32) (result i64) i64.const {packed}))"#
+        ))
+        .unwrap();
+        std::fs::write(package.join("x.wasm"), wasm).unwrap();
+        let extension = ::extensions::Extension::load(&package).unwrap();
+        let window = open_shell(alpha, cx);
+        let store = cx.update(crate::extensions::shared);
+        store.update(cx, |store, cx| {
+            store.entries.push(crate::extensions::Entry {
+                extension,
+                enabled: true,
+            });
+            cx.notify();
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                shell.open_extension_panel(
+                    &crate::extensions::OpenExtensionPanel {
+                        extension: "process.test".into(),
+                        panel: "overview".into(),
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        let revision = |cx: &mut gpui::TestAppContext| {
+            window
+                .read_with(cx, |shell, cx| {
+                    let Content::Workspace(workspace) = &shell.tabs[shell.active].content else {
+                        panic!("project must be open")
+                    };
+                    workspace
+                        .read(cx)
+                        .extension_panel("process.test", "overview")
+                        .and_then(|view| {
+                            view.read(cx)
+                                .model()
+                                .filter(|m| {
+                                    m.state.get("ready").and_then(serde_json::Value::as_bool)
+                                        == Some(true)
+                                })
+                                .map(|_| view.read(cx).revision())
+                        })
+                        .unwrap_or(0)
+                })
+                .unwrap()
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while revision(cx) == 0 && std::time::Instant::now() < until {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let first = revision(cx);
+        assert!(first > 0);
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while revision(cx) <= first && std::time::Instant::now() < until {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(revision(cx) > first);
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.running.is_none()));
+        close_window(window, cx);
+        cleanup(root);
     }
 }

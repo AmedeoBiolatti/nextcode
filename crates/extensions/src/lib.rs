@@ -16,8 +16,8 @@ pub use panels::{validate_panel_event, validate_panel_update};
 
 use anyhow::{Context, Result, bail, ensure};
 use extension_api::{
-    API_VERSION, Document, Invocation, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Manifest, Permission,
-    Request, Response,
+    Document, Invocation, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Manifest, Permission, Request,
+    Response,
 };
 use std::{
     io::{self, Write},
@@ -118,7 +118,7 @@ impl Extension {
 
     pub fn run(&self, mut request: Request) -> Result<Response> {
         ensure!(
-            request.api_version == API_VERSION,
+            request.api_version == self.policy.api_version,
             "request API version {} is unsupported",
             request.api_version
         );
@@ -136,7 +136,24 @@ impl Extension {
                 state,
                 inputs,
                 ..
+            }
+            | Invocation::Refresh {
+                panel,
+                state,
+                inputs,
+                ..
+            }
+            | Invocation::ProcessExit {
+                panel,
+                state,
+                inputs,
+                ..
             } => {
+                ensure!(
+                    self.policy.api_version >= 3
+                        || matches!(request.invocation, Invocation::UiEvent { .. }),
+                    "background invocations require API 3"
+                );
                 ensure!(
                     self.policy.panels.iter().any(|p| p.id == *panel),
                     "unknown extension panel"
@@ -213,9 +230,18 @@ impl Extension {
             .context("extension returned an invalid output pointer/length")?;
         let response: Response = serde_json::from_slice(output)
             .context("extension response must be valid UTF-8 protocol JSON")?;
+        self.validate_reply(&request, &response)?;
+        Ok(response)
+    }
+    /// Validate host-provided stdout exactly like a WASM reply. No effects are
+    /// applied until this and the UI's live-origin checks have both succeeded.
+    pub fn validate_reply(&self, request: &Request, response: &Response) -> Result<()> {
         validate_response(
-            &response,
-            request.document.as_ref(),
+            response,
+            request
+                .document
+                .as_ref()
+                .filter(|_| self.policy.permissions.contains(&Permission::ReadDocument)),
             &self.policy.permissions,
         )?;
         let mut ids = std::collections::HashSet::new();
@@ -225,7 +251,10 @@ impl Extension {
                 "response updates undeclared panel"
             );
             ensure!(ids.insert(&panel.id), "duplicate panel update");
-            if let Invocation::UiEvent { panel: target, .. } = &request.invocation {
+            if let Invocation::UiEvent { panel: target, .. }
+            | Invocation::Refresh { panel: target, .. }
+            | Invocation::ProcessExit { panel: target, .. } = &request.invocation
+            {
                 ensure!(target == &panel.id, "event updates another panel");
             }
         }
@@ -233,11 +262,57 @@ impl Extension {
             && let Invocation::OpenPanel { id } = &request.invocation
         {
             ensure!(
-                response.panels.iter().any(|p| &p.id == id),
+                response.panels.iter().any(|p| &p.id == id)
+                    || (self.policy.api_version >= 3 && !response.processes.is_empty()),
                 "open-panel response omitted requested panel"
             );
         }
-        Ok(response)
+
+        ensure!(
+            self.policy.api_version >= 3
+                || (response.processes.is_empty()
+                    && response.panels.iter().all(|p| p.refresh_ms.is_none())),
+            "processes and timers require API 3"
+        );
+        if !response.processes.is_empty() {
+            ensure!(
+                self.policy.permissions.contains(&Permission::RunProcess),
+                "extension lacks run-process permission"
+            );
+            ensure!(
+                !matches!(request.invocation, Invocation::Command { .. }),
+                "processes require a panel invocation"
+            );
+        }
+        let mut ids = std::collections::HashSet::new();
+        for process in &response.processes {
+            panels::validate_id(&process.id)?;
+            ensure!(ids.insert(&process.id), "duplicate process id");
+            ensure!(
+                self.policy
+                    .processes
+                    .iter()
+                    .any(|p| p.program == process.program),
+                "undeclared program"
+            );
+            ensure!(
+                (1..=extension_api::MAX_PROCESS_TIMEOUT_MS).contains(&process.timeout_ms),
+                "invalid process timeout"
+            );
+            ensure!(
+                process.args.len() <= 256
+                    && process
+                        .args
+                        .iter()
+                        .all(|a| a.len() <= 65536 && !a.contains('\0')),
+                "invalid or excessive process arguments"
+            );
+            ensure!(
+                process.args.iter().map(String::len).sum::<usize>() <= 65536,
+                "process arguments exceed 64 KiB"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -328,8 +403,15 @@ pub fn validate_response(
     );
     panels::validate_encoded_size(response, MAX_RESPONSE_BYTES)?;
     ensure!(
-        response.error.is_none() || (response.edits.is_empty() && response.panels.is_empty()),
+        response.error.is_none()
+            || (response.edits.is_empty()
+                && response.panels.is_empty()
+                && response.processes.is_empty()),
         "response contains updates together with error"
+    );
+    ensure!(
+        response.processes.len() <= extension_api::MAX_PROCESSES,
+        "too many processes"
     );
     ensure!(response.panels.len() <= 8, "too many panel updates");
     for panel in &response.panels {
@@ -379,5 +461,7 @@ impl Write for BoundedJson {
     }
 }
 
+#[cfg(test)]
+use extension_api::API_VERSION;
 #[cfg(test)]
 mod tests;

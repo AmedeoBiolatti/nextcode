@@ -7,7 +7,7 @@ use crate::{
     },
     workspace::ExtensionPanelOrigin as PanelOrigin,
 };
-use extension_api::{API_VERSION, Invocation, Permission, Request};
+use extension_api::{Invocation, Permission, Request};
 use std::sync::atomic::Ordering;
 
 impl Shell {
@@ -122,6 +122,7 @@ impl Shell {
                     "Read the active document.\nIncludes path and selection."
                 }
                 Permission::EditDocument => "Edit that document.\nUndoable; never auto-saved.",
+                Permission::RunProcess => "Run declared programs.\nOn the project host.\nUses your account’s\nfiles, network and env.",
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -134,8 +135,29 @@ impl Shell {
             .map(|chunk| std::str::from_utf8(chunk).expect("validated ASCII id and version"))
             .collect::<Vec<_>>()
             .join("\n");
+        let programs = manifest
+            .processes
+            .iter()
+            .map(|p| {
+                format!(
+                    "Run in the project:\n{}",
+                    p.program
+                        .as_bytes()
+                        .chunks(24)
+                        .map(|s| std::str::from_utf8(s).expect("ASCII program name"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let access = if programs.is_empty() {
+            "No filesystem or network.\nNo processes or environment.".to_owned()
+        } else {
+            format!("{programs}\nPrograms may access\nfiles and the network.")
+        };
         let detail = format!(
-            "{identity}\n\n{}\n\nNo filesystem or network.\nNo processes or environment.\nSettings are shared with it.",
+            "{identity}\n\n{}\n\n{access}\nSettings are shared with it.",
             if permissions.is_empty() {
                 "No document permissions"
             } else {
@@ -143,6 +165,7 @@ impl Shell {
             }
         );
         let approved = manifest.permissions.clone();
+        let approved_programs = manifest.processes.clone();
         let answer = window.prompt(
             PromptLevel::Warning,
             "Enable extension?",
@@ -160,6 +183,7 @@ impl Shell {
                         if store.entries.iter().any(|entry| {
                             entry.extension.manifest.id == id
                                 && entry.extension.manifest.permissions == approved
+                                && entry.extension.manifest.processes == approved_programs
                         }) {
                             store.set_enabled(&id, true, cx);
                         }
@@ -239,11 +263,12 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ExtensionViewEvent::Invoke {
-            revision,
-            event,
-            inputs,
-        } = input;
+        if matches!(input, ExtensionViewEvent::Background { .. })
+            && (self.extensions.read(cx).running.is_some() || self.extensions.read(cx).loading)
+        {
+            view.update(cx, |view, _| view.defer_background(input));
+            return;
+        }
         let id = view.read(cx).extension().to_owned();
         if !workspace.read(cx).contains_extension_view(&view) {
             return;
@@ -252,28 +277,77 @@ impl Shell {
         let Some(model) = current.model() else {
             return;
         };
+        let revision = input.revision();
         if current.revision() != revision {
             return;
         }
-        if let Err(err) = ::extensions::validate_panel_event(model, &event, &inputs) {
-            self.extension_error(&id, format!("{err:#}"), cx);
-            return;
-        }
-        let invocation = Invocation::UiEvent {
-            panel: model.id.clone(),
-            revision,
-            state: model.state.clone(),
-            inputs: inputs.clone(),
-            event,
+        let (invocation, inputs, direct, process_result) = match input {
+            ExtensionViewEvent::Invoke { event, inputs, .. } => {
+                if let Err(err) = ::extensions::validate_panel_event(model, &event, &inputs) {
+                    self.extension_error(&id, format!("{err:#}"), cx);
+                    return;
+                }
+                (
+                    Invocation::UiEvent {
+                        panel: model.id.clone(),
+                        revision,
+                        state: model.state.clone(),
+                        inputs: inputs.clone(),
+                        event,
+                    },
+                    inputs,
+                    None,
+                    false,
+                )
+            }
+            ExtensionViewEvent::Background {
+                process,
+                direct,
+                inputs,
+                ..
+            } => {
+                if let Some(process) = process {
+                    let stdout = (direct
+                        && process.exit_code == Some(0)
+                        && !process.truncated
+                        && process.error.is_none())
+                    .then(|| process.stdout.clone());
+                    (
+                        Invocation::ProcessExit {
+                            panel: model.id.clone(),
+                            revision,
+                            state: model.state.clone(),
+                            inputs: inputs.clone(),
+                            process,
+                        },
+                        inputs,
+                        stdout,
+                        true,
+                    )
+                } else {
+                    (
+                        Invocation::Refresh {
+                            panel: model.id.clone(),
+                            revision,
+                            state: model.state.clone(),
+                            inputs: inputs.clone(),
+                        },
+                        inputs,
+                        None,
+                        false,
+                    )
+                }
+            }
         };
-        self.invoke_extension(
+        self.invoke_extension_reply(
             &id,
-            invocation,
+            (invocation, direct),
             Some(workspace),
             Some(PanelOrigin {
                 view,
                 revision,
                 submitted_inputs: Some(inputs),
+                process_result,
             }),
             window,
             cx,
@@ -284,6 +358,18 @@ impl Shell {
         &mut self,
         id: &str,
         invocation: Invocation,
+        workspace: Option<Entity<Workspace>>,
+        origin: Option<PanelOrigin>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.invoke_extension_reply(id, (invocation, None), workspace, origin, window, cx);
+    }
+
+    fn invoke_extension_reply(
+        &mut self,
+        id: &str,
+        (invocation, direct): (Invocation, Option<String>),
         workspace: Option<Entity<Workspace>>,
         mut origin: Option<PanelOrigin>,
         window: &mut Window,
@@ -378,6 +464,7 @@ impl Shell {
                 view,
                 revision,
                 submitted_inputs: None,
+                process_result: false,
             });
         }
         self.notice = None;
@@ -386,12 +473,23 @@ impl Shell {
         let background_id = id.clone();
         let task = cx.background_spawn(async move {
             let settings = extensions::read_settings(&background_id)?;
-            extension.run(Request {
-                api_version: API_VERSION,
+            let request = Request {
+                api_version: extension.manifest.api_version,
                 invocation,
                 document,
                 settings,
-            })
+            };
+            if let Some(stdout) = direct {
+                anyhow::ensure!(
+                    stdout.len() <= extension_api::MAX_RESPONSE_BYTES,
+                    "process response exceeds 1 MiB"
+                );
+                let response = serde_json::from_str(&stdout)?;
+                extension.validate_reply(&request, &response)?;
+                Ok(response)
+            } else {
+                extension.run(request)
+            }
         });
         let store = self.extensions.clone();
         let window = window.window_handle();
@@ -424,6 +522,13 @@ impl Shell {
                             return Err("Panel was closed or replaced; stale extension result discarded".into());
                         }
                     }
+                    let requests = std::mem::take(&mut response.processes);
+                    if !requests.is_empty() {
+                        let origin = origin.as_ref().ok_or("Processes require an originating panel")?;
+                        origin.view.read(cx).can_start_processes(&requests)?;
+                        let active = this.extensions.read(cx).process_count(&id);
+                        if active + requests.len() > extension_api::MAX_PROCESSES { return Err("At most four processes may run per extension".into()); }
+                    }
                     if !response.edits.is_empty() {
                         let (Some(editor), Some((version, path)), Some(workspace)) = (&editor, &version, &workspace) else {
                             return Err("No document is available for extension edits".into());
@@ -437,12 +542,18 @@ impl Shell {
                     if !response.panels.is_empty() {
                         let response_origin = origin.as_mut().map(|origin| PanelOrigin {
                             view: origin.view.clone(), revision: origin.revision,
-                            submitted_inputs: origin.submitted_inputs.take(),
+                            submitted_inputs: origin.submitted_inputs.take(), process_result: origin.process_result,
                         });
                         workspace.as_ref().unwrap().update(cx, |workspace, cx| {
                             workspace.apply_extension_panels(&id, &contributions,
                                 std::mem::take(&mut response.panels), response_origin, window, cx)
                         })?;
+                    }
+                    if !requests.is_empty() {
+                        let origin = origin.as_ref().unwrap();
+                        let workspace = workspace.as_ref().unwrap();
+                        let project = workspace.read(cx).project().clone();
+                        this.start_extension_processes(&id, project, &origin.view, requests, cx)?;
                     }
                     Ok(())
                 })();
@@ -454,6 +565,7 @@ impl Shell {
                             origin.view.update(cx, |view, cx| view.fail(error.clone(), cx));
                     }
                 }
+                if let Some(origin) = &origin { origin.view.update(cx, |view, cx| view.finish_invocation(cx)); }
                 cx.notify();
                 outcome
             }));
@@ -463,5 +575,63 @@ impl Shell {
             };
             store.update(cx, |store, cx| store.finish(&id, logs, outcome, cx)).ok();
         }).detach();
+    }
+    fn start_extension_processes(
+        &mut self,
+        id: &str,
+        project: crate::project::Project,
+        view: &Entity<ExtensionView>,
+        requests: Vec<extension_api::ProcessRequest>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let slots = self
+            .extensions
+            .update(cx, |store, _| store.reserve_processes(id, requests.len()))?;
+        view.update(cx, |view, cx| {
+            if view.model().is_none() {
+                view.replace_from(
+                    extension_api::PanelUpdate {
+                        id: view.panel().to_owned(),
+                        refresh_ms: None,
+                        state: serde_json::json!({}),
+                        root: extension_api::Widget::Label {
+                            id: "loading".into(),
+                            text: "Loading…".into(),
+                        },
+                    },
+                    None,
+                    false,
+                    cx,
+                );
+            }
+        });
+        let lifetime = view.read(cx).lifetime.clone();
+        for (request, (slot, token)) in requests.into_iter().zip(slots) {
+            view.update(cx, |view, _| {
+                view.start_process(request.id.clone(), token.clone())
+            });
+            let view = view.downgrade();
+            let store = self.extensions.clone();
+            let project = project.clone();
+            let lifetime = lifetime.clone();
+            let direct = request.response == Some(extension_api::ProcessResponse::Stdout);
+            let worker_token = token.clone();
+            let task = cx.background_spawn(async move {
+                project.run_extension_process(&request, &worker_token, &lifetime)
+            });
+            cx.spawn(async move |_, cx| {
+                let result = task.await;
+                // Do not let a cancelled old job consume a newer job's reused ID.
+                view.update(cx, |view, cx| {
+                    view.process_finished(result, &token, direct, cx)
+                })
+                .ok();
+                store
+                    .update(cx, |store, cx| store.process_finished(slot, cx))
+                    .ok();
+            })
+            .detach();
+        }
+        Ok(())
     }
 }

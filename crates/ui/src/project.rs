@@ -33,6 +33,7 @@ use crate::{
     workspace_file::{self, Folder},
 };
 
+mod extension_process;
 mod pinpoint;
 mod process_tree;
 

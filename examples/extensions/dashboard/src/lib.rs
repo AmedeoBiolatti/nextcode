@@ -26,7 +26,7 @@ fn handle(request: Request) -> Response {
             event,
             ..
         } => (panel, state, inputs, Some(event)),
-        Invocation::Command { .. } => {
+        _ => {
             return Response {
                 error: Some("This extension contributes panels, not commands".into()),
                 ..Response::default()
@@ -225,6 +225,7 @@ fn handle(request: Request) -> Response {
     }));
     Response {
         panels: vec![PanelUpdate {
+            refresh_ms: None,
             id,
             root: Widget::Scroll {
                 id: "scroll".into(),

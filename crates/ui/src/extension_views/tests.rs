@@ -28,6 +28,7 @@ fn panel(value: &str, include_input: bool) -> PanelUpdate {
         disabled: false,
     });
     PanelUpdate {
+        refresh_ms: None,
         id: "panel".into(),
         root: Widget::Column {
             id: "root".into(),
@@ -125,7 +126,10 @@ fn dispatch_rejects_invalid_disabled_and_busy_actions_and_emits_complete_form(
     assert_eq!(events_ref.len(), 1);
     let ExtensionViewEvent::Invoke {
         revision, inputs, ..
-    } = &events_ref[0];
+    } = &events_ref[0]
+    else {
+        panic!("expected UI event")
+    };
     assert_eq!(*revision, 1);
     assert_eq!(
         inputs.get("query"),
@@ -191,4 +195,103 @@ fn keyed_editors_keep_focus_across_revisions_and_tab_moves_in_tree_order(cx: &mu
     cx.update(|window, cx| {
         assert!(editor.focus_handle(cx).is_focused(window));
     });
+}
+
+fn exited(id: &str) -> ProcessExit {
+    ProcessExit {
+        id: id.into(),
+        exit_code: Some(0),
+        stdout: "{}".into(),
+        stderr: String::new(),
+        truncated: false,
+        error: None,
+    }
+}
+#[gpui::test]
+fn sibling_processes_complete_serially_against_the_updated_panel_revision(cx: &mut TestAppContext) {
+    let view = view(cx);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&view, move |_, event: &ExtensionViewEvent, _| {
+            recorded.borrow_mut().push(event.clone())
+        })
+    });
+    let a = CancelToken::new();
+    let b = CancelToken::new();
+    view.update(cx, |v, cx| {
+        v.replace(panel("initial", true), None, cx);
+        v.start_process("a".into(), a.clone());
+        v.start_process("b".into(), b.clone());
+        v.process_finished(exited("a"), &a, false, cx);
+        v.process_finished(exited("b"), &b, false, cx);
+        // Registry observations must not release a locally pending invocation.
+        v.set_busy(false, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(events.borrow().len(), 1);
+    assert_eq!(events.borrow()[0].revision(), 1);
+    view.update(cx, |v, cx| {
+        v.replace_from(panel("first reply", true), None, true, cx);
+        v.finish_invocation(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(events.borrow().len(), 2);
+    assert_eq!(events.borrow()[1].revision(), 2);
+}
+#[gpui::test]
+fn replacing_a_panel_cancels_jobs_and_old_ids_cannot_consume_new_results(cx: &mut TestAppContext) {
+    let view = view(cx);
+    let old = CancelToken::new();
+    let new = CancelToken::new();
+    view.update(cx, |v, cx| {
+        v.replace(panel("one", false), None, cx);
+        v.start_process("status".into(), old.clone());
+        v.replace(panel("two", false), None, cx);
+        assert!(old.is_cancelled());
+        v.start_process("status".into(), new.clone());
+        v.process_finished(exited("status"), &old, false, cx);
+        assert!(v.processes.contains_key("status"));
+        assert!(!new.is_cancelled());
+    });
+}
+#[gpui::test]
+fn panel_timer_is_one_shot_and_waits_for_processes(cx: &mut TestAppContext) {
+    let view = view(cx);
+    let token = CancelToken::new();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&view, move |_, event: &ExtensionViewEvent, _| {
+            recorded.borrow_mut().push(event.clone())
+        })
+    });
+    view.update(cx, |v, cx| {
+        let mut update = panel("one", false);
+        update.refresh_ms = Some(1000);
+        v.replace(update, None, cx);
+        v.start_process("status".into(), token.clone());
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.run_until_parked();
+    assert!(events.borrow().is_empty());
+    view.update(cx, |v, cx| {
+        v.process_finished(exited("status"), &token, false, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(events.borrow().len(), 1);
+    view.update(cx, |v, cx| v.finish_invocation(cx));
+    cx.run_until_parked();
+    assert_eq!(events.borrow().len(), 2);
+    assert!(matches!(
+        events.borrow()[1],
+        ExtensionViewEvent::Background { process: None, .. }
+    ));
+    view.update(cx, |v, cx| v.finish_invocation(cx));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.run_until_parked();
+    assert_eq!(events.borrow().len(), 2);
 }

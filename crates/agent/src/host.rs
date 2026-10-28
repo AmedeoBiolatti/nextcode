@@ -539,7 +539,7 @@ mod tests {
         fs::write(
             &store,
             "https://other:wrong-organisation@dev.azure.com/OtherOrg/Analytics/_git/repo\n\
-             https://ada:correct-organisation@dev.azure.com/Contoso/Analytics/_git/repo\n",
+             https://ada:correct-organisation@dev.azure.com/MiXTelematics/Analytics/_git/repo\n",
         )
         .unwrap();
         // A path-sensitive provider behind the installed agent helper.
@@ -582,7 +582,7 @@ mod tests {
         git.stdin
             .take()
             .unwrap()
-            .write_all(b"url=https://dev.azure.com/Contoso/Analytics/_git/repo\n\n")
+            .write_all(b"url=https://dev.azure.com/MiXTelematics/Analytics/_git/repo\n\n")
             .unwrap();
         let output = git.wait_with_output().unwrap();
         assert!(
@@ -593,7 +593,10 @@ mod tests {
         let answer = Credential::parse(&String::from_utf8(output.stdout).unwrap());
         assert_eq!(answer.get("username"), Some("ada"));
         assert_eq!(answer.get("password"), Some("correct-organisation"));
-        assert_eq!(answer.get("path"), Some("Contoso/Analytics/_git/repo"));
+        assert_eq!(
+            answer.get("path"),
+            Some("MiXTelematics/Analytics/_git/repo")
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -16,6 +16,7 @@ fn manifest() -> Manifest {
         }],
         panels: Vec::new(),
         permissions: vec![Permission::ReadDocument, Permission::EditDocument],
+        processes: Vec::new(),
     }
 }
 
@@ -645,6 +646,7 @@ fn extended_constant_expressions_are_rejected_before_approval() {
 fn panel_fixture() -> extension_api::PanelUpdate {
     use extension_api::*;
     PanelUpdate {
+        refresh_ms: None,
         id: "test.panel".into(),
         state: serde_json::json!({"count": 1}),
         root: Widget::Column {
@@ -1163,6 +1165,7 @@ fn valid_large_select_values_reach_the_guest_but_text_fields_stay_bounded() {
     use std::collections::BTreeMap;
     let value = "x".repeat(4097);
     let panel = PanelUpdate {
+        refresh_ms: None,
         id: "test.panel".into(),
         state: serde_json::Value::Null,
         root: Widget::Column {
@@ -1226,4 +1229,107 @@ fn valid_large_select_values_reach_the_guest_but_text_fields_stay_bounded() {
         *value = "x".repeat(4097);
     }
     assert!(validate_panel_update(&text_panel).is_err());
+}
+
+fn process_manifest() -> Manifest {
+    let mut m = manifest();
+    m.permissions = vec![Permission::RunProcess];
+    m.processes = vec![extension_api::DeclaredProcess {
+        program: "kx".into(),
+    }];
+    m.panels = vec![extension_api::PanelContribution {
+        id: "overview".into(),
+        title: "Overview".into(),
+        placement: extension_api::PanelPlacement::Editor,
+    }];
+    m
+}
+fn process_request() -> Request {
+    Request {
+        invocation: Invocation::Refresh {
+            panel: "overview".into(),
+            revision: 4,
+            state: serde_json::json!({}),
+            inputs: Default::default(),
+        },
+        document: None,
+        ..request()
+    }
+}
+#[test]
+fn process_declarations_require_permission_bare_unique_names_and_api_three() {
+    let original = process_manifest();
+    package::validate_manifest(&original).unwrap();
+    for name in ["", "/bin/kx", "../kx", "a/b", "a\\b", "kx;sh", "con", ".kx"] {
+        let mut m = original.clone();
+        m.processes[0].program = name.into();
+        assert!(package::validate_manifest(&m).is_err(), "{name}");
+    }
+    let mut m = original.clone();
+    m.processes.push(m.processes[0].clone());
+    assert!(package::validate_manifest(&m).is_err());
+    let mut m = original.clone();
+    m.permissions.clear();
+    assert!(package::validate_manifest(&m).is_err());
+    let mut m = original.clone();
+    m.processes.clear();
+    assert!(package::validate_manifest(&m).is_err());
+    let mut m = original;
+    m.api_version = 2;
+    assert!(package::validate_manifest(&m).is_err());
+}
+#[test]
+fn process_effects_obey_immutable_policy_scope_and_atomic_validation() {
+    let wasm = wasm_response(b"{}", "i32.const 2097152", None, "");
+    let mut extension = compile(&wasm, process_manifest()).unwrap();
+    let req = process_request();
+    let valid = serde_json::json!({"processes":[{"id":"status","program":"kx","args":["nextcode","panel"]}]});
+    let response: Response = serde_json::from_value(valid.clone()).unwrap();
+    extension.validate_reply(&req, &response).unwrap();
+    assert_eq!(response.processes[0].timeout_ms, 30_000);
+    for bad in [
+        serde_json::json!({"processes":[{"id":"s","program":"sh"}]}),
+        serde_json::json!({"processes":[{"id":"s","program":"kx","timeout_ms":120001}]}),
+        serde_json::json!({"processes":[{"id":"s","program":"kx","args":["bad\u{0}arg"]}]}),
+        serde_json::json!({"processes":[{"id":"s","program":"kx"},{"id":"s","program":"kx"}]}),
+        serde_json::json!({"error":"failed","processes":[{"id":"s","program":"kx"}]}),
+    ] {
+        let response: Response = serde_json::from_value(bad).unwrap();
+        assert!(extension.validate_reply(&req, &response).is_err());
+    }
+    assert!(extension.validate_reply(&request(), &response).is_err());
+    extension
+        .manifest
+        .processes
+        .push(extension_api::DeclaredProcess {
+            program: "sh".into(),
+        });
+    let undeclared: Response =
+        serde_json::from_value(serde_json::json!({"processes":[{"id":"s","program":"sh"}]}))
+            .unwrap();
+    assert!(extension.validate_reply(&req, &undeclared).is_err());
+    let other = Response {
+        panels: vec![panel_fixture()],
+        ..Default::default()
+    };
+    assert!(extension.validate_reply(&req, &other).is_err());
+}
+#[test]
+fn api_two_packages_still_run_but_cannot_acquire_processes_or_timers() {
+    let mut m = manifest();
+    m.api_version = 2;
+    let wasm = wasm_response(b"{}", "i32.const 2097152", None, "");
+    let extension = compile(&wasm, m).unwrap();
+    let mut req = request();
+    req.api_version = 2;
+    extension.run(req.clone()).unwrap();
+    let effects: Response =
+        serde_json::from_value(serde_json::json!({"processes":[{"id":"s","program":"kx"}]}))
+            .unwrap();
+    assert!(extension.validate_reply(&req, &effects).is_err());
+    let mut panel = panel_fixture();
+    panel.refresh_ms = Some(999);
+    assert!(validate_panel_update(&panel).is_err());
+    panel.refresh_ms = Some(1000);
+    validate_panel_update(&panel).unwrap();
 }

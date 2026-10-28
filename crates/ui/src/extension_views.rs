@@ -1,11 +1,12 @@
 //! Native, workspace-local views of validated extension panel trees.
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::Arc,
 };
 
-use extension_api::{InputValue, PanelUpdate, UiEvent, UiEventKind, Widget};
+use crate::project::CancelToken;
+use extension_api::{InputValue, PanelUpdate, ProcessExit, UiEvent, UiEventKind, Widget};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
     ScrollAnchor, ScrollHandle, SharedString, Window, actions, div, prelude::*, px,
@@ -35,11 +36,34 @@ pub(crate) fn bind_keys(cx: &mut App) {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ExtensionViewEvent {
+    Background {
+        revision: u64,
+        process: Option<ProcessExit>,
+        direct: bool,
+        inputs: BTreeMap<String, InputValue>,
+    },
     Invoke {
         revision: u64,
         event: UiEvent,
         inputs: BTreeMap<String, InputValue>,
     },
+}
+
+impl ExtensionViewEvent {
+    pub(crate) fn revision(&self) -> u64 {
+        match self {
+            Self::Invoke { revision, .. } | Self::Background { revision, .. } => *revision,
+        }
+    }
+}
+
+/// Owned by the workspace's panel entry, so closing a panel cancels its jobs
+/// even if an in-flight invocation still holds the view alive.
+pub(crate) struct PanelLifetime(pub CancelToken);
+impl Drop for PanelLifetime {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 pub(crate) struct ExtensionView {
@@ -61,7 +85,13 @@ pub(crate) struct ExtensionView {
     scroll_paths: HashMap<String, Vec<String>>,
     focus: FocusHandle,
     busy: bool,
+    invoking: bool,
     error: Option<String>,
+    pub(crate) lifetime: CancelToken,
+    processes: HashMap<String, CancelToken>,
+    completed: VecDeque<(ProcessExit, bool)>,
+    refresh_due: bool,
+    refresh_task: Option<gpui::Task<()>>,
 }
 
 impl EventEmitter<ExtensionViewEvent> for ExtensionView {}
@@ -97,7 +127,13 @@ impl ExtensionView {
             scroll_paths: HashMap::new(),
             focus: cx.focus_handle(),
             busy: false,
+            invoking: false,
             error: None,
+            lifetime: CancelToken::new(),
+            processes: HashMap::new(),
+            completed: VecDeque::new(),
+            refresh_due: false,
+            refresh_task: None,
         }
     }
     pub(crate) fn extension(&self) -> &str {
@@ -117,10 +153,12 @@ impl ExtensionView {
     }
     pub(crate) fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
         self.busy = busy;
+        self.dispatch_background(cx);
         cx.notify();
     }
     pub(crate) fn fail(&mut self, message: String, cx: &mut Context<Self>) {
         self.busy = false;
+        self.invoking = false;
         self.error = Some(message);
         cx.notify();
     }
@@ -137,7 +175,7 @@ impl ExtensionView {
         ))
     }
 
-    fn current_inputs(&self, cx: &App) -> BTreeMap<String, InputValue> {
+    pub(crate) fn current_inputs(&self, cx: &App) -> BTreeMap<String, InputValue> {
         self.inputs
             .iter()
             .map(|(id, value)| {
@@ -150,10 +188,123 @@ impl ExtensionView {
             .collect()
     }
 
+    pub(crate) fn cancel_processes(&mut self) {
+        for token in self.processes.values() {
+            token.cancel();
+        }
+        self.processes.clear();
+        self.completed.clear();
+    }
+
+    pub(crate) fn can_start_processes(
+        &self,
+        requests: &[extension_api::ProcessRequest],
+    ) -> Result<(), String> {
+        if self.processes.len() + self.completed.len() + requests.len()
+            > extension_api::MAX_PROCESSES
+        {
+            return Err("At most four processes may belong to a panel".into());
+        }
+        if requests.iter().any(|r| {
+            self.processes.contains_key(&r.id) || self.completed.iter().any(|(p, _)| p.id == r.id)
+        }) {
+            return Err("Process id is already in use by this panel".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn start_process(&mut self, id: String, token: CancelToken) {
+        self.processes.insert(id, token);
+    }
+
+    pub(crate) fn process_finished(
+        &mut self,
+        result: ProcessExit,
+        expected: &CancelToken,
+        direct: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .processes
+            .get(&result.id)
+            .is_some_and(|token| token.same(expected))
+        {
+            return;
+        }
+        let token = self.processes.remove(&result.id).unwrap();
+        if !token.is_cancelled() {
+            self.completed.push_back((result, direct));
+        } else {
+            self.refresh_task = None;
+            self.refresh_due = false;
+        }
+        self.dispatch_background(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn finish_invocation(&mut self, cx: &mut Context<Self>) {
+        self.invoking = false;
+        self.dispatch_background(cx);
+    }
+
+    pub(crate) fn defer_background(&mut self, event: ExtensionViewEvent) {
+        if let ExtensionViewEvent::Background {
+            process, direct, ..
+        } = event
+        {
+            if let Some(process) = process {
+                self.completed.push_front((process, direct));
+            } else {
+                self.refresh_due = true;
+            }
+            self.invoking = false;
+            self.busy = true;
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        self.busy || self.invoking || !self.processes.is_empty() || !self.completed.is_empty()
+    }
+
+    fn dispatch_background(&mut self, cx: &mut Context<Self>) {
+        if self.busy || self.invoking || self.lifetime.is_cancelled() {
+            return;
+        }
+        let (process, direct) = if let Some((process, direct)) = self.completed.pop_front() {
+            (Some(process), direct)
+        } else if self.refresh_due && self.processes.is_empty() {
+            self.refresh_due = false;
+            (None, false)
+        } else {
+            return;
+        };
+        if self.model.is_none() {
+            return;
+        }
+        self.invoking = true;
+        cx.emit(ExtensionViewEvent::Background {
+            revision: self.revision,
+            process,
+            direct,
+            inputs: self.current_inputs(cx),
+        });
+    }
+
+    #[cfg(test)]
     pub(crate) fn replace(
         &mut self,
         update: PanelUpdate,
+        submitted: Option<&BTreeMap<String, InputValue>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_from(update, submitted, false, cx);
+    }
+
+    pub(crate) fn replace_from(
+        &mut self,
+        update: PanelUpdate,
         submitted_inputs: Option<&BTreeMap<String, InputValue>>,
+        preserve_processes: bool,
         cx: &mut Context<Self>,
     ) {
         if update.id != self.panel {
@@ -163,6 +314,23 @@ impl ExtensionView {
         if let Err(error) = extensions::validate_panel_update(&update) {
             self.fail(format!("Invalid extension panel: {error}"), cx);
             return;
+        }
+        if !preserve_processes {
+            self.cancel_processes();
+        }
+        self.refresh_task = None;
+        self.refresh_due = false;
+        if let Some(ms) = update.refresh_ms {
+            self.refresh_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(ms))
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.refresh_due = true;
+                    this.dispatch_background(cx);
+                })
+                .ok();
+            }));
         }
         let current = self.current_inputs(cx);
         let mut defaults = BTreeMap::new();
@@ -297,12 +465,13 @@ impl ExtensionView {
         self.model = Some(Arc::new(update));
         self.revision = self.revision.saturating_add(1);
         self.busy = false;
+        self.invoking = false;
         self.error = None;
         cx.notify();
     }
 
     fn emit(&mut self, event: UiEvent, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.is_busy() {
             return;
         }
         let Some(model) = &self.model else {
@@ -315,7 +484,7 @@ impl ExtensionView {
             return;
         }
         self.error = None;
-        self.busy = true;
+        self.invoking = true;
         cx.notify();
         cx.emit(ExtensionViewEvent::Invoke {
             revision: self.revision,
@@ -325,7 +494,7 @@ impl ExtensionView {
     }
 
     fn change(&mut self, id: &str, value: InputValue, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.is_busy() {
             return;
         }
         let Some(model) = &self.model else {
@@ -376,7 +545,7 @@ impl ExtensionView {
         }
     }
     fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.is_busy() {
             return;
         }
         let Some(id) = self
@@ -502,7 +671,7 @@ impl ExtensionView {
                     text,
                     false,
                     None,
-                    *disabled || self.busy,
+                    *disabled || self.is_busy(),
                     Rc::new(move |_, cx| {
                         weak.update(cx, |view, cx| {
                             view.emit(
@@ -605,7 +774,7 @@ impl ExtensionView {
                     SharedString::from(format!("{id}-checkbox")),
                     checked,
                     label,
-                    *disabled || self.busy,
+                    *disabled || self.is_busy(),
                     Rc::new(move |checked, _, cx| {
                         weak.update(cx, |view, cx| {
                             view.change(&callback_id, InputValue::Bool(checked), cx)
@@ -632,7 +801,7 @@ impl ExtensionView {
                         .map(|option| SharedString::from(option.label.clone()))
                         .collect(),
                     selected,
-                    *disabled || self.busy,
+                    *disabled || self.is_busy(),
                     px(260.),
                     Rc::new(move |index, _, cx| {
                         if let Some(value) = values.get(index) {
@@ -727,7 +896,7 @@ impl ExtensionView {
             .id(SharedString::from(format!("{id}-focus")))
             .anchor_scroll(self.anchors.get(id).cloned())
             .key_context("ExtensionControl")
-            .when(disabled || self.busy, |control| control.opacity(0.6))
+            .when(disabled || self.is_busy(), |control| control.opacity(0.6))
             .when(!disabled, |control| {
                 if let Some(handle) = self.controls.get(id) {
                     let focus = handle.clone();
@@ -809,7 +978,7 @@ impl Render for ExtensionView {
                     .flex()
                     .justify_between()
                     .child(SharedString::from(self.title.clone()))
-                    .when(self.busy, |row| {
+                    .when(self.is_busy(), |row| {
                         row.child(
                             div()
                                 .text_color(theme::muted())

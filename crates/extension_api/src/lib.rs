@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const API_VERSION: u32 = 2;
+pub const API_VERSION: u32 = 3;
 /// Maximum encoded request size, including document and settings.
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum encoded response size, including edits, logs, and errors.
@@ -20,6 +20,8 @@ pub struct Manifest {
     #[serde(default)]
     pub panels: Vec<PanelContribution>,
     pub permissions: Vec<Permission>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes: Vec<DeclaredProcess>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +36,55 @@ pub struct Command {
 pub enum Permission {
     ReadDocument,
     EditDocument,
+    RunProcess,
+}
+
+/// A bare executable name, approved together with the permission grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredProcess {
+    pub program: String,
+}
+
+pub const DEFAULT_PROCESS_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_PROCESS_TIMEOUT_MS: u64 = 120_000;
+/// Before JSON escaping; both streams together fit comfortably in a request.
+pub const MAX_PROCESS_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_PROCESSES: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRequest {
+    pub id: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_process_timeout")]
+    pub timeout_ms: u64,
+    /// On successful, complete output, validate stdout as the response directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ProcessResponse>,
+}
+
+fn default_process_timeout() -> u64 {
+    DEFAULT_PROCESS_TIMEOUT_MS
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProcessResponse {
+    Stdout,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessExit {
+    pub id: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub truncated: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -66,6 +117,8 @@ pub struct Selection {
 pub struct Response {
     pub edits: Vec<TextEdit>,
     pub panels: Vec<PanelUpdate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes: Vec<ProcessRequest>,
     pub logs: Vec<String>,
     pub error: Option<String>,
 }
@@ -101,6 +154,19 @@ pub enum Invocation {
     },
     OpenPanel {
         id: String,
+    },
+    Refresh {
+        panel: String,
+        revision: u64,
+        state: serde_json::Value,
+        inputs: std::collections::BTreeMap<String, InputValue>,
+    },
+    ProcessExit {
+        panel: String,
+        revision: u64,
+        state: serde_json::Value,
+        inputs: std::collections::BTreeMap<String, InputValue>,
+        process: ProcessExit,
     },
     UiEvent {
         panel: String,
@@ -138,6 +204,8 @@ pub enum UiEventKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PanelUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_ms: Option<u64>,
     pub id: String,
     pub root: Widget,
     pub state: serde_json::Value,

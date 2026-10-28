@@ -222,6 +222,12 @@ impl<'a> Bounds<'a> {
     }
 }
 pub fn validate_panel_update(panel: &PanelUpdate) -> Result<()> {
+    ensure!(
+        panel
+            .refresh_ms
+            .is_none_or(|ms| (1000..=86_400_000).contains(&ms)),
+        "refresh_ms must be between 1000 and 86400000"
+    );
     validate_id(&panel.id)?;
     validate_state(&panel.state)?;
     Bounds {

@@ -52,9 +52,24 @@ pub fn bind_keys(cx: &mut App) {
 struct State {
     /// A grant records the approved capability set, not merely an extension ID.
     enabled: BTreeMap<String, Vec<Permission>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    programs: BTreeMap<String, Vec<extension_api::DeclaredProcess>>,
     /// Built-in extensions turned on or off; the others keep their default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     builtin: BTreeMap<String, bool>,
+}
+
+impl State {
+    fn approves(&self, manifest: &extension_api::Manifest) -> bool {
+        self.enabled
+            .get(&manifest.id)
+            .is_some_and(|granted| manifest.permissions.iter().all(|p| granted.contains(p)))
+            && manifest.processes.iter().all(|program| {
+                self.programs
+                    .get(&manifest.id)
+                    .is_some_and(|granted| granted.contains(program))
+            })
+    }
 }
 
 fn config_dir() -> anyhow::Result<PathBuf> {
@@ -156,6 +171,8 @@ pub struct Extensions {
     /// Changes only when installed WASM snapshots are reloaded; unrelated
     /// installs and permission changes must not reset other panels' state.
     pub generation: u64,
+    processes: BTreeMap<u64, (String, crate::project::CancelToken)>,
+    next_process: u64,
     output: VecDeque<(String, SharedString)>,
     output_bytes: usize,
 }
@@ -174,6 +191,8 @@ pub fn shared(cx: &mut App) -> Entity<Extensions> {
             loading: false,
             running: None,
             generation: 0,
+            processes: BTreeMap::new(),
+            next_process: 0,
             output: VecDeque::new(),
             output_bytes: 0,
         };
@@ -202,6 +221,9 @@ impl Extensions {
             return;
         }
         self.loading = true;
+        for (_, token) in self.processes.values() {
+            token.cancel();
+        }
         self.generation += 1;
         let task = cx.background_spawn(async move {
             let state = read_state()?;
@@ -219,16 +241,7 @@ impl Extensions {
                         for (path, result) in found {
                             match result {
                                 Ok(extension) => {
-                                    let enabled =
-                                        this.state.enabled.get(&extension.manifest.id).is_some_and(
-                                            |granted| {
-                                                extension
-                                                    .manifest
-                                                    .permissions
-                                                    .iter()
-                                                    .all(|permission| granted.contains(permission))
-                                            },
-                                        );
+                                    let enabled = this.state.approves(&extension.manifest);
                                     this.entries.push(Entry { extension, enabled });
                                 }
                                 Err(err) => {
@@ -305,8 +318,20 @@ impl Extensions {
         if enabled {
             next.enabled
                 .insert(id.to_owned(), entry.extension.manifest.permissions.clone());
+            if !entry.extension.manifest.processes.is_empty() {
+                next.programs
+                    .insert(id.to_owned(), entry.extension.manifest.processes.clone());
+            } else {
+                next.programs.remove(id);
+            }
         } else {
             next.enabled.remove(id);
+            next.programs.remove(id);
+            for (extension, token) in self.processes.values() {
+                if extension == id {
+                    token.cancel();
+                }
+            }
             if let Some((running, cancelled)) = &self.running
                 && running == id
             {
@@ -432,7 +457,47 @@ impl Extensions {
         cx.notify();
     }
 
+    pub(crate) fn process_count(&self, id: &str) -> usize {
+        self.processes
+            .values()
+            .filter(|(extension, _)| extension == id)
+            .count()
+    }
+
+    pub(crate) fn reserve_processes(
+        &mut self,
+        id: &str,
+        count: usize,
+    ) -> Result<Vec<(u64, crate::project::CancelToken)>, String> {
+        let active = self
+            .processes
+            .values()
+            .filter(|(extension, _)| extension == id)
+            .count();
+        if active + count > extension_api::MAX_PROCESSES {
+            return Err("At most four processes may run per extension".into());
+        }
+        let mut jobs = Vec::new();
+        for _ in 0..count {
+            self.next_process += 1;
+            let token = crate::project::CancelToken::new();
+            self.processes
+                .insert(self.next_process, (id.to_owned(), token.clone()));
+            jobs.push((self.next_process, token));
+        }
+        Ok(jobs)
+    }
+
+    pub(crate) fn process_finished(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.processes.remove(&id);
+        cx.notify();
+    }
+
     fn cancel(&mut self, cx: &mut Context<Self>) {
+        for (_, token) in self.processes.values() {
+            token.cancel();
+        }
+        cx.notify();
         if let Some((id, cancelled)) = &self.running {
             cancelled.store(true, Ordering::Relaxed);
             let id = id.clone();
@@ -492,7 +557,7 @@ impl Render for ExtensionPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let loading = store.loading;
-        let running = store.running.is_some();
+        let running = store.running.is_some() || !store.processes.is_empty();
         let entries: Vec<_> = store
             .entries
             .iter()
@@ -546,7 +611,7 @@ impl Render for ExtensionPanel {
                             .pin("toggle"))
                         .pin(format!("builtin:{id}")).label(builtin.name)
                 })))
-            .child(div().text_color(theme::muted()).child("Installed — Rust / WebAssembly. Local packages start disabled. Enable to review document permissions. No filesystem, network or process access."))
+            .child(div().text_color(theme::muted()).child("Installed — Rust / WebAssembly. Local packages start disabled. Enable to review document access and declared programs."))
             .child(div().flex().gap_2().items_center()
                 .child("Package folder:")
                 .child(div().flex_1().h(px(28.)).px_1().border_1().border_color(theme::border())
@@ -621,5 +686,27 @@ mod tests {
         state.builtin.insert("assembly".into(), true);
         let saved = serde_json::to_string(&state).unwrap();
         assert_eq!(serde_json::from_str::<State>(&saved).unwrap(), state);
+    }
+    #[test]
+    fn program_grants_cannot_be_extended_by_editing_the_manifest() {
+        let old: State = serde_json::from_str(r#"{"enabled":{"demo":["run-process"]}}"#).unwrap();
+        let mut manifest: extension_api::Manifest = serde_json::from_value(serde_json::json!({
+            "id":"demo", "name":"Demo", "version":"1.0.0", "api_version":3, "module":"x.wasm",
+            "commands":[], "panels":[], "permissions":["run-process"], "processes":[{"program":"kx"}]
+        })).unwrap();
+        assert!(!old.approves(&manifest));
+        let mut state = old;
+        state
+            .programs
+            .insert("demo".into(), manifest.processes.clone());
+        assert!(state.approves(&manifest));
+        manifest.processes.push(extension_api::DeclaredProcess {
+            program: "python".into(),
+        });
+        assert!(!state.approves(&manifest));
+        assert_eq!(
+            serde_json::from_str::<State>(&serde_json::to_string(&state).unwrap()).unwrap(),
+            state
+        );
     }
 }
