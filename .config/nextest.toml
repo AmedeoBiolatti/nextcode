@@ -1,0 +1,12 @@
+[profile.ci]
+fail-fast = false
+# Tests spawn editor, agent, language-server and compiler processes. Allow
+# cross-crate concurrency without flooding the small hosted runners.
+test-threads = 4
+
+[test-groups]
+project-processes = { max-threads = 2 }
+
+[[profile.ci.overrides]]
+filter = 'binary(headless) | test(project::extension_process::)'
+test-group = 'project-processes'

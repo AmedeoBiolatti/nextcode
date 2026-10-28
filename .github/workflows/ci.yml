@@ -26,8 +26,31 @@ env:
     libx11-dev libxcb1-dev libssl-dev libvulkan-dev libzstd-dev
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!{README,HANDOFF,REQUEST,CONTRIBUTING,AGENTS,CODE_OF_CONDUCT,SECURITY,CHANGELOG}.md'
+              - '!LICENSE-*'
+
   fmt:
     name: Rustfmt
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -38,6 +61,8 @@ jobs:
 
   clippy:
     name: Clippy (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -54,11 +79,18 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate from the old dependency-only cache; job/OS/toolchain
+          # remain part of the key. Keep workspace libraries between runs.
+          key: workspace-v1
+          cache-workspace-crates: true
       # `-D warnings` reaches workspace members only; vendor/gpui keeps its warnings.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -66,7 +98,7 @@ jobs:
           - { name: Linux, os: ubuntu-latest }
           # The runner's LLVM puts an lldb-dap on PATH that never answers, so the
           # LLDB end-to-end test (which skips without an adapter) is left out.
-          - { name: Windows, os: windows-latest, skip: --skip headless_mode_debugs_a_cargo_binary_with_lldb }
+          - { name: Windows, os: windows-latest, filter: '-E "not test(headless_mode_debugs_a_cargo_binary_with_lldb)"' }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -78,4 +110,39 @@ jobs:
           # The headless tests drive a real rust-analyzer.
           components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked --no-fail-fast -- ${{ matrix.skip }}
+        with:
+          key: workspace-v1
+          cache-workspace-crates: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.150
+      - name: Workspace tests
+        run: cargo nextest run --workspace --locked --profile ci ${{ matrix.filter }}
+      # Nextest runs unit/integration tests, but does not run doctests.
+      - name: Documentation tests
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --locked --doc
+
+  ci:
+    name: CI
+    needs: [changes, fmt, clippy, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all applicable checks
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+          FMT: ${{ needs.fmt.result }}
+          CLIPPY: ${{ needs.clippy.result }}
+          TEST: ${{ needs.test.result }}
+        run: |
+          test "$CHANGES" = success
+          case "$CODE" in
+            true) expected=success ;;
+            false) expected=skipped ;;
+            *) echo 'Change detection returned no decision'; exit 1 ;;
+          esac
+          test "$FMT" = "$expected"
+          test "$CLIPPY" = "$expected"
+          test "$TEST" = "$expected"

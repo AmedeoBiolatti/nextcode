@@ -142,3 +142,30 @@ LTO and gpui's `image` crate trimmed to the formats shown, for a smaller
 executable: on machines whose endpoint security scans every image load,
 each MB of executable costs milliseconds per launch, and a rebuilt
 executable's first launch pays a full scan.
+
+## Continuous integration
+
+CI keeps Rustfmt, Clippy and tests on Linux and Windows. Documentation-only
+changes (under `docs/`, the root documentation files listed in the workflow,
+and licenses) skip the Rust jobs. Everything else, including workflows and
+nextest configuration, runs all checks; a manual run always does too. The
+final **CI** check verifies change detection and every applicable job, so a
+failed detector cannot turn into a successful documentation-only run.
+
+The test jobs use pinned prebuilt cargo-nextest binaries to run tests across
+crates concurrently. `.config/nextest.toml` limits concurrency to four tests,
+and to two for headless/project-process tests. Ignored tests remain ignored;
+Windows retains its existing LLDB exclusion. Doctests run separately with
+`cargo test --workspace --locked --doc`, even if the main test run fails.
+
+To use the same test scheduling locally after installing cargo-nextest:
+
+```sh
+cargo nextest run --workspace --locked --profile ci
+cargo test --workspace --locked --doc
+```
+
+Clippy and tests have separate caches per platform and Rust toolchain, with
+workspace artifacts included. A new lockfile or toolchain can require a cold
+build. Compare both cold and warm CI runs when changing cache settings; cache
+transfer and cleanup are part of the elapsed time, not just Cargo's timing.
