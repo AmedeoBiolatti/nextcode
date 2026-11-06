@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "dashboard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "extension_sdk",
  "serde_json",
@@ -12,7 +12,7 @@ dependencies = [
 
 [[package]]
 name = "extension_api"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",

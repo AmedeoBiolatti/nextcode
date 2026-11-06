@@ -30,8 +30,7 @@ fn handle(request: Request) -> Response {
             text: selected.to_uppercase(),
         }],
         logs: vec!["Uppercased the selected text".to_owned()],
-        error: None,
-        panels: Vec::new(),
+        ..Response::default()
     }
 }
 

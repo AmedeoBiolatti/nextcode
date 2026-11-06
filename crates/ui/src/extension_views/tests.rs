@@ -36,6 +36,8 @@ fn panel(value: &str, include_input: bool) -> PanelUpdate {
             id: "root".into(),
             children,
             gap: 8,
+            width: None,
+            grow: false,
         },
         state: json!({"value": value}),
     }
@@ -357,22 +359,67 @@ fn empty_and_inline_labels_remove_the_extra_row_and_legends_are_optional(cx: &mu
             "{kind}: inline labels must not add a row"
         );
     }
+    // A chart is as tall as its `height`; a hidden legend leaves that room to the plot.
     let mut heights = Vec::new();
     for legend in [true, false] {
         let widget = serde_json::from_value(json!({"type":"chart","id":"chart","title":"Loss","height":140,"legend":legend,
-            "chart":{"kind":"line","series":[{"name":"Run","color":11,"points":[{"x":0,"y":1}]}],"x_label":"step","y_label":"loss"}})).unwrap();
+            "chart":{"kind":"line","series":[{"name":"Run","color":11,"points":[{"x":0,"y":1}]},
+                                             {"name":"Other","points":[{"x":1,"y":2}]}],"x_label":"step","y_label":"loss"}})).unwrap();
         view.update(&mut cx, |view, cx| view.replace(update(widget), None, cx));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
+        let chart = cx.debug_bounds("sized-widget").expect("chart rendered");
+        assert_eq!(
+            chart.size.height,
+            gpui::px(140.),
+            "the chart keeps its height"
+        );
         heights.push(
-            cx.debug_bounds("sized-widget")
-                .expect("chart rendered")
+            cx.debug_bounds("chart-plot")
+                .expect("plot rendered")
                 .size
                 .height,
         );
     }
     assert!(
-        heights[0] > heights[1],
+        heights[0] < heights[1],
         "legend must not reserve space when hidden: {heights:?}"
     );
+}
+
+#[gpui::test]
+fn actions_taken_while_busy_apply_locally_and_are_sent_once_idle(cx: &mut TestAppContext) {
+    let view = view(cx);
+    view.update(cx, |view, cx| view.replace(panel("local", true), None, cx));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let recorded = events.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&view, move |_, event: &ExtensionViewEvent, _| {
+            recorded.borrow_mut().push(event.clone())
+        })
+    });
+    let click = || UiEvent {
+        widget: "run".into(),
+        kind: UiEventKind::Click,
+    };
+    view.update(cx, |view, cx| {
+        view.emit(click(), cx);
+        // While that runs: the checkbox changes at once, and its event waits.
+        view.change("enabled", InputValue::Bool(false), cx);
+        assert_eq!(view.inputs.get("enabled"), Some(&InputValue::Bool(false)));
+        assert!(view.pending.is_some());
+    });
+    assert_eq!(events.borrow().len(), 1);
+    view.update(cx, |view, cx| view.finish_invocation(cx));
+    let events = events.borrow();
+    assert_eq!(
+        events.len(),
+        2,
+        "the queued change is sent when the panel is idle"
+    );
+    let ExtensionViewEvent::Invoke { event, inputs, .. } = &events[1] else {
+        panic!("expected UI event")
+    };
+    assert_eq!(event.widget, "enabled");
+    assert_eq!(inputs.get("enabled"), Some(&InputValue::Bool(false)));
 }

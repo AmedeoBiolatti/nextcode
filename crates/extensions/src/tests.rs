@@ -693,6 +693,14 @@ fn panel_fixture() -> extension_api::PanelUpdate {
                     id: "table".into(),
                     columns: vec!["Column".into()],
                     rows: vec![vec!["Cell".into()]],
+                    widths: vec![],
+                    selectable: false,
+                    selected: None,
+                    max_height: None,
+                    check: false,
+                    checked: vec![],
+                    disabled: vec![],
+                    swatches: vec![],
                 },
                 Widget::Chart {
                     legend: true,
@@ -704,13 +712,26 @@ fn panel_fixture() -> extension_api::PanelUpdate {
                         series: vec![ChartSeries {
                             color: None,
                             name: "Series".into(),
-                            points: vec![ChartPoint { x: 0.0, y: 1.0 }],
+                            points: vec![ChartPoint {
+                                x: 0.0,
+                                y: 1.0,
+                                label: None,
+                            }],
+                            style: None,
                         }],
                         x_label: "X".into(),
                         y_label: "Y".into(),
+                        x_scale: Default::default(),
+                        y_scale: Default::default(),
+                        x_format: Default::default(),
+                        y_format: Default::default(),
                     },
+                    controls: vec![],
+                    sync: None,
                 },
             ],
+            width: None,
+            grow: false,
         },
     }
 }
@@ -788,7 +809,7 @@ fn panel_tree_and_exact_event_envelope_are_validated() {
 fn panel_bounds_and_error_atomicity_apply_without_document_edits() {
     use extension_api::*;
     let mut panel = panel_fixture();
-    panel.state = serde_json::json!("x".repeat(16384));
+    panel.state = serde_json::json!("x".repeat(64 * 1024));
     assert!(validate_panel_update(&panel).is_err());
     panel.state = serde_json::Value::Null;
     for root in [
@@ -811,12 +832,20 @@ fn panel_bounds_and_error_atomicity_apply_without_document_edits() {
         },
         Widget::Label {
             id: "l".into(),
-            text: "x".repeat(65537),
+            text: "x".repeat(256 * 1024 + 1),
         },
         Widget::Table {
             id: "t".into(),
             columns: vec!["a".into()],
             rows: vec![vec![]],
+            widths: vec![],
+            selectable: false,
+            selected: None,
+            max_height: None,
+            check: false,
+            checked: vec![],
+            disabled: vec![],
+            swatches: vec![],
         },
         Widget::Column {
             id: "r".into(),
@@ -825,6 +854,8 @@ fn panel_bounds_and_error_atomicity_apply_without_document_edits() {
                 id: "r".into(),
                 size: 0,
             }],
+            width: None,
+            grow: false,
         },
         Widget::Chart {
             legend: true,
@@ -833,11 +864,13 @@ fn panel_bounds_and_error_atomicity_apply_without_document_edits() {
             title: "".into(),
             height: 120,
             chart: ChartSpec::Histogram {
-                values: vec![1.0; 4097],
+                values: vec![1.0; 16385],
                 bins: 1,
                 x_label: "".into(),
                 y_label: "".into(),
             },
+            controls: vec![],
+            sync: None,
         },
     ] {
         panel.root = root;
@@ -914,10 +947,19 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
             series: vec![ChartSeries {
                 color: None,
                 name: "s".into(),
-                points: vec![ChartPoint { x: 2.0, y: 3.0 }],
+                points: vec![ChartPoint {
+                    x: 2.0,
+                    y: 3.0,
+                    label: None,
+                }],
+                style: None,
             }],
             x_label: "x".into(),
             y_label: "y".into(),
+            x_scale: Default::default(),
+            y_scale: Default::default(),
+            x_format: Default::default(),
+            y_format: Default::default(),
         },
         ChartSpec::Bar {
             labels: vec!["a".into()],
@@ -928,6 +970,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
             }],
             x_label: "x".into(),
             y_label: "y".into(),
+            y_format: Default::default(),
         },
         ChartSpec::Histogram {
             values: vec![0.0, 1.0],
@@ -943,6 +986,8 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
             title: "Chart".into(),
             chart,
             height: 500,
+            controls: vec![],
+            sync: None,
         };
         validate_panel_update(&panel).unwrap();
     }
@@ -951,6 +996,10 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
             series: vec![],
             x_label: "".into(),
             y_label: "".into(),
+            x_scale: Default::default(),
+            y_scale: Default::default(),
+            x_format: Default::default(),
+            y_format: Default::default(),
         },
         ChartSpec::Scatter {
             series: vec![ChartSeries {
@@ -959,10 +1008,16 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
                 points: vec![ChartPoint {
                     x: f64::INFINITY,
                     y: 0.0,
+                    label: None,
                 }],
+                style: None,
             }],
             x_label: "".into(),
             y_label: "".into(),
+            x_scale: Default::default(),
+            y_scale: Default::default(),
+            x_format: Default::default(),
+            y_format: Default::default(),
         },
         ChartSpec::Bar {
             labels: vec!["a".into()],
@@ -973,6 +1028,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
             }],
             x_label: "".into(),
             y_label: "".into(),
+            y_format: Default::default(),
         },
         ChartSpec::Histogram {
             values: vec![0.0],
@@ -994,6 +1050,8 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
             title: "".into(),
             chart,
             height: 120,
+            controls: vec![],
+            sync: None,
         };
         assert!(validate_panel_update(&panel).is_err());
     }
@@ -1014,31 +1072,44 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
                 series: vec![ChartSeries {
                     color: Some(1),
                     name: "s".into(),
-                    points: vec![ChartPoint { x: 0.0, y: 1.0 }],
+                    points: vec![ChartPoint {
+                        x: 0.0,
+                        y: 1.0,
+                        label: None,
+                    }],
+                    style: None,
                 }],
                 x_label: "".into(),
                 y_label: "".into(),
+                x_scale: Default::default(),
+                y_scale: Default::default(),
+                x_format: Default::default(),
+                y_format: Default::default(),
             },
             height: 140,
+            controls: vec![],
+            sync: None,
         };
         assert_eq!(validate_panel_update(&panel).is_ok(), valid, "{width:?}");
     }
     panel.root = Widget::Column {
         id: "root".into(),
         gap: 0,
-        children: (0..128)
+        children: (0..256)
             .map(|i| Widget::Space {
                 id: format!("s{i}"),
                 size: 0,
             })
             .collect(),
+        width: None,
+        grow: false,
     };
     assert!(validate_panel_update(&panel).is_err());
     panel.root = Widget::Label {
         id: "leaf".into(),
         text: "text".into(),
     };
-    for depth in 0..8 {
+    for depth in 0..12 {
         panel.root = Widget::Scroll {
             id: format!("scroll{depth}"),
             child: Box::new(panel.root),
@@ -1077,6 +1148,7 @@ fn charts_and_structural_limits_cover_all_native_shapes() {
                     size: 48,
                 },
             ],
+            align: None,
         }),
     };
     validate_panel_update(&panel).unwrap();
@@ -1233,6 +1305,8 @@ fn valid_large_select_values_reach_the_guest_but_text_fields_stay_bounded() {
                     disabled: false,
                 },
             ],
+            width: None,
+            grow: false,
         },
     };
     let inputs = BTreeMap::from([("choice".into(), InputValue::Text(value))]);
@@ -1431,6 +1505,229 @@ fn compact_widgets_accept_legacy_defaults_and_validate_shared_colors() {
                 .unwrap_err()
                 .to_string()
                 .contains("color")
+        );
+    }
+}
+
+#[test]
+fn api4_layout_tables_tabs_sections_and_chart_controls_validate_with_their_events() {
+    use extension_api::*;
+    let point = |x, y| ChartPoint::new(x, y);
+    let chart = |scale| {
+        Widget::chart(
+            "loss",
+            "loss",
+            ChartSpec::line([
+                ChartSeries::new("a", [point(1., 0.5), point(2., 0.25)]).style(SeriesStyle::Step)
+            ])
+            .scales(Scale::Linear, scale),
+        )
+        .controls([Widget::select(
+            "y",
+            "",
+            "loss",
+            [
+                SelectOption::new("loss", "loss"),
+                SelectOption::new("acc", "acc"),
+            ],
+        )])
+        .sync("curves")
+    };
+    let table = Widget::table(
+        "runs",
+        vec!["run".into(), "score".into()],
+        vec![
+            vec!["r1".into(), "0.8".into()],
+            vec!["r2".into(), "0.7".into()],
+        ],
+    )
+    .widths([60, 0])
+    .selectable(Some(1))
+    .checks([0], [1], [Some(0), None]);
+    let mut panel = PanelUpdate {
+        refresh_ms: None,
+        id: "p".into(),
+        state: serde_json::Value::Null,
+        root: Widget::column(
+            "root",
+            [
+                Widget::tabs(
+                    "nav",
+                    "a",
+                    [SelectOption::new("a", "A"), SelectOption::new("b", "B")],
+                ),
+                Widget::row(
+                    "work",
+                    [
+                        Widget::column("side", [table]).width(320),
+                        Widget::column(
+                            "main",
+                            [Widget::section(
+                                "sec",
+                                "val",
+                                true,
+                                [Widget::grid(
+                                    "g",
+                                    360,
+                                    [chart(Scale::Log), Widget::stat("s", "best", "0.81")],
+                                )],
+                            )],
+                        )
+                        .grow(),
+                    ],
+                ),
+            ],
+        ),
+    };
+    validate_panel_update(&panel).unwrap();
+    let inputs = std::collections::BTreeMap::from([
+        ("nav".to_owned(), InputValue::Text("b".into())),
+        ("sec".to_owned(), InputValue::Bool(false)),
+        ("y".to_owned(), InputValue::Text("acc".into())),
+    ]);
+    let event = |widget: &str, kind| UiEvent {
+        widget: widget.into(),
+        kind,
+    };
+    for (widget, kind, valid) in [
+        (
+            "nav",
+            UiEventKind::Change {
+                value: InputValue::Text("b".into()),
+            },
+            true,
+        ),
+        (
+            "nav",
+            UiEventKind::Change {
+                value: InputValue::Text("a".into()),
+            },
+            false,
+        ),
+        (
+            "sec",
+            UiEventKind::Change {
+                value: InputValue::Bool(false),
+            },
+            true,
+        ),
+        (
+            "y",
+            UiEventKind::Change {
+                value: InputValue::Text("acc".into()),
+            },
+            true,
+        ),
+        ("runs", UiEventKind::SelectRow { index: 1 }, true),
+        ("runs", UiEventKind::SelectRow { index: 2 }, false),
+        (
+            "runs",
+            UiEventKind::CheckRow {
+                index: 0,
+                value: false,
+            },
+            true,
+        ),
+        (
+            "runs",
+            UiEventKind::CheckRow {
+                index: 1,
+                value: true,
+            },
+            false,
+        ),
+        ("runs", UiEventKind::Click, false),
+    ] {
+        assert_eq!(
+            validate_panel_event(&panel, &event(widget, kind.clone()), &inputs).is_ok(),
+            valid,
+            "{widget} {kind:?}"
+        );
+    }
+    // Inputs must cover the tabs, the section and the chart's own select.
+    let mut missing = inputs.clone();
+    missing.remove("y");
+    assert!(
+        validate_panel_event(
+            &panel,
+            &event(
+                "nav",
+                UiEventKind::Change {
+                    value: InputValue::Text("b".into())
+                }
+            ),
+            &missing
+        )
+        .is_err()
+    );
+
+    let original = panel.root.clone();
+    for (broken, why) in [
+        (Widget::column("c", []).width(100), "column width"),
+        (Widget::grid("g", 100, []), "grid min_width"),
+        (Widget::grid("g", 320, []).columns(13), "grid columns"),
+        (
+            Widget::table("t", vec!["a".into()], vec![]).widths([1, 2]),
+            "a width a column",
+        ),
+        (
+            Widget::table("t", vec!["a".into()], vec![vec!["x".into()]]).checks(
+                [0],
+                [],
+                [Some(12)],
+            ),
+            "swatch color",
+        ),
+        (
+            Widget::table("t", vec!["a".into()], vec![vec!["x".into()]]).checks([1], [], []),
+            "checked row",
+        ),
+        (
+            chart(Scale::Log).controls([Widget::label("l", "x")]),
+            "control kind",
+        ),
+        (
+            Widget::chart(
+                "c",
+                "",
+                ChartSpec::line([ChartSeries::new("a", [point(1., 0.)])])
+                    .scales(Scale::Linear, Scale::Log),
+            ),
+            "log of zero",
+        ),
+        (
+            Widget::tabs("t", "z", [SelectOption::new("a", "A")]),
+            "tab value",
+        ),
+    ] {
+        panel.root = broken;
+        assert!(validate_panel_update(&panel).is_err(), "{why}");
+    }
+    // Twelve series a chart, thirteen too many.
+    let many = |n: usize| {
+        Widget::chart(
+            "c",
+            "",
+            ChartSpec::line((0..n).map(|i| ChartSeries::new(format!("s{i}"), [point(0., 1.)]))),
+        )
+    };
+    panel.root = many(12);
+    validate_panel_update(&panel).unwrap();
+    panel.root = many(13);
+    assert!(validate_panel_update(&panel).is_err());
+    panel.root = original;
+    validate_panel_update(&panel).unwrap();
+}
+
+#[test]
+fn hosts_accept_api_versions_two_to_four() {
+    for (version, valid) in [(1, false), (2, true), (3, true), (4, true), (5, false)] {
+        let mut manifest = manifest();
+        manifest.api_version = version;
+        assert_eq!(
+            package::validate_manifest(&manifest).is_ok(),
+            valid,
+            "{version}"
         );
     }
 }

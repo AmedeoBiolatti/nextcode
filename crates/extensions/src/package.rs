@@ -5,7 +5,7 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
 };
-use extension_api::{API_VERSION, Manifest, Permission};
+use extension_api::{API_VERSION, MIN_API_VERSION, Manifest, Permission};
 use std::{
     collections::HashSet,
     io::{self, Read, Write},
@@ -143,10 +143,9 @@ pub(super) fn validate_manifest(manifest: &Manifest) -> Result<()> {
         "extension version must be a valid semantic version, e.g. 1.0.0"
     );
     ensure!(
-        matches!(manifest.api_version, 2 | API_VERSION),
-        "unsupported extension API version {}; host supports {}",
-        manifest.api_version,
-        API_VERSION
+        (MIN_API_VERSION..=API_VERSION).contains(&manifest.api_version),
+        "unsupported extension API version {}; host supports {MIN_API_VERSION} to {API_VERSION}",
+        manifest.api_version
     );
     let module = &manifest.module;
     ensure!(
