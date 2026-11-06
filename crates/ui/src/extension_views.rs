@@ -1,8 +1,10 @@
 //! Native, workspace-local views of validated extension panel trees.
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use crate::project::CancelToken;
@@ -15,7 +17,9 @@ use gpui::{
 use crate::{controls, editor::Editor, pinpoint::Pin, theme};
 
 mod charts;
+mod layout;
 mod markdown;
+mod tables;
 #[cfg(test)]
 mod tests;
 
@@ -93,6 +97,20 @@ pub(crate) struct ExtensionView {
     completed: VecDeque<(ProcessExit, bool)>,
     refresh_due: bool,
     refresh_task: Option<gpui::Task<()>>,
+    /// A user action taken while the panel was busy, sent once it is idle (the latest one wins).
+    pending: Option<UiEvent>,
+    /// Since when the panel has been busy; the indicator shows only for work longer than a moment.
+    busy_since: Option<Instant>,
+    busy_timer: Option<gpui::Task<()>>,
+    tables: HashMap<String, tables::TableState>,
+    /// The width each grid had when last laid out, to choose its column count.
+    grids: HashMap<String, Rc<Cell<f32>>>,
+    content_width: Rc<Cell<f32>>,
+    /// The sections each widget is inside, outermost first: a closed one hides it from Tab.
+    sections: HashMap<String, Vec<String>>,
+    /// Focus rings show after Tab moves focus, not after a click.
+    focus_visible: bool,
+    weak: gpui::WeakEntity<Self>,
 }
 
 impl EventEmitter<ExtensionViewEvent> for ExtensionView {}
@@ -136,6 +154,15 @@ impl ExtensionView {
             completed: VecDeque::new(),
             refresh_due: false,
             refresh_task: None,
+            pending: None,
+            busy_since: None,
+            busy_timer: None,
+            tables: HashMap::new(),
+            grids: HashMap::new(),
+            content_width: Rc::new(Cell::new(0.)),
+            sections: HashMap::new(),
+            focus_visible: false,
+            weak: cx.weak_entity(),
         }
     }
     pub(crate) fn extension(&self) -> &str {
@@ -277,6 +304,16 @@ impl ExtensionView {
         if self.busy || self.invoking || self.lifetime.is_cancelled() {
             return;
         }
+        // What the person did while the panel worked goes first, if it still applies to the panel shown.
+        if self.processes.is_empty()
+            && self.completed.is_empty()
+            && let Some(event) = self.pending.take()
+        {
+            self.emit(event, cx);
+            if self.invoking {
+                return;
+            }
+        }
         let (process, direct) = if let Some((process, direct)) = self.completed.pop_front() {
             (Some(process), direct)
         } else if self.refresh_due && self.processes.is_empty() {
@@ -345,6 +382,7 @@ impl ExtensionView {
         let mut text_ids = HashSet::new();
         let mut chart_ids = HashSet::new();
         let mut markdown_ids = HashSet::new();
+        let mut table_ids = HashSet::new();
         visit(&update.root, &mut |widget| {
             let id = widget.id();
             match widget {
@@ -367,9 +405,24 @@ impl ExtensionView {
                 }
                 Widget::Select {
                     value, disabled, ..
+                }
+                | Widget::Tabs {
+                    value, disabled, ..
                 } => {
                     defaults.insert(id.to_owned(), InputValue::Text(value.clone()));
                     if !disabled {
+                        order.push(id.to_owned());
+                    }
+                }
+                Widget::Section { open, .. } => {
+                    defaults.insert(id.to_owned(), InputValue::Bool(*open));
+                    order.push(id.to_owned());
+                }
+                Widget::Table {
+                    selectable, check, ..
+                } => {
+                    table_ids.insert(id.to_owned());
+                    if *selectable || *check {
                         order.push(id.to_owned());
                     }
                 }
@@ -378,14 +431,16 @@ impl ExtensionView {
                         order.push(id.to_owned());
                     }
                 }
-                Widget::Chart { chart, .. } => {
+                Widget::Chart { chart, sync, .. } => {
                     chart_ids.insert(id.to_owned());
                     order.push(id.to_owned());
                     match self.charts.get_mut(id) {
-                        Some(state) => state.replace(chart),
+                        Some(state) => state.replace(chart, sync.clone()),
                         None => {
-                            self.charts
-                                .insert(id.to_owned(), charts::ChartState::new(chart));
+                            self.charts.insert(
+                                id.to_owned(),
+                                charts::ChartState::new(chart, sync.clone()),
+                            );
                         }
                     }
                 }
@@ -448,6 +503,26 @@ impl ExtensionView {
             }
         }
         self.charts.retain(|id, _| chart_ids.contains(id));
+        // A table's optimistic ticks and selection give way to the model, unless an action on it is still queued.
+        let pending = self.pending.as_ref().map(|event| event.widget.clone());
+        self.tables.retain(|id, _| table_ids.contains(id));
+        for (id, table) in &mut self.tables {
+            if pending.as_ref() != Some(id) {
+                table.reset();
+            }
+        }
+        let mut grid_ids = HashSet::new();
+        self.sections.clear();
+        sections(&update.root, &mut Vec::new(), &mut self.sections);
+        visit(&update.root, &mut |widget| {
+            if let Widget::Grid { id, .. } = widget {
+                grid_ids.insert(id.clone());
+                self.grids
+                    .entry(id.clone())
+                    .or_insert_with(|| Rc::new(Cell::new(0.)));
+            }
+        });
+        self.grids.retain(|id, _| grid_ids.contains(id));
         self.markdown.retain(|id, _| markdown_ids.contains(id));
         let mut scroll_ids = HashSet::new();
         visit(&update.root, &mut |widget| {
@@ -478,7 +553,12 @@ impl ExtensionView {
     }
 
     fn emit(&mut self, event: UiEvent, cx: &mut Context<Self>) {
+        if self.lifetime.is_cancelled() {
+            return;
+        }
         if self.is_busy() {
+            self.pending = Some(event);
+            cx.notify();
             return;
         }
         let Some(model) = &self.model else {
@@ -501,9 +581,6 @@ impl ExtensionView {
     }
 
     fn change(&mut self, id: &str, value: InputValue, cx: &mut Context<Self>) {
-        if self.is_busy() {
-            return;
-        }
         let Some(model) = &self.model else {
             return;
         };
@@ -529,16 +606,31 @@ impl ExtensionView {
             .map(|editor| editor.focus_handle(cx))
             .or_else(|| self.controls.get(id).cloned())
     }
+    /// Whether a widget is drawn: no section around it is closed.
+    fn shown(&self, id: &str) -> bool {
+        self.sections.get(id).is_none_or(|path| {
+            path.iter()
+                .all(|section| !matches!(self.inputs.get(section), Some(InputValue::Bool(false))))
+        })
+    }
     fn focus_next(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.order.iter().position(|id| {
+        let order: Vec<String> = self
+            .order
+            .iter()
+            .filter(|id| self.shown(id))
+            .cloned()
+            .collect();
+        let current = order.iter().position(|id| {
             self.handle(id, cx)
                 .is_some_and(|handle| handle.is_focused(window))
         });
-        if let Some(index) = next_focus(self.order.len(), current, reverse) {
-            if let Some(handle) = self.handle(&self.order[index], cx) {
+        if let Some(index) = next_focus(order.len(), current, reverse) {
+            self.focus_visible = true;
+            cx.notify();
+            if let Some(handle) = self.handle(&order[index], cx) {
                 window.focus(&handle);
             }
-            let id = &self.order[index];
+            let id = &order[index];
             if let Some(parents) = self.scroll_paths.get(id) {
                 for parent in parents {
                     if let Some(anchor) = self.anchors.get(parent) {
@@ -552,9 +644,6 @@ impl ExtensionView {
         }
     }
     fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_busy() {
-            return;
-        }
         let Some(id) = self
             .order
             .iter()
@@ -587,11 +676,11 @@ impl ExtensionView {
                 },
                 cx,
             ),
-            Widget::Checkbox { .. } => {
+            Widget::Checkbox { .. } | Widget::Section { .. } => {
                 let checked = matches!(self.inputs.get(&id), Some(InputValue::Bool(true)));
                 self.change(&id, InputValue::Bool(!checked), cx);
             }
-            Widget::Select { options, .. } => {
+            Widget::Select { options, .. } | Widget::Tabs { options, .. } => {
                 let current = self.inputs.get(&id);
                 let index = options.iter().position(|option| matches!(current, Some(InputValue::Text(value)) if value == &option.value)).map_or(0, |index| (index + 1) % options.len());
                 if let Some(option) = options.get(index) {
@@ -618,7 +707,9 @@ impl ExtensionView {
         let Some(model) = self.model.clone() else {
             return false;
         };
-        let Some(Widget::Select { options, .. }) = find(&model.root, &id) else {
+        let (Some(Widget::Select { options, .. }) | Some(Widget::Tabs { options, .. })) =
+            find(&model.root, &id)
+        else {
             return false;
         };
         if options.is_empty() {
@@ -630,23 +721,16 @@ impl ExtensionView {
         true
     }
 
-    fn render_widget(&self, widget: &Widget, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn render_widget(&self, widget: &Widget, cx: &Context<Self>) -> AnyElement {
         let id = widget.id().to_owned();
         let weak = cx.entity().downgrade();
         let element = match widget {
-            Widget::Row { children, gap, .. } | Widget::Column { children, gap, .. } => div()
-                .id(SharedString::from(id))
-                .flex()
-                .when(matches!(widget, Widget::Column { .. }), |row| {
-                    row.flex_col()
-                })
-                .when(matches!(widget, Widget::Row { .. }), |row| {
-                    row.flex_wrap().items_end()
-                })
-                .gap(px(f32::from(*gap)))
-                .min_w_0()
-                .children(children.iter().map(|child| self.render_widget(child, cx)))
-                .into_any_element(),
+            Widget::Row { .. }
+            | Widget::Column { .. }
+            | Widget::Grid { .. }
+            | Widget::Section { .. }
+            | Widget::Stat { .. }
+            | Widget::Tabs { .. } => self.render_layout(widget, cx),
             Widget::Scroll { child, height, .. } => div()
                 .id(SharedString::from(id.clone()))
                 .anchor_scroll(self.anchors.get(&id).cloned())
@@ -678,7 +762,7 @@ impl ExtensionView {
                     text,
                     false,
                     None,
-                    *disabled || self.is_busy(),
+                    *disabled,
                     Rc::new(move |_, cx| {
                         weak.update(cx, |view, cx| {
                             view.emit(
@@ -774,7 +858,7 @@ impl ExtensionView {
                     SharedString::from(format!("{id}-checkbox")),
                     checked,
                     label,
-                    *disabled || self.is_busy(),
+                    *disabled,
                     color.map(charts::color),
                     Rc::new(move |checked, _, cx| {
                         weak.update(cx, |view, cx| {
@@ -803,7 +887,7 @@ impl ExtensionView {
                         .map(|option| SharedString::from(option.label.clone()))
                         .collect(),
                     selected,
-                    *disabled || self.is_busy(),
+                    *disabled,
                     select_width(
                         label,
                         *label_inline,
@@ -844,42 +928,8 @@ impl ExtensionView {
                 )))
                 .child(controls::progress(*value as f32, theme::accent(), px(260.)))
                 .into_any_element(),
-            Widget::Table { columns, rows, .. } => {
-                let row = |cells: &[String], header: bool| {
-                    div().flex().children(cells.iter().map(|cell| {
-                        div()
-                            .w(px(150.))
-                            .flex_none()
-                            .px_2()
-                            .py_1()
-                            .border_b_1()
-                            .border_color(theme::border())
-                            .when(header, |cell| {
-                                cell.font_weight(gpui::FontWeight::BOLD).bg(theme::panel())
-                            })
-                            .child(SharedString::from(cell.clone()))
-                    }))
-                };
-                div()
-                    .id(SharedString::from(id))
-                    .max_h(px(320.))
-                    .overflow_scroll()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(row(columns, true))
-                            .children(rows.iter().map(|cells| row(cells, false))),
-                    )
-                    .into_any_element()
-            }
-            Widget::Chart {
-                title,
-                height,
-                legend,
-                width,
-                ..
-            } => self.render_chart(&id, title, *height, *legend, *width, cx),
+            Widget::Table { .. } => self.render_table(widget, cx),
+            Widget::Chart { .. } => self.render_chart(widget, cx),
         };
         let label = match widget {
             Widget::Label { text, .. }
@@ -889,10 +939,13 @@ impl ExtensionView {
             | Widget::Checkbox { label, .. }
             | Widget::Select { label, .. }
             | Widget::Progress { label, .. } => label.clone(),
-            Widget::Chart { title, .. } => title.clone(),
+            Widget::Chart { title, .. } | Widget::Section { title, .. } => title.clone(),
+            Widget::Stat { label, value, .. } => format!("{label}: {value}"),
+            Widget::Tabs { .. } => "Tabs".into(),
             Widget::Table { .. } => "Table".into(),
             Widget::Row { .. } => "Row".into(),
             Widget::Column { .. } => "Column".into(),
+            Widget::Grid { .. } => "Grid".into(),
             Widget::Scroll { .. } => "Scroll".into(),
             Widget::Space { .. } => "Space".into(),
         };
@@ -904,7 +957,7 @@ impl ExtensionView {
 
     /// A control that takes keyboard focus. `framed` controls (charts) always show their border; the others show
     /// it only while focused, so rows of fields and checkboxes aren't each boxed twice.
-    fn focusable_control(
+    pub(super) fn focusable_control(
         &self,
         id: &str,
         disabled: bool,
@@ -915,14 +968,22 @@ impl ExtensionView {
             .id(SharedString::from(format!("{id}-focus")))
             .anchor_scroll(self.anchors.get(id).cloned())
             .key_context("ExtensionControl")
-            .when(disabled || self.is_busy(), |control| control.opacity(0.6))
+            .when(disabled, |control| control.opacity(0.6))
             .when(!disabled, |control| {
                 if let Some(handle) = self.controls.get(id) {
                     let focus = handle.clone();
+                    let weak = self.weak.clone();
                     control
                         .track_focus(handle)
-                        .on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
-                            window.focus(&focus)
+                        .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                            window.focus(&focus);
+                            weak.update(cx, |view, cx| {
+                                if view.focus_visible {
+                                    view.focus_visible = false;
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
                         })
                         .border_1()
                         .border_color(if framed {
@@ -930,7 +991,9 @@ impl ExtensionView {
                         } else {
                             gpui::transparent_black()
                         })
-                        .focus(|style| style.border_color(theme::accent()))
+                        .when(self.focus_visible, |control| {
+                            control.focus(|style| style.border_color(theme::accent()))
+                        })
                 } else {
                     control
                 }
@@ -956,12 +1019,31 @@ fn select_width<'a>(label: &str, inline: bool, options: impl Iterator<Item = &'a
     px(((prefix + longest) as f32 * 7. + 34.).clamp(96., 260.))
 }
 
+/// Work shorter than this shows no indicator, so quick refreshes don't flicker.
+const BUSY_DELAY: Duration = Duration::from_millis(400);
+
 impl Render for ExtensionView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.is_busy() {
+            if self.busy_since.is_none() {
+                self.busy_since = Some(Instant::now());
+                self.busy_timer = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(BUSY_DELAY).await;
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                }));
+            }
+        } else {
+            self.busy_since = None;
+            self.busy_timer = None;
+        }
+        let show_busy = self
+            .busy_since
+            .is_some_and(|since| since.elapsed() >= BUSY_DELAY);
         let content = self
             .model
             .as_ref()
             .map(|model| self.render_widget(&model.root, cx));
+        let content_width = self.content_width.clone();
         div()
             .id("extension-view")
             .key_context("ExtensionPanel")
@@ -970,6 +1052,7 @@ impl Render for ExtensionView {
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
+            .relative()
             .flex()
             .flex_col()
             .gap_2()
@@ -995,6 +1078,10 @@ impl Render for ExtensionView {
                     cx.stop_propagation();
                     return;
                 }
+                if !modifiers.shift && view.table_key(key, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if !modifiers.shift
                     && matches!(key, "up" | "down" | "left" | "right")
                     && view.select_key(matches!(key, "up" | "left"), window, cx)
@@ -1012,23 +1099,12 @@ impl Render for ExtensionView {
                 cx.listener(|view, _: &ActivateControl, window, cx| view.activate(window, cx)),
             )
             .on_action(cx.listener(|view, _: &SubmitControl, window, cx| view.activate(window, cx)))
-            .when(self.show_title || self.is_busy(), |view| {
+            .when(self.show_title, |view| {
                 view.child(
                     div()
-                        .flex()
-                        .justify_between()
-                        .when(self.show_title, |row| {
-                            row.child(SharedString::from(self.title.clone()))
-                        })
-                        .when(self.is_busy(), |row| {
-                            row.child(
-                                div()
-                                    .text_color(theme::muted())
-                                    .child("Running…")
-                                    .pin("busy")
-                                    .label("Running extension"),
-                            )
-                        }),
+                        .flex_none()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child(SharedString::from(self.title.clone())),
                 )
             })
             .when_some(self.error.clone(), |view, error| {
@@ -1059,8 +1135,47 @@ impl Render for ExtensionView {
                     .min_w_0()
                     .overflow_scroll()
                     .track_scroll(&self.scroll)
-                    .children(content),
+                    .children(content)
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, _| content_width.set(f32::from(bounds.size.width)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(1.)),
+                    ),
             )
+            // Over the panel's corner, so starting and finishing work never moves what the panel shows.
+            .when(show_busy, |view| {
+                view.child(
+                    div()
+                        .absolute()
+                        .top(px(6.))
+                        .right(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .h(px(20.))
+                        .rounded_full()
+                        .bg(theme::panel())
+                        .border_1()
+                        .border_color(theme::border())
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(div().size(px(6.)).rounded_full().bg(theme::accent()))
+                        .child(if self.pending.is_some() {
+                            "Queued…"
+                        } else {
+                            "Updating…"
+                        })
+                        .pin("busy")
+                        .label("Running extension"),
+                )
+            })
             .pin(format!("extension:{}:{}", self.extension, self.panel))
             .label(self.title.clone())
     }
@@ -1068,26 +1183,30 @@ impl Render for ExtensionView {
 
 fn visit(widget: &Widget, callback: &mut impl FnMut(&Widget)) {
     callback(widget);
-    match widget {
-        Widget::Row { children, .. } | Widget::Column { children, .. } => {
-            for child in children {
-                visit(child, callback);
-            }
-        }
-        Widget::Scroll { child, .. } => visit(child, callback),
-        _ => {}
+    for child in widget.children() {
+        visit(child, callback);
     }
 }
 fn find<'a>(widget: &'a Widget, id: &str) -> Option<&'a Widget> {
     if widget.id() == id {
         return Some(widget);
     }
-    match widget {
-        Widget::Row { children, .. } | Widget::Column { children, .. } => {
-            children.iter().find_map(|child| find(child, id))
-        }
-        Widget::Scroll { child, .. } => find(child, id),
-        _ => None,
+    widget.children().iter().find_map(|child| find(child, id))
+}
+/// For each widget, the sections around it, outermost first.
+fn sections(widget: &Widget, path: &mut Vec<String>, out: &mut HashMap<String, Vec<String>>) {
+    if !path.is_empty() {
+        out.insert(widget.id().to_owned(), path.clone());
+    }
+    let section = matches!(widget, Widget::Section { .. });
+    if section {
+        path.push(widget.id().to_owned());
+    }
+    for child in widget.children() {
+        sections(child, path, out);
+    }
+    if section {
+        path.pop();
     }
 }
 fn reconcile(
@@ -1135,11 +1254,6 @@ fn prepare_scrolling(
     );
     paths.insert(widget.id().to_owned(), parents.to_vec());
     match widget {
-        Widget::Row { children, .. } | Widget::Column { children, .. } => {
-            for child in children {
-                prepare_scrolling(child, handle, parents, scrolls, anchors, paths);
-            }
-        }
         Widget::Scroll { id, child, .. } => {
             if let Some(scroll) = scrolls.get(id) {
                 let mut parents = parents.to_vec();
@@ -1147,6 +1261,10 @@ fn prepare_scrolling(
                 prepare_scrolling(child, scroll, &parents, scrolls, anchors, paths);
             }
         }
-        _ => {}
+        _ => {
+            for child in widget.children() {
+                prepare_scrolling(child, handle, parents, scrolls, anchors, paths);
+            }
+        }
     }
 }

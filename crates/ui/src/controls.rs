@@ -657,7 +657,8 @@ pub fn text_field_with_prefix(
         } else {
             div()
                 .relative()
-                .when(prefix.is_some(), |area| area.flex_1().min_w_0())
+                // As tall as the field: the editor fills its parent, and a flex item's own height is 0.
+                .when(prefix.is_some(), |area| area.flex_1().min_w_0().h_full())
                 .child(editor.clone())
                 .when_some(placeholder, |area, placeholder| {
                     area.child(

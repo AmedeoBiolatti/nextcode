@@ -1,8 +1,8 @@
 {
   "id": "dashboard",
   "name": "Generated Data Dashboard",
-  "version": "0.1.0",
-  "api_version": 3,
+  "version": "0.2.0",
+  "api_version": 4,
   "module": "dashboard.wasm",
   "commands": [],
   "panels": [

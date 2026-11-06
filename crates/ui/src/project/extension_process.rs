@@ -1,24 +1,42 @@
 //! Bounded, cancellable panel commands. Output is drained even after its cap.
 use super::*;
-use extension_api::{MAX_PROCESS_OUTPUT_BYTES, ProcessExit, ProcessRequest};
+use extension_api::{
+    MAX_PROCESS_OUTPUT_BYTES, MAX_PROCESS_RESPONSE_BYTES, ProcessExit, ProcessRequest,
+    ProcessResponse,
+};
 use std::sync::mpsc;
 
-#[derive(Default)]
 struct Output {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     truncated: bool,
+    /// A process whose stdout is the panel's whole response keeps up to the response limit.
+    stdout_cap: usize,
 }
 impl Output {
+    fn new(request: &ProcessRequest) -> Self {
+        Self {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+            stdout_cap: match request.response {
+                Some(ProcessResponse::Stdout) => MAX_PROCESS_RESPONSE_BYTES,
+                None => MAX_PROCESS_OUTPUT_BYTES,
+            },
+        }
+    }
     fn append(&mut self, data: &[u8], stderr: bool) {
         let out = if stderr {
             &mut self.stderr
         } else {
             &mut self.stdout
         };
-        let take = data
-            .len()
-            .min(MAX_PROCESS_OUTPUT_BYTES.saturating_sub(out.len()));
+        let cap = if stderr {
+            MAX_PROCESS_OUTPUT_BYTES
+        } else {
+            self.stdout_cap
+        };
+        let take = data.len().min(cap.saturating_sub(out.len()));
         out.extend_from_slice(&data[..take]);
         self.truncated |= take < data.len();
     }
@@ -35,6 +53,18 @@ impl Output {
     }
 }
 
+/// What a declared tool is told about its host, so it can draw panels with the newest fields the host accepts:
+/// the editor's version and the newest extension API version.
+fn host_env() -> Vec<(String, String)> {
+    vec![
+        ("NEXT_CODE_VERSION".into(), env!("CARGO_PKG_VERSION").into()),
+        (
+            "NEXT_CODE_EXTENSION_API".into(),
+            extension_api::API_VERSION.to_string(),
+        ),
+    ]
+}
+
 impl Project {
     pub(crate) fn run_extension_process(
         &self,
@@ -42,7 +72,7 @@ impl Project {
         cancel: &CancelToken,
         lifetime: &CancelToken,
     ) -> ProcessExit {
-        let output = Arc::new(Mutex::new(Output::default()));
+        let output = Arc::new(Mutex::new(Output::new(request)));
         let result = self.collect_extension_process(request, cancel, lifetime, &output);
         let (code, error) = match result {
             Ok(Some(code)) => (Some(code), None),
@@ -92,7 +122,7 @@ impl Project {
                     program: Some(agent_path(&program)?.into()),
                     args: request.args.clone(),
                     cwd: agent_path(self.root())?.into(),
-                    env: vec![],
+                    env: host_env(),
                     pty: None,
                 }),
                 move |event| match event {
@@ -156,8 +186,7 @@ impl Project {
         if let Ok(path) = std::env::join_paths(paths) {
             command.env("PATH", path);
         }
-        // Lets a declared tool adapt its output to this host (optional fields added after API 3).
-        command.env("NEXT_CODE_VERSION", env!("CARGO_PKG_VERSION"));
+        command.envs(host_env());
         remote::launch::no_window(&mut command);
         let mut spawned = Tree::spawn(&mut command)?;
         let child = spawned.child.as_mut().unwrap();
@@ -286,6 +315,33 @@ mod tests {
             assert_eq!(out.stdout.len(), MAX_PROCESS_OUTPUT_BYTES);
             assert_eq!(out.stderr.len(), MAX_PROCESS_OUTPUT_BYTES);
         }
+    }
+    #[test]
+    fn panel_process_is_told_the_host_version_and_extension_api_on_both_hosts() {
+        for remote in [false, true] {
+            let out = run(
+                &project(remote),
+                &request("printf '%s %s' \"$NEXT_CODE_VERSION\" \"$NEXT_CODE_EXTENSION_API\""),
+            );
+            assert_eq!(
+                out.stdout,
+                format!(
+                    "{} {}",
+                    env!("CARGO_PKG_VERSION"),
+                    extension_api::API_VERSION
+                ),
+                "remote: {remote}"
+            );
+        }
+    }
+    #[test]
+    fn panel_process_whose_stdout_is_the_response_keeps_up_to_the_response_limit() {
+        let mut req = request("head -c 1100000 /dev/zero; head -c 400000 /dev/zero >&2");
+        req.response = Some(ProcessResponse::Stdout);
+        let out = run(&project(false), &req);
+        assert!(out.truncated);
+        assert_eq!(out.stdout.len(), MAX_PROCESS_RESPONSE_BYTES);
+        assert_eq!(out.stderr.len(), MAX_PROCESS_OUTPUT_BYTES);
     }
     fn alive(path: &Path) -> bool {
         let Ok(pid) = fs::read_to_string(path) else {

@@ -3,6 +3,23 @@
 //! Pass a `fn(Request) -> Response` to [`export_extension!`], then compile a
 //! `cdylib` for `wasm32-unknown-unknown`. Every invocation gets a fresh instance.
 //! All document and edit offsets are UTF-8 byte offsets, not character indices.
+//!
+//! Panels are built with the constructors and setters on [`Widget`], [`ChartSpec`] and [`ChartSeries`]:
+//!
+//! ```
+//! use extension_sdk::*;
+//! let page = Widget::row("work", [
+//!     Widget::column("runs", [Widget::table("t", vec!["run".into()], vec![vec!["r1".into()]])
+//!         .selectable(None)]).width(320),
+//!     Widget::column("charts", [Widget::grid("g", 360, [
+//!         Widget::chart("loss", "val/loss", ChartSpec::line([
+//!             ChartSeries::new("r1", [ChartPoint::new(1., 0.9), ChartPoint::new(2., 0.7)]).color(0),
+//!         ]).scales(Scale::Linear, Scale::Log)).legend(false).sync("curves"),
+//!         Widget::stat("best", "Best score", "0.812").detail("r1"),
+//!     ])]).grow(),
+//! ]);
+//! assert_eq!(page.children().len(), 2);
+//! ```
 
 pub use extension_api;
 pub use extension_api::*;
@@ -47,7 +64,9 @@ macro_rules! export_extension {
 #[doc(hidden)]
 #[cfg(any(target_arch = "wasm32", test))]
 pub mod __private {
-    use super::{Request, Response, API_VERSION, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES};
+    use super::{
+        Request, Response, API_VERSION, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, MIN_API_VERSION,
+    };
     use std::io::{self, Write};
 
     fn error(message: &str) -> Vec<u8> {
@@ -91,7 +110,8 @@ pub mod __private {
                 );
             }
         };
-        if request.api_version != API_VERSION {
+        // The host sends the version the manifest declares; this SDK speaks all of them.
+        if !(MIN_API_VERSION..=API_VERSION).contains(&request.api_version) {
             return error("Unsupported extension API version");
         }
         if let Some(document) = &request.document {

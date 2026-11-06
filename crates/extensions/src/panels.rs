@@ -1,5 +1,5 @@
 use anyhow::{Result, bail, ensure};
-use extension_api::*;
+use extension_api::{limits, *};
 use std::collections::{BTreeMap, HashSet};
 
 pub(crate) fn validate_id(id: &str) -> Result<()> {
@@ -14,7 +14,8 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 pub(crate) fn validate_state(state: &serde_json::Value) -> Result<()> {
-    validate_encoded_size(state, 16 * 1024)
+    validate_encoded_size(state, limits::STATE_BYTES)
+        .map_err(|_| anyhow::anyhow!("panel state exceeds 64 KiB"))
 }
 pub(crate) fn validate_encoded_size(value: &impl serde::Serialize, maximum: usize) -> Result<()> {
     struct Counter {
@@ -35,6 +36,13 @@ pub(crate) fn validate_encoded_size(value: &impl serde::Serialize, maximum: usiz
     serde_json::to_writer(Counter { remaining: maximum }, value)?;
     Ok(())
 }
+fn color(color: Option<u8>, what: &str) -> Result<()> {
+    ensure!(
+        color.is_none_or(|color| color < limits::PALETTE),
+        "invalid {what} color: expected 0..11"
+    );
+    Ok(())
+}
 struct Bounds<'a> {
     ids: HashSet<&'a str>,
     text: usize,
@@ -43,7 +51,10 @@ struct Bounds<'a> {
 impl<'a> Bounds<'a> {
     fn text(&mut self, text: &str) -> Result<()> {
         self.text += text.len();
-        ensure!(self.text <= 65536, "panel text exceeds 64 KiB");
+        ensure!(
+            self.text <= limits::TEXT_BYTES,
+            "panel text exceeds 256 KiB"
+        );
         Ok(())
     }
     fn numbers(&mut self, values: impl Iterator<Item = f64>) -> Result<()> {
@@ -54,7 +65,28 @@ impl<'a> Bounds<'a> {
             );
             self.points += 1;
         }
-        ensure!(self.points <= 4096, "panel exceeds 4096 chart values");
+        ensure!(
+            self.points <= limits::CHART_VALUES,
+            "panel exceeds 16384 chart values"
+        );
+        Ok(())
+    }
+    fn options(&mut self, value: &str, options: &[SelectOption]) -> Result<()> {
+        self.text(value)?;
+        ensure!(
+            !options.is_empty() && options.len() <= limits::OPTIONS,
+            "invalid select options"
+        );
+        let mut values = HashSet::new();
+        for option in options {
+            ensure!(
+                !option.value.is_empty() && values.insert(&option.value),
+                "invalid select value"
+            );
+            self.text(&option.value)?;
+            self.text(&option.label)?;
+        }
+        ensure!(values.contains(&value.to_owned()), "selected value missing");
         Ok(())
     }
     fn chart(&mut self, chart: &ChartSpec) -> Result<()> {
@@ -63,24 +95,27 @@ impl<'a> Bounds<'a> {
                 series,
                 x_label,
                 y_label,
+                x_scale,
+                y_scale,
+                ..
             }
             | ChartSpec::Scatter {
                 series,
                 x_label,
                 y_label,
+                x_scale,
+                y_scale,
+                ..
             } => {
                 self.text(x_label)?;
                 self.text(y_label)?;
                 ensure!(
-                    !series.is_empty() && series.len() <= 6,
-                    "chart requires 1..6 series"
+                    !series.is_empty() && series.len() <= limits::SERIES,
+                    "chart requires 1..12 series"
                 );
                 for series in series {
                     self.text(&series.name)?;
-                    ensure!(
-                        series.color.is_none_or(|color| color < 12),
-                        "invalid chart color: expected 0..11"
-                    );
+                    color(series.color, "chart")?;
                     ensure!(!series.points.is_empty(), "empty chart series");
                     // Each point is one datum; both coordinates are validated.
                     for point in &series.points {
@@ -88,6 +123,17 @@ impl<'a> Bounds<'a> {
                             point.x.is_finite() && point.x.abs() <= 1e12,
                             "invalid chart x"
                         );
+                        ensure!(
+                            *x_scale == Scale::Linear || point.x > 0.,
+                            "a log x axis takes positive values only"
+                        );
+                        ensure!(
+                            *y_scale == Scale::Linear || point.y > 0.,
+                            "a log y axis takes positive values only"
+                        );
+                        if let Some(label) = &point.label {
+                            self.text(label)?;
+                        }
                     }
                     self.numbers(series.points.iter().map(|p| p.y))?;
                 }
@@ -97,11 +143,12 @@ impl<'a> Bounds<'a> {
                 series,
                 x_label,
                 y_label,
+                ..
             } => {
                 self.text(x_label)?;
                 self.text(y_label)?;
                 ensure!(
-                    !labels.is_empty() && !series.is_empty() && series.len() <= 6,
+                    !labels.is_empty() && !series.is_empty() && series.len() <= limits::SERIES,
                     "invalid bar shape"
                 );
                 for label in labels {
@@ -110,10 +157,7 @@ impl<'a> Bounds<'a> {
                 }
                 for series in series {
                     self.text(&series.name)?;
-                    ensure!(
-                        series.color.is_none_or(|color| color < 12),
-                        "invalid chart color: expected 0..11"
-                    );
+                    color(series.color, "chart")?;
                     ensure!(series.values.len() == labels.len(), "bar width mismatch");
                     self.numbers(series.values.iter().copied())?;
                 }
@@ -136,43 +180,80 @@ impl<'a> Bounds<'a> {
         Ok(())
     }
     fn widget(&mut self, widget: &'a Widget, depth: usize) -> Result<()> {
-        ensure!(depth <= 8, "panel exceeds depth 8");
+        ensure!(depth <= limits::DEPTH, "panel exceeds depth 12");
         validate_id(widget.id())?;
         ensure!(self.ids.insert(widget.id()), "duplicate widget id");
-        ensure!(self.ids.len() <= 128, "panel exceeds 128 widgets");
+        ensure!(
+            self.ids.len() <= limits::WIDGETS,
+            "panel exceeds 256 widgets"
+        );
         self.text(widget.id())?;
         match widget {
-            Widget::Row { children, gap, .. } | Widget::Column { children, gap, .. } => {
+            Widget::Row { gap, .. } => ensure!(*gap <= 48, "invalid gap"),
+            Widget::Column { gap, width, .. } => {
                 ensure!(*gap <= 48, "invalid gap");
-                for child in children {
-                    self.widget(child, depth + 1)?;
-                }
+                ensure!(
+                    width.is_none_or(|width| (120..=1600).contains(&width)),
+                    "invalid column width: expected 120..1600"
+                );
             }
-            Widget::Scroll { child, height, .. } => {
-                ensure!((32..=600).contains(height), "invalid scroll height");
-                self.widget(child, depth + 1)?;
+            Widget::Grid {
+                gap,
+                min_width,
+                columns,
+                ..
+            } => {
+                ensure!(*gap <= 48, "invalid gap");
+                ensure!(
+                    columns.is_none_or(|columns| (1..=12).contains(&columns)),
+                    "invalid grid columns: expected 1..12"
+                );
+                ensure!(
+                    (120..=1600).contains(min_width),
+                    "invalid grid min_width: expected 120..1600"
+                );
+            }
+            Widget::Section { title, .. } => self.text(title)?,
+            Widget::Scroll { height, .. } => {
+                ensure!((32..=1200).contains(height), "invalid scroll height");
             }
             Widget::Space { size, .. } => ensure!(*size <= 48, "invalid space"),
             Widget::Label { text, .. }
             | Widget::Markdown { text, .. }
             | Widget::Button { text, .. } => self.text(text)?,
+            Widget::Stat {
+                label,
+                value,
+                detail,
+                color: swatch,
+                ..
+            } => {
+                self.text(label)?;
+                self.text(value)?;
+                self.text(detail)?;
+                color(*swatch, "stat")?;
+            }
             Widget::TextInput {
                 label,
                 value,
                 placeholder,
                 ..
             } => {
-                ensure!(value.len() <= 4096, "text input exceeds 4 KiB");
+                ensure!(
+                    value.len() <= limits::TEXT_INPUT_BYTES,
+                    "text input exceeds 4 KiB"
+                );
                 self.text(label)?;
                 self.text(value)?;
                 self.text(placeholder)?;
             }
-            Widget::Checkbox { label, color, .. } => {
+            Widget::Checkbox {
+                label,
+                color: swatch,
+                ..
+            } => {
                 self.text(label)?;
-                ensure!(
-                    color.is_none_or(|color| color < 12),
-                    "invalid checkbox color: expected 0..11"
-                );
+                color(*swatch, "checkbox")?;
             }
             Widget::Select {
                 label,
@@ -181,22 +262,9 @@ impl<'a> Bounds<'a> {
                 ..
             } => {
                 self.text(label)?;
-                self.text(value)?;
-                ensure!(
-                    !options.is_empty() && options.len() <= 32,
-                    "invalid select options"
-                );
-                let mut values = HashSet::new();
-                for option in options {
-                    ensure!(
-                        !option.value.is_empty() && values.insert(&option.value),
-                        "invalid select value"
-                    );
-                    self.text(&option.value)?;
-                    self.text(&option.label)?;
-                }
-                ensure!(values.contains(value), "selected value missing");
+                self.options(value, options)?;
             }
+            Widget::Tabs { value, options, .. } => self.options(value, options)?,
             Widget::Progress { label, value, .. } => {
                 self.text(label)?;
                 ensure!(
@@ -204,11 +272,23 @@ impl<'a> Bounds<'a> {
                     "invalid progress"
                 );
             }
-            Widget::Table { columns, rows, .. } => {
+            Widget::Table {
+                columns,
+                rows,
+                widths,
+                selectable,
+                selected,
+                max_height,
+                check,
+                checked,
+                disabled,
+                swatches,
+                ..
+            } => {
                 ensure!(
                     !columns.is_empty()
-                        && columns.len() <= 16
-                        && rows.len().saturating_mul(columns.len()) <= 1024,
+                        && columns.len() <= limits::TABLE_COLUMNS
+                        && rows.len().saturating_mul(columns.len()) <= limits::TABLE_CELLS,
                     "invalid table shape"
                 );
                 for column in columns {
@@ -220,22 +300,72 @@ impl<'a> Bounds<'a> {
                         self.text(cell)?;
                     }
                 }
+                ensure!(
+                    widths.is_empty()
+                        || (widths.len() == columns.len()
+                            && widths.iter().all(|w| *w == 0 || (16..=1200).contains(w))),
+                    "table widths: one a column, 0 or 16..1200 px"
+                );
+                ensure!(
+                    selected.is_none_or(|row| *selectable && (row as usize) < rows.len()),
+                    "invalid selected row"
+                );
+                ensure!(
+                    max_height.is_none_or(|h| (120..=1200).contains(&h)),
+                    "invalid table max_height: expected 120..1200"
+                );
+                ensure!(
+                    *check || (checked.is_empty() && disabled.is_empty() && swatches.is_empty()),
+                    "checked, disabled and swatches require check"
+                );
+                for list in [checked, disabled] {
+                    let mut seen = HashSet::new();
+                    ensure!(
+                        list.iter()
+                            .all(|row| (*row as usize) < rows.len() && seen.insert(row)),
+                        "invalid table row index"
+                    );
+                }
+                ensure!(
+                    swatches.is_empty() || swatches.len() == rows.len(),
+                    "table swatches: one a row"
+                );
+                for swatch in swatches {
+                    color(*swatch, "table")?;
+                }
             }
             Widget::Chart {
                 title,
                 chart,
                 height,
                 width,
+                controls,
+                sync,
                 ..
             } => {
                 self.text(title)?;
-                ensure!((120..=500).contains(height), "invalid chart height");
+                ensure!((120..=600).contains(height), "invalid chart height");
                 ensure!(
                     width.is_none_or(|width| (180..=1600).contains(&width)),
                     "invalid chart width: expected 180..1600"
                 );
+                ensure!(
+                    controls.len() <= limits::CHART_CONTROLS
+                        && controls.iter().all(|control| matches!(
+                            control,
+                            Widget::Select { .. } | Widget::Button { .. } | Widget::Checkbox { .. }
+                        )),
+                    "chart controls: up to 4 selects, buttons or checkboxes"
+                );
+                if let Some(sync) = sync {
+                    validate_id(sync)?;
+                    self.text(sync)?;
+                }
                 self.chart(chart)?;
             }
+        }
+        for child in widget.children() {
+            self.widget(child, depth + 1)?;
         }
         Ok(())
     }
@@ -258,14 +388,8 @@ pub fn validate_panel_update(panel: &PanelUpdate) -> Result<()> {
 }
 fn collect<'a>(widget: &'a Widget, widgets: &mut Vec<&'a Widget>) {
     widgets.push(widget);
-    match widget {
-        Widget::Row { children, .. } | Widget::Column { children, .. } => {
-            for child in children {
-                collect(child, widgets);
-            }
-        }
-        Widget::Scroll { child, .. } => collect(child, widgets),
-        _ => (),
+    for child in widget.children() {
+        collect(child, widgets);
     }
 }
 pub fn validate_panel_event(
@@ -282,18 +406,18 @@ pub fn validate_panel_event(
             Widget::TextInput { id, .. } => {
                 controls += 1;
                 ensure!(
-                    matches!(inputs.get(id), Some(InputValue::Text(text)) if text.len() <= 4096),
+                    matches!(inputs.get(id), Some(InputValue::Text(text)) if text.len() <= limits::TEXT_INPUT_BYTES),
                     "missing or invalid text input"
                 );
             }
-            Widget::Checkbox { id, .. } => {
+            Widget::Checkbox { id, .. } | Widget::Section { id, .. } => {
                 controls += 1;
                 ensure!(
                     matches!(inputs.get(id), Some(InputValue::Bool(_))),
                     "missing or invalid checkbox input"
                 );
             }
-            Widget::Select { id, options, .. } => {
+            Widget::Select { id, options, .. } | Widget::Tabs { id, options, .. } => {
                 controls += 1;
                 ensure!(
                     matches!(inputs.get(id), Some(InputValue::Text(text)) if options.iter().any(|o| &o.value==text)),
@@ -326,7 +450,8 @@ pub fn validate_panel_event(
                 id,
                 disabled: false,
                 ..
-            },
+            }
+            | Widget::Section { id, .. },
             UiEventKind::Change {
                 value: InputValue::Bool(value),
             },
@@ -339,6 +464,11 @@ pub fn validate_panel_event(
                 id,
                 disabled: false,
                 ..
+            }
+            | Widget::Tabs {
+                id,
+                disabled: false,
+                ..
             },
             UiEventKind::Change {
                 value: InputValue::Text(value),
@@ -346,6 +476,26 @@ pub fn validate_panel_event(
         ) => ensure!(
             matches!(inputs.get(id), Some(InputValue::Text(input)) if input == value),
             "change value mismatches input"
+        ),
+        (
+            Widget::Table {
+                rows,
+                selectable: true,
+                ..
+            },
+            UiEventKind::SelectRow { index },
+        ) => ensure!((*index as usize) < rows.len(), "table row out of range"),
+        (
+            Widget::Table {
+                rows,
+                check: true,
+                disabled,
+                ..
+            },
+            UiEventKind::CheckRow { index, .. },
+        ) => ensure!(
+            (*index as usize) < rows.len() && !disabled.contains(index),
+            "table row out of range or disabled"
         ),
         (Widget::Chart { chart, .. }, UiEventKind::ChartSelect { series, index }) => {
             let (series, index) = (*series as usize, *index as usize);

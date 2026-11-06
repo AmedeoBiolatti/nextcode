@@ -4,10 +4,12 @@ NextCode loads local, import-free WASM extension packages. The versioned
 interface is UTF-8 JSON in WASM linear memory, not Rust's native ABI: other
 languages can implement the same interface without changing the editor.
 The supplied Rust SDK supports commands, document edits and native declarative
-UI panels. API 3 adds declared project programs and refresh timers. API 2
-packages remain supported with their existing permissions and envelope. New
-SDK builds and the examples use `api_version: 3`; replace/reload or reinstall
-a package after rebuilding it.
+UI panels. API 3 adds declared project programs and refresh timers; API 4
+adds dashboard layout (grids, sidebars, tabs, sections, stat tiles), tables
+with sized columns and clickable or checkable rows, and richer charts. API 2
+and 3 packages remain supported with their existing permissions and
+envelope. New SDK builds and the examples use `api_version: 4`;
+replace/reload or reinstall a package after rebuilding it.
 
 ## Install and run
 
@@ -62,13 +64,15 @@ uppercase transformation is one undo step and does not save the file.
 An empty selection reports an error in the notice and extension output.
 
 Install `examples/extensions/dashboard` and enable it, then open a project
-and choose **Open Generated Data Dashboard: Generated Dashboard**. Its
-native input, Recompute button, checkbox and dropdown calculate a generated
-signal, summary table, progress indicator and line/scatter/bar/histogram
-charts. The data is explicitly synthetic, not a live feed. Sample counts
-must be integers from 8 to 256; invalid values report an error without
-replacing the current panel. **Generated Report** opens an independent
-instance in an editor tab. No document permissions are needed.
+and choose **Open Generated Data Dashboard: Generated Dashboard**. It uses
+every widget: tabs, a sidebar of controls beside a growing column, stat
+tiles and charts in grids, a table whose ticked rows choose the charted
+channels (its swatches are their colors), synced line charts in each series
+style, a log axis picked from a chart's title row, and a section that folds
+away. The data is explicitly synthetic, not a live feed. Sample counts must
+be integers from 8 to 256; invalid values report an error without replacing
+the current panel. **Generated Report** opens an independent instance in an
+editor tab. No document permissions are needed.
 
 To write another extension, start from that example: an isolated Cargo
 workspace, a `cdylib` targeting `wasm32-unknown-unknown`, a dependency on
@@ -103,52 +107,121 @@ An extension declares `panels` in its manifest, each with `id`, `title` and
 declared `id`, a widget-tree `root` and opaque JSON `state`. NextCode draws
 the UI; extensions never receive native widget handles or GPUI pointers.
 
-Supported widget `type`s: `row`, `column`, `scroll`, `space`, `label`,
-`markdown`, `button`, `text-input`, `checkbox`, `select`, `progress`,
-`table`, `chart`. Every widget has a unique `id` within its panel. The
-complete field types are in `crates/extension_api/src/lib.rs`; the dashboard
-is a working Rust authoring example using every widget and chart kind.
-Markdown is resource-free formatted text: image/HTML/link destinations
-cannot load files or network resources.
+Widget `type`s: `row`, `column`, `grid`, `section`, `scroll`, `space`,
+`label`, `markdown`, `stat`, `button`, `text-input`, `checkbox`, `select`,
+`tabs`, `progress`, `table`, `chart`. Every widget has a unique `id` within
+its panel. The complete field types are in `crates/extension_api/src/lib.rs`;
+the dashboard is a working Rust authoring example using every widget and
+chart kind. Markdown is resource-free formatted text: image/HTML/link
+destinations cannot load files or network resources.
 
-Compact dashboard controls use optional API 3 fields:
+Optional fields can be left out of the JSON: `gap` (8), `disabled` (false),
+`label`/`placeholder`/`value` of fields (empty), a chart's `title` (empty),
+`height` (220) and `legend` (true), axis labels (empty). Rust authors build
+widgets with constructors and setters instead of struct literals, so new
+optional fields never break them:
 
-- Charts accept `"legend": false` to hide the legend; omitted means `true`.
-  Keyboard zoom and selection still work; the repeated keyboard hint is
-  no longer printed under each chart.
-- Line, scatter and bar series accept `"color": 0` through `11`. Omitted
-  colors use the series index. Checkbox widgets accept the same palette
-  index and draw a swatch between the box and label, so a run list can act
-  as a shared legend without placeholder series.
-- Text inputs and selects with `"label": ""` draw only the field. With a
-  nonempty label, `"label_inline": true` places `Label: value` inside the
-  field instead of reserving a separate label row. The default remains
-  a label above the field.
-- Line charts draw a marker only where a point has no segment to show (a
-  series of one point, or a point between gaps) and for the point hovered or
-  selected; scatter charts mark every point. Zoom in, zoom out and reset are
-  small icon buttons at the right end of a chart's title row.
-- A select's field is as wide as its longest option (with an inline label),
-  from 96 to 260 px. Controls other than charts show their focus border only
-  while focused.
-- Charts accept `"width"` in px (180–1600); omitted, a chart fills the
-  width available to it (at least 180 px).
-- Declared programs run with `NEXT_CODE_VERSION` set to the editor's version,
-  so a tool that draws panels can use these optional fields only on a host
-  that accepts them (older hosts refuse unknown fields).
-- Editor panels omit the extra manifest-title row because the editor tab
-  already names the panel. Moving a panel to the dock restores its header;
-  loading, running and error indicators remain available.
-
-```json
-{"type":"chart","id":"loss","title":"val/loss","height":140,"legend":false,
- "chart":{"kind":"line","x_label":"step","y_label":"loss",
-          "series":[{"name":"r0958","color":2,"points":[{"x":1,"y":0.5}]}]}}
+```rust
+Widget::row("work", [
+    Widget::column("runs", [runs_table]).width(320),
+    Widget::column("charts", [Widget::grid("curves", 360, charts)]).grow(),
+])
+Widget::chart("loss", "val/loss", ChartSpec::line([
+    ChartSeries::new("r12", points).color(2).style(SeriesStyle::Step),
+]).scales(Scale::Linear, Scale::Log)).legend(false).sync("curves")
 ```
 
-These additions do not change event indices, shortcuts or existing API 3
-JSON defaults. Rust SDK users set the new optional fields explicitly when
-constructing widgets and series.
+### Layout (API 4)
+
+- `column` takes `"width"` (120–1600 px) or `"grow": true`. A row holding a
+  growing column is a sidebar layout: it does not wrap, its children align
+  at the top, and the growing column takes the width left, which its charts
+  and grids then fill.
+- `row` takes `"align"`: `start`, `center` or `end` (the default without a
+  growing column, so labelled fields line up with buttons).
+- `grid` (`min_width` 120–1600 px, default 320; `gap`) lays its children
+  out in as many equal columns as fit, at least `min_width` each.
+- `section` (`title`, `open`, `children`) is a header that folds its
+  children away. Clicking it shows or hides them at once and sends
+  `change` with the new `open` (a boolean input); an extension may also
+  leave out the children of a closed section.
+- `tabs` (`value`, `options`) is a tab strip. Picking a tab sends `change`
+  with its value, as a select does; the extension draws the page below.
+- `stat` (`label`, `value`, optional `detail` and palette `color`) is a
+  dashboard tile with a headline number.
+
+### Tables (API 4)
+
+```json
+{"type":"table","id":"runs","columns":["run","score","hypothesis"],"rows":[...],
+ "widths":[70,90,0],"selectable":true,"selected":2,"max_height":600,
+ "check":true,"checked":[0,1],"disabled":[5],"swatches":[0,1,null]}
+```
+
+- `widths`: px per column, `0` shares what is left. Without it, columns
+  share the width in proportion to their content.
+- Cells are one line, cut with `…`; hovering a row with long cells shows it
+  whole. Columns of numbers are aligned right.
+- `selectable`: clicking a row (or Enter on it) sends
+  `{"kind":"select-row","index":2}`; `selected` highlights one.
+- `check`: a checkbox starts every row. Ticking one sends
+  `{"kind":"check-row","index":3,"value":true}` and shows at once.
+  `checked` lists ticked rows, `disabled` rows that can't be ticked, and
+  `swatches` a palette index (or `null`) per row, drawn next to the box, so
+  the table can be the charts' legend.
+- `max_height`: 120–1200 px (default 320); the header stays in place.
+- A focused table moves its row with Up/Down.
+
+### Charts
+
+Charts lay out their own axes: ticks fall on round values (1, 2 or 5 ×
+10ⁿ) with their gridlines, written short (`0 200k 400k`, `1.2M`, `1e-6`);
+the y axis rounds out to its outer ticks; empty axis labels take no room.
+Hovering a line chart shows a crosshair at the nearest x and a tooltip with
+every series' value there; scatter charts show the nearest dot, and bar
+charts a category's bars. Drag across a plot to zoom to that range,
+double-click to reset; `+`/`−`/`0` work on a focused chart, and the small
+zoom buttons appear while it is hovered or zoomed. Clicking a point or bar
+selects it and sends its original series and datum index (histograms use
+bin indices).
+
+- Series take `"color"`: 0–11. The first eight are a categorical palette
+  chosen to stay distinguishable with color-vision deficiencies, in light
+  and dark themes. Omitted colors use the series index.
+- Line and scatter series take `"style"`: `line`, `step` (holds a value
+  until the next point), `dashed`, `points` or `area`. The default is
+  `line` in a line chart and `points` in a scatter chart. A line marks only
+  the points it can't draw (a series of one point) and the hovered one.
+- Points take `"label"`, shown on hover instead of the series name.
+- Line and scatter charts take `"x_scale"`/`"y_scale"`: `linear` or `log`
+  (positive values only), and `"x_format"`/`"y_format"`: `number`, `date`
+  (Unix seconds, shown in UTC), `duration` (seconds: `45s`, `12m`, `3h20`)
+  or `percent` (a fraction shown as `83%`). Bar charts take `y_format`.
+- `"legend": false` hides the legend; with one series there is none.
+- `"width"`: 180–1600 px; omitted, a chart fills the width available to it.
+  `"height"` (120–600 px) is the whole chart, title and legend included.
+- `"controls"`: up to four small selects, buttons or checkboxes drawn in
+  the chart's title row (a y-axis picker); they are panel widgets with the
+  usual inputs and events.
+- `"sync": "<group>"`: charts of one group share their hover line and zoom.
+
+```json
+{"type":"chart","id":"loss","title":"val/loss","height":180,"legend":false,"sync":"curves",
+ "controls":[{"type":"select","id":"y","value":"val/loss","options":[{"value":"val/loss","label":"val/loss"}]}],
+ "chart":{"kind":"line","x_label":"step","y_scale":"log",
+          "series":[{"name":"r0958","color":2,"style":"step","points":[{"x":1,"y":0.5,"label":"r0958 · dart"}]}]}}
+```
+
+Declared programs run with `NEXT_CODE_VERSION` (the editor's version) and
+`NEXT_CODE_EXTENSION_API` (the newest API version the host accepts, `4`) in
+their environment, on every kind of host, so a tool that draws panels can
+use newer fields only where they are accepted (older hosts refuse unknown
+fields).
+
+Editor panels omit the extra manifest-title row because the editor tab
+already names the panel. Moving a panel to the dock restores its header.
+Work longer than a moment shows a small **Updating…** badge over the
+panel's top-right corner; it never moves the panel's contents.
 
 Dock panels live in the movable/resizable **Extensions** dock, with
 internal tabs for each view. **Move to Editor** and **Move to Dock** move
@@ -159,29 +232,31 @@ Opening an already open panel reveals it without reinitialising it.
 Explicit Reload packages closes views; disabling an extension closes only
 its views. Unrelated installations and opening the manager preserve them.
 
-Text edits stay local until Enter or a button action. Checkbox/dropdown
-changes send events immediately. Each event carries all current form
-values and the last accepted `state`; return a new root/state to update the
-view. Stable widget IDs preserve focus and text typed while an earlier
-response was pending. Actions are disabled while WASM is running, but text
-can still be edited. Closed/replaced/reloaded views reject stale replies,
+Text edits stay local until Enter or a button action. Checkbox, dropdown,
+tab and section changes send events immediately. Each event carries all
+current form values and the last accepted `state`; return a new root/state
+to update the view. Stable widget IDs preserve focus, scroll positions,
+chart zoom and text typed while an earlier response was pending. While the
+extension or its processes are running, controls stay usable: checkboxes,
+selects, tabs, sections and table ticks change at once, and the latest
+action is sent when the panel is idle (dropped if the new panel no longer
+has that widget). Closed/replaced/reloaded views reject stale replies,
 including any document edits returned with them.
 
-Tab/Shift+Tab navigate controls; Enter activates buttons/submits text,
-Space toggles checkboxes, and arrows select options. Focus a chart and use
-`+`/`−` to zoom and `0` to reset, or use its native buttons. Hover shows
-values; clicking a point/bar selects it and sends its original series and
-datum index (histograms use bin indices). Zoom also sends an event.
-Ordinary modified editor/application shortcuts remain available.
+Tab/Shift+Tab navigate controls (skipping those in closed sections); Enter
+activates buttons, submits text and selects a table row, Space toggles
+checkboxes, sections and table ticks, and arrows select options and tabs.
+Zoom sends a `chart-zoom` event. Ordinary modified editor/application
+shortcuts remain available.
 
 A command or opening response can initialise several declared panels.
 A UI-event response may update only its originating panel. All response
 models are validated before applying them; returning UI/edits with an
 error, duplicate widget IDs or undeclared panels is invalid.
 
-## Language-neutral ABI, versions 2 and 3
+## Language-neutral ABI, versions 2 to 4
 
-The manifest's exact fields are `id`, `name`, `version`, `api_version` (2 or 3),
+The manifest's exact fields are `id`, `name`, `version`, `api_version` (2, 3 or 4),
 `module` (one plain `.wasm` filename), `commands` (`id`, `title`), `panels`
 (`id`, `title`, `placement`) and `permissions`. At least one command or
 panel is required. Unknown fields/capabilities, duplicate contributions and
@@ -256,7 +331,8 @@ A dashboard button event's invocation, inside the normal request envelope:
 ```
 
 Event kinds: `click`, `submit`, `change` (with `value`), `chart-select`
-(`series`, `index`) and `chart-zoom` (`start`, `end`). Inputs are strings or
+(`series`, `index`), `chart-zoom` (`start`, `end`), `select-row` (`index`)
+and `check-row` (`index`, `value`). Inputs are strings or
 booleans keyed by current control IDs; the host validates type, membership,
 enabled target and chart bounds against its current model. Widget event
 `kind` is an object containing the tagged event payload, as shown above.
@@ -268,17 +344,20 @@ Returning both edits and an error is invalid. Live version/path checks
 run immediately before applying the batch.
 
 Parsing/compilation and invocation run off the UI thread. Each invocation
-has 10 million fuel units (including start/allocation), at most 64 MiB
+has 500 million fuel units (about a fifth of a second of work; a 40 KiB
+panel built and encoded in Rust takes about 10 million) (including start/allocation), at most 64 MiB
 linear memory and one 16,384-element table. Limits: 64 KiB manifest,
 16 MiB WASM module, 8 MiB editor document, 1 MiB settings, 16 MiB encoded
 request, 1 MiB encoded response, 4,096 edits and 1,024 log entries.
-UI limits: 8 declared panels per extension, 128 widgets/depth 8 per panel,
-64 KiB aggregate panel text, 4 KiB per text-input value, 16 KiB encoded
-panel state, 32 select options, 16 table columns/1,024 cells, 6 series per
-chart and 4,096 total chart data points/values per panel. Histogram bins:
-1–64. Numeric chart values must be finite and within ±1e12; progress is
-finite in [0, 1]. Layout gaps/spaces are 0–48 px; scroll heights 32–600 px,
-chart heights 120–500 px. The encoded response limit includes all panels.
+UI limits (the same for every API version, in
+`extension_api::limits`): 8 declared panels per extension, 256
+widgets/depth 12 per panel, 256 KiB aggregate panel text (point labels
+included), 4 KiB per text-input value, 64 KiB encoded panel state, 32
+select or tab options, 16 table columns/4,096 cells, 12 series per chart,
+4 chart controls and 16,384 total chart data points/values per panel.
+Histogram bins: 1–64. Numeric chart values must be finite and within
+±1e12; progress is finite in [0, 1]. Layout gaps/spaces are 0–48 px;
+scroll heights 32–1200 px, chart heights 120–600 px. The encoded response limit includes all panels.
 JSON escaping counts toward encoded limits. Failures are shown in output
 and command errors also appear in the editor notice.
 
@@ -309,8 +388,9 @@ installed where the project lives. Four processes may run per extension,
 and a panel may have at most four active or queued results. Process IDs
 must be unique among that panel's outstanding jobs. Timeout defaults to
 30 seconds and must be between 1 ms and 120 seconds. Each output stream
-is drained but retained only up to 256 KiB, before UTF-8 decoding and JSON
-escaping; excess output sets `truncated`. Invalid UTF-8 is replaced.
+is drained but retained only up to 256 KiB (stdout of a
+`"response":"stdout"` process: 1 MiB, the response limit), before UTF-8
+decoding and JSON escaping; excess output sets `truncated`. Invalid UTF-8 is replaced.
 
 Completion invokes the extension with the current panel revision, state
 and form inputs, plus:

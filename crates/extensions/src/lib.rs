@@ -1,6 +1,6 @@
 //! Restricted, import-free wasm32 extension packages.
 //!
-//! Each invocation gets a fresh instance, 10 million fuel (including start and
+//! Each invocation gets a fresh instance, 500 million fuel (including start and
 //! allocation), at most 64 MiB linear memory and one 16,384-element table. JSON
 //! requests are limited to 16 MiB and responses to 1 MiB, manifests to 64 KiB and modules
 //! to 16 MiB. Responses may contain at most 4,096 edits and 1,024 log entries.
@@ -31,7 +31,10 @@ use wasmi::{
 
 pub const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TABLE_ELEMENTS: usize = 16_384;
-pub const MAX_FUEL: u64 = 10_000_000;
+/// About a fifth of a second of guest work in a release build: enough to build and encode a full 1 MiB response
+/// (a 40 KiB panel takes about 10 million). This crate's own tests, which spin until the fuel runs out, keep a
+/// smaller budget so they stay fast in debug builds.
+pub const MAX_FUEL: u64 = if cfg!(test) { 10_000_000 } else { 500_000_000 };
 pub const MAX_EDITS: usize = 4096;
 pub const MAX_LOGS: usize = 1024;
 
@@ -159,7 +162,10 @@ impl Extension {
                     "unknown extension panel"
                 );
                 panels::validate_state(state)?;
-                ensure!(inputs.len() <= 128, "too many panel inputs");
+                ensure!(
+                    inputs.len() <= extension_api::limits::WIDGETS,
+                    "too many panel inputs"
+                );
                 for (id, value) in inputs {
                     panels::validate_id(id)?;
                     if let extension_api::InputValue::Text(text) = value {
