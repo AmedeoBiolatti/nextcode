@@ -86,6 +86,8 @@ pub(crate) struct ExtensionView {
     markdown: HashMap<String, Arc<markdown::Markdown>>,
     scroll: ScrollHandle,
     scrolls: HashMap<String, ScrollHandle>,
+    /// The scrolling of each column of a sidebar root (see [`panes`]), by column id.
+    panes: HashMap<String, ScrollHandle>,
     anchors: HashMap<String, ScrollAnchor>,
     scroll_paths: HashMap<String, Vec<String>>,
     focus: FocusHandle,
@@ -143,6 +145,7 @@ impl ExtensionView {
             markdown: HashMap::new(),
             scroll: ScrollHandle::new(),
             scrolls: HashMap::new(),
+            panes: HashMap::new(),
             anchors: HashMap::new(),
             scroll_paths: HashMap::new(),
             focus: cx.focus_handle(),
@@ -534,14 +537,44 @@ impl ExtensionView {
         self.scrolls.retain(|id, _| scroll_ids.contains(id));
         self.anchors.clear();
         self.scroll_paths.clear();
-        prepare_scrolling(
-            &update.root,
-            &self.scroll,
-            &[],
-            &self.scrolls,
-            &mut self.anchors,
-            &mut self.scroll_paths,
-        );
+        match panes(&update.root) {
+            // Each column scrolls on its own: what it holds scrolls into view there.
+            Some((root, columns)) => {
+                self.anchors.insert(
+                    root.to_owned(),
+                    ScrollAnchor::for_handle(self.scroll.clone()),
+                );
+                self.scroll_paths.insert(root.to_owned(), Vec::new());
+                self.panes
+                    .retain(|id, _| columns.iter().any(|column| column.id() == id));
+                for column in columns {
+                    let handle = self
+                        .panes
+                        .entry(column.id().to_owned())
+                        .or_default()
+                        .clone();
+                    prepare_scrolling(
+                        column,
+                        &handle,
+                        &[],
+                        &self.scrolls,
+                        &mut self.anchors,
+                        &mut self.scroll_paths,
+                    );
+                }
+            }
+            None => {
+                self.panes.clear();
+                prepare_scrolling(
+                    &update.root,
+                    &self.scroll,
+                    &[],
+                    &self.scrolls,
+                    &mut self.anchors,
+                    &mut self.scroll_paths,
+                );
+            }
+        }
         self.inputs = reconciled;
         self.order = order;
         self.model = Some(Arc::new(update));
@@ -1039,10 +1072,17 @@ impl Render for ExtensionView {
         let show_busy = self
             .busy_since
             .is_some_and(|since| since.elapsed() >= BUSY_DELAY);
-        let content = self
-            .model
+        let model = self.model.clone();
+        let paned = model
             .as_ref()
-            .map(|model| self.render_widget(&model.root, cx));
+            .is_some_and(|model| panes(&model.root).is_some());
+        let content = model.as_ref().map(|model| {
+            if paned {
+                self.render_panes(&model.root, cx)
+            } else {
+                self.render_widget(&model.root, cx)
+            }
+        });
         let content_width = self.content_width.clone();
         div()
             .id("extension-view")
@@ -1133,7 +1173,9 @@ impl Render for ExtensionView {
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .overflow_scroll()
+                    // Panes fill it and scroll themselves.
+                    .when(paned, |content| content.flex().flex_col().overflow_hidden())
+                    .when(!paned, |content| content.overflow_scroll())
                     .track_scroll(&self.scroll)
                     .children(content)
                     .child(
@@ -1238,6 +1280,21 @@ fn next_focus(length: usize, current: Option<usize>, reverse: bool) -> Option<us
         (None, true) => length - 1,
         (None, false) => 0,
     })
+}
+
+/// A root row with a growing column of columns only (a sidebar beside its content) fills the panel, and
+/// each of its columns scrolls on its own, as an app's sidebar and content do: the root's id and columns.
+pub(super) fn panes(root: &Widget) -> Option<(&str, &[Widget])> {
+    let Widget::Row { id, children, .. } = root else {
+        return None;
+    };
+    let columns = children
+        .iter()
+        .all(|child| matches!(child, Widget::Column { .. }));
+    let grows = children
+        .iter()
+        .any(|child| matches!(child, Widget::Column { grow: true, .. }));
+    (columns && grows).then_some((id.as_str(), children.as_slice()))
 }
 
 fn prepare_scrolling(

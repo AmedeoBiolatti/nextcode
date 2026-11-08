@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+azure_devops.workspace = true
 instance.workspace = true
 dap.workspace = true
 extension_api.workspace = true

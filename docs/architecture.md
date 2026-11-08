@@ -20,5 +20,6 @@
 | `crates/python` | `pyproject.toml` / `uv.lock`, uv command lines, pytest node ids |
 | `crates/notebook` | Notebooks: `.ipynb` and marimo file formats (round-trip exact), marimo's static analysis and cell graph, kernel output folding, ANSI colours, the kernel bridge (`assets/bridge.py`) and its JSON-lines protocol |
 | `crates/git` | Git through its CLI: porcelain v2 status, stage/unstage/discard/commit, hunk patches, branches, worktrees, fetch/pull/push, history, diffs |
+| `crates/azure_devops` | Azure DevOps Services client: Entra sign-in through Azure CLI, remote URL detection, open PRs, pipeline runs, timelines and logs; host-supplied cancellable process runner |
 | `crates/spell` | Spell checking: Hunspell dictionaries through `spellbook` (bundled en_US), word lists, word splitting, which parts of a document are prose |
 | `crates/ui` | `next_code_editor` binary: editor, docks, LSP, terminal, search, problems, git and Python panels, diffs, fuzzy file finder (`Ctrl+P`) |

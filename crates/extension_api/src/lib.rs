@@ -17,6 +17,9 @@ pub mod limits {
     pub const TABLE_CELLS: usize = 4096;
     pub const CHART_CONTROLS: usize = 4;
     pub const PALETTE: u8 = 12;
+    /// Icons in a table's cells, all cells together, and in one cell.
+    pub const TABLE_MARKS: usize = 4096;
+    pub const CELL_MARKS: usize = 12;
 }
 
 /// The newest protocol version. Hosts also accept packages written for 2 and 3.
@@ -282,6 +285,48 @@ pub enum Align {
     End,
 }
 
+/// A small icon drawn before a table cell's text (API 4): a reviewer's vote, a check's outcome. `label` says
+/// what it means; it is shown on hover and read out with the row.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Mark {
+    pub icon: Icon,
+    /// A palette index (0..12); omitted: the muted text color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u8>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+}
+impl Mark {
+    pub fn new(icon: Icon, label: impl Into<String>) -> Self {
+        Self {
+            icon,
+            color: None,
+            label: label.into(),
+        }
+    }
+    pub fn color(mut self, color: u8) -> Self {
+        self.color = Some(color);
+        self
+    }
+}
+
+/// The icons a [`Mark`] can show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Icon {
+    Check,
+    Cross,
+    Clock,
+    /// An empty ring: not yet, none.
+    Circle,
+    /// A filled dot.
+    Dot,
+    Minus,
+    Warning,
+    Comment,
+    Person,
+}
+
 /// The widget tree of a panel. Optional fields may be omitted from the JSON; the Rust builders below
 /// (`Widget::row`, `Widget::chart`, …) fill them in.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -433,9 +478,13 @@ pub enum Widget {
         /// Rows whose box can't be ticked.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         disabled: Vec<u32>,
-        /// One palette index (or null) per row, drawn as a swatch: the table doubles as a chart legend.
+        /// One palette index (or null) per row, drawn as a swatch: the table doubles as a chart legend, or
+        /// shows a status. Works with or without `check`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         swatches: Vec<Option<u8>>,
+        /// Icons before the cells' text: rows of cells of marks (API 4). Shorter rows and cells have none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        marks: Vec<Vec<Vec<Mark>>>,
     },
     Chart {
         id: String,
@@ -650,6 +699,7 @@ impl Widget {
             checked: Vec::new(),
             disabled: Vec::new(),
             swatches: Vec::new(),
+            marks: Vec::new(),
         }
     }
     pub fn chart(id: impl Into<String>, title: impl Into<String>, chart: ChartSpec) -> Self {
@@ -784,6 +834,20 @@ impl Widget {
         {
             *selectable = true;
             *selected = value;
+        }
+        self
+    }
+    /// A swatch a row (a palette index or none), without checkboxes.
+    pub fn swatches(mut self, colors: impl IntoIterator<Item = Option<u8>>) -> Self {
+        if let Self::Table { swatches, .. } = &mut self {
+            *swatches = colors.into_iter().collect();
+        }
+        self
+    }
+    /// Icons before cells' text: one list of cells a row, one list of marks a cell.
+    pub fn marks(mut self, value: Vec<Vec<Vec<Mark>>>) -> Self {
+        if let Self::Table { marks, .. } = &mut self {
+            *marks = value;
         }
         self
     }

@@ -701,6 +701,7 @@ fn panel_fixture() -> extension_api::PanelUpdate {
                     checked: vec![],
                     disabled: vec![],
                     swatches: vec![],
+                    marks: vec![],
                 },
                 Widget::Chart {
                     legend: true,
@@ -846,6 +847,7 @@ fn panel_bounds_and_error_atomicity_apply_without_document_edits() {
             checked: vec![],
             disabled: vec![],
             swatches: vec![],
+            marks: vec![],
         },
         Widget::Column {
             id: "r".into(),
@@ -1679,6 +1681,29 @@ fn api4_layout_tables_tabs_sections_and_chart_controls_validate_with_their_event
             "swatch color",
         ),
         (
+            Widget::table("t", vec!["a".into()], vec![vec!["x".into()]]).swatches([Some(1), None]),
+            "a swatch a row",
+        ),
+        (
+            Widget::table("t", vec!["a".into()], vec![vec!["x".into()]]).marks(vec![vec![
+                vec![],
+                vec![extension_api::Mark::new(extension_api::Icon::Check, "")],
+            ]]),
+            "marks a cell",
+        ),
+        (
+            Widget::table("t", vec!["a".into()], vec![vec!["x".into()]]).marks(vec![vec![vec![
+                extension_api::Mark::new(extension_api::Icon::Check, "").color(12),
+            ]]]),
+            "mark color",
+        ),
+        (
+            Widget::table("t", vec!["a".into()], vec![vec!["x".into()]]).marks(vec![vec![
+                vec![extension_api::Mark::new(extension_api::Icon::Dot, ""); 13],
+            ]]),
+            "marks in a cell",
+        ),
+        (
             Widget::table("t", vec!["a".into()], vec![vec!["x".into()]]).checks([1], [], []),
             "checked row",
         ),
@@ -1703,6 +1728,17 @@ fn api4_layout_tables_tabs_sections_and_chart_controls_validate_with_their_event
         panel.root = broken;
         assert!(validate_panel_update(&panel).is_err(), "{why}");
     }
+    // Marks may leave out trailing rows and cells.
+    panel.root = Widget::table(
+        "t",
+        vec!["a".into(), "b".into()],
+        vec![vec!["x".into(), "y".into()]; 2],
+    )
+    .marks(vec![vec![
+        vec![],
+        vec![extension_api::Mark::new(extension_api::Icon::Check, "Ada approved").color(5)],
+    ]]);
+    validate_panel_update(&panel).unwrap();
     // Twelve series a chart, thirteen too many.
     let many = |n: usize| {
         Widget::chart(

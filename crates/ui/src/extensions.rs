@@ -596,15 +596,16 @@ impl Render for ExtensionPanel {
                 .child(div().id("close").cursor_pointer().child("Close")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(PanelEvent::Close))).pin("close")))
             .child(div().text_color(theme::muted()).child("Built-in — part of next_code; turn on what you use."))
-            .child(div().id("builtins").max_h(px(160.)).overflow_y_scroll().flex().flex_col()
+            .child(div().id("builtins").max_h(px(220.)).overflow_y_scroll().flex().flex_col()
                 .children(builtins.into_iter().map(|(builtin, enabled)| {
                     let id = builtin.id;
                     div().id(id).flex().items_center().gap_3().py_1()
                         .border_b_1().border_color(theme::border())
-                        .child(div().flex_1().flex().flex_col()
+                        // The description wraps; the toggle keeps its place.
+                        .child(div().flex_1().min_w_0().flex().flex_col()
                             .child(builtin.name)
                             .child(div().text_xs().text_color(theme::muted()).child(builtin.description)))
-                        .child(div().id("toggle").cursor_pointer().child(if enabled { "Disable" } else { "Enable" })
+                        .child(div().id("toggle").flex_none().cursor_pointer().child(if enabled { "Disable" } else { "Enable" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.store.update(cx, |store, cx| store.set_builtin_enabled(id, !enabled, cx));
                             }))

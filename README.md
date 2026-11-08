@@ -24,6 +24,10 @@
   hierarchy, parameter and inlay hints, rename, quick fixes, formatting.
 - **Git**: PyCharm-style Commit window, commit graph, side-by-side diffs,
   branches, worktrees, stash and shelf, blame, hunk staging.
+- **Azure DevOps**: optional built-in that opens each Azure DevOps project in
+  a window tab, with Microsoft SSO through local Azure CLI, open pull requests
+  with their approvals, checks and comments, pipeline runs, stage/job
+  timelines and logs.
 - **Remote projects**: WSL distros, dev containers and machines over SSH
   (Tailscale machines listed for you), with search,
   language servers, terminals and debugging running where the project

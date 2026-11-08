@@ -283,6 +283,7 @@ impl<'a> Bounds<'a> {
                 checked,
                 disabled,
                 swatches,
+                marks,
                 ..
             } => {
                 ensure!(
@@ -315,8 +316,8 @@ impl<'a> Bounds<'a> {
                     "invalid table max_height: expected 120..1200"
                 );
                 ensure!(
-                    *check || (checked.is_empty() && disabled.is_empty() && swatches.is_empty()),
-                    "checked, disabled and swatches require check"
+                    *check || (checked.is_empty() && disabled.is_empty()),
+                    "checked and disabled require check"
                 );
                 for list in [checked, disabled] {
                     let mut seen = HashSet::new();
@@ -332,6 +333,22 @@ impl<'a> Bounds<'a> {
                 );
                 for swatch in swatches {
                     color(*swatch, "table")?;
+                }
+                ensure!(
+                    marks.len() <= rows.len() && marks.iter().all(|row| row.len() <= columns.len()),
+                    "table marks: at most one list a cell"
+                );
+                let mut total = 0;
+                for cell in marks.iter().flatten() {
+                    total += cell.len();
+                    ensure!(
+                        cell.len() <= limits::CELL_MARKS && total <= limits::TABLE_MARKS,
+                        "too many table marks"
+                    );
+                    for mark in cell {
+                        color(mark.color, "table mark")?;
+                        self.text(&mark.label)?;
+                    }
                 }
             }
             Widget::Chart {

@@ -548,22 +548,11 @@ fn y_ticks(geometry: &Geometry, height: f32) -> (Range, Ticks) {
     let rounded = geometry.y_axis.scale == Scale::Linear
         && matches!(
             geometry.y_axis.format,
-            AxisFormat::Number | AxisFormat::Percent
+            AxisFormat::Number | AxisFormat::Percent | AxisFormat::Duration
         );
     if rounded {
-        let step = axis::nice_step(
-            (data.max - data.min)
-                * if geometry.y_axis.format == AxisFormat::Percent {
-                    100.
-                } else {
-                    1.
-                },
-            target,
-        ) / if geometry.y_axis.format == AxisFormat::Percent {
-            100.
-        } else {
-            1.
-        };
+        // The step the axis' own format picks (round numbers, percents or durations such as 30m).
+        let step = Ticks::new(data.min, data.max, geometry.y_axis, target).step;
         // Out to the next multiples, an exact multiple (a bar chart's zero) staying where it is.
         let domain = Range::new(
             (data.min / step + 1e-9).floor() * step,
@@ -1603,6 +1592,26 @@ mod tests {
         // A count starting at zero keeps zero as its bottom.
         let hist = Geometry::new(&ChartSpec::histogram(vec![0., 0., 1., 2., 2., 2.], 3));
         assert_eq!(y_ticks(&hist, 150.).0.min, 0.);
+        // Durations round out to duration steps: 0 to 20 minutes in 5 or 10 minute ticks.
+        let runs = Geometry::new(
+            &ChartSpec::scatter([ChartSeries::new(
+                "runs",
+                [ChartPoint::new(0., 540.), ChartPoint::new(1., 1100.)],
+            )])
+            .formats(AxisFormat::Number, AxisFormat::Duration),
+        );
+        let (domain, ticks) = y_ticks(&runs, 150.);
+        assert!(
+            domain.max >= 1100. && ticks.values.len() >= 2,
+            "{domain:?} {:?}",
+            ticks.labels()
+        );
+        assert!(
+            ticks
+                .labels()
+                .iter()
+                .all(|label| label.ends_with('m') || label.ends_with('s'))
+        );
         // The ticks are the domain's own step: the top gridline is the domain's top, above every point.
         let score = Geometry::new(&ChartSpec::line([ChartSeries::new(
             "best",

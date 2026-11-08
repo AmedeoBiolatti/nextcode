@@ -24,6 +24,7 @@
 ## Tools
 
 - [Git and multiple projects](git.md)
+- [Azure DevOps](azure-devops.md): Microsoft SSO, open PRs, pipeline runs and logs
 - [Run configurations and tests](run-and-test.md)
 - [Debugging](debugging.md)
 - [Python (uv)](python.md)
