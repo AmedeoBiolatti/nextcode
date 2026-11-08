@@ -136,7 +136,9 @@ Widget::chart("loss", "val/loss", ChartSpec::line([
 - `column` takes `"width"` (120–1600 px) or `"grow": true`. A row holding a
   growing column is a sidebar layout: it does not wrap, its children align
   at the top, and the growing column takes the width left, which its charts
-  and grids then fill.
+  and grids then fill. When such a row of columns is the panel's root, it
+  fills the panel's height and each column scrolls on its own, so a
+  sidebar stays in place beside long content.
 - `row` takes `"align"`: `start`, `center` or `end` (the default without a
   growing column, so labelled fields line up with buttons).
 - `grid` (`min_width` 120–1600 px, default 320; `gap`) lays its children
@@ -155,7 +157,8 @@ Widget::chart("loss", "val/loss", ChartSpec::line([
 ```json
 {"type":"table","id":"runs","columns":["run","score","hypothesis"],"rows":[...],
  "widths":[70,90,0],"selectable":true,"selected":2,"max_height":600,
- "check":true,"checked":[0,1],"disabled":[5],"swatches":[0,1,null]}
+ "check":true,"checked":[0,1],"disabled":[5],"swatches":[0,1,null],
+ "marks":[[[], [{"icon":"check","color":5,"label":"Ada approved"}]]]}
 ```
 
 - `widths`: px per column, `0` shares what is left. Without it, columns
@@ -168,7 +171,16 @@ Widget::chart("loss", "val/loss", ChartSpec::line([
   `{"kind":"check-row","index":3,"value":true}` and shows at once.
   `checked` lists ticked rows, `disabled` rows that can't be ticked, and
   `swatches` a palette index (or `null`) per row, drawn next to the box, so
-  the table can be the charts' legend.
+  the table can be the charts' legend. Swatches also work without `check`,
+  as a status dot at the start of each row.
+- `marks`: small icons before a cell's text, one list per cell, by row
+  then column (shorter rows and cells have none). Each has an `icon`
+  (`check`, `cross`, `clock`, `circle`, `dot`, `minus`, `warning`,
+  `comment` or `person`), an optional palette `color` (muted without one)
+  and a `label`, shown on hover and read with the row. Up to 12 a cell and
+  4,096 a table. A column with marks keeps its text on the left, even when
+  it is numbers. Use them for states that read at a glance, such as one tick
+  per approval.
 - `max_height`: 120–1200 px (default 320); the header stays in place.
 - A focused table moves its row with Up/Down.
 

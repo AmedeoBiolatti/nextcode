@@ -5,6 +5,40 @@ use extension_api::{Align, InputValue, Widget};
 use gpui::{AnyElement, Context, SharedString, canvas, div, prelude::*, px};
 
 impl ExtensionView {
+    /// A sidebar root (see [`super::panes`]): its columns side by side, the full height, each scrolling.
+    pub(super) fn render_panes(&self, root: &Widget, cx: &Context<Self>) -> AnyElement {
+        let (Some((id, columns)), Widget::Row { gap, .. }) = (super::panes(root), root) else {
+            return self.render_widget(root, cx);
+        };
+        div()
+            .id(SharedString::from(id.to_owned()))
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_row()
+            .gap(px(f32::from(*gap)))
+            .children(columns.iter().map(|column| {
+                let grow = matches!(column, Widget::Column { grow: true, .. });
+                div()
+                    .id(SharedString::from(format!("{}-pane", column.id())))
+                    .h_full()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when_some(self.panes.get(column.id()), |pane, scroll| {
+                        pane.track_scroll(scroll)
+                    })
+                    .map(|pane| {
+                        if grow {
+                            pane.flex_1().min_w_0()
+                        } else {
+                            pane.flex_none()
+                        }
+                    })
+                    .child(self.render_widget(column, cx))
+            }))
+            .into_any_element()
+    }
+
     pub(super) fn render_layout(&self, widget: &Widget, cx: &Context<Self>) -> AnyElement {
         match widget {
             Widget::Row {

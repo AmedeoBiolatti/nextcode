@@ -1,8 +1,8 @@
 //! Tables: sized columns, one-line cells, numbers aligned right, rows to select and to tick.
 use super::{ExtensionView, charts};
 use crate::{debugger::panel::Tooltip, pinpoint::Pin, theme};
-use extension_api::{UiEvent, UiEventKind, Widget};
-use gpui::{AnyElement, Context, SharedString, Window, div, prelude::*, px};
+use extension_api::{Icon, Mark, UiEvent, UiEventKind, Widget};
+use gpui::{AnyElement, Context, SharedString, Window, div, prelude::*, px, svg};
 use std::collections::BTreeSet;
 
 const ROW: f32 = 26.;
@@ -213,13 +213,26 @@ impl ExtensionView {
             checked,
             disabled,
             swatches,
+            marks,
             ..
         } = widget
         else {
             return div().into_any_element();
         };
+        let no_marks: &[Mark] = &[];
+        let marks_of = |row: usize, column: usize| {
+            marks
+                .get(row)
+                .and_then(|cells| cells.get(column))
+                .map_or(no_marks, Vec::as_slice)
+        };
         let widths = widths(widget);
-        let numeric: Vec<bool> = (0..columns.len()).map(|c| numeric(rows, c)).collect();
+        // A column with icons shows states, not quantities: its text stays on the left.
+        let numeric: Vec<bool> = (0..columns.len())
+            .map(|c| {
+                numeric(rows, c) && marks.iter().all(|row| row.get(c).is_none_or(Vec::is_empty))
+            })
+            .collect();
         let state = self.tables.get(id);
         let selected = state.and_then(|table| table.selected).or(*selected);
         // The keyboard's row, set only by Up/Down.
@@ -227,24 +240,42 @@ impl ExtensionView {
         let ticked = self.table_checked(id, checked);
         let has_swatches = swatches.iter().any(Option::is_some);
         let lead = if *check { 28. } else { 0. } + if has_swatches { 14. } else { 0. };
-        let cell = |column: usize, text: &str, header: bool| {
+        let cell = |column: usize, text: &str, header: bool, marks: &[Mark], key: String| {
             let base = div()
                 .h_full()
                 .flex()
                 .items_center()
+                .gap(px(4.))
                 .px(px(6.))
                 .min_w_0()
                 .overflow_hidden()
                 .when(numeric[column], |cell| cell.justify_end())
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .when(numeric[column] && !header, |cell| {
-                            cell.font_family(theme::MONO_FONT).text_xs()
-                        })
-                        .child(SharedString::from(text.to_owned())),
-                );
+                .when(!marks.is_empty(), |cell| {
+                    cell.child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(1.))
+                            .children(
+                                marks
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, mark)| render_mark(mark, format!("{key}-{i}"))),
+                            ),
+                    )
+                })
+                .when(!text.is_empty(), |cell| {
+                    cell.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .when(numeric[column] && !header, |cell| {
+                                cell.font_family(theme::MONO_FONT).text_xs()
+                            })
+                            .child(SharedString::from(text.to_owned())),
+                    )
+                });
             match widths[column] {
                 Width::Fixed(width) => base.w(px(width)).flex_none(),
                 Width::Share(basis) => base
@@ -270,14 +301,30 @@ impl ExtensionView {
                 columns
                     .iter()
                     .enumerate()
-                    .map(|(c, name)| cell(c, name, true)),
+                    .map(|(c, name)| cell(c, name, true, no_marks, String::new())),
             );
         let body = rows.iter().enumerate().map(|(index, cells)| {
             let row_index = index as u32;
             let is_selected = selected == Some(row_index);
             let is_checked = ticked.contains(&row_index);
             let locked = disabled.contains(&row_index);
-            let full: String = cells.join("  ·  ");
+            // What the row says, its marks' labels included (hover, pinpoint).
+            let full: String = cells
+                .iter()
+                .enumerate()
+                .map(|(c, text)| {
+                    let labels = marks_of(index, c)
+                        .iter()
+                        .map(|m| m.label.as_str())
+                        .filter(|l| !l.is_empty());
+                    let mut parts: Vec<&str> = labels.collect();
+                    if !text.is_empty() {
+                        parts.push(text);
+                    }
+                    parts.join(", ")
+                })
+                .collect::<Vec<_>>()
+                .join("  ·  ");
             let long = cells.iter().any(|cell| cell.chars().count() > 24);
             let (select_weak, check_weak) = (weak.clone(), weak.clone());
             let (select_id, check_id) = (id.clone(), id.clone());
@@ -369,12 +416,15 @@ impl ExtensionView {
                             })),
                     )
                 })
-                .children(
-                    cells
-                        .iter()
-                        .enumerate()
-                        .map(|(c, text)| cell(c, text, false)),
-                )
+                .children(cells.iter().enumerate().map(|(c, text)| {
+                    cell(
+                        c,
+                        text,
+                        false,
+                        marks_of(index, c),
+                        format!("{id}-mark-{index}-{c}"),
+                    )
+                }))
                 .pin(format!("row:{}", index + 1))
                 .label(full)
         });
@@ -403,6 +453,35 @@ impl ExtensionView {
             content.into_any_element()
         }
     }
+}
+
+/// A mark: its icon in its color (muted without one), its label on hover.
+fn render_mark(mark: &Mark, key: String) -> AnyElement {
+    let path = match mark.icon {
+        Icon::Check => "icons/check.svg",
+        Icon::Cross => "icons/close.svg",
+        Icon::Clock => "icons/clock.svg",
+        Icon::Circle => "icons/circle.svg",
+        Icon::Dot => "icons/dot.svg",
+        Icon::Minus => "icons/minus.svg",
+        Icon::Warning => "icons/warning.svg",
+        Icon::Comment => "icons/comment.svg",
+        Icon::Person => "icons/person.svg",
+    };
+    let color = mark.color.map_or_else(theme::muted, charts::color);
+    let label = mark.label.clone();
+    div()
+        .id(SharedString::from(key))
+        .flex_none()
+        .size(px(14.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(svg().path(path).size(px(13.)).text_color(color))
+        .when(!label.is_empty(), |mark| {
+            mark.tooltip(move |window, cx| Tooltip::view(label.clone(), window, cx))
+        })
+        .into_any_element()
 }
 
 #[cfg(test)]

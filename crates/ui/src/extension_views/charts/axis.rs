@@ -33,7 +33,7 @@ impl Axis {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Ticks {
     pub values: Vec<f64>,
-    step: f64,
+    pub step: f64,
     axis: Axis,
 }
 

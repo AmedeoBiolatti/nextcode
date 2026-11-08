@@ -122,6 +122,12 @@ glyph_icons![
     "search",
     "window",
     "workflow",
+    // Table marks (extension panels).
+    "circle",
+    "clock",
+    "comment",
+    "dot",
+    "warning",
 ];
 
 fn all_icons() -> impl Iterator<Item = &'static (&'static str, &'static [u8])> {

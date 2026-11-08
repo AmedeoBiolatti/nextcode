@@ -3,13 +3,14 @@ resolver = "3"
 members = ["crates/*", "grammars/*"]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 publish = false
 
 [workspace.dependencies]
 alacritty_terminal = "0.26"
 anyhow = "1"
+azure_devops = { path = "crates/azure_devops" }
 dap = { path = "crates/dap" }
 extension_api = { path = "crates/extension_api" }
 extensions = { path = "crates/extensions" }

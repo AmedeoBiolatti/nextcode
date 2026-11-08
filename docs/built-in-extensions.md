@@ -13,6 +13,7 @@ turns them all back to their defaults.
 | Extension | Default | Contributes |
 |---|---|---|
 | [Assembly Inspection](assembly-inspection.md) | off | Run > Tools > Inspect Assembly, assembly tabs |
+| [Azure DevOps](azure-devops.md) | off | File > Open Azure DevOps: each Azure DevOps project in a window tab, Microsoft SSO through local Azure CLI, open PRs with their reviews, checks and comments, pipeline runs, timelines and logs |
 | [Workflows](workflows.md) | on | workflow tabs, Run > Workflows > Open Workflow… / Open Workflow File… / Add Workflow Folder… / New Workflow…, the palette's *Run Workflow:* entries |
 | [Notebooks](notebooks.md) | on | notebook tabs for `.ipynb` and marimo files, the `notebook::*` commands, Run > Notebooks > Run Cell / Run All Cells / Interrupt / Restart, the *Open as Notebook* suggestion |
 | [Python](python.md) | on | the Python panel, the `python::*` commands (Sync, Lock, Run File, Run Tests…) and the *out of date* Sync suggestion |

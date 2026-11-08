@@ -423,3 +423,16 @@ fn actions_taken_while_busy_apply_locally_and_are_sent_once_idle(cx: &mut TestAp
     assert_eq!(event.widget, "enabled");
     assert_eq!(inputs.get("enabled"), Some(&InputValue::Bool(false)));
 }
+
+#[test]
+fn a_sidebar_root_scrolls_each_column() {
+    let side = Widget::column("side", [Widget::label("a", "A")]).width(240);
+    let main = Widget::column("main", [Widget::label("b", "B")]).grow();
+    let root = Widget::row("root", [side.clone(), main.clone()]);
+    let (id, columns) = super::panes(&root).unwrap();
+    assert_eq!((id, columns.len()), ("root", 2));
+    // Without a growing column, or with anything but columns, it is an ordinary row.
+    assert!(super::panes(&Widget::row("root", [side.clone()])).is_none());
+    assert!(super::panes(&Widget::row("root", [main, Widget::label("c", "C")])).is_none());
+    assert!(super::panes(&Widget::column("root", [side])).is_none());
+}

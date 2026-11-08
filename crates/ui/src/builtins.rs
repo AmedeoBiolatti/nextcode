@@ -30,6 +30,7 @@ use crate::{
 };
 
 pub mod assembly;
+pub mod azure;
 pub mod notebook;
 pub mod notes;
 pub mod python;
@@ -41,6 +42,7 @@ pub mod workflows;
 /// come first (and may anchor on an earlier one's).
 pub const ALL: &[&Builtin] = &[
     &assembly::BUILTIN,
+    &azure::BUILTIN,
     &workflows::BUILTIN,
     &notebook::BUILTIN,
     &python::BUILTIN,
